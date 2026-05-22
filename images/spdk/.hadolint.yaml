@@ -1,0 +1,8 @@
+---
+failure-threshold: warning
+
+ignored:
+  # dnf version pinning is managed via renovate datasource comments
+  # where applicable; build-dependency packages installed by pkgdep.sh
+  # cannot be individually pinned.
+  - DL3041

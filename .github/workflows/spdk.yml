@@ -1,0 +1,310 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+# ------------------------------------------------------------------
+# SPDK Container Image — Build, Scan, Sign, Publish
+# ------------------------------------------------------------------
+name: SPDK
+
+on:
+  push:
+    branches: [main]
+    tags: ["spdk/v*"]
+    paths:
+      - "images/spdk/**"
+      - ".github/workflows/spdk.yml"
+  pull_request:
+    paths:
+      - "images/spdk/**"
+      - ".github/workflows/spdk.yml"
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: ghcr.io/evariops/spdk
+
+# ── Top-level permissions (least-privilege baseline) ─────────────
+permissions:
+  contents: read
+
+# ── Cancel superseded runs on the same branch / PR ──────────────
+concurrency:
+  group: spdk-${{ github.ref }}
+  cancel-in-progress: true
+
+# ==================================================================
+jobs:
+  # ────────────────────────────────────────────────────────────────
+  # 1. Lint
+  # ────────────────────────────────────────────────────────────────
+  lint:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Lint Dockerfile
+        uses: hadolint/hadolint-action@2332a7b74a6de0dda2e2221d575162eba76ba5e5 # v3.3.0
+        with:
+          dockerfile: images/spdk/Dockerfile
+          config: images/spdk/.hadolint.yaml
+
+  # ────────────────────────────────────────────────────────────────
+  # 2. Build SPDK — amd64 (native runner)
+  # ────────────────────────────────────────────────────────────────
+  build-amd64:
+    needs: lint
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      imageid: ${{ steps.build.outputs.imageid }}
+      tag: ${{ steps.tag.outputs.tag }}
+      minor_tag: ${{ steps.tag.outputs.minor_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tag suffix
+        id: tag
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/spdk/v* ]]; then
+            TAG="${GITHUB_REF#refs/tags/spdk/}"
+            # If tag is 3-part semver (vX.Y.Z), derive floating minor tag (vX.Y)
+            if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "minor_tag=${TAG%.*}" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            TAG="sha-${GITHUB_SHA::7}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Build (amd64)
+        id: build
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
+        with:
+          context: images/spdk
+          file: images/spdk/Dockerfile
+          platforms: linux/amd64
+          push: ${{ startsWith(github.ref, 'refs/tags/') }}
+          load: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          tags: ${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}-amd64
+          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:cache-amd64
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref={0}:cache-amd64,mode=max', env.IMAGE_NAME) || '' }}
+
+      # ── Vulnerability scan (gate — before manifest merge) ─────
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        env:
+          TRIVY_PLATFORM: linux/amd64
+        with:
+          image-ref: ${{ startsWith(github.ref, 'refs/tags/') && format('{0}:{1}-amd64', env.IMAGE_NAME, steps.tag.outputs.tag) || steps.build.outputs.imageid }}
+          format: "table"
+          exit-code: "1"
+          severity: "HIGH,CRITICAL"
+
+  # ────────────────────────────────────────────────────────────────
+  # 3. Build SPDK — arm64 (native ARM runner, NO QEMU)
+  # ────────────────────────────────────────────────────────────────
+  build-arm64:
+    needs: lint
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tag suffix
+        id: tag
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/spdk/v* ]]; then
+            TAG="${GITHUB_REF#refs/tags/spdk/}"
+            if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "minor_tag=${TAG%.*}" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            TAG="sha-${GITHUB_SHA::7}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Build (arm64)
+        id: build
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
+        with:
+          context: images/spdk
+          file: images/spdk/Dockerfile
+          platforms: linux/arm64
+          push: ${{ startsWith(github.ref, 'refs/tags/') }}
+          load: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          tags: ${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}-arm64
+          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:cache-arm64
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref={0}:cache-arm64,mode=max', env.IMAGE_NAME) || '' }}
+
+      # ── Vulnerability scan (gate — before manifest merge) ─────
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        env:
+          TRIVY_PLATFORM: linux/arm64
+        with:
+          image-ref: ${{ startsWith(github.ref, 'refs/tags/') && format('{0}:{1}-arm64', env.IMAGE_NAME, steps.tag.outputs.tag) || steps.build.outputs.imageid }}
+          format: "table"
+          exit-code: "1"
+          severity: "HIGH,CRITICAL"
+
+  # ────────────────────────────────────────────────────────────────
+  # 4. Multi-arch manifest + Sign + SBOM + Attest
+  # ────────────────────────────────────────────────────────────────
+  publish:
+    needs: [build-amd64, build-arm64]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write       # cosign keyless (Fulcio OIDC)
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      # ── Create multi-arch manifest ────────────────────────────
+      - name: Create and push multi-arch manifest
+        id: manifest
+        env:
+          TAG: ${{ needs.build-amd64.outputs.tag }}
+          MINOR_TAG: ${{ needs.build-amd64.outputs.minor_tag }}
+        run: |
+          set -euo pipefail
+
+          # Create versioned manifest from per-arch tags
+          docker buildx imagetools create \
+            -t "${IMAGE_NAME}:${TAG}" \
+            "${IMAGE_NAME}:${TAG}-amd64" \
+            "${IMAGE_NAME}:${TAG}-arm64"
+
+          # Floating minor tag (e.g. v26.01 from v26.01.0)
+          if [[ -n "${MINOR_TAG}" ]]; then
+            docker buildx imagetools create \
+              -t "${IMAGE_NAME}:${MINOR_TAG}" \
+              "${IMAGE_NAME}:${TAG}-amd64" \
+              "${IMAGE_NAME}:${TAG}-arm64"
+          fi
+
+          # If this is a release tag, also create sha tag
+          if [[ "$GITHUB_REF" == refs/tags/spdk/v* ]]; then
+            SHA_TAG="sha-${GITHUB_SHA::7}"
+            docker buildx imagetools create \
+              -t "${IMAGE_NAME}:${SHA_TAG}" \
+              "${IMAGE_NAME}:${TAG}-amd64" \
+              "${IMAGE_NAME}:${TAG}-arm64"
+          fi
+
+          # Retrieve the manifest digest
+          DIGEST=$(docker buildx imagetools inspect "${IMAGE_NAME}:${TAG}" --raw | sha256sum | awk '{print "sha256:"$1}')
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Manifest digest: ${DIGEST}"
+
+      # ── Cosign: install ───────────────────────────────────────
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22 # v4.1.0
+
+      # ── Cosign: sign image (keyless via Fulcio OIDC) ──────────
+      - name: Sign image
+        env:
+          DIGEST: ${{ steps.manifest.outputs.digest }}
+        run: |
+          cosign sign --yes "${IMAGE_NAME}@${DIGEST}"
+
+      # ── SBOM generation (SPDX) ───────────────────────────────
+      - name: Generate SBOM (SPDX)
+        uses: anchore/sbom-action@57aae528053a48a3f6235f2d9461b05fbcb7366d # v0.23.1
+        with:
+          image: ${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: true
+          upload-artifact-retention: 90
+
+      # ── SBOM generation (CycloneDX) ──────────────────────────
+      - name: Generate SBOM (CycloneDX)
+        uses: anchore/sbom-action@57aae528053a48a3f6235f2d9461b05fbcb7366d # v0.23.1
+        with:
+          image: ${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+          upload-artifact: true
+          upload-artifact-retention: 90
+
+      # ── Enrich SBOMs with source package metadata ─────────────
+      - name: Checkout (for scripts)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+          path: repo
+
+      - name: Enrich SBOMs
+        env:
+          TAG: ${{ needs.build-amd64.outputs.tag }}
+        run: |
+          VER="${TAG#v}"; VER="${VER%.*}"
+          ./repo/.github/scripts/enrich-sbom.sh \
+            --name spdk \
+            --version "$VER" \
+            --supplier "SPDK Project (Linux Foundation)" \
+            --license "BSD-3-Clause" \
+            --purl "pkg:github/spdk/spdk@v${VER}" \
+            --download "https://github.com/spdk/spdk/archive/refs/tags/v${VER}.tar.gz" \
+            --vcs "https://github.com/spdk/spdk" \
+            --spdx sbom.spdx.json \
+            --cdx sbom.cdx.json
+
+      # ── Cosign: attest SBOMs on the image ─────────────────────
+      - name: Attest SBOM
+        env:
+          DIGEST: ${{ steps.manifest.outputs.digest }}
+        run: |
+          cosign attest --yes \
+            --predicate sbom.spdx.json \
+            --type spdxjson \
+            "${IMAGE_NAME}@${DIGEST}"
+          cosign attest --yes \
+            --predicate sbom.cdx.json \
+            --type cyclonedx \
+            "${IMAGE_NAME}@${DIGEST}"

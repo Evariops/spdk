@@ -1,0 +1,24 @@
+---
+version: 2
+updates:
+  # GitHub Actions — check daily for new action versions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "dependencies"
+      - "github-actions"
+
+  # Docker — check daily for base image updates (SPDK)
+  - package-ecosystem: "docker"
+    directory: "/images/spdk"
+    schedule:
+      interval: "daily"
+    commit-message:
+      prefix: "docker"
+    labels:
+      - "dependencies"
+      - "docker"
