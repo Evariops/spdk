@@ -6,3 +6,5 @@ ignored:
   # where applicable; build-dependency packages installed by pkgdep.sh
   # cannot be individually pinned.
   - DL3041
+  # DEBUG_FLAG is intentionally unquoted (empty when not debug)
+  - SC2086

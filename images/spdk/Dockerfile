@@ -38,8 +38,8 @@ ARG BUILD_TYPE=release
 
 WORKDIR /build
 
-# renovate: datasource=repology depName=fedora_43/git versioning=loose
-RUN dnf install -y --setopt=install_weak_deps=False --nodocs git-2.53.0 && \
+# hadolint ignore=DL3041
+RUN dnf install -y --setopt=install_weak_deps=False --nodocs git && \
     dnf clean all && rm -rf /var/cache/dnf
 
 RUN git clone --branch "${SPDK_VERSION}" --depth 1 --recurse-submodules \
