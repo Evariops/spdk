@@ -28,7 +28,7 @@
 # ============================================================================
 # Stage 1: Build SPDK from source
 # ============================================================================
-FROM docker.io/library/fedora:43 AS builder
+FROM docker.io/library/fedora:44 AS builder
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -159,7 +159,7 @@ RUN set -euo pipefail && \
 # Built only when explicitly targeted:
 #   docker build --target debug --build-arg BUILD_TYPE=debug .
 # ============================================================================
-FROM docker.io/library/fedora:43 AS debug
+FROM docker.io/library/fedora:44 AS debug
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
