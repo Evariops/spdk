@@ -290,7 +290,8 @@ cbt_epoch_freeze(struct cbt_device *dev, const char *epoch_id)
 
 	struct cbt_epoch *ep = cbt_find_epoch(dev, epoch_id);
 	if (!ep) return -ENOENT;
-	if (ep->state != CBT_EPOCH_OPEN && ep->state != CBT_EPOCH_FROZEN) {
+	if (ep->state != CBT_EPOCH_OPEN && ep->state != CBT_EPOCH_FROZEN &&
+	    ep->state != CBT_EPOCH_REBUILDING) {
 		return -EINVAL;
 	}
 
@@ -533,10 +534,10 @@ static void test_freeze_non_open_epoch(void)
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
 	ASSERT_RC(cbt_epoch_rebuild_start(dev, "ep1"), 0);
 
-	/* Can't freeze a REBUILDING epoch. */
-	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), -EINVAL);
+	/* Re-freeze from REBUILDING is now allowed (convergence loop). */
+	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
 
-	/* Invalidate, then try to freeze. */
+	/* Invalidate, then try to freeze — INVALID is rejected. */
 	ASSERT_RC(cbt_epoch_invalidate(dev, "ep1"), 0);
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), -EINVAL);
 
@@ -1480,6 +1481,47 @@ static void test_rebuild_get_ranges_during_rebuild(void)
 	PASS();
 }
 
+static void test_rebuild_convergence_refreeze(void)
+{
+	TEST(test_rebuild_convergence_refreeze);
+	fi_reset();
+	struct cbt_device *dev = cbt_create(2048, 64, 512);
+	ASSERT(dev != NULL);
+
+	/* Full convergence loop: open → freeze → rebuild → re-freeze → rebuild → close */
+	ASSERT_RC(cbt_epoch_open(dev, "ep1", "backend1", 1), 0);
+	cbt_mark_dirty(dev, 0, 128);
+
+	/* Pass 1: freeze (OPEN→FROZEN) */
+	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
+	struct cbt_epoch *ep = cbt_find_epoch(dev, "ep1");
+	ASSERT(ep != NULL);
+	ASSERT_EQ(ep->state, CBT_EPOCH_FROZEN);
+
+	/* Simulate partial_rebuild completing (FROZEN→REBUILDING) */
+	ASSERT_RC(cbt_epoch_rebuild_start(dev, "ep1"), 0);
+	ASSERT_EQ(ep->state, CBT_EPOCH_REBUILDING);
+
+	/* New writes arrive during rebuild */
+	cbt_mark_dirty(dev, 512, 64);
+
+	/* Pass 2: re-freeze (REBUILDING→FROZEN) — the key fix */
+	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
+	ASSERT_EQ(ep->state, CBT_EPOCH_FROZEN);
+	ASSERT(ep->bitmap_frozen != NULL);
+
+	/* Pass 2: rebuild again (FROZEN→REBUILDING) */
+	ASSERT_RC(cbt_epoch_rebuild_start(dev, "ep1"), 0);
+	ASSERT_EQ(ep->state, CBT_EPOCH_REBUILDING);
+
+	/* Close from REBUILDING state */
+	ASSERT_RC(cbt_epoch_close(dev, "ep1"), 0);
+	ASSERT(cbt_find_epoch(dev, "ep1") == NULL);
+
+	cbt_destroy(dev);
+	PASS();
+}
+
 /* ================================================================== */
 /* Main                                                               */
 /* ================================================================== */
@@ -1564,6 +1606,7 @@ main(void)
 	test_rebuild_close_after_rebuild();
 	test_rebuild_invalidate_during_rebuild();
 	test_rebuild_get_ranges_during_rebuild();
+	test_rebuild_convergence_refreeze();
 
 	printf("\n========================================================\n");
 	printf("Results: %d passed, %d failed\n", g_passed, g_failed);

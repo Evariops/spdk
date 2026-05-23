@@ -961,7 +961,8 @@ bdev_cbt_epoch_freeze(const char *cbt_name, const char *epoch_id)
 	if (!ep) {
 		return -ENOENT;
 	}
-	if (ep->state != CBT_EPOCH_OPEN && ep->state != CBT_EPOCH_FROZEN) {
+	if (ep->state != CBT_EPOCH_OPEN && ep->state != CBT_EPOCH_FROZEN &&
+	    ep->state != CBT_EPOCH_REBUILDING) {
 		return -EINVAL;
 	}
 
