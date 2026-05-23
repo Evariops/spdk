@@ -62,7 +62,6 @@ jobs:
   # 1. Lint
   # ────────────────────────────────────────────────────────────────
   lint:
-    needs: authorize
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -82,7 +81,7 @@ jobs:
   # 2. Build SPDK debug — amd64 (native runner)
   # ────────────────────────────────────────────────────────────────
   build-amd64:
-    needs: lint
+    needs: [authorize, lint]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -156,7 +155,7 @@ jobs:
   # 3. Build SPDK debug — arm64 (native ARM runner, NO QEMU)
   # ────────────────────────────────────────────────────────────────
   build-arm64:
-    needs: lint
+    needs: [authorize, lint]
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
