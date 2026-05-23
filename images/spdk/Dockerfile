@@ -97,6 +97,7 @@ RUN SPDK_ARCH=$([ "${TARGETARCH}" = "arm64" ] && echo "armv8-a" || echo "nehalem
         --without-iscsi-initiator \
         --without-vhost \
         --without-virtio \
+        --without-nvme-cuse \
         --without-fsdev \
         --without-daos \
         --without-rbd \
