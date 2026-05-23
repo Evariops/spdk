@@ -1,6 +1,13 @@
 # yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
 # ------------------------------------------------------------------
-# SPDK Container Image — Build, Scan, Sign, Publish
+# SPDK Container Images — Build, Scan, Sign, Publish
+# ------------------------------------------------------------------
+# Builds both production (scratch-based) and debug (Fedora-based)
+# images from the same Dockerfile using matrix strategy.
+#
+# Images:
+#   ghcr.io/evariops/spdk        — production (scratch, ~14 MB)
+#   ghcr.io/evariops/spdk-debug  — debug (Fedora, gdb/strace/perf)
 # ------------------------------------------------------------------
 name: SPDK
 
@@ -21,9 +28,6 @@ on:
       - "patches/**"
       - ".github/workflows/spdk.yml"
   workflow_dispatch:
-
-env:
-  IMAGE_NAME: ghcr.io/evariops/spdk
 
 # ── Top-level permissions (least-privilege baseline) ─────────────
 permissions:
@@ -71,16 +75,14 @@ jobs:
           config: images/spdk/.hadolint.yaml
 
   # ────────────────────────────────────────────────────────────────
-  # 2. Build SPDK — amd64 (native runner)
+  # 2. Compute image tag (single source of truth)
   # ────────────────────────────────────────────────────────────────
-  build-amd64:
+  compute-tag:
     needs: [authorize, lint]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
     outputs:
-      imageid: ${{ steps.build.outputs.imageid }}
       tag: ${{ steps.tag.outputs.tag }}
       minor_tag: ${{ steps.tag.outputs.minor_tag }}
     steps:
@@ -88,18 +90,9 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+          sparse-checkout: images/spdk/Dockerfile
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
-
-      - name: Log in to GHCR
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Compute tag suffix
+      - name: Compute tag
         id: tag
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -108,7 +101,6 @@ jobs:
           VERSION=$(sed -n 's/^ARG SPDK_VERSION=\(v[^ ]*\)/\1/p' images/spdk/Dockerfile)
           if [[ "$GITHUB_REF" == refs/tags/spdk/v* ]]; then
             TAG="${GITHUB_REF#refs/tags/spdk/}"
-            # If tag is 3-part semver (vX.Y.Z), derive floating minor tag (vX.Y)
             if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
               echo "minor_tag=${TAG%.*}" >> "$GITHUB_OUTPUT"
             fi
@@ -120,36 +112,28 @@ jobs:
           fi
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
-      - name: Build (amd64)
-        id: build
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
-        with:
-          context: .
-          file: images/spdk/Dockerfile
-          platforms: linux/amd64
-          push: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'pull_request' }}
-          load: ${{ github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/') }}
-          tags: ${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}-amd64
-          cache-from: type=gha,scope=spdk-amd64
-          cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,scope=spdk-amd64,mode=max' || '' }}
-
-      # ── Vulnerability scan (gate — before manifest merge) ─────
-      - name: Trivy vulnerability scan
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        env:
-          TRIVY_PLATFORM: linux/amd64
-        with:
-          image-ref: ${{ (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')) && steps.build.outputs.imageid || format('{0}:{1}-amd64', env.IMAGE_NAME, steps.tag.outputs.tag) }}
-          format: "table"
-          exit-code: "1"
-          severity: "HIGH,CRITICAL"
-
   # ────────────────────────────────────────────────────────────────
-  # 3. Build SPDK — arm64 (native ARM runner, NO QEMU)
+  # 3. Build — matrix (variant × arch)
   # ────────────────────────────────────────────────────────────────
-  build-arm64:
-    needs: [authorize, lint]
-    runs-on: ubuntu-24.04-arm
+  build:
+    needs: [compute-tag]
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [release, debug]
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+          - variant: release
+            image: ghcr.io/evariops/spdk
+            target: ""
+          - variant: debug
+            image: ghcr.io/evariops/spdk-debug
+            target: debug
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
@@ -169,46 +153,28 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Compute tag suffix
-        id: tag
-        env:
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          VERSION=$(sed -n 's/^ARG SPDK_VERSION=\(v[^ ]*\)/\1/p' images/spdk/Dockerfile)
-          if [[ "$GITHUB_REF" == refs/tags/spdk/v* ]]; then
-            TAG="${GITHUB_REF#refs/tags/spdk/}"
-            if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-              echo "minor_tag=${TAG%.*}" >> "$GITHUB_OUTPUT"
-            fi
-          elif [[ -n "${PR_NUMBER}" ]]; then
-            SHORT_SHA=$(echo "${PR_HEAD_SHA}" | cut -c1-7)
-            TAG="${VERSION}-pr${PR_NUMBER}-${SHORT_SHA}"
-          else
-            TAG="${VERSION}-sha-${GITHUB_SHA::7}"
-          fi
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-
-      - name: Build (arm64)
+      - name: Build
         id: build
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
           file: images/spdk/Dockerfile
-          platforms: linux/arm64
+          target: ${{ matrix.target || null }}
+          platforms: linux/${{ matrix.arch }}
+          build-args: ${{ matrix.variant == 'debug' && 'BUILD_TYPE=debug' || '' }}
           push: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'pull_request' }}
           load: ${{ github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/') }}
-          tags: ${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}-arm64
-          cache-from: type=gha,scope=spdk-arm64
-          cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,scope=spdk-arm64,mode=max' || '' }}
+          tags: ${{ matrix.image }}:${{ needs.compute-tag.outputs.tag }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=spdk-${{ matrix.variant }}-${{ matrix.arch }}
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=gha,scope=spdk-{0}-{1},mode=max', matrix.variant, matrix.arch) || '' }}
 
       # ── Vulnerability scan (gate — before manifest merge) ─────
       - name: Trivy vulnerability scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         env:
-          TRIVY_PLATFORM: linux/arm64
+          TRIVY_PLATFORM: linux/${{ matrix.arch }}
         with:
-          image-ref: ${{ (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')) && steps.build.outputs.imageid || format('{0}:{1}-arm64', env.IMAGE_NAME, steps.tag.outputs.tag) }}
+          image-ref: ${{ (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')) && steps.build.outputs.imageid || format('{0}:{1}-{2}', matrix.image, needs.compute-tag.outputs.tag, matrix.arch) }}
           format: "table"
           exit-code: "1"
           severity: "HIGH,CRITICAL"
@@ -217,12 +183,19 @@ jobs:
   # 4a. PR publish — multi-arch manifest (no signing)
   # ────────────────────────────────────────────────────────────────
   publish-pr:
-    needs: [build-amd64, build-arm64]
+    needs: [compute-tag, build]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+    strategy:
+      matrix:
+        include:
+          - variant: release
+            image: ghcr.io/evariops/spdk
+          - variant: debug
+            image: ghcr.io/evariops/spdk-debug
     steps:
       - name: Log in to GHCR
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
@@ -236,26 +209,34 @@ jobs:
 
       - name: Create multi-arch manifest for PR
         env:
-          TAG: ${{ needs.build-amd64.outputs.tag }}
+          TAG: ${{ needs.compute-tag.outputs.tag }}
+          IMAGE: ${{ matrix.image }}
         run: |
           set -euo pipefail
           docker buildx imagetools create \
-            -t "${IMAGE_NAME}:${TAG}" \
-            "${IMAGE_NAME}:${TAG}-amd64" \
-            "${IMAGE_NAME}:${TAG}-arm64"
-          echo "✓ Published: ${IMAGE_NAME}:${TAG}"
+            -t "${IMAGE}:${TAG}" \
+            "${IMAGE}:${TAG}-amd64" \
+            "${IMAGE}:${TAG}-arm64"
+          echo "✓ Published: ${IMAGE}:${TAG}"
 
   # ────────────────────────────────────────────────────────────────
   # 4b. Release publish — multi-arch manifest + Sign + SBOM + Attest
   # ────────────────────────────────────────────────────────────────
   publish:
-    needs: [build-amd64, build-arm64]
+    needs: [compute-tag, build]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
       id-token: write       # cosign keyless (Fulcio OIDC)
+    strategy:
+      matrix:
+        include:
+          - variant: release
+            image: ghcr.io/evariops/spdk
+          - variant: debug
+            image: ghcr.io/evariops/spdk-debug
     steps:
       - name: Log in to GHCR
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
@@ -271,36 +252,37 @@ jobs:
       - name: Create and push multi-arch manifest
         id: manifest
         env:
-          TAG: ${{ needs.build-amd64.outputs.tag }}
-          MINOR_TAG: ${{ needs.build-amd64.outputs.minor_tag }}
+          TAG: ${{ needs.compute-tag.outputs.tag }}
+          MINOR_TAG: ${{ needs.compute-tag.outputs.minor_tag }}
+          IMAGE: ${{ matrix.image }}
         run: |
           set -euo pipefail
 
           # Create versioned manifest from per-arch tags
           docker buildx imagetools create \
-            -t "${IMAGE_NAME}:${TAG}" \
-            "${IMAGE_NAME}:${TAG}-amd64" \
-            "${IMAGE_NAME}:${TAG}-arm64"
+            -t "${IMAGE}:${TAG}" \
+            "${IMAGE}:${TAG}-amd64" \
+            "${IMAGE}:${TAG}-arm64"
 
           # Floating minor tag (e.g. v26.01 from v26.01.0)
           if [[ -n "${MINOR_TAG}" ]]; then
             docker buildx imagetools create \
-              -t "${IMAGE_NAME}:${MINOR_TAG}" \
-              "${IMAGE_NAME}:${TAG}-amd64" \
-              "${IMAGE_NAME}:${TAG}-arm64"
+              -t "${IMAGE}:${MINOR_TAG}" \
+              "${IMAGE}:${TAG}-amd64" \
+              "${IMAGE}:${TAG}-arm64"
           fi
 
           # If this is a release tag, also create sha tag
           if [[ "$GITHUB_REF" == refs/tags/spdk/v* ]]; then
             SHA_TAG="sha-${GITHUB_SHA::7}"
             docker buildx imagetools create \
-              -t "${IMAGE_NAME}:${SHA_TAG}" \
-              "${IMAGE_NAME}:${TAG}-amd64" \
-              "${IMAGE_NAME}:${TAG}-arm64"
+              -t "${IMAGE}:${SHA_TAG}" \
+              "${IMAGE}:${TAG}-amd64" \
+              "${IMAGE}:${TAG}-arm64"
           fi
 
           # Retrieve the manifest digest
-          DIGEST=$(docker buildx imagetools inspect "${IMAGE_NAME}:${TAG}" --raw | sha256sum | awk '{print "sha256:"$1}')
+          DIGEST=$(docker buildx imagetools inspect "${IMAGE}:${TAG}" --raw | sha256sum | awk '{print "sha256:"$1}')
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
           echo "Manifest digest: ${DIGEST}"
 
@@ -312,14 +294,15 @@ jobs:
       - name: Sign image
         env:
           DIGEST: ${{ steps.manifest.outputs.digest }}
+          IMAGE: ${{ matrix.image }}
         run: |
-          cosign sign --yes "${IMAGE_NAME}@${DIGEST}"
+          cosign sign --yes "${IMAGE}@${DIGEST}"
 
       # ── SBOM generation (SPDX) ───────────────────────────────
       - name: Generate SBOM (SPDX)
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
-          image: ${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
+          image: ${{ matrix.image }}@${{ steps.manifest.outputs.digest }}
           format: spdx-json
           output-file: sbom.spdx.json
           upload-artifact: true
@@ -329,7 +312,7 @@ jobs:
       - name: Generate SBOM (CycloneDX)
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
-          image: ${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
+          image: ${{ matrix.image }}@${{ steps.manifest.outputs.digest }}
           format: cyclonedx-json
           output-file: sbom.cdx.json
           upload-artifact: true
@@ -345,7 +328,7 @@ jobs:
 
       - name: Enrich SBOMs
         env:
-          TAG: ${{ needs.build-amd64.outputs.tag }}
+          TAG: ${{ needs.compute-tag.outputs.tag }}
         run: |
           VER="${TAG#v}"; VER="${VER%.*}"
           ./repo/.github/scripts/enrich-sbom.sh \
@@ -363,12 +346,13 @@ jobs:
       - name: Attest SBOM
         env:
           DIGEST: ${{ steps.manifest.outputs.digest }}
+          IMAGE: ${{ matrix.image }}
         run: |
           cosign attest --yes \
             --predicate sbom.spdx.json \
             --type spdxjson \
-            "${IMAGE_NAME}@${DIGEST}"
+            "${IMAGE}@${DIGEST}"
           cosign attest --yes \
             --predicate sbom.cdx.json \
             --type cyclonedx \
-            "${IMAGE_NAME}@${DIGEST}"
+            "${IMAGE}@${DIGEST}"
