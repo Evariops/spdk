@@ -47,6 +47,8 @@ RUN git clone --branch "${SPDK_VERSION}" --depth 1 --recurse-submodules \
 
 WORKDIR /build/spdk
 
+# Fedora 45's CMake rejects cmake_minimum_required(<3.5) in SPDK subprojects (ISA-L, etc.)
+ENV CMAKE_POLICY_VERSION_MINIMUM=3.5
 RUN ./scripts/pkgdep.sh -d
 
 # Ensure io_uring and AIO dependencies are present (pkgdep.sh may not install them)
