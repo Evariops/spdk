@@ -117,7 +117,7 @@ jobs:
 
       # ── Vulnerability scan (gate — before manifest merge) ─────
       - name: Trivy vulnerability scan
-        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # 0.36.0
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         env:
           TRIVY_PLATFORM: linux/amd64
         with:
@@ -182,7 +182,7 @@ jobs:
 
       # ── Vulnerability scan (gate — before manifest merge) ─────
       - name: Trivy vulnerability scan
-        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # 0.36.0
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         env:
           TRIVY_PLATFORM: linux/arm64
         with:
