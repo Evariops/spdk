@@ -667,3 +667,183 @@ cleanup:
 	free_rpc_cbt_name_only(&req);
 }
 SPDK_RPC_REGISTER("bdev_cbt_reset", rpc_bdev_cbt_reset, SPDK_RPC_RUNTIME)
+
+/* ================================================================== */
+/* bdev_cbt_partial_rebuild (async — deferred RPC response)           */
+/* ================================================================== */
+
+struct rpc_cbt_partial_rebuild {
+	char     *name;
+	char     *epoch_id;
+	char     *target_bdev_name;
+	uint64_t  max_bandwidth_mb_sec;
+	uint32_t  queue_depth;
+	struct cbt_rebuild_range *override_ranges;
+	uint32_t  num_override_ranges;
+};
+
+static void
+free_rpc_cbt_partial_rebuild(struct rpc_cbt_partial_rebuild *r)
+{
+	free(r->name);
+	free(r->epoch_id);
+	free(r->target_bdev_name);
+	free(r->override_ranges);
+}
+
+static int
+decode_override_ranges(const struct spdk_json_val *val, void *out)
+{
+	struct rpc_cbt_partial_rebuild *req = out;
+	struct spdk_json_val *array_val = (struct spdk_json_val *)val;
+	uint32_t count, i;
+	struct cbt_rebuild_range *ranges;
+
+	if (val->type != SPDK_JSON_VAL_ARRAY_BEGIN) {
+		return -EINVAL;
+	}
+
+	count = val->len;
+	if (count == 0) {
+		req->override_ranges = NULL;
+		req->num_override_ranges = 0;
+		return 0;
+	}
+
+	ranges = calloc(count, sizeof(*ranges));
+	if (!ranges) {
+		return -ENOMEM;
+	}
+
+	/* Step into array items. */
+	array_val++;
+	for (i = 0; i < count; i++) {
+		/* Each element is an object with offset_blocks and length_blocks. */
+		struct spdk_json_val *obj = array_val;
+		if (obj->type != SPDK_JSON_VAL_OBJECT_BEGIN) {
+			free(ranges);
+			return -EINVAL;
+		}
+
+		uint32_t obj_size = obj->len;
+		struct spdk_json_val *key = obj + 1;
+		uint32_t j;
+
+		for (j = 0; j < obj_size; j++) {
+			if (key->type != SPDK_JSON_VAL_NAME) {
+				break;
+			}
+			struct spdk_json_val *value = key + 1;
+
+			if (spdk_json_strequal(key, "offset_blocks")) {
+				if (spdk_json_number_to_uint64(value, &ranges[i].offset_blocks)) {
+					free(ranges);
+					return -EINVAL;
+				}
+			} else if (spdk_json_strequal(key, "length_blocks")) {
+				if (spdk_json_number_to_uint64(value, &ranges[i].length_blocks)) {
+					free(ranges);
+					return -EINVAL;
+				}
+			}
+			key = value + spdk_json_val_len(value);
+		}
+
+		/* Advance past this object. */
+		array_val = obj + 1 + spdk_json_val_len(obj) - 1;
+		/* Actually skip entire object. */
+		array_val = (struct spdk_json_val *)obj + spdk_json_val_len(obj);
+	}
+
+	req->override_ranges = ranges;
+	req->num_override_ranges = count;
+	return 0;
+}
+
+static const struct spdk_json_object_decoder rpc_cbt_partial_rebuild_decoders[] = {
+	{"name",                 offsetof(struct rpc_cbt_partial_rebuild, name),                 spdk_json_decode_string},
+	{"epoch_id",             offsetof(struct rpc_cbt_partial_rebuild, epoch_id),             spdk_json_decode_string},
+	{"target_bdev_name",     offsetof(struct rpc_cbt_partial_rebuild, target_bdev_name),     spdk_json_decode_string},
+	{"max_bandwidth_mb_sec", offsetof(struct rpc_cbt_partial_rebuild, max_bandwidth_mb_sec), spdk_json_decode_uint64, true},
+	{"queue_depth",          offsetof(struct rpc_cbt_partial_rebuild, queue_depth),          spdk_json_decode_uint32, true},
+};
+
+struct rpc_rebuild_cb_arg {
+	struct spdk_jsonrpc_request *request;
+};
+
+static void
+rpc_rebuild_done_cb(void *cb_arg, const struct cbt_rebuild_result *result)
+{
+	struct rpc_rebuild_cb_arg *arg = cb_arg;
+	struct spdk_jsonrpc_request *request = arg->request;
+
+	if (result->error != 0) {
+		spdk_jsonrpc_send_error_response(request, result->error,
+						 spdk_strerror(-result->error));
+	} else {
+		struct spdk_json_write_ctx *w = spdk_jsonrpc_begin_result(request);
+		spdk_json_write_object_begin(w);
+		spdk_json_write_named_bool(w, "completed", result->completed);
+		spdk_json_write_named_uint64(w, "chunks_copied", result->chunks_copied);
+		spdk_json_write_named_uint64(w, "bytes_copied", result->bytes_copied);
+		spdk_json_write_named_uint64(w, "duration_ms", result->duration_ms);
+		spdk_json_write_named_double(w, "residual_dirty_ratio",
+					     result->residual_dirty_ratio);
+		spdk_json_write_object_end(w);
+		spdk_jsonrpc_end_result(request, w);
+	}
+
+	free(arg);
+}
+
+static void
+rpc_bdev_cbt_partial_rebuild(struct spdk_jsonrpc_request *request,
+			     const struct spdk_json_val *params)
+{
+	struct rpc_cbt_partial_rebuild req = {0};
+	struct rpc_rebuild_cb_arg *cb_arg;
+	int rc;
+
+	if (spdk_json_decode_object(params, rpc_cbt_partial_rebuild_decoders,
+				    SPDK_COUNTOF(rpc_cbt_partial_rebuild_decoders), &req)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "Failed to decode parameters");
+		goto cleanup;
+	}
+
+	/* Manually decode optional override_ranges array if present. */
+	/* For simplicity, override_ranges are not decoded here — we only
+	 * support bitmap-driven rebuild via this RPC. Override ranges can
+	 * be added later if needed by extending the decoder.
+	 */
+
+	cb_arg = calloc(1, sizeof(*cb_arg));
+	if (!cb_arg) {
+		spdk_jsonrpc_send_error_response(request, -ENOMEM,
+						 spdk_strerror(ENOMEM));
+		goto cleanup;
+	}
+	cb_arg->request = request;
+
+	rc = bdev_cbt_partial_rebuild(req.name, req.epoch_id,
+				      req.target_bdev_name,
+				      req.max_bandwidth_mb_sec,
+				      req.queue_depth,
+				      req.override_ranges,
+				      req.num_override_ranges,
+				      rpc_rebuild_done_cb, cb_arg);
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
+		free(cb_arg);
+		goto cleanup;
+	}
+
+	/* Response will be sent asynchronously by rpc_rebuild_done_cb. */
+	free_rpc_cbt_partial_rebuild(&req);
+	return;
+
+cleanup:
+	free_rpc_cbt_partial_rebuild(&req);
+}
+SPDK_RPC_REGISTER("bdev_cbt_partial_rebuild", rpc_bdev_cbt_partial_rebuild, SPDK_RPC_RUNTIME)

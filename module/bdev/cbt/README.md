@@ -34,6 +34,24 @@ An *epoch* represents a single backend outage and its associated recovery. The o
 
 **Rebuild start** (`bdev_cbt_epoch_rebuild_start`) transitions the epoch from FROZEN to REBUILDING. This is a state marker — the actual data copy happens externally. While REBUILDING, the epoch cannot be evicted, reset, or have the bitmap cleared underneath it.
 
+**Partial rebuild** (`bdev_cbt_partial_rebuild`) performs the actual data copy asynchronously within the SPDK process. It reads dirty chunks from the CBT bdev (which passes through to the RAID base) and writes them to a specified target bdev. The operation is fully async and callback-driven — the RPC response is deferred until the copy completes.
+
+Parameters:
+- `name`: the CBT bdev to read from
+- `epoch_id`: must be in FROZEN state (transitions to REBUILDING)
+- `target_bdev_name`: the destination bdev (must exist in the same spdk_tgt process)
+- `max_bandwidth_mb_sec`: bandwidth throttle in MB/s (0 = unlimited)
+- `queue_depth`: concurrent I/Os (1–128, default 16)
+
+The implementation allocates `queue_depth` DMA buffers of chunk_size each, opens IO channels on both source and target bdevs, and walks the frozen bitmap submitting read/write pairs. A per-second bandwidth window limits throughput when throttling is configured.
+
+On completion, the response includes:
+- `completed`: boolean success indicator
+- `chunks_copied`: number of dirty chunks copied
+- `bytes_copied`: total bytes transferred
+- `duration_ms`: wall-clock time for the operation
+- `residual_dirty_ratio`: fraction of the bitmap that is now dirty (writes that arrived during the copy). This ratio drives the orchestrator's convergence loop — when it drops below a threshold, a final quiesce+freeze+copy achieves zero delta.
+
 **Closing** (`bdev_cbt_epoch_close`) discards the epoch and its frozen bitmap. If no epochs remain active, the healthy-clear poller is re-enabled.
 
 **Invalidation** (`bdev_cbt_epoch_invalidate`) marks an epoch as unrecoverable. The orchestrator knows it must fall back to a full rebuild for that backend.
@@ -48,20 +66,21 @@ The orchestrator must explicitly call `bdev_cbt_set_backends_healthy(true)` to c
 
 ## Convergence and quiesce
 
-The module does not quiesce IO or drive convergence. It provides the primitives; the orchestrator implements the strategy.
+The module provides both the tracking primitives and the async copy engine. The orchestrator drives the convergence loop but does not implement the data copy — that happens inside the SPDK process via `bdev_cbt_partial_rebuild`.
 
 A typical orchestrator sequence for partial rebuild under sustained write load:
 
 1. Open epoch. The bitmap accumulates all writes.
 2. Freeze. Snapshot the dirty state.
-3. Read ranges and copy dirty blocks to the stale backend.
+3. Call `bdev_cbt_partial_rebuild` — copies dirty chunks to the stale backend.
 4. During the copy, new writes accumulate in the live bitmap.
-5. Re-freeze. The new snapshot captures only what arrived since the last freeze.
-6. Repeat until the delta is small enough.
-7. ANA drain (2s quiesce at the NVMe-oF target level). No more writes arrive.
-8. Final freeze. Delta is zero by construction.
-9. Copy final delta (nothing or near-nothing). Close epoch.
-10. Re-add the backend with `skip_rebuild=true`. Signal healthy.
+5. On completion, read `residual_dirty_ratio` from the response.
+6. Re-freeze. The new snapshot captures only what arrived since the last freeze.
+7. Repeat steps 3–6 until residual_dirty_ratio is below threshold.
+8. ANA drain (2s quiesce at the NVMe-oF target level). No more writes arrive.
+9. Final freeze. Delta is zero by construction.
+10. Final `bdev_cbt_partial_rebuild` (nothing or near-nothing). Close epoch.
+11. Re-add the backend with `skip_rebuild=true`. Signal healthy.
 
 The module cannot converge on its own when write rate approaches rebuild bandwidth. The ANA drain at step 7 is mandatory to guarantee termination. This quiesce happens above the module — at the target or multipath level — and is invisible to the CBT code.
 

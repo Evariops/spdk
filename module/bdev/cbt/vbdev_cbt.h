@@ -24,6 +24,8 @@ extern "C" {
 #define CBT_HEALTHY_CLEAR_INTERVAL_US   5000000  /* 5 s */
 #define CBT_EPOCH_ID_MAX                64
 #define CBT_BACKEND_ID_MAX              128
+#define CBT_REBUILD_DEFAULT_QD          16
+#define CBT_REBUILD_MAX_QD              128
 
 /* ── Epoch lifecycle ───────────────────────────────────────────────── */
 
@@ -87,6 +89,49 @@ int bdev_cbt_epoch_close(const char *cbt_name, const char *epoch_id);
 int bdev_cbt_epoch_invalidate(const char *cbt_name, const char *epoch_id);
 
 int bdev_cbt_epoch_rebuild_start(const char *cbt_name, const char *epoch_id);
+
+/* ── Partial rebuild (async — deferred RPC response) ───────────────── */
+
+struct cbt_rebuild_result {
+	bool        completed;       /* true=all chunks copied, false=partial/error */
+	uint64_t    chunks_copied;
+	uint64_t    bytes_copied;
+	uint64_t    duration_ms;
+	double      residual_dirty_ratio;
+	int         error;           /* 0 on success, negative errno on failure */
+};
+
+struct cbt_rebuild_range {
+	uint64_t    offset_blocks;
+	uint64_t    length_blocks;
+};
+
+/**
+ * Callback invoked when partial rebuild completes (success or failure).
+ */
+typedef void (*cbt_rebuild_done_cb)(void *cb_arg, const struct cbt_rebuild_result *result);
+
+/**
+ * Start an async partial rebuild: copy dirty chunks from the CBT bdev
+ * to the target bdev. The epoch must be in FROZEN state.
+ *
+ * \param cbt_name          CBT bdev name
+ * \param epoch_id          Epoch in FROZEN state
+ * \param target_bdev_name  Destination bdev (must exist in this process)
+ * \param max_bw_mb_sec     Bandwidth limit (MB/s), 0 = unlimited
+ * \param queue_depth       Max concurrent I/Os (1..128)
+ * \param override_ranges   If non-NULL, copy only these ranges
+ * \param num_ranges        Number of override ranges (0 = use bitmap)
+ * \param cb_fn             Completion callback
+ * \param cb_arg            Opaque argument for callback
+ * \return 0 if rebuild started, negative errno on immediate failure
+ */
+int bdev_cbt_partial_rebuild(const char *cbt_name, const char *epoch_id,
+			     const char *target_bdev_name,
+			     uint64_t max_bw_mb_sec, uint32_t queue_depth,
+			     const struct cbt_rebuild_range *override_ranges,
+			     uint32_t num_ranges,
+			     cbt_rebuild_done_cb cb_fn, void *cb_arg);
 
 /**
  * Return dirty ranges from the frozen bitmap of the given epoch.

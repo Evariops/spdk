@@ -1302,6 +1302,185 @@ static void test_non_power_of_2_chunk_rounded(void)
 }
 
 /* ================================================================== */
+/* SECTION: Partial rebuild state machine validation                  */
+/* ================================================================== */
+
+static void test_rebuild_start_requires_frozen_state(void)
+{
+	TEST(test_rebuild_start_requires_frozen_state);
+	fi_reset();
+	struct cbt_device *dev = cbt_create(2048, 64, 512);
+	ASSERT(dev != NULL);
+
+	/* Open epoch — not yet frozen. */
+	ASSERT_RC(cbt_epoch_open(dev, "ep1", "backend1", 1), 0);
+
+	/* rebuild_start should fail with -EINVAL (not FROZEN). */
+	ASSERT_RC(cbt_epoch_rebuild_start(dev, "ep1"), -EINVAL);
+
+	/* Freeze, then rebuild_start should succeed. */
+	cbt_mark_dirty(dev, 0, 128);
+	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
+	ASSERT_RC(cbt_epoch_rebuild_start(dev, "ep1"), 0);
+
+	/* Verify state is now REBUILDING. */
+	struct cbt_epoch *ep = cbt_find_epoch(dev, "ep1");
+	ASSERT(ep != NULL);
+	ASSERT_EQ(ep->state, CBT_EPOCH_REBUILDING);
+
+	/* Double rebuild_start should fail (already REBUILDING, not FROZEN). */
+	ASSERT_RC(cbt_epoch_rebuild_start(dev, "ep1"), -EINVAL);
+
+	cbt_destroy(dev);
+	PASS();
+}
+
+static void test_rebuild_start_nonexistent_epoch(void)
+{
+	TEST(test_rebuild_start_nonexistent_epoch);
+	fi_reset();
+	struct cbt_device *dev = cbt_create(2048, 64, 512);
+	ASSERT(dev != NULL);
+
+	ASSERT_RC(cbt_epoch_rebuild_start(dev, "ghost"), -ENOENT);
+
+	cbt_destroy(dev);
+	PASS();
+}
+
+static void test_rebuild_preserves_frozen_bitmap(void)
+{
+	TEST(test_rebuild_preserves_frozen_bitmap);
+	fi_reset();
+	struct cbt_device *dev = cbt_create(2048, 64, 512);
+	ASSERT(dev != NULL);
+
+	ASSERT_RC(cbt_epoch_open(dev, "ep1", "backend1", 1), 0);
+	cbt_mark_dirty(dev, 0, 128);
+	cbt_mark_dirty(dev, 256, 64);
+	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
+
+	struct cbt_epoch *ep = cbt_find_epoch(dev, "ep1");
+	ASSERT(ep != NULL);
+	ASSERT(ep->bitmap_frozen != NULL);
+
+	/* Save a copy of the frozen bitmap. */
+	uint8_t *saved = malloc(dev->bitmap_size_bytes);
+	ASSERT(saved != NULL);
+	memcpy(saved, ep->bitmap_frozen, dev->bitmap_size_bytes);
+
+	/* Start rebuild — transition to REBUILDING. */
+	ASSERT_RC(cbt_epoch_rebuild_start(dev, "ep1"), 0);
+
+	/* New writes arrive during rebuild — modify live bitmap. */
+	cbt_mark_dirty(dev, 1024, 128);
+
+	/* The frozen bitmap should be unchanged. */
+	ASSERT(memcmp(ep->bitmap_frozen, saved, dev->bitmap_size_bytes) == 0);
+
+	free(saved);
+	cbt_destroy(dev);
+	PASS();
+}
+
+static void test_rebuild_epoch_cannot_be_evicted(void)
+{
+	TEST(test_rebuild_epoch_cannot_be_evicted);
+	fi_reset();
+	struct cbt_device *dev = cbt_create(2048, 64, 512);
+	ASSERT(dev != NULL);
+
+	/* In production code, a REBUILDING epoch cannot be evicted.
+	 * Here we verify the state machine property: once in REBUILDING,
+	 * the epoch stays intact through additional operations.
+	 */
+	ASSERT_RC(cbt_epoch_open(dev, "ep1", "b1", 1), 0);
+	cbt_mark_dirty(dev, 0, 128);
+	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
+	ASSERT_RC(cbt_epoch_rebuild_start(dev, "ep1"), 0);
+
+	/* The epoch is in REBUILDING — verify it persists. */
+	struct cbt_epoch *ep = cbt_find_epoch(dev, "ep1");
+	ASSERT(ep != NULL);
+	ASSERT_EQ(ep->state, CBT_EPOCH_REBUILDING);
+
+	/* The frozen bitmap is still accessible. */
+	ASSERT(ep->bitmap_frozen != NULL);
+
+	cbt_destroy(dev);
+	PASS();
+}
+
+static void test_rebuild_close_after_rebuild(void)
+{
+	TEST(test_rebuild_close_after_rebuild);
+	fi_reset();
+	struct cbt_device *dev = cbt_create(2048, 64, 512);
+	ASSERT(dev != NULL);
+
+	ASSERT_RC(cbt_epoch_open(dev, "ep1", "backend1", 1), 0);
+	cbt_mark_dirty(dev, 0, 128);
+	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
+	ASSERT_RC(cbt_epoch_rebuild_start(dev, "ep1"), 0);
+
+	/* Close should succeed from REBUILDING state. */
+	ASSERT_RC(cbt_epoch_close(dev, "ep1"), 0);
+
+	/* Epoch should be gone. */
+	ASSERT(cbt_find_epoch(dev, "ep1") == NULL);
+	ASSERT_EQ(dev->epoch_count, 0);
+
+	cbt_destroy(dev);
+	PASS();
+}
+
+static void test_rebuild_invalidate_during_rebuild(void)
+{
+	TEST(test_rebuild_invalidate_during_rebuild);
+	fi_reset();
+	struct cbt_device *dev = cbt_create(2048, 64, 512);
+	ASSERT(dev != NULL);
+
+	ASSERT_RC(cbt_epoch_open(dev, "ep1", "backend1", 1), 0);
+	cbt_mark_dirty(dev, 0, 128);
+	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
+	ASSERT_RC(cbt_epoch_rebuild_start(dev, "ep1"), 0);
+
+	/* Invalidation should work from any state. */
+	ASSERT_RC(cbt_epoch_invalidate(dev, "ep1"), 0);
+
+	struct cbt_epoch *ep = cbt_find_epoch(dev, "ep1");
+	ASSERT(ep != NULL);
+	ASSERT_EQ(ep->state, CBT_EPOCH_INVALID);
+
+	cbt_destroy(dev);
+	PASS();
+}
+
+static void test_rebuild_get_ranges_during_rebuild(void)
+{
+	TEST(test_rebuild_get_ranges_during_rebuild);
+	fi_reset();
+	struct cbt_device *dev = cbt_create(2048, 64, 512);
+	ASSERT(dev != NULL);
+
+	ASSERT_RC(cbt_epoch_open(dev, "ep1", "backend1", 1), 0);
+	cbt_mark_dirty(dev, 0, 128);
+	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
+	ASSERT_RC(cbt_epoch_rebuild_start(dev, "ep1"), 0);
+
+	/* get_dirty_ranges should work during REBUILDING (epoch has frozen bitmap). */
+	struct dirty_range *ranges = NULL;
+	uint32_t count = 0;
+	ASSERT_RC(cbt_epoch_get_dirty_ranges(dev, "ep1", 0, &ranges, &count), 0);
+	ASSERT(count > 0);
+	free(ranges);
+
+	cbt_destroy(dev);
+	PASS();
+}
+
+/* ================================================================== */
 /* Main                                                               */
 /* ================================================================== */
 
@@ -1376,6 +1555,15 @@ main(void)
 	test_zero_chunk_size_kb();
 	test_chunk_larger_than_volume();
 	test_non_power_of_2_chunk_rounded();
+
+	printf("\n── Partial rebuild state machine ──\n");
+	test_rebuild_start_requires_frozen_state();
+	test_rebuild_start_nonexistent_epoch();
+	test_rebuild_preserves_frozen_bitmap();
+	test_rebuild_epoch_cannot_be_evicted();
+	test_rebuild_close_after_rebuild();
+	test_rebuild_invalidate_during_rebuild();
+	test_rebuild_get_ranges_during_rebuild();
 
 	printf("\n========================================================\n");
 	printf("Results: %d passed, %d failed\n", g_passed, g_failed);

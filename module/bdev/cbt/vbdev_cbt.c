@@ -1182,6 +1182,528 @@ bdev_cbt_epoch_get_dirty_ranges(const char *cbt_name, const char *epoch_id,
 }
 
 /* ================================================================== */
+/* Partial rebuild — async copy of dirty chunks                       */
+/* ================================================================== */
+
+struct cbt_rebuild_io_slot {
+	void     *buf;
+	uint64_t  chunk_offset_blocks;
+	uint64_t  chunk_length_blocks;
+	bool      in_use;
+};
+
+struct cbt_rebuild_ctx {
+	struct vbdev_cbt         *cbt;
+	struct cbt_epoch         *epoch;
+	struct spdk_bdev_desc    *src_desc;
+	struct spdk_bdev_desc    *dst_desc;
+	struct spdk_io_channel   *src_ch;
+	struct spdk_io_channel   *dst_ch;
+
+	/* Bitmap to walk (frozen bitmap or override ranges) */
+	const uint8_t            *bitmap;
+	struct cbt_rebuild_range *override_ranges;
+	uint32_t                  num_ranges;
+	uint32_t                  current_range_idx;
+
+	/* Bitmap scan position */
+	uint64_t                  current_bit;
+
+	/* Progress */
+	uint64_t                  chunks_copied;
+	uint64_t                  bytes_copied;
+	uint64_t                  start_tsc;
+	int                       outstanding_ios;
+	int                       max_outstanding;
+
+	/* Bandwidth throttle */
+	uint64_t                  max_bytes_per_sec;
+	uint64_t                  bytes_this_window;
+	uint64_t                  window_start_tsc;
+	struct spdk_poller       *throttle_poller;
+	bool                      throttled;
+
+	/* DMA buffer slots */
+	struct cbt_rebuild_io_slot *slots;
+	int                       num_slots;
+
+	/* Completion */
+	cbt_rebuild_done_cb       cb_fn;
+	void                     *cb_arg;
+	bool                      aborted;
+	int                       error;
+};
+
+static void cbt_rebuild_submit_next(struct cbt_rebuild_ctx *ctx);
+static void cbt_rebuild_finish(struct cbt_rebuild_ctx *ctx);
+
+static uint64_t
+cbt_get_tsc_hz(void)
+{
+	return spdk_get_ticks_hz();
+}
+
+static struct cbt_rebuild_io_slot *
+cbt_rebuild_get_free_slot(struct cbt_rebuild_ctx *ctx)
+{
+	for (int i = 0; i < ctx->num_slots; i++) {
+		if (!ctx->slots[i].in_use) {
+			return &ctx->slots[i];
+		}
+	}
+	return NULL;
+}
+
+static void
+cbt_rebuild_base_event_cb(enum spdk_bdev_event_type type,
+			  struct spdk_bdev *bdev, void *event_ctx)
+{
+	/* If the bdev is removed mid-rebuild, the IO callbacks will
+	 * return failure and the rebuild will abort gracefully.
+	 */
+}
+
+/* Find the next dirty bit starting from ctx->current_bit.
+ * Returns false if no more dirty bits. */
+static bool
+cbt_rebuild_find_next_dirty(struct cbt_rebuild_ctx *ctx, uint64_t *out_bit)
+{
+	const uint8_t *bmap = ctx->bitmap;
+	uint64_t total = ctx->cbt->bitmap_size_bits;
+
+	while (ctx->current_bit < total) {
+		uint64_t byte_idx = ctx->current_bit >> 3;
+		uint8_t byte_val = bmap[byte_idx];
+
+		if (byte_val == 0) {
+			/* Skip entire byte — no dirty bits. */
+			ctx->current_bit = (byte_idx + 1) << 3;
+			continue;
+		}
+
+		uint8_t bit_pos = ctx->current_bit & 7;
+		if (byte_val & (1u << bit_pos)) {
+			*out_bit = ctx->current_bit;
+			ctx->current_bit++;
+			return true;
+		}
+		ctx->current_bit++;
+	}
+	return false;
+}
+
+/* Find the next range to copy when using override_ranges. */
+static bool
+cbt_rebuild_find_next_range(struct cbt_rebuild_ctx *ctx,
+			    uint64_t *out_offset, uint64_t *out_length)
+{
+	if (ctx->current_range_idx >= ctx->num_ranges) {
+		return false;
+	}
+	*out_offset = ctx->override_ranges[ctx->current_range_idx].offset_blocks;
+	*out_length = ctx->override_ranges[ctx->current_range_idx].length_blocks;
+	ctx->current_range_idx++;
+	return true;
+}
+
+static void
+cbt_rebuild_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct cbt_rebuild_ctx *ctx = cb_arg;
+	struct cbt_rebuild_io_slot *slot = NULL;
+
+	/* Find which slot this write belongs to by matching the buffer. */
+	for (int i = 0; i < ctx->num_slots; i++) {
+		if (ctx->slots[i].in_use && ctx->slots[i].buf == bdev_io->iov.iov_base) {
+			slot = &ctx->slots[i];
+			break;
+		}
+	}
+
+	spdk_bdev_free_io(bdev_io);
+	ctx->outstanding_ios--;
+
+	if (!success) {
+		ctx->error = -EIO;
+		ctx->aborted = true;
+	} else if (slot) {
+		ctx->chunks_copied++;
+		ctx->bytes_copied += slot->chunk_length_blocks *
+				     ctx->cbt->cbt_bdev.blocklen;
+		ctx->bytes_this_window += slot->chunk_length_blocks *
+					  ctx->cbt->cbt_bdev.blocklen;
+	}
+
+	if (slot) {
+		slot->in_use = false;
+	}
+
+	if (ctx->aborted && ctx->outstanding_ios == 0) {
+		cbt_rebuild_finish(ctx);
+		return;
+	}
+
+	cbt_rebuild_submit_next(ctx);
+}
+
+static void
+cbt_rebuild_read_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct cbt_rebuild_ctx *ctx = cb_arg;
+	struct cbt_rebuild_io_slot *slot = NULL;
+	int rc;
+
+	/* Find the slot. */
+	for (int i = 0; i < ctx->num_slots; i++) {
+		if (ctx->slots[i].in_use && ctx->slots[i].buf == bdev_io->iov.iov_base) {
+			slot = &ctx->slots[i];
+			break;
+		}
+	}
+
+	spdk_bdev_free_io(bdev_io);
+
+	if (!success || !slot) {
+		ctx->outstanding_ios--;
+		if (slot) {
+			slot->in_use = false;
+		}
+		ctx->error = -EIO;
+		ctx->aborted = true;
+		if (ctx->outstanding_ios == 0) {
+			cbt_rebuild_finish(ctx);
+		}
+		return;
+	}
+
+	/* Write the data to the target bdev. */
+	rc = spdk_bdev_write(ctx->dst_desc, ctx->dst_ch,
+			     slot->buf,
+			     slot->chunk_offset_blocks * ctx->cbt->cbt_bdev.blocklen,
+			     slot->chunk_length_blocks * ctx->cbt->cbt_bdev.blocklen,
+			     cbt_rebuild_write_cb, ctx);
+	if (rc != 0) {
+		slot->in_use = false;
+		ctx->outstanding_ios--;
+		ctx->error = rc;
+		ctx->aborted = true;
+		if (ctx->outstanding_ios == 0) {
+			cbt_rebuild_finish(ctx);
+		}
+	}
+}
+
+static int
+cbt_rebuild_throttle_poller_fn(void *arg)
+{
+	struct cbt_rebuild_ctx *ctx = arg;
+	uint64_t now = spdk_get_ticks();
+	uint64_t elapsed_us = (now - ctx->window_start_tsc) * 1000000 / cbt_get_tsc_hz();
+
+	/* Reset window every second. */
+	if (elapsed_us >= 1000000) {
+		ctx->bytes_this_window = 0;
+		ctx->window_start_tsc = now;
+		if (ctx->throttled) {
+			ctx->throttled = false;
+			cbt_rebuild_submit_next(ctx);
+		}
+	}
+
+	return ctx->throttled ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
+}
+
+static void
+cbt_rebuild_submit_next(struct cbt_rebuild_ctx *ctx)
+{
+	struct cbt_rebuild_io_slot *slot;
+	uint64_t offset_blocks, length_blocks;
+	int rc;
+
+	while (!ctx->aborted && ctx->outstanding_ios < ctx->max_outstanding) {
+		/* Bandwidth throttle check. */
+		if (ctx->max_bytes_per_sec > 0 &&
+		    ctx->bytes_this_window >= ctx->max_bytes_per_sec) {
+			ctx->throttled = true;
+			break;
+		}
+
+		slot = cbt_rebuild_get_free_slot(ctx);
+		if (!slot) {
+			break;
+		}
+
+		/* Get next chunk to copy. */
+		if (ctx->override_ranges) {
+			if (!cbt_rebuild_find_next_range(ctx, &offset_blocks, &length_blocks)) {
+				goto done_scanning;
+			}
+		} else {
+			uint64_t bit;
+			if (!cbt_rebuild_find_next_dirty(ctx, &bit)) {
+				goto done_scanning;
+			}
+			offset_blocks = bit * ctx->cbt->chunk_size_blocks;
+			length_blocks = ctx->cbt->chunk_size_blocks;
+			/* Clamp to device size. */
+			if (offset_blocks + length_blocks > ctx->cbt->total_blocks) {
+				length_blocks = ctx->cbt->total_blocks - offset_blocks;
+			}
+		}
+
+		slot->in_use = true;
+		slot->chunk_offset_blocks = offset_blocks;
+		slot->chunk_length_blocks = length_blocks;
+		ctx->outstanding_ios++;
+
+		rc = spdk_bdev_read(ctx->src_desc, ctx->src_ch,
+				    slot->buf,
+				    offset_blocks * ctx->cbt->cbt_bdev.blocklen,
+				    length_blocks * ctx->cbt->cbt_bdev.blocklen,
+				    cbt_rebuild_read_cb, ctx);
+		if (rc != 0) {
+			slot->in_use = false;
+			ctx->outstanding_ios--;
+			ctx->error = rc;
+			ctx->aborted = true;
+			break;
+		}
+	}
+
+	/* If no outstanding IOs and we're done or aborted, finish. */
+	if (ctx->outstanding_ios == 0) {
+		cbt_rebuild_finish(ctx);
+	}
+	return;
+
+done_scanning:
+	/* No more dirty bits/ranges. Wait for outstanding IOs to drain. */
+	if (ctx->outstanding_ios == 0) {
+		cbt_rebuild_finish(ctx);
+	}
+}
+
+static void
+cbt_rebuild_finish(struct cbt_rebuild_ctx *ctx)
+{
+	struct cbt_rebuild_result result = {0};
+	uint64_t elapsed_tsc = spdk_get_ticks() - ctx->start_tsc;
+
+	result.chunks_copied = ctx->chunks_copied;
+	result.bytes_copied = ctx->bytes_copied;
+	result.duration_ms = elapsed_tsc * 1000 / cbt_get_tsc_hz();
+	result.error = ctx->error;
+	result.completed = (ctx->error == 0);
+
+	/* Compute residual dirty ratio: re-snapshot the live bitmap and count
+	 * new dirty bits that arrived during the copy.
+	 */
+	if (result.completed && ctx->cbt->bitmap_size_bits > 0) {
+		__atomic_thread_fence(__ATOMIC_ACQUIRE);
+		/* Re-freeze the epoch's bitmap_frozen with current live bitmap. */
+		memcpy(ctx->epoch->bitmap_frozen, ctx->cbt->bitmap,
+		       ctx->cbt->bitmap_size_bytes);
+		/* Count dirty bits in the new snapshot. */
+		uint64_t new_dirty = 0;
+		const uint8_t *bmap = ctx->epoch->bitmap_frozen;
+		uint64_t n = ctx->cbt->bitmap_size_bytes / 8;
+		uint64_t tail = ctx->cbt->bitmap_size_bytes % 8;
+		for (uint64_t i = 0; i < n; i++) {
+			uint64_t word;
+			memcpy(&word, bmap + i * 8, sizeof(word));
+			new_dirty += (uint64_t)__builtin_popcountll(word);
+		}
+		for (uint64_t i = 0; i < tail; i++) {
+			new_dirty += (uint64_t)__builtin_popcount(bmap[n * 8 + i]);
+		}
+		result.residual_dirty_ratio = (double)new_dirty /
+					      (double)ctx->cbt->bitmap_size_bits;
+	}
+
+	/* Transition epoch to REBUILDING state (keep it there). */
+	if (ctx->epoch->state == CBT_EPOCH_FROZEN) {
+		ctx->epoch->state = CBT_EPOCH_REBUILDING;
+	}
+
+	/* Cleanup. */
+	if (ctx->throttle_poller) {
+		spdk_poller_unregister(&ctx->throttle_poller);
+	}
+	if (ctx->src_ch) {
+		spdk_put_io_channel(ctx->src_ch);
+	}
+	if (ctx->dst_ch) {
+		spdk_put_io_channel(ctx->dst_ch);
+	}
+	if (ctx->src_desc) {
+		spdk_bdev_close(ctx->src_desc);
+	}
+	if (ctx->dst_desc) {
+		spdk_bdev_close(ctx->dst_desc);
+	}
+	for (int i = 0; i < ctx->num_slots; i++) {
+		if (ctx->slots[i].buf) {
+			spdk_dma_free(ctx->slots[i].buf);
+		}
+	}
+	free(ctx->slots);
+	free(ctx->override_ranges);
+
+	/* Invoke completion callback. */
+	ctx->cb_fn(ctx->cb_arg, &result);
+	free(ctx);
+}
+
+int
+bdev_cbt_partial_rebuild(const char *cbt_name, const char *epoch_id,
+			 const char *target_bdev_name,
+			 uint64_t max_bw_mb_sec, uint32_t queue_depth,
+			 const struct cbt_rebuild_range *override_ranges,
+			 uint32_t num_ranges,
+			 cbt_rebuild_done_cb cb_fn, void *cb_arg)
+{
+	struct vbdev_cbt *cbt;
+	struct cbt_epoch *ep;
+	struct cbt_rebuild_ctx *ctx;
+	uint64_t chunk_bytes;
+	int rc;
+
+	assert(spdk_get_thread() == spdk_thread_get_app_thread());
+
+	cbt = cbt_find_by_name(cbt_name);
+	if (!cbt) {
+		return -ENODEV;
+	}
+
+	ep = cbt_find_epoch(cbt, epoch_id);
+	if (!ep) {
+		return -ENOENT;
+	}
+	if (ep->state != CBT_EPOCH_FROZEN) {
+		return -EINVAL;
+	}
+	if (!ep->bitmap_frozen) {
+		return -EINVAL;
+	}
+
+	/* Validate queue_depth. */
+	if (queue_depth == 0) {
+		queue_depth = CBT_REBUILD_DEFAULT_QD;
+	}
+	if (queue_depth > CBT_REBUILD_MAX_QD) {
+		queue_depth = CBT_REBUILD_MAX_QD;
+	}
+
+	/* Allocate rebuild context. */
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		return -ENOMEM;
+	}
+
+	ctx->cbt = cbt;
+	ctx->epoch = ep;
+	ctx->max_outstanding = (int)queue_depth;
+	ctx->num_slots = (int)queue_depth;
+	ctx->max_bytes_per_sec = max_bw_mb_sec * 1024 * 1024;
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+	ctx->start_tsc = spdk_get_ticks();
+	ctx->window_start_tsc = ctx->start_tsc;
+	ctx->bitmap = ep->bitmap_frozen;
+
+	/* Copy override ranges if provided. */
+	if (override_ranges && num_ranges > 0) {
+		ctx->override_ranges = calloc(num_ranges, sizeof(*ctx->override_ranges));
+		if (!ctx->override_ranges) {
+			free(ctx);
+			return -ENOMEM;
+		}
+		memcpy(ctx->override_ranges, override_ranges,
+		       num_ranges * sizeof(*ctx->override_ranges));
+		ctx->num_ranges = num_ranges;
+	}
+
+	/* Open source bdev (the CBT bdev itself — reads go to base/RAID). */
+	rc = spdk_bdev_open_ext(spdk_bdev_get_name(&cbt->cbt_bdev), false,
+				cbt_rebuild_base_event_cb, NULL, &ctx->src_desc);
+	if (rc != 0) {
+		free(ctx->override_ranges);
+		free(ctx);
+		return rc;
+	}
+
+	/* Open target bdev. */
+	rc = spdk_bdev_open_ext(target_bdev_name, true,
+				cbt_rebuild_base_event_cb, NULL, &ctx->dst_desc);
+	if (rc != 0) {
+		spdk_bdev_close(ctx->src_desc);
+		free(ctx->override_ranges);
+		free(ctx);
+		return rc;
+	}
+
+	/* Get IO channels. */
+	ctx->src_ch = spdk_bdev_get_io_channel(ctx->src_desc);
+	ctx->dst_ch = spdk_bdev_get_io_channel(ctx->dst_desc);
+	if (!ctx->src_ch || !ctx->dst_ch) {
+		if (ctx->src_ch) spdk_put_io_channel(ctx->src_ch);
+		if (ctx->dst_ch) spdk_put_io_channel(ctx->dst_ch);
+		spdk_bdev_close(ctx->src_desc);
+		spdk_bdev_close(ctx->dst_desc);
+		free(ctx->override_ranges);
+		free(ctx);
+		return -ENOMEM;
+	}
+
+	/* Allocate DMA buffer slots. */
+	chunk_bytes = (uint64_t)cbt->chunk_size_blocks * cbt->cbt_bdev.blocklen;
+	ctx->slots = calloc((size_t)ctx->num_slots, sizeof(*ctx->slots));
+	if (!ctx->slots) {
+		spdk_put_io_channel(ctx->src_ch);
+		spdk_put_io_channel(ctx->dst_ch);
+		spdk_bdev_close(ctx->src_desc);
+		spdk_bdev_close(ctx->dst_desc);
+		free(ctx->override_ranges);
+		free(ctx);
+		return -ENOMEM;
+	}
+
+	for (int i = 0; i < ctx->num_slots; i++) {
+		ctx->slots[i].buf = spdk_dma_malloc(chunk_bytes, 4096, NULL);
+		if (!ctx->slots[i].buf) {
+			/* Free already allocated. */
+			for (int j = 0; j < i; j++) {
+				spdk_dma_free(ctx->slots[j].buf);
+			}
+			free(ctx->slots);
+			spdk_put_io_channel(ctx->src_ch);
+			spdk_put_io_channel(ctx->dst_ch);
+			spdk_bdev_close(ctx->src_desc);
+			spdk_bdev_close(ctx->dst_desc);
+			free(ctx->override_ranges);
+			free(ctx);
+			return -ENOMEM;
+		}
+	}
+
+	/* Start bandwidth throttle poller if needed. */
+	if (ctx->max_bytes_per_sec > 0) {
+		ctx->throttle_poller = SPDK_POLLER_REGISTER(
+			cbt_rebuild_throttle_poller_fn, ctx, 100000); /* 100ms */
+	}
+
+	SPDK_NOTICELOG("CBT: partial_rebuild started for '%s' epoch '%s' → '%s' "
+		       "(qd=%d, bw_limit=%lu MB/s)\n",
+		       cbt_name, epoch_id, target_bdev_name,
+		       ctx->max_outstanding,
+		       (unsigned long)max_bw_mb_sec);
+
+	/* Kick off the first batch. */
+	cbt_rebuild_submit_next(ctx);
+	return 0;
+}
+
+/* ================================================================== */
 /* Legacy aliases                                                     */
 /* ================================================================== */
 
