@@ -165,6 +165,9 @@ jobs:
           push: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'pull_request' }}
           load: ${{ github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/') }}
           tags: ${{ matrix.image }}:${{ needs.compute-tag.outputs.tag }}-${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.version=${{ needs.compute-tag.outputs.tag }}
+            org.opencontainers.image.source=https://github.com/Evariops/spdk
           cache-from: type=gha,scope=spdk-${{ matrix.variant }}-${{ matrix.arch }}
           cache-to: ${{ github.event_name != 'pull_request' && format('type=gha,scope=spdk-{0}-{1},mode=max', matrix.variant, matrix.arch) || '' }}
 
@@ -214,6 +217,8 @@ jobs:
         run: |
           set -euo pipefail
           docker buildx imagetools create \
+            --annotation "index:org.opencontainers.image.version=${TAG}" \
+            --annotation "index:org.opencontainers.image.source=https://github.com/Evariops/spdk" \
             -t "${IMAGE}:${TAG}" \
             "${IMAGE}:${TAG}-amd64" \
             "${IMAGE}:${TAG}-arm64"
@@ -260,7 +265,10 @@ jobs:
 
           # Create versioned manifest from per-arch tags
           docker buildx imagetools create \
+            --annotation "index:org.opencontainers.image.version=${TAG}" \
+            --annotation "index:org.opencontainers.image.source=https://github.com/Evariops/spdk" \
             -t "${IMAGE}:${TAG}" \
+            -t "${IMAGE}:latest" \
             "${IMAGE}:${TAG}-amd64" \
             "${IMAGE}:${TAG}-arm64"
 
