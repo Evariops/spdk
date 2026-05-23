@@ -47,6 +47,16 @@ RUN git clone --branch "${SPDK_VERSION}" --depth 1 --recurse-submodules \
 
 WORKDIR /build/spdk
 
+# ── Inject CBT module and RAID patch ──
+COPY module/bdev/cbt/ module/bdev/cbt/
+COPY patches/ /build/patches/
+
+# Register CBT in the bdev module build
+RUN sed -i '/^DIRS-y += delay/s/$/ cbt/' module/bdev/Makefile
+
+# Apply skip_rebuild patch for RAID add_base_bdev
+RUN git apply /build/patches/0001-raid-add-skip_rebuild-parameter.patch
+
 # Fedora 45's CMake rejects cmake_minimum_required(<3.5) in SPDK subprojects (ISA-L, etc.)
 ENV CMAKE_POLICY_VERSION_MINIMUM=3.5
 RUN ./scripts/pkgdep.sh -d
