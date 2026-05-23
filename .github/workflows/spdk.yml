@@ -10,10 +10,15 @@ on:
     tags: ["spdk/v*"]
     paths:
       - "images/spdk/**"
+      - "module/bdev/cbt/**"
+      - "patches/**"
       - ".github/workflows/spdk.yml"
   pull_request:
+    types: [labeled, synchronize]
     paths:
       - "images/spdk/**"
+      - "module/bdev/cbt/**"
+      - "patches/**"
       - ".github/workflows/spdk.yml"
   workflow_dispatch:
 
@@ -32,9 +37,25 @@ concurrency:
 # ==================================================================
 jobs:
   # ────────────────────────────────────────────────────────────────
+  # 0. Gate — only authorized actors can trigger PR image builds
+  # ────────────────────────────────────────────────────────────────
+  authorize:
+    name: Authorize
+    runs-on: ubuntu-24.04
+    if: >-
+      github.event_name != 'pull_request'
+      || (
+        contains(github.event.pull_request.labels.*.name, 'build-images')
+        && contains(fromJSON('["rducom","renovate[bot]"]'), github.actor)
+      )
+    steps:
+      - run: echo "✓ Authorized"
+
+  # ────────────────────────────────────────────────────────────────
   # 1. Lint
   # ────────────────────────────────────────────────────────────────
   lint:
+    needs: authorize
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -73,7 +94,6 @@ jobs:
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
 
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
           registry: ghcr.io
@@ -82,6 +102,9 @@ jobs:
 
       - name: Compute tag suffix
         id: tag
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           if [[ "$GITHUB_REF" == refs/tags/spdk/v* ]]; then
             TAG="${GITHUB_REF#refs/tags/spdk/}"
@@ -89,6 +112,9 @@ jobs:
             if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
               echo "minor_tag=${TAG%.*}" >> "$GITHUB_OUTPUT"
             fi
+          elif [[ -n "${PR_NUMBER}" ]]; then
+            SHORT_SHA=$(echo "${PR_HEAD_SHA}" | cut -c1-7)
+            TAG="pr${PR_NUMBER}-${SHORT_SHA}"
           else
             TAG="sha-${GITHUB_SHA::7}"
           fi
@@ -98,11 +124,11 @@ jobs:
         id: build
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
-          context: images/spdk
+          context: .
           file: images/spdk/Dockerfile
           platforms: linux/amd64
-          push: ${{ startsWith(github.ref, 'refs/tags/') }}
-          load: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          push: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'pull_request' }}
+          load: ${{ github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/') }}
           tags: ${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}-amd64
           cache-from: type=gha,scope=spdk-amd64
           cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,scope=spdk-amd64,mode=max' || '' }}
@@ -113,7 +139,7 @@ jobs:
         env:
           TRIVY_PLATFORM: linux/amd64
         with:
-          image-ref: ${{ startsWith(github.ref, 'refs/tags/') && format('{0}:{1}-amd64', env.IMAGE_NAME, steps.tag.outputs.tag) || steps.build.outputs.imageid }}
+          image-ref: ${{ (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')) && steps.build.outputs.imageid || format('{0}:{1}-amd64', env.IMAGE_NAME, steps.tag.outputs.tag) }}
           format: "table"
           exit-code: "1"
           severity: "HIGH,CRITICAL"
@@ -137,7 +163,6 @@ jobs:
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
 
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
           registry: ghcr.io
@@ -146,12 +171,18 @@ jobs:
 
       - name: Compute tag suffix
         id: tag
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           if [[ "$GITHUB_REF" == refs/tags/spdk/v* ]]; then
             TAG="${GITHUB_REF#refs/tags/spdk/}"
             if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
               echo "minor_tag=${TAG%.*}" >> "$GITHUB_OUTPUT"
             fi
+          elif [[ -n "${PR_NUMBER}" ]]; then
+            SHORT_SHA=$(echo "${PR_HEAD_SHA}" | cut -c1-7)
+            TAG="pr${PR_NUMBER}-${SHORT_SHA}"
           else
             TAG="sha-${GITHUB_SHA::7}"
           fi
@@ -161,11 +192,11 @@ jobs:
         id: build
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
-          context: images/spdk
+          context: .
           file: images/spdk/Dockerfile
           platforms: linux/arm64
-          push: ${{ startsWith(github.ref, 'refs/tags/') }}
-          load: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          push: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'pull_request' }}
+          load: ${{ github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/') }}
           tags: ${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}-arm64
           cache-from: type=gha,scope=spdk-arm64
           cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,scope=spdk-arm64,mode=max' || '' }}
@@ -176,7 +207,7 @@ jobs:
         env:
           TRIVY_PLATFORM: linux/arm64
         with:
-          image-ref: ${{ startsWith(github.ref, 'refs/tags/') && format('{0}:{1}-arm64', env.IMAGE_NAME, steps.tag.outputs.tag) || steps.build.outputs.imageid }}
+          image-ref: ${{ (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')) && steps.build.outputs.imageid || format('{0}:{1}-arm64', env.IMAGE_NAME, steps.tag.outputs.tag) }}
           format: "table"
           exit-code: "1"
           severity: "HIGH,CRITICAL"
