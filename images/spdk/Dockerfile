@@ -52,6 +52,7 @@ COPY module/bdev/cbt/ module/bdev/cbt/
 COPY patches/ /build/patches/
 
 # Register CBT in the bdev module build, link list, and deps & apply RAID patch
+# hadolint ignore=SC2016
 RUN sed -i '/^DIRS-y += delay/s/$/ cbt/' module/bdev/Makefile && \
     sed -i '/^BLOCKDEV_MODULES_LIST += bdev_zone_block/a BLOCKDEV_MODULES_LIST += bdev_cbt' mk/spdk.modules.mk && \
     sed -i '/^DEPDIRS-bdev_passthru/a DEPDIRS-bdev_cbt := $(BDEV_DEPS_THREAD)' mk/spdk.lib_deps.mk && \
