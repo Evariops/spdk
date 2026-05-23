@@ -51,11 +51,11 @@ WORKDIR /build/spdk
 COPY module/bdev/cbt/ module/bdev/cbt/
 COPY patches/ /build/patches/
 
-# Register CBT in the bdev module build
-RUN sed -i '/^DIRS-y += delay/s/$/ cbt/' module/bdev/Makefile
-
-# Apply skip_rebuild patch for RAID add_base_bdev
-RUN git apply /build/patches/0001-raid-add-skip_rebuild-parameter.patch
+# Register CBT in the bdev module build, link list, and deps & apply RAID patch
+RUN sed -i '/^DIRS-y += delay/s/$/ cbt/' module/bdev/Makefile && \
+    sed -i '/^BLOCKDEV_MODULES_LIST += bdev_zone_block/a BLOCKDEV_MODULES_LIST += bdev_cbt' mk/spdk.modules.mk && \
+    sed -i '/^DEPDIRS-bdev_passthru/a DEPDIRS-bdev_cbt := $(BDEV_DEPS_THREAD)' mk/spdk.lib_deps.mk && \
+    git apply /build/patches/0001-raid-add-skip_rebuild-parameter.patch
 
 # Fedora 45's CMake rejects cmake_minimum_required(<3.5) in SPDK subprojects (ISA-L, etc.)
 ENV CMAKE_POLICY_VERSION_MINIMUM=3.5
