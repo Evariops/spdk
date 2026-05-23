@@ -6,6 +6,8 @@
     ":pinDigestsDisabled"
   ],
   "labels": ["dependencies"],
+  "minimumReleaseAge": "2 days",
+  "internalChecksFilter": "strict",
   "packageRules": [
     {
       "matchManagers": ["github-actions"],
