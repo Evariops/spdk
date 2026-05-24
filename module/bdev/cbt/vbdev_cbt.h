@@ -26,6 +26,17 @@ extern "C" {
 #define CBT_BACKEND_ID_MAX              128
 #define CBT_REBUILD_DEFAULT_QD          16
 #define CBT_REBUILD_MAX_QD              128
+#define CBT_REBUILD_GC_DELAY_US         60000000 /* 60s before GC of completed entries */
+#define CBT_REBUILD_ID_MAX              64
+
+/* ── Rebuild state (async model) ───────────────────────────────────── */
+
+enum cbt_rebuild_state {
+	CBT_REBUILD_RUNNING   = 0,
+	CBT_REBUILD_COMPLETED = 1,
+	CBT_REBUILD_FAILED    = 2,
+	CBT_REBUILD_CANCELLED = 3,
+};
 
 /* ── Epoch lifecycle ───────────────────────────────────────────────── */
 
@@ -128,10 +139,62 @@ typedef void (*cbt_rebuild_done_cb)(void *cb_arg, const struct cbt_rebuild_resul
  */
 int bdev_cbt_partial_rebuild(const char *cbt_name, const char *epoch_id,
 			     const char *target_bdev_name,
+			     const char *source_bdev_name,
 			     uint64_t max_bw_mb_sec, uint32_t queue_depth,
 			     const struct cbt_rebuild_range *override_ranges,
 			     uint32_t num_ranges,
 			     cbt_rebuild_done_cb cb_fn, void *cb_arg);
+
+/* ── Async rebuild API (Phase 2) ───────────────────────────────────── */
+
+struct cbt_rebuild_status {
+	enum cbt_rebuild_state  state;
+	uint64_t                chunks_copied;
+	uint64_t                total_chunks;
+	uint64_t                bytes_copied;
+	uint64_t                duration_ms;
+	double                  residual_dirty_ratio;
+	int                     error;
+};
+
+/**
+ * Start an async rebuild (returns immediately with a rebuild_id).
+ * The epoch transitions from FROZEN to REBUILDING.
+ * Only one rebuild per epoch at a time.
+ *
+ * \param source_bdev_name  If non-NULL, read from this bdev instead of the CBT bdev
+ * \param out_rebuild_id    Buffer of at least CBT_REBUILD_ID_MAX bytes for the ID
+ * \return 0 on success, negative errno on failure
+ */
+int bdev_cbt_start_rebuild(const char *cbt_name, const char *epoch_id,
+			   const char *target_bdev_name,
+			   const char *source_bdev_name,
+			   uint64_t max_bw_mb_sec, uint32_t queue_depth,
+			   char *out_rebuild_id);
+
+/**
+ * Query the status of a rebuild by its ID.
+ * \return 0 on success (status filled), -ENOENT if rebuild_id unknown
+ */
+int bdev_cbt_get_rebuild_status(const char *rebuild_id,
+				struct cbt_rebuild_status *out_status);
+
+/**
+ * Update bandwidth and/or queue_depth of a running rebuild.
+ * Takes effect at the next throttle window (≤1s).
+ * \return 0 on success, -ENOENT if unknown, -EINVAL if not running
+ */
+int bdev_cbt_update_rebuild_options(const char *rebuild_id,
+				    uint64_t max_bw_mb_sec,
+				    uint32_t queue_depth);
+
+/**
+ * Cancel a running rebuild. In-flight I/Os are drained (not aborted mid-IO).
+ * The epoch remains in REBUILDING state.
+ * \param out_chunks_copied  Filled with chunks copied before cancellation
+ * \return 0 on success, -ENOENT if unknown, -EINVAL if not running
+ */
+int bdev_cbt_cancel_rebuild(const char *rebuild_id, uint64_t *out_chunks_copied);
 
 /**
  * Return dirty ranges from the frozen bitmap of the given epoch.

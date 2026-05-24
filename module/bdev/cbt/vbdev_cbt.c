@@ -1211,6 +1211,7 @@ struct cbt_rebuild_ctx {
 
 	/* Bitmap scan position */
 	uint64_t                  current_bit;
+	uint64_t                  total_dirty_chunks; /* precomputed for progress */
 
 	/* Progress */
 	uint64_t                  chunks_copied;
@@ -1234,20 +1235,129 @@ struct cbt_rebuild_ctx {
 	cbt_rebuild_done_cb       cb_fn;
 	void                     *cb_arg;
 	bool                      aborted;
+	bool                      cancelled;  /* graceful cancel (drain, don't abort) */
 	int                       error;
 
+	/* ── Async model (Phase 2) ── */
+	char                      rebuild_id[CBT_REBUILD_ID_MAX];
+	enum cbt_rebuild_state    state;
+	uint64_t                  completion_tsc;  /* TSC when finished (for GC) */
+	struct cbt_rebuild_result final_result;    /* stored for get_status queries */
+	TAILQ_ENTRY(cbt_rebuild_ctx) registry_link;
+
 	/* ── Instrumentation counters ── */
-	uint64_t                  submit_calls;       /* times submit_next was called */
-	uint64_t                  submit_no_slot;     /* submit_next found no free slot */
-	uint64_t                  submit_throttled;   /* submit_next hit bandwidth limit */
-	uint64_t                  total_read_tsc;     /* cumulative read latency (tsc) */
-	uint64_t                  total_write_tsc;    /* cumulative write latency (tsc) */
+	uint64_t                  submit_calls;
+	uint64_t                  submit_no_slot;
+	uint64_t                  submit_throttled;
+	uint64_t                  total_read_tsc;
+	uint64_t                  total_write_tsc;
 	uint64_t                  max_read_tsc;
 	uint64_t                  max_write_tsc;
-	uint64_t                  qd_sum;            /* sum of outstanding_ios at each submit */
-	uint64_t                  qd_samples;        /* number of samples */
-	uint64_t                  ios_coalesced;      /* I/Os that were coalesced */
+	uint64_t                  qd_sum;
+	uint64_t                  qd_samples;
+	uint64_t                  ios_coalesced;
 };
+
+/* ── Global rebuild registry ── */
+static TAILQ_HEAD(cbt_rebuild_registry_head, cbt_rebuild_ctx) g_rebuild_registry =
+	TAILQ_HEAD_INITIALIZER(g_rebuild_registry);
+static uint64_t g_rebuild_id_counter = 0;
+static struct spdk_poller *g_rebuild_gc_poller = NULL;
+
+static struct cbt_rebuild_ctx *
+cbt_rebuild_find_by_id(const char *rebuild_id)
+{
+	struct cbt_rebuild_ctx *ctx;
+	TAILQ_FOREACH(ctx, &g_rebuild_registry, registry_link) {
+		if (strcmp(ctx->rebuild_id, rebuild_id) == 0) {
+			return ctx;
+		}
+	}
+	return NULL;
+}
+
+static struct cbt_rebuild_ctx *
+cbt_rebuild_find_active_for_epoch(const char *epoch_id)
+{
+	struct cbt_rebuild_ctx *ctx;
+	TAILQ_FOREACH(ctx, &g_rebuild_registry, registry_link) {
+		if (ctx->state == CBT_REBUILD_RUNNING &&
+		    strcmp(ctx->epoch->epoch_id, epoch_id) == 0) {
+			return ctx;
+		}
+	}
+	return NULL;
+}
+
+static void
+cbt_rebuild_registry_cleanup(struct cbt_rebuild_ctx *ctx)
+{
+	if (ctx->throttle_poller) {
+		spdk_poller_unregister(&ctx->throttle_poller);
+	}
+	if (ctx->src_ch) {
+		spdk_put_io_channel(ctx->src_ch);
+	}
+	if (ctx->dst_ch) {
+		spdk_put_io_channel(ctx->dst_ch);
+	}
+	if (ctx->src_desc) {
+		spdk_bdev_close(ctx->src_desc);
+	}
+	if (ctx->dst_desc) {
+		spdk_bdev_close(ctx->dst_desc);
+	}
+	for (int i = 0; i < ctx->num_slots; i++) {
+		if (ctx->slots[i].buf) {
+			spdk_dma_free(ctx->slots[i].buf);
+		}
+	}
+	free(ctx->slots);
+	ctx->slots = NULL;
+	free(ctx->override_ranges);
+	ctx->override_ranges = NULL;
+}
+
+static int
+cbt_rebuild_gc_poller_fn(void *arg)
+{
+	struct cbt_rebuild_ctx *ctx, *tmp;
+	uint64_t now = spdk_get_ticks();
+	uint64_t gc_tsc = (uint64_t)CBT_REBUILD_GC_DELAY_US *
+			  spdk_get_ticks_hz() / 1000000;
+	bool any_removed = false;
+
+	TAILQ_FOREACH_SAFE(ctx, &g_rebuild_registry, registry_link, tmp) {
+		if (ctx->state == CBT_REBUILD_RUNNING) {
+			continue;
+		}
+		if (now - ctx->completion_tsc > gc_tsc) {
+			TAILQ_REMOVE(&g_rebuild_registry, ctx, registry_link);
+			free(ctx);
+			any_removed = true;
+		}
+	}
+
+	(void)any_removed;
+	return SPDK_POLLER_IDLE;
+}
+
+static uint64_t
+cbt_count_dirty_bits(const uint8_t *bitmap, uint64_t size_bytes)
+{
+	uint64_t count = 0;
+	uint64_t n = size_bytes / 8;
+	uint64_t tail = size_bytes % 8;
+	for (uint64_t i = 0; i < n; i++) {
+		uint64_t word;
+		memcpy(&word, bitmap + i * 8, sizeof(word));
+		count += (uint64_t)__builtin_popcountll(word);
+	}
+	for (uint64_t i = 0; i < tail; i++) {
+		count += (uint64_t)__builtin_popcount(bitmap[n * 8 + i]);
+	}
+	return count;
+}
 
 static void cbt_rebuild_submit_next(struct cbt_rebuild_ctx *ctx);
 static void cbt_rebuild_finish(struct cbt_rebuild_ctx *ctx);
@@ -1387,7 +1497,7 @@ cbt_rebuild_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 		slot->in_use = false;
 	}
 
-	if (ctx->aborted && ctx->outstanding_ios == 0) {
+	if ((ctx->aborted || ctx->cancelled) && ctx->outstanding_ios == 0) {
 		cbt_rebuild_finish(ctx);
 		return;
 	}
@@ -1481,7 +1591,8 @@ cbt_rebuild_submit_next(struct cbt_rebuild_ctx *ctx)
 	ctx->qd_sum += (uint64_t)ctx->outstanding_ios;
 	ctx->qd_samples++;
 
-	while (!ctx->aborted && ctx->outstanding_ios < ctx->max_outstanding) {
+	while (!ctx->aborted && !ctx->cancelled &&
+	       ctx->outstanding_ios < ctx->max_outstanding) {
 		/* Bandwidth throttle check. */
 		if (ctx->max_bytes_per_sec > 0 &&
 		    ctx->bytes_this_window >= ctx->max_bytes_per_sec) {
@@ -1556,21 +1667,23 @@ cbt_rebuild_finish(struct cbt_rebuild_ctx *ctx)
 	struct cbt_rebuild_result result = {0};
 	uint64_t elapsed_tsc = spdk_get_ticks() - ctx->start_tsc;
 	uint64_t hz = cbt_get_tsc_hz();
+	uint64_t avg_read_us, avg_write_us, max_read_us, max_write_us, avg_qd;
+	uint64_t new_dirty;
 
 	result.chunks_copied = ctx->chunks_copied;
 	result.bytes_copied = ctx->bytes_copied;
 	result.duration_ms = elapsed_tsc * 1000 / hz;
 	result.error = ctx->error;
-	result.completed = (ctx->error == 0);
+	result.completed = (ctx->error == 0 && !ctx->cancelled);
 
 	/* ── Instrumentation report ── */
-	uint64_t avg_read_us = ctx->chunks_copied ?
+	avg_read_us = ctx->chunks_copied ?
 		(ctx->total_read_tsc * 1000000 / hz) / ctx->chunks_copied : 0;
-	uint64_t avg_write_us = ctx->chunks_copied ?
+	avg_write_us = ctx->chunks_copied ?
 		(ctx->total_write_tsc * 1000000 / hz) / ctx->chunks_copied : 0;
-	uint64_t max_read_us = ctx->max_read_tsc * 1000000 / hz;
-	uint64_t max_write_us = ctx->max_write_tsc * 1000000 / hz;
-	uint64_t avg_qd = ctx->qd_samples ? ctx->qd_sum / ctx->qd_samples : 0;
+	max_read_us = ctx->max_read_tsc * 1000000 / hz;
+	max_write_us = ctx->max_write_tsc * 1000000 / hz;
+	avg_qd = ctx->qd_samples ? ctx->qd_sum / ctx->qd_samples : 0;
 
 	SPDK_NOTICELOG("CBT rebuild stats: duration=%lums chunks=%lu bytes=%lu MiB\n",
 		       (unsigned long)result.duration_ms,
@@ -1591,27 +1704,13 @@ cbt_rebuild_finish(struct cbt_rebuild_ctx *ctx)
 		       (unsigned long)(result.bytes_copied / 1024 / 1024 * 1000 /
 				       result.duration_ms) : 0);
 
-	/* Compute residual dirty ratio: re-snapshot the live bitmap and count
-	 * new dirty bits that arrived during the copy.
-	 */
+	/* Compute residual dirty ratio on successful completion. */
 	if (result.completed && ctx->cbt->bitmap_size_bits > 0) {
 		__atomic_thread_fence(__ATOMIC_ACQUIRE);
-		/* Re-freeze the epoch's bitmap_frozen with current live bitmap. */
 		memcpy(ctx->epoch->bitmap_frozen, ctx->cbt->bitmap,
 		       ctx->cbt->bitmap_size_bytes);
-		/* Count dirty bits in the new snapshot. */
-		uint64_t new_dirty = 0;
-		const uint8_t *bmap = ctx->epoch->bitmap_frozen;
-		uint64_t n = ctx->cbt->bitmap_size_bytes / 8;
-		uint64_t tail = ctx->cbt->bitmap_size_bytes % 8;
-		for (uint64_t i = 0; i < n; i++) {
-			uint64_t word;
-			memcpy(&word, bmap + i * 8, sizeof(word));
-			new_dirty += (uint64_t)__builtin_popcountll(word);
-		}
-		for (uint64_t i = 0; i < tail; i++) {
-			new_dirty += (uint64_t)__builtin_popcount(bmap[n * 8 + i]);
-		}
+		new_dirty = cbt_count_dirty_bits(ctx->epoch->bitmap_frozen,
+						 ctx->cbt->bitmap_size_bytes);
 		result.residual_dirty_ratio = (double)new_dirty /
 					      (double)ctx->cbt->bitmap_size_bits;
 	}
@@ -1621,38 +1720,41 @@ cbt_rebuild_finish(struct cbt_rebuild_ctx *ctx)
 		ctx->epoch->state = CBT_EPOCH_REBUILDING;
 	}
 
-	/* Cleanup. */
-	if (ctx->throttle_poller) {
-		spdk_poller_unregister(&ctx->throttle_poller);
-	}
-	if (ctx->src_ch) {
-		spdk_put_io_channel(ctx->src_ch);
-	}
-	if (ctx->dst_ch) {
-		spdk_put_io_channel(ctx->dst_ch);
-	}
-	if (ctx->src_desc) {
-		spdk_bdev_close(ctx->src_desc);
-	}
-	if (ctx->dst_desc) {
-		spdk_bdev_close(ctx->dst_desc);
-	}
-	for (int i = 0; i < ctx->num_slots; i++) {
-		if (ctx->slots[i].buf) {
-			spdk_dma_free(ctx->slots[i].buf);
-		}
-	}
-	free(ctx->slots);
-	free(ctx->override_ranges);
+	/* Cleanup I/O resources. */
+	cbt_rebuild_registry_cleanup(ctx);
 
-	/* Invoke completion callback. */
-	ctx->cb_fn(ctx->cb_arg, &result);
-	free(ctx);
+	/* ── Finalize state for the registry ── */
+	if (ctx->cancelled) {
+		ctx->state = CBT_REBUILD_CANCELLED;
+	} else if (ctx->error != 0) {
+		ctx->state = CBT_REBUILD_FAILED;
+	} else {
+		ctx->state = CBT_REBUILD_COMPLETED;
+	}
+	ctx->final_result = result;
+	ctx->completion_tsc = spdk_get_ticks();
+
+	/* Invoke completion callback (legacy fire-and-wait path). */
+	if (ctx->cb_fn) {
+		ctx->cb_fn(ctx->cb_arg, &result);
+	}
+
+	/* If this is the legacy path (has cb_fn, no rebuild_id), remove from
+	 * registry and free immediately. Async entries stay for get_status.
+	 */
+	if (ctx->rebuild_id[0] == '\0') {
+		TAILQ_REMOVE(&g_rebuild_registry, ctx, registry_link);
+		free(ctx);
+	}
+	/* else: ctx stays in g_rebuild_registry for get_status queries.
+	 * GC poller will free it after CBT_REBUILD_GC_DELAY_US.
+	 */
 }
 
 int
 bdev_cbt_partial_rebuild(const char *cbt_name, const char *epoch_id,
 			 const char *target_bdev_name,
+			 const char *source_bdev_name,
 			 uint64_t max_bw_mb_sec, uint32_t queue_depth,
 			 const struct cbt_rebuild_range *override_ranges,
 			 uint32_t num_ranges,
@@ -1661,6 +1763,7 @@ bdev_cbt_partial_rebuild(const char *cbt_name, const char *epoch_id,
 	struct vbdev_cbt *cbt;
 	struct cbt_epoch *ep;
 	struct cbt_rebuild_ctx *ctx;
+	const char *src_name;
 	uint64_t chunk_bytes;
 	int rc;
 
@@ -1675,7 +1778,7 @@ bdev_cbt_partial_rebuild(const char *cbt_name, const char *epoch_id,
 	if (!ep) {
 		return -ENOENT;
 	}
-	if (ep->state != CBT_EPOCH_FROZEN) {
+	if (ep->state != CBT_EPOCH_FROZEN && ep->state != CBT_EPOCH_REBUILDING) {
 		return -EINVAL;
 	}
 	if (!ep->bitmap_frozen) {
@@ -1719,8 +1822,12 @@ bdev_cbt_partial_rebuild(const char *cbt_name, const char *epoch_id,
 		ctx->num_ranges = num_ranges;
 	}
 
-	/* Open source bdev (the CBT bdev itself — reads go to base/RAID). */
-	rc = spdk_bdev_open_ext(spdk_bdev_get_name(&cbt->cbt_bdev), false,
+	/* Open source bdev. Use source_bdev_name override if provided,
+	 * otherwise default to the CBT bdev itself (reads go to base/RAID).
+	 */
+	src_name = source_bdev_name ? source_bdev_name :
+		   spdk_bdev_get_name(&cbt->cbt_bdev);
+	rc = spdk_bdev_open_ext(src_name, false,
 				cbt_rebuild_base_event_cb, NULL, &ctx->src_desc);
 	if (rc != 0) {
 		free(ctx->override_ranges);
@@ -1792,6 +1899,20 @@ bdev_cbt_partial_rebuild(const char *cbt_name, const char *epoch_id,
 			cbt_rebuild_throttle_poller_fn, ctx, 100000); /* 100ms */
 	}
 
+	/* Precompute total dirty chunks for progress reporting. */
+	ctx->total_dirty_chunks = cbt_count_dirty_bits(ep->bitmap_frozen,
+						       cbt->bitmap_size_bytes);
+
+	/* Register in the rebuild registry. */
+	ctx->state = CBT_REBUILD_RUNNING;
+	TAILQ_INSERT_TAIL(&g_rebuild_registry, ctx, registry_link);
+
+	/* Start GC poller on first use. */
+	if (!g_rebuild_gc_poller) {
+		g_rebuild_gc_poller = SPDK_POLLER_REGISTER(
+			cbt_rebuild_gc_poller_fn, NULL, 10000000); /* 10s */
+	}
+
 	SPDK_NOTICELOG("CBT: partial_rebuild started for '%s' epoch '%s' → '%s' "
 		       "(qd=%d, bw_limit=%lu MB/s, coalesce=%d chunks/io)\n",
 		       cbt_name, epoch_id, target_bdev_name,
@@ -1801,6 +1922,169 @@ bdev_cbt_partial_rebuild(const char *cbt_name, const char *epoch_id,
 
 	/* Kick off the first batch. */
 	cbt_rebuild_submit_next(ctx);
+	return 0;
+}
+
+/* ================================================================== */
+/* Async rebuild API (Phase 2)                                        */
+/* ================================================================== */
+
+int
+bdev_cbt_start_rebuild(const char *cbt_name, const char *epoch_id,
+		       const char *target_bdev_name,
+		       const char *source_bdev_name,
+		       uint64_t max_bw_mb_sec, uint32_t queue_depth,
+		       char *out_rebuild_id)
+{
+	struct vbdev_cbt *cbt;
+	struct cbt_epoch *ep;
+	struct cbt_rebuild_ctx *ctx;
+	uint64_t id;
+	int rc;
+
+	assert(spdk_get_thread() == spdk_thread_get_app_thread());
+
+	/* Validate early — same checks as bdev_cbt_partial_rebuild. */
+	cbt = cbt_find_by_name(cbt_name);
+	if (!cbt) {
+		return -ENODEV;
+	}
+	ep = cbt_find_epoch(cbt, epoch_id);
+	if (!ep) {
+		return -ENOENT;
+	}
+	if (ep->state != CBT_EPOCH_FROZEN && ep->state != CBT_EPOCH_REBUILDING) {
+		return -EINVAL;
+	}
+	if (cbt_rebuild_find_active_for_epoch(epoch_id)) {
+		return -EBUSY;
+	}
+
+	/* Generate a unique rebuild_id. */
+	id = ++g_rebuild_id_counter;
+	snprintf(out_rebuild_id, CBT_REBUILD_ID_MAX, "rebuild-%lu", (unsigned long)id);
+
+	/* Start the rebuild using the existing engine (no callback — async model). */
+	rc = bdev_cbt_partial_rebuild(cbt_name, epoch_id, target_bdev_name,
+				      source_bdev_name, max_bw_mb_sec,
+				      queue_depth, NULL, 0, NULL, NULL);
+	if (rc != 0) {
+		return rc;
+	}
+
+	/* Tag the just-created context with its rebuild_id.
+	 * It's the last entry in the registry (we just inserted it).
+	 */
+	TAILQ_FOREACH_REVERSE(ctx, &g_rebuild_registry, cbt_rebuild_registry_head,
+			      registry_link) {
+		if (ctx->state == CBT_REBUILD_RUNNING && ctx->rebuild_id[0] == '\0') {
+			snprintf(ctx->rebuild_id, sizeof(ctx->rebuild_id),
+				 "%s", out_rebuild_id);
+			break;
+		}
+	}
+
+	return 0;
+}
+
+int
+bdev_cbt_get_rebuild_status(const char *rebuild_id,
+			    struct cbt_rebuild_status *out_status)
+{
+	struct cbt_rebuild_ctx *ctx;
+
+	assert(spdk_get_thread() == spdk_thread_get_app_thread());
+
+	ctx = cbt_rebuild_find_by_id(rebuild_id);
+	if (!ctx) {
+		return -ENOENT;
+	}
+
+	out_status->state = ctx->state;
+	out_status->chunks_copied = ctx->chunks_copied;
+	out_status->total_chunks = ctx->total_dirty_chunks;
+	out_status->bytes_copied = ctx->bytes_copied;
+
+	if (ctx->state == CBT_REBUILD_RUNNING) {
+		uint64_t elapsed_tsc = spdk_get_ticks() - ctx->start_tsc;
+		out_status->duration_ms = elapsed_tsc * 1000 / cbt_get_tsc_hz();
+	} else {
+		/* Freeze duration at completion time. */
+		out_status->duration_ms = ctx->final_result.duration_ms;
+	}
+
+	if (ctx->state != CBT_REBUILD_RUNNING) {
+		out_status->residual_dirty_ratio = ctx->final_result.residual_dirty_ratio;
+	} else {
+		out_status->residual_dirty_ratio = 0.0;
+	}
+	out_status->error = ctx->error;
+
+	return 0;
+}
+
+int
+bdev_cbt_update_rebuild_options(const char *rebuild_id,
+				uint64_t max_bw_mb_sec,
+				uint32_t queue_depth)
+{
+	struct cbt_rebuild_ctx *ctx;
+
+	assert(spdk_get_thread() == spdk_thread_get_app_thread());
+
+	ctx = cbt_rebuild_find_by_id(rebuild_id);
+	if (!ctx) {
+		return -ENOENT;
+	}
+	if (ctx->state != CBT_REBUILD_RUNNING) {
+		return -EINVAL;
+	}
+
+	/* Update bandwidth limit — takes effect at next window reset.
+	 * 0 = no change (field omitted in JSON). To set unlimited, use a
+	 * very large value. Non-zero = limit in MB/s.
+	 */
+	if (max_bw_mb_sec > 0) {
+		ctx->max_bytes_per_sec = max_bw_mb_sec * 1024 * 1024;
+	}
+
+	/* Update queue depth — takes effect immediately in submit_next.
+	 * 0 = no change (field omitted in JSON).
+	 */
+	if (queue_depth > 0 && queue_depth <= CBT_REBUILD_MAX_QD) {
+		ctx->max_outstanding = (int)queue_depth;
+	}
+
+	SPDK_NOTICELOG("CBT: rebuild '%s' options updated: bw=%lu MB/s qd=%d\n",
+		       rebuild_id, (unsigned long)max_bw_mb_sec,
+		       ctx->max_outstanding);
+	return 0;
+}
+
+int
+bdev_cbt_cancel_rebuild(const char *rebuild_id, uint64_t *out_chunks_copied)
+{
+	struct cbt_rebuild_ctx *ctx;
+
+	assert(spdk_get_thread() == spdk_thread_get_app_thread());
+
+	ctx = cbt_rebuild_find_by_id(rebuild_id);
+	if (!ctx) {
+		return -ENOENT;
+	}
+	if (ctx->state != CBT_REBUILD_RUNNING) {
+		return -EINVAL;
+	}
+
+	/* Set cancelled flag — submit_next will stop issuing new I/Os.
+	 * In-flight I/Os will complete normally, then cbt_rebuild_finish
+	 * will be called from write_cb when outstanding_ios reaches 0.
+	 */
+	ctx->cancelled = true;
+	*out_chunks_copied = ctx->chunks_copied;
+
+	SPDK_NOTICELOG("CBT: rebuild '%s' cancelled (chunks_copied=%lu)\n",
+		       rebuild_id, (unsigned long)ctx->chunks_copied);
 	return 0;
 }
 

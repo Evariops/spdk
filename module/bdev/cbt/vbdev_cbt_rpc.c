@@ -676,6 +676,7 @@ struct rpc_cbt_partial_rebuild {
 	char     *name;
 	char     *epoch_id;
 	char     *target_bdev_name;
+	char     *source_bdev_name;
 	uint64_t  max_bandwidth_mb_sec;
 	uint32_t  queue_depth;
 	struct cbt_rebuild_range *override_ranges;
@@ -688,6 +689,7 @@ free_rpc_cbt_partial_rebuild(struct rpc_cbt_partial_rebuild *r)
 	free(r->name);
 	free(r->epoch_id);
 	free(r->target_bdev_name);
+	free(r->source_bdev_name);
 	free(r->override_ranges);
 }
 
@@ -764,6 +766,7 @@ static const struct spdk_json_object_decoder rpc_cbt_partial_rebuild_decoders[] 
 	{"name",                 offsetof(struct rpc_cbt_partial_rebuild, name),                 spdk_json_decode_string},
 	{"epoch_id",             offsetof(struct rpc_cbt_partial_rebuild, epoch_id),             spdk_json_decode_string},
 	{"target_bdev_name",     offsetof(struct rpc_cbt_partial_rebuild, target_bdev_name),     spdk_json_decode_string},
+	{"source_bdev_name",     offsetof(struct rpc_cbt_partial_rebuild, source_bdev_name),     spdk_json_decode_string, true},
 	{"max_bandwidth_mb_sec", offsetof(struct rpc_cbt_partial_rebuild, max_bandwidth_mb_sec), spdk_json_decode_uint64, true},
 	{"queue_depth",          offsetof(struct rpc_cbt_partial_rebuild, queue_depth),          spdk_json_decode_uint32, true},
 };
@@ -828,6 +831,7 @@ rpc_bdev_cbt_partial_rebuild(struct spdk_jsonrpc_request *request,
 
 	rc = bdev_cbt_partial_rebuild(req.name, req.epoch_id,
 				      req.target_bdev_name,
+				      req.source_bdev_name,
 				      req.max_bandwidth_mb_sec,
 				      req.queue_depth,
 				      req.override_ranges,
@@ -847,3 +851,237 @@ cleanup:
 	free_rpc_cbt_partial_rebuild(&req);
 }
 SPDK_RPC_REGISTER("bdev_cbt_partial_rebuild", rpc_bdev_cbt_partial_rebuild, SPDK_RPC_RUNTIME)
+
+/* ── bdev_cbt_start_rebuild ── */
+
+struct rpc_cbt_start_rebuild {
+	char     *name;
+	char     *epoch_id;
+	char     *target_bdev_name;
+	char     *source_bdev_name;
+	uint64_t  max_bandwidth_mb_sec;
+	uint32_t  queue_depth;
+};
+
+static void
+free_rpc_cbt_start_rebuild(struct rpc_cbt_start_rebuild *r)
+{
+	free(r->name);
+	free(r->epoch_id);
+	free(r->target_bdev_name);
+	free(r->source_bdev_name);
+}
+
+static const struct spdk_json_object_decoder rpc_cbt_start_rebuild_decoders[] = {
+	{"name",                 offsetof(struct rpc_cbt_start_rebuild, name),                 spdk_json_decode_string},
+	{"epoch_id",             offsetof(struct rpc_cbt_start_rebuild, epoch_id),             spdk_json_decode_string},
+	{"target_bdev_name",     offsetof(struct rpc_cbt_start_rebuild, target_bdev_name),     spdk_json_decode_string},
+	{"source_bdev_name",     offsetof(struct rpc_cbt_start_rebuild, source_bdev_name),     spdk_json_decode_string, true},
+	{"max_bandwidth_mb_sec", offsetof(struct rpc_cbt_start_rebuild, max_bandwidth_mb_sec), spdk_json_decode_uint64, true},
+	{"queue_depth",          offsetof(struct rpc_cbt_start_rebuild, queue_depth),          spdk_json_decode_uint32, true},
+};
+
+static void
+rpc_bdev_cbt_start_rebuild(struct spdk_jsonrpc_request *request,
+			    const struct spdk_json_val *params)
+{
+	struct rpc_cbt_start_rebuild req = {};
+	struct spdk_json_write_ctx *w;
+	char rebuild_id[CBT_REBUILD_ID_MAX];
+	int rc;
+
+	if (spdk_json_decode_object(params, rpc_cbt_start_rebuild_decoders,
+				    SPDK_COUNTOF(rpc_cbt_start_rebuild_decoders), &req)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "Failed to decode start_rebuild params");
+		goto cleanup;
+	}
+
+	rc = bdev_cbt_start_rebuild(req.name, req.epoch_id,
+				    req.target_bdev_name, req.source_bdev_name,
+				    req.max_bandwidth_mb_sec, req.queue_depth,
+				    rebuild_id);
+	if (rc) {
+		spdk_jsonrpc_send_error_response(request, rc,
+						 spdk_strerror(-rc));
+		goto cleanup;
+	}
+
+	w = spdk_jsonrpc_begin_result(request);
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_string(w, "rebuild_id", rebuild_id);
+	spdk_json_write_object_end(w);
+	spdk_jsonrpc_end_result(request, w);
+
+cleanup:
+	free_rpc_cbt_start_rebuild(&req);
+}
+SPDK_RPC_REGISTER("bdev_cbt_start_rebuild", rpc_bdev_cbt_start_rebuild, SPDK_RPC_RUNTIME)
+
+/* ── bdev_cbt_get_rebuild_status ── */
+
+struct rpc_cbt_get_rebuild_status {
+	char *rebuild_id;
+};
+
+static void
+free_rpc_cbt_get_rebuild_status(struct rpc_cbt_get_rebuild_status *r)
+{
+	free(r->rebuild_id);
+}
+
+static const struct spdk_json_object_decoder rpc_cbt_get_rebuild_status_decoders[] = {
+	{"rebuild_id", offsetof(struct rpc_cbt_get_rebuild_status, rebuild_id), spdk_json_decode_string},
+};
+
+static void
+rpc_bdev_cbt_get_rebuild_status(struct spdk_jsonrpc_request *request,
+				const struct spdk_json_val *params)
+{
+	struct rpc_cbt_get_rebuild_status req = {};
+	struct cbt_rebuild_status status;
+	struct spdk_json_write_ctx *w;
+	const char *state_str;
+	int rc;
+
+	if (spdk_json_decode_object(params, rpc_cbt_get_rebuild_status_decoders,
+				    SPDK_COUNTOF(rpc_cbt_get_rebuild_status_decoders), &req)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "Failed to decode get_rebuild_status params");
+		goto cleanup;
+	}
+
+	rc = bdev_cbt_get_rebuild_status(req.rebuild_id, &status);
+	if (rc) {
+		spdk_jsonrpc_send_error_response(request, rc,
+						 spdk_strerror(-rc));
+		goto cleanup;
+	}
+
+	w = spdk_jsonrpc_begin_result(request);
+	spdk_json_write_object_begin(w);
+
+	switch (status.state) {
+	case CBT_REBUILD_RUNNING:   state_str = "running";   break;
+	case CBT_REBUILD_COMPLETED: state_str = "completed"; break;
+	case CBT_REBUILD_FAILED:    state_str = "failed";    break;
+	case CBT_REBUILD_CANCELLED: state_str = "cancelled"; break;
+	default:                    state_str = "unknown";    break;
+	}
+	spdk_json_write_named_string(w, "state", state_str);
+	spdk_json_write_named_uint64(w, "chunks_copied", status.chunks_copied);
+	spdk_json_write_named_uint64(w, "total_chunks", status.total_chunks);
+	spdk_json_write_named_uint64(w, "bytes_copied", status.bytes_copied);
+	spdk_json_write_named_uint64(w, "duration_ms", status.duration_ms);
+	spdk_json_write_named_double(w, "residual_dirty_ratio", status.residual_dirty_ratio);
+	if (status.error) {
+		spdk_json_write_named_int32(w, "error", status.error);
+	}
+
+	spdk_json_write_object_end(w);
+	spdk_jsonrpc_end_result(request, w);
+
+cleanup:
+	free_rpc_cbt_get_rebuild_status(&req);
+}
+SPDK_RPC_REGISTER("bdev_cbt_get_rebuild_status", rpc_bdev_cbt_get_rebuild_status, SPDK_RPC_RUNTIME)
+
+/* ── bdev_cbt_update_rebuild_options ── */
+
+struct rpc_cbt_update_rebuild_options {
+	char     *rebuild_id;
+	uint64_t  max_bandwidth_mb_sec;
+	uint32_t  queue_depth;
+};
+
+static void
+free_rpc_cbt_update_rebuild_options(struct rpc_cbt_update_rebuild_options *r)
+{
+	free(r->rebuild_id);
+}
+
+static const struct spdk_json_object_decoder rpc_cbt_update_rebuild_options_decoders[] = {
+	{"rebuild_id",           offsetof(struct rpc_cbt_update_rebuild_options, rebuild_id),           spdk_json_decode_string},
+	{"max_bandwidth_mb_sec", offsetof(struct rpc_cbt_update_rebuild_options, max_bandwidth_mb_sec), spdk_json_decode_uint64, true},
+	{"queue_depth",          offsetof(struct rpc_cbt_update_rebuild_options, queue_depth),          spdk_json_decode_uint32, true},
+};
+
+static void
+rpc_bdev_cbt_update_rebuild_options(struct spdk_jsonrpc_request *request,
+				    const struct spdk_json_val *params)
+{
+	struct rpc_cbt_update_rebuild_options req = {};
+	int rc;
+
+	if (spdk_json_decode_object(params, rpc_cbt_update_rebuild_options_decoders,
+				    SPDK_COUNTOF(rpc_cbt_update_rebuild_options_decoders), &req)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "Failed to decode update_rebuild_options params");
+		goto cleanup;
+	}
+
+	rc = bdev_cbt_update_rebuild_options(req.rebuild_id,
+					     req.max_bandwidth_mb_sec,
+					     req.queue_depth);
+	if (rc) {
+		spdk_jsonrpc_send_error_response(request, rc,
+						 spdk_strerror(-rc));
+		goto cleanup;
+	}
+
+	spdk_jsonrpc_send_bool_response(request, true);
+
+cleanup:
+	free_rpc_cbt_update_rebuild_options(&req);
+}
+SPDK_RPC_REGISTER("bdev_cbt_update_rebuild_options", rpc_bdev_cbt_update_rebuild_options, SPDK_RPC_RUNTIME)
+
+/* ── bdev_cbt_cancel_rebuild ── */
+
+struct rpc_cbt_cancel_rebuild {
+	char *rebuild_id;
+};
+
+static void
+free_rpc_cbt_cancel_rebuild(struct rpc_cbt_cancel_rebuild *r)
+{
+	free(r->rebuild_id);
+}
+
+static const struct spdk_json_object_decoder rpc_cbt_cancel_rebuild_decoders[] = {
+	{"rebuild_id", offsetof(struct rpc_cbt_cancel_rebuild, rebuild_id), spdk_json_decode_string},
+};
+
+static void
+rpc_bdev_cbt_cancel_rebuild(struct spdk_jsonrpc_request *request,
+			    const struct spdk_json_val *params)
+{
+	struct rpc_cbt_cancel_rebuild req = {};
+	struct spdk_json_write_ctx *w;
+	uint64_t chunks_copied;
+	int rc;
+
+	if (spdk_json_decode_object(params, rpc_cbt_cancel_rebuild_decoders,
+				    SPDK_COUNTOF(rpc_cbt_cancel_rebuild_decoders), &req)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "Failed to decode cancel_rebuild params");
+		goto cleanup;
+	}
+
+	rc = bdev_cbt_cancel_rebuild(req.rebuild_id, &chunks_copied);
+	if (rc) {
+		spdk_jsonrpc_send_error_response(request, rc,
+						 spdk_strerror(-rc));
+		goto cleanup;
+	}
+
+	w = spdk_jsonrpc_begin_result(request);
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_uint64(w, "chunks_copied", chunks_copied);
+	spdk_json_write_object_end(w);
+	spdk_jsonrpc_end_result(request, w);
+
+cleanup:
+	free_rpc_cbt_cancel_rebuild(&req);
+}
+SPDK_RPC_REGISTER("bdev_cbt_cancel_rebuild", rpc_bdev_cbt_cancel_rebuild, SPDK_RPC_RUNTIME)
