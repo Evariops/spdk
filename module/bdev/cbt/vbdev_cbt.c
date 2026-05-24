@@ -1190,6 +1190,8 @@ struct cbt_rebuild_io_slot {
 	void     *buf;
 	uint64_t  chunk_offset_blocks;
 	uint64_t  chunk_length_blocks;
+	uint64_t  read_start_tsc;
+	uint64_t  write_start_tsc;
 	bool      in_use;
 };
 
@@ -1233,6 +1235,18 @@ struct cbt_rebuild_ctx {
 	void                     *cb_arg;
 	bool                      aborted;
 	int                       error;
+
+	/* ── Instrumentation counters ── */
+	uint64_t                  submit_calls;       /* times submit_next was called */
+	uint64_t                  submit_no_slot;     /* submit_next found no free slot */
+	uint64_t                  submit_throttled;   /* submit_next hit bandwidth limit */
+	uint64_t                  total_read_tsc;     /* cumulative read latency (tsc) */
+	uint64_t                  total_write_tsc;    /* cumulative write latency (tsc) */
+	uint64_t                  max_read_tsc;
+	uint64_t                  max_write_tsc;
+	uint64_t                  qd_sum;            /* sum of outstanding_ios at each submit */
+	uint64_t                  qd_samples;        /* number of samples */
+	uint64_t                  ios_coalesced;      /* I/Os that were coalesced */
 };
 
 static void cbt_rebuild_submit_next(struct cbt_rebuild_ctx *ctx);
@@ -1264,33 +1278,60 @@ cbt_rebuild_base_event_cb(enum spdk_bdev_event_type type,
 	 */
 }
 
-/* Find the next dirty bit starting from ctx->current_bit.
+/* Maximum number of chunks to coalesce into a single I/O.
+ * 16 chunks × 64KB = 1 MiB max I/O size — sweet spot for NVMe-oF TCP.
+ */
+#define CBT_REBUILD_MAX_COALESCE_CHUNKS  16
+
+/* Find the next contiguous run of dirty bits starting from ctx->current_bit.
+ * Returns the starting bit and the run length (in chunks), up to max_chunks.
  * Returns false if no more dirty bits. */
 static bool
-cbt_rebuild_find_next_dirty(struct cbt_rebuild_ctx *ctx, uint64_t *out_bit)
+cbt_rebuild_find_next_dirty_run(struct cbt_rebuild_ctx *ctx,
+				uint64_t *out_start_bit, uint64_t *out_run_len)
 {
 	const uint8_t *bmap = ctx->bitmap;
 	uint64_t total = ctx->cbt->bitmap_size_bits;
+	uint64_t start;
+	uint64_t run;
 
+	/* Find first dirty bit. */
 	while (ctx->current_bit < total) {
 		uint64_t byte_idx = ctx->current_bit >> 3;
 		uint8_t byte_val = bmap[byte_idx];
 
 		if (byte_val == 0) {
-			/* Skip entire byte — no dirty bits. */
 			ctx->current_bit = (byte_idx + 1) << 3;
 			continue;
 		}
 
 		uint8_t bit_pos = ctx->current_bit & 7;
 		if (byte_val & (1u << bit_pos)) {
-			*out_bit = ctx->current_bit;
-			ctx->current_bit++;
-			return true;
+			goto found_start;
 		}
 		ctx->current_bit++;
 	}
 	return false;
+
+found_start:
+	start = ctx->current_bit;
+	run = 1;
+	ctx->current_bit++;
+
+	/* Extend the run while consecutive bits are dirty, up to max coalesce. */
+	while (run < CBT_REBUILD_MAX_COALESCE_CHUNKS && ctx->current_bit < total) {
+		uint64_t byte_idx = ctx->current_bit >> 3;
+		uint8_t bit_pos = ctx->current_bit & 7;
+		if (!(bmap[byte_idx] & (1u << bit_pos))) {
+			break;
+		}
+		run++;
+		ctx->current_bit++;
+	}
+
+	*out_start_bit = start;
+	*out_run_len = run;
+	return true;
 }
 
 /* Find the next range to copy when using override_ranges. */
@@ -1328,6 +1369,13 @@ cbt_rebuild_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 		ctx->error = -EIO;
 		ctx->aborted = true;
 	} else if (slot) {
+		/* Instrumentation: write latency */
+		uint64_t write_tsc = spdk_get_ticks() - slot->write_start_tsc;
+		ctx->total_write_tsc += write_tsc;
+		if (write_tsc > ctx->max_write_tsc) {
+			ctx->max_write_tsc = write_tsc;
+		}
+
 		ctx->chunks_copied++;
 		ctx->bytes_copied += slot->chunk_length_blocks *
 				     ctx->cbt->cbt_bdev.blocklen;
@@ -1377,7 +1425,15 @@ cbt_rebuild_read_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 		return;
 	}
 
+	/* Instrumentation: read latency */
+	uint64_t read_tsc = spdk_get_ticks() - slot->read_start_tsc;
+	ctx->total_read_tsc += read_tsc;
+	if (read_tsc > ctx->max_read_tsc) {
+		ctx->max_read_tsc = read_tsc;
+	}
+
 	/* Write the data to the target bdev. */
+	slot->write_start_tsc = spdk_get_ticks();
 	rc = spdk_bdev_write(ctx->dst_desc, ctx->dst_ch,
 			     slot->buf,
 			     slot->chunk_offset_blocks * ctx->cbt->cbt_bdev.blocklen,
@@ -1421,40 +1477,50 @@ cbt_rebuild_submit_next(struct cbt_rebuild_ctx *ctx)
 	uint64_t offset_blocks, length_blocks;
 	int rc;
 
+	ctx->submit_calls++;
+	ctx->qd_sum += (uint64_t)ctx->outstanding_ios;
+	ctx->qd_samples++;
+
 	while (!ctx->aborted && ctx->outstanding_ios < ctx->max_outstanding) {
 		/* Bandwidth throttle check. */
 		if (ctx->max_bytes_per_sec > 0 &&
 		    ctx->bytes_this_window >= ctx->max_bytes_per_sec) {
 			ctx->throttled = true;
+			ctx->submit_throttled++;
 			break;
 		}
 
 		slot = cbt_rebuild_get_free_slot(ctx);
 		if (!slot) {
+			ctx->submit_no_slot++;
 			break;
 		}
 
-		/* Get next chunk to copy. */
+		/* Get next chunk(s) to copy. */
 		if (ctx->override_ranges) {
 			if (!cbt_rebuild_find_next_range(ctx, &offset_blocks, &length_blocks)) {
 				goto done_scanning;
 			}
 		} else {
-			uint64_t bit;
-			if (!cbt_rebuild_find_next_dirty(ctx, &bit)) {
+			uint64_t start_bit, run_len;
+			if (!cbt_rebuild_find_next_dirty_run(ctx, &start_bit, &run_len)) {
 				goto done_scanning;
 			}
-			offset_blocks = bit * ctx->cbt->chunk_size_blocks;
-			length_blocks = ctx->cbt->chunk_size_blocks;
+			offset_blocks = start_bit * ctx->cbt->chunk_size_blocks;
+			length_blocks = run_len * ctx->cbt->chunk_size_blocks;
 			/* Clamp to device size. */
 			if (offset_blocks + length_blocks > ctx->cbt->total_blocks) {
 				length_blocks = ctx->cbt->total_blocks - offset_blocks;
+			}
+			if (run_len > 1) {
+				ctx->ios_coalesced += run_len - 1;
 			}
 		}
 
 		slot->in_use = true;
 		slot->chunk_offset_blocks = offset_blocks;
 		slot->chunk_length_blocks = length_blocks;
+		slot->read_start_tsc = spdk_get_ticks();
 		ctx->outstanding_ios++;
 
 		rc = spdk_bdev_read(ctx->src_desc, ctx->src_ch,
@@ -1489,12 +1555,41 @@ cbt_rebuild_finish(struct cbt_rebuild_ctx *ctx)
 {
 	struct cbt_rebuild_result result = {0};
 	uint64_t elapsed_tsc = spdk_get_ticks() - ctx->start_tsc;
+	uint64_t hz = cbt_get_tsc_hz();
 
 	result.chunks_copied = ctx->chunks_copied;
 	result.bytes_copied = ctx->bytes_copied;
-	result.duration_ms = elapsed_tsc * 1000 / cbt_get_tsc_hz();
+	result.duration_ms = elapsed_tsc * 1000 / hz;
 	result.error = ctx->error;
 	result.completed = (ctx->error == 0);
+
+	/* ── Instrumentation report ── */
+	uint64_t avg_read_us = ctx->chunks_copied ?
+		(ctx->total_read_tsc * 1000000 / hz) / ctx->chunks_copied : 0;
+	uint64_t avg_write_us = ctx->chunks_copied ?
+		(ctx->total_write_tsc * 1000000 / hz) / ctx->chunks_copied : 0;
+	uint64_t max_read_us = ctx->max_read_tsc * 1000000 / hz;
+	uint64_t max_write_us = ctx->max_write_tsc * 1000000 / hz;
+	uint64_t avg_qd = ctx->qd_samples ? ctx->qd_sum / ctx->qd_samples : 0;
+
+	SPDK_NOTICELOG("CBT rebuild stats: duration=%lums chunks=%lu bytes=%lu MiB\n",
+		       (unsigned long)result.duration_ms,
+		       (unsigned long)result.chunks_copied,
+		       (unsigned long)(result.bytes_copied >> 20));
+	SPDK_NOTICELOG("  read_latency:  avg=%luus max=%luus\n",
+		       (unsigned long)avg_read_us, (unsigned long)max_read_us);
+	SPDK_NOTICELOG("  write_latency: avg=%luus max=%luus\n",
+		       (unsigned long)avg_write_us, (unsigned long)max_write_us);
+	SPDK_NOTICELOG("  pipeline: avg_qd=%lu submit_calls=%lu no_slot=%lu throttled=%lu\n",
+		       (unsigned long)avg_qd,
+		       (unsigned long)ctx->submit_calls,
+		       (unsigned long)ctx->submit_no_slot,
+		       (unsigned long)ctx->submit_throttled);
+	SPDK_NOTICELOG("  ios_coalesced=%lu throughput=%lu MiB/s\n",
+		       (unsigned long)ctx->ios_coalesced,
+		       result.duration_ms ?
+		       (unsigned long)(result.bytes_copied / 1024 / 1024 * 1000 /
+				       result.duration_ms) : 0);
 
 	/* Compute residual dirty ratio: re-snapshot the live bitmap and count
 	 * new dirty bits that arrived during the copy.
@@ -1656,8 +1751,12 @@ bdev_cbt_partial_rebuild(const char *cbt_name, const char *epoch_id,
 		return -ENOMEM;
 	}
 
-	/* Allocate DMA buffer slots. */
-	chunk_bytes = (uint64_t)cbt->chunk_size_blocks * cbt->cbt_bdev.blocklen;
+	/* Allocate DMA buffer slots.
+	 * Each slot must hold up to CBT_REBUILD_MAX_COALESCE_CHUNKS chunks
+	 * to support I/O coalescing (e.g., 16 × 64KB = 1 MiB per slot).
+	 */
+	chunk_bytes = (uint64_t)cbt->chunk_size_blocks * cbt->cbt_bdev.blocklen *
+		      CBT_REBUILD_MAX_COALESCE_CHUNKS;
 	ctx->slots = calloc((size_t)ctx->num_slots, sizeof(*ctx->slots));
 	if (!ctx->slots) {
 		spdk_put_io_channel(ctx->src_ch);
@@ -1694,10 +1793,11 @@ bdev_cbt_partial_rebuild(const char *cbt_name, const char *epoch_id,
 	}
 
 	SPDK_NOTICELOG("CBT: partial_rebuild started for '%s' epoch '%s' → '%s' "
-		       "(qd=%d, bw_limit=%lu MB/s)\n",
+		       "(qd=%d, bw_limit=%lu MB/s, coalesce=%d chunks/io)\n",
 		       cbt_name, epoch_id, target_bdev_name,
 		       ctx->max_outstanding,
-		       (unsigned long)max_bw_mb_sec);
+		       (unsigned long)max_bw_mb_sec,
+		       CBT_REBUILD_MAX_COALESCE_CHUNKS);
 
 	/* Kick off the first batch. */
 	cbt_rebuild_submit_next(ctx);
