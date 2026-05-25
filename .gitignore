@@ -1,0 +1,9 @@
+# Vendored SPDK source (local dev only, not tracked)
+vendor/spdk/
+
+# Test binaries & debug symbols
+module/bdev/cbt/test_cbt_bitmap
+module/bdev/cbt/test_cbt_props
+module/bdev/cbt/test_cbt_resilience
+module/bdev/cbt/test_cbt_postfix
+module/bdev/cbt/*.dSYM/

@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Evariops.
+#
+# Standalone test build — does NOT require SPDK libraries.
+# Exercises the bitmap logic in isolation.
+
+CC      ?= cc
+CFLAGS  ?= -Wall -Wextra -Werror -std=c11 -g -O0 -fsanitize=address,undefined
+LDFLAGS ?= -fsanitize=address,undefined -lpthread
+
+.PHONY: all test test-props test-resilience clean
+
+all: test_cbt_bitmap test_cbt_props test_cbt_resilience test_cbt_postfix
+
+test_cbt_bitmap: test_cbt_bitmap.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+test_cbt_props: test_cbt_props.c
+	$(CC) $(CFLAGS) -O2 -Wno-unused-function -o $@ $< $(LDFLAGS)
+
+test_cbt_resilience: test_cbt_resilience.c
+	$(CC) $(CFLAGS) -Wno-unused-function -o $@ $< $(LDFLAGS)
+
+test_cbt_postfix: test_cbt_postfix.c
+	$(CC) $(CFLAGS) -Wno-unused-function -o $@ $< $(LDFLAGS)
+
+test: test_cbt_bitmap test_cbt_resilience test_cbt_postfix
+	./test_cbt_bitmap
+	./test_cbt_resilience
+	./test_cbt_postfix
+
+test-props: test_cbt_props
+	./test_cbt_props
+
+test-resilience: test_cbt_resilience
+	./test_cbt_resilience
+
+clean:
+	rm -f test_cbt_bitmap test_cbt_props test_cbt_resilience test_cbt_postfix

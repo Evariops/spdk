@@ -1,0 +1,264 @@
+From c004e1653bd1fe24a4f585bc416b80f350223f35 Mon Sep 17 00:00:00 2001
+From: Evariops <noreply@evariops.com>
+Date: Sat, 23 May 2026 12:57:10 +0200
+Subject: [PATCH] raid: add skip_rebuild parameter to bdev_raid_add_base_bdev
+
+When a base bdev is re-added after a CBT-driven partial rebuild,
+the full surface rebuild is unnecessary. This adds an optional
+skip_rebuild boolean to the bdev_raid_add_base_bdev RPC.
+
+When true, the RAID module:
+1. Marks the base bdev ONLINE immediately (no full rebuild)
+2. Quiesces the RAID bdev to safely update IO channels
+3. Opens base_channel[slot] in all existing IO channels
+4. Unquiesces to resume IO
+5. Writes superblock if enabled (persists across reboot)
+
+Signed-off-by: Evariops <noreply@evariops.com>
+---
+ module/bdev/raid/bdev_raid.c     | 139 ++++++++++++++++++++++++++++++-
+ module/bdev/raid/bdev_raid.h     |   4 +
+ module/bdev/raid/bdev_raid_rpc.c |   9 +-
+ 3 files changed, 149 insertions(+), 3 deletions(-)
+
+diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
+index 7ab1607..94ada40 100644
+--- a/module/bdev/raid/bdev_raid.c
++++ b/module/bdev/raid/bdev_raid.c
+@@ -3201,10 +3201,121 @@ raid_bdev_ch_sync(struct spdk_io_channel_iter *i)
+ 	spdk_for_each_channel_continue(i, 0);
+ }
+ 
++/* ── skip_rebuild: promote base bdev into existing IO channels ────── */
++
++struct skip_rebuild_ctx {
++	struct raid_base_bdev_info	*base_info;
++	raid_base_bdev_cb		 cb_fn;
++	void				*cb_ctx;
++};
++
++static void
++raid_bdev_skip_rebuild_write_sb_cb(int status, struct raid_bdev *raid_bdev, void *ctx)
++{
++	if (status != 0) {
++		SPDK_ERRLOG("Failed to write superblock after skip_rebuild on '%s': %s\n",
++			    raid_bdev->bdev.name, spdk_strerror(-status));
++	}
++}
++
++static void
++raid_bdev_skip_rebuild_unquiesced(void *ctx, int status)
++{
++	struct skip_rebuild_ctx *sr_ctx = ctx;
++	struct raid_base_bdev_info *base_info = sr_ctx->base_info;
++	struct raid_bdev *raid_bdev = base_info->raid_bdev;
++
++	if (status != 0) {
++		SPDK_ERRLOG("Failed to unquiesce after skip_rebuild: %s\n",
++			    spdk_strerror(-status));
++	}
++
++	if (raid_bdev->superblock_enabled) {
++		struct raid_bdev_superblock *sb = raid_bdev->sb;
++		struct raid_bdev_sb_base_bdev *sb_base_bdev;
++		uint8_t i;
++
++		for (i = 0; i < sb->base_bdevs_size; i++) {
++			sb_base_bdev = &sb->base_bdevs[i];
++			if (sb_base_bdev->slot == raid_bdev_base_bdev_slot(base_info)) {
++				sb_base_bdev->state = RAID_SB_BASE_BDEV_CONFIGURED;
++				sb_base_bdev->data_offset = base_info->data_offset;
++				spdk_uuid_copy(&sb_base_bdev->uuid, &base_info->uuid);
++				break;
++			}
++		}
++		raid_bdev_write_superblock(raid_bdev,
++					   raid_bdev_skip_rebuild_write_sb_cb, NULL);
++	}
++
++	if (sr_ctx->cb_fn) {
++		sr_ctx->cb_fn(sr_ctx->cb_ctx, 0);
++	}
++	free(sr_ctx);
++}
++
++static void
++raid_bdev_skip_rebuild_ch_done(struct spdk_io_channel_iter *i, int status)
++{
++	struct skip_rebuild_ctx *sr_ctx = spdk_io_channel_iter_get_ctx(i);
++	struct raid_bdev *raid_bdev = sr_ctx->base_info->raid_bdev;
++	int rc;
++
++	rc = spdk_bdev_unquiesce(&raid_bdev->bdev, &g_raid_if,
++				 raid_bdev_skip_rebuild_unquiesced, sr_ctx);
++	if (rc != 0) {
++		raid_bdev_skip_rebuild_unquiesced(sr_ctx, rc);
++	}
++}
++
++static void
++raid_bdev_skip_rebuild_ch_iter(struct spdk_io_channel_iter *i)
++{
++	struct skip_rebuild_ctx *sr_ctx = spdk_io_channel_iter_get_ctx(i);
++	struct spdk_io_channel *ch = spdk_io_channel_iter_get_channel(i);
++	struct raid_bdev_io_channel *raid_ch = spdk_io_channel_get_ctx(ch);
++	struct raid_base_bdev_info *base_info = sr_ctx->base_info;
++	uint8_t slot = raid_bdev_base_bdev_slot(base_info);
++
++	assert(raid_ch->base_channel[slot] == NULL);
++	raid_ch->base_channel[slot] = spdk_bdev_get_io_channel(base_info->desc);
++	if (raid_ch->base_channel[slot] == NULL) {
++		SPDK_ERRLOG("skip_rebuild: failed to get io channel for slot %u\n", slot);
++	}
++
++	spdk_for_each_channel_continue(i, 0);
++}
++
++static void
++raid_bdev_skip_rebuild_quiesced(void *ctx, int status)
++{
++	struct skip_rebuild_ctx *sr_ctx = ctx;
++	struct raid_base_bdev_info *base_info = sr_ctx->base_info;
++	struct raid_bdev *raid_bdev = base_info->raid_bdev;
++
++	if (status != 0) {
++		SPDK_ERRLOG("Failed to quiesce for skip_rebuild: %s\n",
++			    spdk_strerror(-status));
++		if (sr_ctx->cb_fn) {
++			sr_ctx->cb_fn(sr_ctx->cb_ctx, status);
++		}
++		free(sr_ctx);
++		return;
++	}
++
++	base_info->is_process_target = false;
++
++	spdk_for_each_channel(raid_bdev, raid_bdev_skip_rebuild_ch_iter, sr_ctx,
++			      raid_bdev_skip_rebuild_ch_done);
++}
++
++/* ──────────────────────────────────────────────────────────────────── */
++
+ static void
+ raid_bdev_configure_base_bdev_cont(struct raid_base_bdev_info *base_info)
+ {
+ 	struct raid_bdev *raid_bdev = base_info->raid_bdev;
++	bool skip_rebuild = base_info->skip_rebuild;
+ 	raid_base_bdev_cb configure_cb;
+ 	int rc;
+ 
+@@ -3243,7 +3354,30 @@ raid_bdev_configure_base_bdev_cont(struct raid_base_bdev_info *base_info)
+ 		}
+ 	} else if (base_info->is_process_target) {
+ 		raid_bdev->num_base_bdevs_operational++;
+-		rc = raid_bdev_start_rebuild(base_info);
++		if (skip_rebuild) {
++			struct skip_rebuild_ctx *sr_ctx = calloc(1, sizeof(*sr_ctx));
++			if (!sr_ctx) {
++				SPDK_ERRLOG("skip_rebuild: context allocation failed\n");
++				_raid_bdev_remove_base_bdev(base_info, NULL, NULL);
++				rc = -ENOMEM;
++			} else {
++				SPDK_NOTICELOG("Skipping rebuild for base bdev '%s' "
++					       "(skip_rebuild=true, quiescing)\n",
++					       base_info->name);
++				sr_ctx->base_info = base_info;
++				sr_ctx->cb_fn = configure_cb;
++				sr_ctx->cb_ctx = base_info->configure_cb_ctx;
++				rc = spdk_bdev_quiesce(&raid_bdev->bdev, &g_raid_if,
++						       raid_bdev_skip_rebuild_quiesced, sr_ctx);
++				if (rc != 0) {
++					raid_bdev_skip_rebuild_quiesced(sr_ctx, rc);
++				}
++				/* Async path — callback handles configure_cb. */
++				return;
++			}
++		} else {
++			rc = raid_bdev_start_rebuild(base_info);
++		}
+ 		if (rc != 0) {
+ 			SPDK_ERRLOG("Failed to start rebuild: %s\n", spdk_strerror(-rc));
+ 			_raid_bdev_remove_base_bdev(base_info, NULL, NULL);
+@@ -3488,6 +3622,7 @@ out:
+ 
+ int
+ raid_bdev_add_base_bdev(struct raid_bdev *raid_bdev, const char *name,
++			bool skip_rebuild,
+ 			raid_base_bdev_cb cb_fn, void *cb_ctx)
+ {
+ 	struct raid_base_bdev_info *base_info = NULL, *iter;
+@@ -3543,6 +3678,8 @@ raid_bdev_add_base_bdev(struct raid_bdev *raid_bdev, const char *name,
+ 		return -ENOMEM;
+ 	}
+ 
++	base_info->skip_rebuild = skip_rebuild;
++
+ 	rc = raid_bdev_configure_base_bdev(base_info, false, cb_fn, cb_ctx);
+ 	if (rc != 0 && (rc != -ENODEV || raid_bdev->state != RAID_BDEV_STATE_CONFIGURING)) {
+ 		SPDK_ERRLOG("base bdev '%s' configure failed: %s\n", name, spdk_strerror(-rc));
+diff --git a/module/bdev/raid/bdev_raid.h b/module/bdev/raid/bdev_raid.h
+index 0eeda9f..d0484ca 100644
+--- a/module/bdev/raid/bdev_raid.h
++++ b/module/bdev/raid/bdev_raid.h
+@@ -111,6 +111,9 @@ struct raid_base_bdev_info {
+ 
+ 	/* context of the callback */
+ 	void			*configure_cb_ctx;
++
++	/* When true, skip the full rebuild on re-add (CBT partial sync done) */
++	bool			skip_rebuild;
+ };
+ 
+ struct raid_bdev_io;
+@@ -267,6 +270,7 @@ int raid_bdev_create(const char *name, uint32_t strip_size, uint8_t num_base_bde
+ 		     struct raid_bdev **raid_bdev_out);
+ void raid_bdev_delete(struct raid_bdev *raid_bdev, raid_bdev_destruct_cb cb_fn, void *cb_ctx);
+ int raid_bdev_add_base_bdev(struct raid_bdev *raid_bdev, const char *name,
++			    bool skip_rebuild,
+ 			    raid_base_bdev_cb cb_fn, void *cb_ctx);
+ struct raid_bdev *raid_bdev_find_by_name(const char *name);
+ enum raid_level raid_bdev_str_to_level(const char *str);
+diff --git a/module/bdev/raid/bdev_raid_rpc.c b/module/bdev/raid/bdev_raid_rpc.c
+index b1913c7..b1f3d92 100644
+--- a/module/bdev/raid/bdev_raid_rpc.c
++++ b/module/bdev/raid/bdev_raid_rpc.c
+@@ -305,7 +305,7 @@ rpc_bdev_raid_create(struct spdk_jsonrpc_request *request,
+ 	for (i = 0; i < num_base_bdevs; i++) {
+ 		const char *base_bdev_name = req->base_bdevs.base_bdevs[i];
+ 
+-		rc = raid_bdev_add_base_bdev(raid_bdev, base_bdev_name,
++		rc = raid_bdev_add_base_bdev(raid_bdev, base_bdev_name, false,
+ 					     rpc_bdev_raid_create_add_base_bdev_cb, ctx);
+ 		if (rc == -ENODEV) {
+ 			SPDK_DEBUGLOG(bdev_raid, "base bdev %s doesn't exist now\n", base_bdev_name);
+@@ -448,6 +448,9 @@ struct rpc_bdev_raid_add_base_bdev {
+ 
+ 	/* Raid bdev name */
+ 	char			*raid_bdev;
++
++	/* Skip the full rebuild (base bdev already synced by CBT) */
++	bool			skip_rebuild;
+ };
+ 
+ /*
+@@ -472,6 +475,7 @@ free_rpc_bdev_raid_add_base_bdev(struct rpc_bdev_raid_add_base_bdev *req)
+ static const struct spdk_json_object_decoder rpc_bdev_raid_add_base_bdev_decoders[] = {
+ 	{"base_bdev", offsetof(struct rpc_bdev_raid_add_base_bdev, base_bdev), spdk_json_decode_string},
+ 	{"raid_bdev", offsetof(struct rpc_bdev_raid_add_base_bdev, raid_bdev), spdk_json_decode_string},
++	{"skip_rebuild", offsetof(struct rpc_bdev_raid_add_base_bdev, skip_rebuild), spdk_json_decode_bool, true},
+ };
+ 
+ static void
+@@ -526,7 +530,8 @@ rpc_bdev_raid_add_base_bdev(struct spdk_jsonrpc_request *request,
+ 		goto cleanup;
+ 	}
+ 
+-	rc = raid_bdev_add_base_bdev(raid_bdev, req.base_bdev, rpc_bdev_raid_add_base_bdev_done, request);
++	rc = raid_bdev_add_base_bdev(raid_bdev, req.base_bdev, req.skip_rebuild,
++				     rpc_bdev_raid_add_base_bdev_done, request);
+ 	if (rc != 0) {
+ 		spdk_jsonrpc_send_error_response_fmt(request, rc,
+ 						     "Failed to add base bdev %s to RAID bdev %s: %s",
+-- 
+2.50.1 (Apple Git-155)
+

@@ -47,6 +47,17 @@ RUN git clone --branch "${SPDK_VERSION}" --depth 1 --recurse-submodules \
 
 WORKDIR /build/spdk
 
+# ── Inject CBT module and RAID patch ──
+COPY module/bdev/cbt/ module/bdev/cbt/
+COPY patches/ /build/patches/
+
+# Register CBT in the bdev module build, link list, and deps & apply RAID patch
+# hadolint ignore=SC2016
+RUN sed -i '/^DIRS-y += delay/s/$/ cbt/' module/bdev/Makefile && \
+    sed -i '/^BLOCKDEV_MODULES_LIST += bdev_zone_block/a BLOCKDEV_MODULES_LIST += bdev_cbt' mk/spdk.modules.mk && \
+    sed -i '/^DEPDIRS-bdev_passthru/a DEPDIRS-bdev_cbt := $(BDEV_DEPS_THREAD)' mk/spdk.lib_deps.mk && \
+    git apply /build/patches/0001-raid-add-skip_rebuild-parameter.patch
+
 # Fedora 45's CMake rejects cmake_minimum_required(<3.5) in SPDK subprojects (ISA-L, etc.)
 ENV CMAKE_POLICY_VERSION_MINIMUM=3.5
 RUN ./scripts/pkgdep.sh -d
@@ -87,6 +98,7 @@ RUN SPDK_ARCH=$([ "${TARGETARCH}" = "arm64" ] && echo "armv8-a" || echo "nehalem
         --without-iscsi-initiator \
         --without-vhost \
         --without-virtio \
+        --without-nvme-cuse \
         --without-fsdev \
         --without-daos \
         --without-rbd \
