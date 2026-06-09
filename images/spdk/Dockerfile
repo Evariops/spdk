@@ -28,7 +28,7 @@
 # ============================================================================
 # Stage 1: Build SPDK from source
 # ============================================================================
-FROM docker.io/library/fedora:45 AS builder
+FROM docker.io/library/fedora:43 AS builder
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -58,7 +58,7 @@ RUN sed -i '/^DIRS-y += delay/s/$/ cbt/' module/bdev/Makefile && \
     sed -i '/^DEPDIRS-bdev_passthru/a DEPDIRS-bdev_cbt := $(BDEV_DEPS_THREAD)' mk/spdk.lib_deps.mk && \
     git apply /build/patches/0001-raid-add-skip_rebuild-parameter.patch
 
-# Fedora 45's CMake rejects cmake_minimum_required(<3.5) in SPDK subprojects (ISA-L, etc.)
+# Fedora's CMake rejects cmake_minimum_required(<3.5) in SPDK subprojects (ISA-L, etc.)
 ENV CMAKE_POLICY_VERSION_MINIMUM=3.5
 RUN ./scripts/pkgdep.sh -d
 
@@ -173,7 +173,7 @@ RUN set -euo pipefail && \
 # Built only when explicitly targeted:
 #   docker build --target debug --build-arg BUILD_TYPE=debug .
 # ============================================================================
-FROM docker.io/library/fedora:45 AS debug
+FROM docker.io/library/fedora:43 AS debug
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
