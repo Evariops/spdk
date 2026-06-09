@@ -56,7 +56,7 @@ COPY patches/ /build/patches/
 RUN sed -i '/^DIRS-y += delay/s/$/ cbt/' module/bdev/Makefile && \
     sed -i '/^BLOCKDEV_MODULES_LIST += bdev_zone_block/a BLOCKDEV_MODULES_LIST += bdev_cbt' mk/spdk.modules.mk && \
     sed -i '/^DEPDIRS-bdev_passthru/a DEPDIRS-bdev_cbt := $(BDEV_DEPS_THREAD)' mk/spdk.lib_deps.mk && \
-    git apply /build/patches/0001-raid-add-skip_rebuild-parameter.patch
+    for p in /build/patches/*.patch; do echo "Applying ${p}" && git apply "${p}" || exit 1; done
 
 # Fedora's CMake rejects cmake_minimum_required(<3.5) in SPDK subprojects (ISA-L, etc.)
 ENV CMAKE_POLICY_VERSION_MINIMUM=3.5

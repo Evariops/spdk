@@ -1,0 +1,147 @@
+From af7a521923ec587b18151e12c393b9c24f8ff675 Mon Sep 17 00:00:00 2001
+From: Evariops <noreply@evariops.com>
+Date: Tue, 9 Jun 2026 22:05:00 +0200
+Subject: [PATCH] bdev/lvol: add bdev_lvol_get_allocated_ranges RPC
+
+Adds a read-only JSON-RPC that reports the allocated cluster extents of
+a single lvol blob layer, walking the in-memory cluster map via the
+exported spdk_blob_get_next_allocated_io_unit /
+spdk_blob_get_next_unallocated_io_unit APIs. Emits merged, ascending,
+cluster-aligned extents with max_ranges-based pagination.
+
+This is the native changed-block-tracking surface for thin snapshots,
+consumed by spdk-csi for CSI SnapshotMetadata (KEP-3314) incremental
+backups. New file plus a one-line Makefile hunk to minimise upstream
+conflict surface.
+
+Signed-off-by: Evariops <noreply@evariops.com>
+---
+ module/bdev/lvol/Makefile                |   2 +-
+ module/bdev/lvol/vbdev_lvol_ranges_rpc.c | 102 +++++++++++++++++++++++
+ 2 files changed, 103 insertions(+), 1 deletion(-)
+ create mode 100644 module/bdev/lvol/vbdev_lvol_ranges_rpc.c
+
+diff --git a/module/bdev/lvol/Makefile b/module/bdev/lvol/Makefile
+index dc0c559..aba6620 100644
+--- a/module/bdev/lvol/Makefile
++++ b/module/bdev/lvol/Makefile
+@@ -9,7 +9,7 @@ include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
+ SO_VER := 7
+ SO_MINOR := 0
+ 
+-C_SRCS = vbdev_lvol.c vbdev_lvol_rpc.c
++C_SRCS = vbdev_lvol.c vbdev_lvol_rpc.c vbdev_lvol_ranges_rpc.c
+ LIBNAME = bdev_lvol
+ 
+ SPDK_MAP_FILE = $(SPDK_ROOT_DIR)/mk/spdk_blank.map
+diff --git a/module/bdev/lvol/vbdev_lvol_ranges_rpc.c b/module/bdev/lvol/vbdev_lvol_ranges_rpc.c
+new file mode 100644
+index 0000000..fde05cb
+--- /dev/null
++++ b/module/bdev/lvol/vbdev_lvol_ranges_rpc.c
+@@ -0,0 +1,102 @@
++/*   SPDX-License-Identifier: BSD-3-Clause
++ *   Copyright (C) 2026 Evariops.
++ *   All rights reserved.
++ */
++
++#include "spdk/rpc.h"
++#include "spdk/util.h"
++#include "spdk/string.h"
++#include "spdk/blob.h"
++#include "spdk/bdev.h"
++#include "spdk/log.h"
++#include "vbdev_lvol.h"
++
++#define RPC_RANGES_DEFAULT_MAX 4096
++#define RPC_RANGES_HARD_MAX    65536
++
++struct rpc_lvol_ranges {
++	char     *name;
++	uint64_t  offset_bytes;
++	uint32_t  max_ranges;
++};
++
++static const struct spdk_json_object_decoder rpc_lvol_ranges_decoders[] = {
++	{"name", offsetof(struct rpc_lvol_ranges, name), spdk_json_decode_string},
++	{"offset_bytes", offsetof(struct rpc_lvol_ranges, offset_bytes), spdk_json_decode_uint64, true},
++	{"max_ranges", offsetof(struct rpc_lvol_ranges, max_ranges), spdk_json_decode_uint32, true},
++};
++
++static void
++rpc_bdev_lvol_get_allocated_ranges(struct spdk_jsonrpc_request *request,
++				   const struct spdk_json_val *params)
++{
++	struct rpc_lvol_ranges req = { .offset_bytes = 0, .max_ranges = RPC_RANGES_DEFAULT_MAX };
++	struct spdk_json_write_ctx *w;
++	struct spdk_bdev *bdev;
++	struct spdk_lvol *lvol;
++	struct spdk_blob *blob;
++	uint64_t io_unit_size, cluster_size, lvol_size, total_io_units;
++	uint64_t io_unit, next_unalloc, emitted = 0, next_offset = 0;
++
++	if (spdk_json_decode_object(params, rpc_lvol_ranges_decoders,
++				    SPDK_COUNTOF(rpc_lvol_ranges_decoders), &req)) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
++						 "spdk_json_decode_object failed");
++		goto cleanup;
++	}
++	if (req.max_ranges == 0 || req.max_ranges > RPC_RANGES_HARD_MAX) {
++		req.max_ranges = spdk_min(req.max_ranges ? req.max_ranges : RPC_RANGES_DEFAULT_MAX,
++					  (uint32_t)RPC_RANGES_HARD_MAX);
++	}
++
++	bdev = spdk_bdev_get_by_name(req.name);
++	if (bdev == NULL || (lvol = vbdev_lvol_get_from_bdev(bdev)) == NULL) {
++		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
++		goto cleanup;
++	}
++
++	blob = lvol->blob;
++	io_unit_size  = spdk_bs_get_io_unit_size(lvol->lvol_store->blobstore);
++	cluster_size  = spdk_bs_get_cluster_size(lvol->lvol_store->blobstore);
++	lvol_size     = spdk_bdev_get_num_blocks(bdev) * spdk_bdev_get_block_size(bdev);
++	total_io_units = lvol_size / io_unit_size;
++
++	w = spdk_jsonrpc_begin_result(request);
++	spdk_json_write_object_begin(w);
++	spdk_json_write_named_string(w, "name", req.name);
++	spdk_json_write_named_uint64(w, "lvol_size_bytes", lvol_size);
++	spdk_json_write_named_uint64(w, "cluster_size_bytes", cluster_size);
++	spdk_json_write_named_uint64(w, "io_unit_size_bytes", io_unit_size);
++	spdk_json_write_named_array_begin(w, "ranges");
++
++	io_unit = req.offset_bytes / io_unit_size;
++	while (io_unit < total_io_units && emitted < req.max_ranges) {
++		io_unit = spdk_blob_get_next_allocated_io_unit(blob, io_unit);
++		if (io_unit == UINT64_MAX || io_unit >= total_io_units) {
++			break;
++		}
++		next_unalloc = spdk_blob_get_next_unallocated_io_unit(blob, io_unit);
++		if (next_unalloc == UINT64_MAX || next_unalloc > total_io_units) {
++			next_unalloc = total_io_units;
++		}
++		spdk_json_write_object_begin(w);
++		spdk_json_write_named_uint64(w, "offset_bytes", io_unit * io_unit_size);
++		spdk_json_write_named_uint64(w, "length_bytes", (next_unalloc - io_unit) * io_unit_size);
++		spdk_json_write_object_end(w);
++		emitted++;
++		io_unit = next_unalloc;
++	}
++	if (emitted == req.max_ranges && io_unit < total_io_units &&
++	    spdk_blob_get_next_allocated_io_unit(blob, io_unit) != UINT64_MAX) {
++		next_offset = io_unit * io_unit_size;
++	}
++
++	spdk_json_write_array_end(w);
++	spdk_json_write_named_uint64(w, "next_offset_bytes", next_offset);
++	spdk_json_write_object_end(w);
++	spdk_jsonrpc_end_result(request, w);
++cleanup:
++	free(req.name);
++}
++SPDK_RPC_REGISTER("bdev_lvol_get_allocated_ranges", rpc_bdev_lvol_get_allocated_ranges,
++		  SPDK_RPC_RUNTIME)
+-- 
+2.50.1 (Apple Git-155)
+
