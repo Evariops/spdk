@@ -1,0 +1,481 @@
+From b261bd5574138a0a82ce7c1eeff6cc5be1af48c9 Mon Sep 17 00:00:00 2001
+From: Evariops <noreply@evariops.com>
+Date: Sun, 14 Jun 2026 01:30:31 +0200
+Subject: [PATCH] nvmf: add nvmf_subsystem_pause / nvmf_subsystem_resume RPC
+
+Adds two SPDK_RPC_RUNTIME JSON-RPCs that turn the public
+spdk_nvmf_subsystem_pause/resume C API into a STANDING, drain-certified
+I/O barrier that holds a subsystem Paused across RPC calls -- the
+primitive spdk-csi needs for cross-volume crash-consistent group
+snapshots (SPEC-66 H10 / fork docs/SPEC-subsystem-pause-resume.md).
+
+Both RPCs respond only from the state-change completion callback, so a
+200 OK certifies the drain (pause) / the resume. A process-RAM registry
+of standing pauses provides:
+
+  - idempotent re-pause (refreshes a mandatory server-side TTL),
+  - TTL auto-resume so a leaked pause self-heals,
+  - a PSTATE_RESUMING guard so overlapping resumes (TTL vs explicit, or
+    explicit vs explicit) can never double-free a registry entry,
+  - a barrier-integrity token: pause returns an opaque "<instance>:<epoch>"
+    token, resume reports barrier_intact so the controller can drop a
+    snapshot whose freeze was broken by a TTL, a target restart, or a
+    third-party resume.
+
+The TTL ceiling is 60 s and must stay below the host I/O timeout
+(nvme_core.io_timeout); a pause that outlasts it makes the host abort
+despite the target queuing without error.
+
+The registry is lock-free and assumes a single reactor (-m 0x1, the
+production SPDK_CPU_MASK); the first pause logs an error if more than one
+reactor is active. Guard g_paused before widening the CPU mask.
+
+New file plus a one-line lib/nvmf/Makefile hunk to minimise upstream
+conflict surface. Additive and consumer-invisible behind a capability
+probe (rpc_get_methods).
+
+Signed-off-by: Evariops <noreply@evariops.com>
+---
+ lib/nvmf/Makefile         |   2 +-
+ lib/nvmf/nvmf_pause_rpc.c | 416 ++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 417 insertions(+), 1 deletion(-)
+ create mode 100644 lib/nvmf/nvmf_pause_rpc.c
+
+diff --git a/lib/nvmf/Makefile b/lib/nvmf/Makefile
+index 3136f7a..0af5836 100644
+--- a/lib/nvmf/Makefile
++++ b/lib/nvmf/Makefile
+@@ -11,7 +11,7 @@ SO_MINOR := 0
+ 
+ C_SRCS = ctrlr.c ctrlr_discovery.c ctrlr_bdev.c \
+ 	 subsystem.c nvmf.c nvmf_rpc.c transport.c tcp.c \
+-	 stubs.c mdns_server.c
++	 stubs.c mdns_server.c nvmf_pause_rpc.c
+ 
+ C_SRCS-$(CONFIG_RDMA) += rdma.c
+ C_SRCS-$(CONFIG_HAVE_EVP_MAC) += auth.c
+diff --git a/lib/nvmf/nvmf_pause_rpc.c b/lib/nvmf/nvmf_pause_rpc.c
+new file mode 100644
+index 0000000..21e6951
+--- /dev/null
++++ b/lib/nvmf/nvmf_pause_rpc.c
+@@ -0,0 +1,416 @@
++/* lib/nvmf/nvmf_pause_rpc.c — SPDX-License-Identifier: BSD-3-Clause
++ * Evariops fork — companion of spdk-csi SPEC-66 (H10).
++ * nvmf_subsystem_pause / nvmf_subsystem_resume: a STANDING, drain-certified,
++ * TTL-guarded I/O barrier that holds a subsystem Paused across RPC calls. */
++#include "spdk/stdinc.h"
++#include "spdk/rpc.h"
++#include "spdk/nvmf.h"
++#include "spdk/nvmf_spec.h"      /* SPDK_NVMF_NQN_MAX_LEN */
++#include "spdk/string.h"
++#include "spdk/thread.h"         /* SPDK_POLLER_REGISTER */
++#include "spdk/util.h"
++#include "spdk/log.h"
++#include "spdk/queue.h"
++#include "spdk/env.h"           /* spdk_env_get_core_count, spdk_get_ticks */
++
++#define PAUSE_TTL_DEFAULT_MS  30000u
++#define PAUSE_TTL_MAX_MS      60000u    /* 60 s ceiling; keep below host io_timeout (R2) */
++
++/* Standing-pause registry. SPDK control runs on a single reactor (-m 0x1):
++ * every access below is on the app thread. Add a lock if the CPU mask widens. */
++enum paused_state {
++	PSTATE_PAUSED,      /* standing-paused, TTL armed */
++	PSTATE_RESUMING,    /* resume dispatched; freed (ok) or reverted (fail) in the completion cb */
++};
++
++struct paused_subsystem {
++	struct spdk_nvmf_subsystem    *subsystem;
++	char                           nqn[SPDK_NVMF_NQN_MAX_LEN + 1];
++	uint32_t                       nsid;
++	uint32_t                       ttl_ms;       /* remembered to re-arm the TTL on a failed resume */
++	uint64_t                       epoch;        /* identifies this standing pause (barrier token) */
++	enum paused_state              state;
++	struct spdk_poller            *ttl_poller;
++	TAILQ_ENTRY(paused_subsystem)  link;
++};
++static TAILQ_HEAD(, paused_subsystem) g_paused = TAILQ_HEAD_INITIALIZER(g_paused);
++
++/* Barrier-integrity token (RISK R1/R3, §8). g_instance is a per-process nonce so a
++ * token minted before a crash never matches one after restart (registry is RAM-only,
++ * §3.3); g_epoch bumps on every NEW standing pause so a TTL auto-resume + re-pause
++ * mints a fresh token. `pause` returns the token; `resume` reports whether the freeze
++ * was continuous, so the controller can drop a snapshot whose barrier silently broke. */
++static uint64_t g_instance;
++static uint64_t g_epoch;
++
++static void
++paused_first_use(void)
++{
++	static bool warned;
++	if (g_instance == 0) {
++		g_instance = (spdk_get_ticks() << 1) | 1;   /* nonzero per-process nonce */
++	}
++	/* RISK R4: the lock-free registry assumes a single reactor (-m 0x1). */
++	if (!warned && spdk_env_get_core_count() > 1) {
++		warned = true;
++		SPDK_ERRLOG("nvmf pause: %u reactors active; the standing-pause registry is "
++			    "lock-free and assumes -m 0x1 — guard g_paused before widening the mask\n",
++			    spdk_env_get_core_count());
++	}
++}
++
++static struct paused_subsystem *
++paused_find(struct spdk_nvmf_subsystem *ss)
++{
++	struct paused_subsystem *p;
++	TAILQ_FOREACH(p, &g_paused, link) {
++		if (p->subsystem == ss) { return p; }
++	}
++	return NULL;
++}
++
++static void
++paused_entry_free(struct paused_subsystem *p)
++{
++	spdk_poller_unregister(&p->ttl_poller);   /* safe if already NULL */
++	TAILQ_REMOVE(&g_paused, p, link);
++	free(p);
++}
++
++static int ttl_expired(void *arg);
++
++static void
++paused_arm_ttl(struct paused_subsystem *p)
++{
++	spdk_poller_unregister(&p->ttl_poller);   /* safe if already NULL */
++	p->ttl_poller = SPDK_POLLER_REGISTER(ttl_expired, p, (uint64_t)p->ttl_ms * 1000);
++}
++
++/* Initiate a resume of a standing-paused entry. The entry is NOT removed here: it
++ * moves to PSTATE_RESUMING and stays in the registry, so a resume that overlaps
++ * another resume (explicit-vs-TTL or explicit-vs-explicit) becomes a no-op instead
++ * of a second dispatch that would double-free the node. The completion callback
++ * frees it on success, or reverts it to PSTATE_PAUSED + re-arms the TTL on failure.
++ * Precondition: p is in PSTATE_PAUSED. */
++static int
++paused_begin_resume(struct paused_subsystem *p,
++		    spdk_nvmf_subsystem_state_change_done done, void *cb_arg)
++{
++	int rc;
++
++	spdk_poller_unregister(&p->ttl_poller);   /* resume supersedes the TTL timer */
++	p->state = PSTATE_RESUMING;
++	rc = spdk_nvmf_subsystem_resume(p->subsystem, done, cb_arg);
++	if (rc) {
++		/* dispatch never started (cb won't fire) → not actually resuming;
++		 * revert + re-arm so the entry still self-heals. */
++		p->state = PSTATE_PAUSED;
++		paused_arm_ttl(p);
++	}
++	return rc;
++}
++
++/* ---- TTL auto-resume (leaked-pause self-heal) ---- */
++static void
++auto_resume_done(struct spdk_nvmf_subsystem *ss, void *cb_arg, int status)
++{
++	struct paused_subsystem *p = cb_arg;
++	if (status) {
++		/* resume failed; subsystem reverted to Paused → re-arm TTL to retry */
++		SPDK_ERRLOG("nvmf pause: auto-resume of %s failed (%s); re-arming TTL\n",
++			    p->nqn, spdk_strerror(-status));
++		p->state = PSTATE_PAUSED;
++		paused_arm_ttl(p);
++		return;
++	}
++	SPDK_WARNLOG("nvmf pause: TTL auto-resumed leaked pause on %s\n", p->nqn);
++	paused_entry_free(p);
++}
++
++static int
++ttl_expired(void *arg)
++{
++	struct paused_subsystem *p = arg;
++	/* one-shot: paused_begin_resume unregisters this poller (or, on the rare
++	 * dispatch failure, re-arms a fresh one). */
++	if (paused_begin_resume(p, auto_resume_done, p)) {
++		SPDK_ERRLOG("nvmf pause: TTL resume dispatch failed for %s\n", p->nqn);
++	}
++	return SPDK_POLLER_BUSY;
++}
++
++/* ========================= pause ========================= */
++struct rpc_pause_ctx {
++	struct spdk_jsonrpc_request *request;
++	char     *nqn;
++	char     *tgt_name;
++	uint32_t  nsid;          /* 0 => resolve to first namespace */
++	uint32_t  ttl_ms;
++	struct spdk_nvmf_subsystem *subsystem;
++};
++
++static const struct spdk_json_object_decoder rpc_pause_decoders[] = {
++	{"nqn",      offsetof(struct rpc_pause_ctx, nqn),      spdk_json_decode_string},
++	{"tgt_name", offsetof(struct rpc_pause_ctx, tgt_name), spdk_json_decode_string, true},
++	{"nsid",     offsetof(struct rpc_pause_ctx, nsid),     spdk_json_decode_uint32, true},
++	{"ttl_ms",   offsetof(struct rpc_pause_ctx, ttl_ms),   spdk_json_decode_uint32, true},
++};
++
++static void
++rpc_pause_ctx_free(struct rpc_pause_ctx *ctx)
++{
++	free(ctx->nqn); free(ctx->tgt_name); free(ctx);
++}
++
++static void
++pause_done(struct spdk_nvmf_subsystem *ss, void *cb_arg, int status)
++{
++	struct rpc_pause_ctx *ctx = cb_arg;
++	struct paused_subsystem *p;
++	struct spdk_json_write_ctx *w;
++
++	if (status) {
++		spdk_jsonrpc_send_error_response_fmt(ctx->request, status,
++			"pause failed: %s", spdk_strerror(-status));
++		rpc_pause_ctx_free(ctx);
++		return;
++	}
++	/* Drain certified: in-flight I/O complete, new I/O now queued target-side. */
++	p = paused_find(ss);
++	if (p == NULL) {
++		p = calloc(1, sizeof(*p));
++		if (p == NULL) {
++			/* cannot arm TTL → refuse to leave a pause we can't auto-heal */
++			spdk_nvmf_subsystem_resume(ss, NULL, NULL);   /* best-effort undo */
++			spdk_jsonrpc_send_error_response(ctx->request,
++				SPDK_JSONRPC_ERROR_INTERNAL_ERROR, "out of memory");
++			rpc_pause_ctx_free(ctx);
++			return;
++		}
++		p->subsystem = ss;
++		p->nsid = ctx->nsid;
++		p->epoch = ++g_epoch;   /* new barrier → new token */
++		snprintf(p->nqn, sizeof(p->nqn), "%s", spdk_nvmf_subsystem_get_nqn(ss));
++		TAILQ_INSERT_TAIL(&g_paused, p, link);
++	}
++	p->state  = PSTATE_PAUSED;
++	p->ttl_ms = ctx->ttl_ms;
++	paused_arm_ttl(p);   /* (re-)arm — refresh deadline on idempotent re-pause */
++
++	w = spdk_jsonrpc_begin_result(ctx->request);
++	spdk_json_write_object_begin(w);
++	spdk_json_write_named_string(w, "nqn", p->nqn);
++	spdk_json_write_named_uint32(w, "nsid", p->nsid);
++	spdk_json_write_named_bool(w, "paused", true);
++	spdk_json_write_named_uint32(w, "ttl_ms", ctx->ttl_ms);
++	{
++		char tok[48];
++		snprintf(tok, sizeof(tok), "%" PRIu64 ":%" PRIu64, g_instance, p->epoch);
++		spdk_json_write_named_string(w, "token", tok);
++	}
++	spdk_json_write_object_end(w);
++	spdk_jsonrpc_end_result(ctx->request, w);
++	rpc_pause_ctx_free(ctx);
++}
++
++static void
++rpc_nvmf_subsystem_pause(struct spdk_jsonrpc_request *request,
++			 const struct spdk_json_val *params)
++{
++	struct rpc_pause_ctx *ctx;
++	struct spdk_nvmf_tgt *tgt;
++	struct spdk_nvmf_subsystem *ss;
++	struct paused_subsystem *p;
++	int rc;
++
++	paused_first_use();
++
++	ctx = calloc(1, sizeof(*ctx));
++	if (!ctx) {
++		spdk_jsonrpc_send_error_response(request,
++			SPDK_JSONRPC_ERROR_INTERNAL_ERROR, "out of memory");
++		return;
++	}
++	ctx->request = request;
++	ctx->ttl_ms  = PAUSE_TTL_DEFAULT_MS;
++
++	if (spdk_json_decode_object(params, rpc_pause_decoders,
++				    SPDK_COUNTOF(rpc_pause_decoders), ctx)) {
++		spdk_jsonrpc_send_error_response(request,
++			SPDK_JSONRPC_ERROR_INVALID_PARAMS, "decode failed");
++		rpc_pause_ctx_free(ctx);
++		return;
++	}
++	if (ctx->ttl_ms == 0)             { ctx->ttl_ms = PAUSE_TTL_DEFAULT_MS; }
++	if (ctx->ttl_ms > PAUSE_TTL_MAX_MS) { ctx->ttl_ms = PAUSE_TTL_MAX_MS; }
++
++	tgt = spdk_nvmf_get_tgt(ctx->tgt_name);   /* NULL name => the single default tgt */
++	if (!tgt) { spdk_jsonrpc_send_error_response(request, -ENODEV, "target not found");
++		    rpc_pause_ctx_free(ctx); return; }
++	ss = spdk_nvmf_tgt_find_subsystem(tgt, ctx->nqn);
++	if (!ss)  { spdk_jsonrpc_send_error_response(request, -ENOENT, "subsystem not found");
++		    rpc_pause_ctx_free(ctx); return; }
++	ctx->subsystem = ss;
++
++	/* nsid 0 → drain the backing namespace (our replicas expose exactly one) */
++	if (ctx->nsid == 0) {
++		struct spdk_nvmf_ns *ns = spdk_nvmf_subsystem_get_first_ns(ss);
++		ctx->nsid = ns ? spdk_nvmf_ns_get_id(ns) : 0;
++	}
++	if (ctx->nsid == 0) {
++		/* admin-only pause is not a drain barrier → refuse rather than ack a no-op */
++		spdk_jsonrpc_send_error_response(request, -EINVAL,
++			"subsystem has no namespace to drain");
++		rpc_pause_ctx_free(ctx);
++		return;
++	}
++
++	/* idempotent re-pause: already standing-paused → refresh TTL + ack.
++	 * But if a resume is in flight, the subsystem is leaving Paused: refuse with
++	 * -EAGAIN rather than ack a false barrier. */
++	p = paused_find(ss);
++	if (p != NULL) {
++		if (p->state == PSTATE_RESUMING) {
++			spdk_jsonrpc_send_error_response(request, -EAGAIN,
++				"resume in progress; retry");
++			rpc_pause_ctx_free(ctx);
++			return;
++		}
++		pause_done(ss, ctx, 0);   /* refresh TTL + ack (no re-drain) */
++		return;
++	}
++
++	rc = spdk_nvmf_subsystem_pause(ss, ctx->nsid, pause_done, ctx);
++	if (rc) {
++		spdk_jsonrpc_send_error_response_fmt(request, rc,
++			"pause dispatch failed: %s", spdk_strerror(-rc));
++		rpc_pause_ctx_free(ctx);
++	}
++}
++SPDK_RPC_REGISTER("nvmf_subsystem_pause", rpc_nvmf_subsystem_pause, SPDK_RPC_RUNTIME)
++
++/* ========================= resume ========================= */
++struct rpc_resume_ctx {
++	struct spdk_jsonrpc_request *request;
++	char *nqn;
++	char *tgt_name;
++	char *token;                    /* optional: pins the barrier to verify continuity */
++	bool  barrier_intact;           /* computed at dispatch, reported in resume_done */
++	struct paused_subsystem *entry;
++};
++
++static const struct spdk_json_object_decoder rpc_resume_decoders[] = {
++	{"nqn",      offsetof(struct rpc_resume_ctx, nqn),      spdk_json_decode_string},
++	{"tgt_name", offsetof(struct rpc_resume_ctx, tgt_name), spdk_json_decode_string, true},
++	{"token",    offsetof(struct rpc_resume_ctx, token),    spdk_json_decode_string, true},
++};
++
++static void
++rpc_resume_ctx_free(struct rpc_resume_ctx *ctx)
++{
++	free(ctx->nqn); free(ctx->tgt_name); free(ctx->token); free(ctx);
++}
++
++static void
++resume_done(struct spdk_nvmf_subsystem *ss, void *cb_arg, int status)
++{
++	struct rpc_resume_ctx *ctx = cb_arg;
++	struct paused_subsystem *p = ctx->entry;
++	struct spdk_json_write_ctx *w;
++
++	if (status) {
++		/* resume failed; subsystem reverted to Paused. Keep the entry but
++		 * re-arm its TTL so a lost retry still self-heals. */
++		p->state = PSTATE_PAUSED;
++		paused_arm_ttl(p);
++		spdk_jsonrpc_send_error_response_fmt(ctx->request, status,
++			"resume failed: %s", spdk_strerror(-status));
++		rpc_resume_ctx_free(ctx);
++		return;
++	}
++	paused_entry_free(p);
++	w = spdk_jsonrpc_begin_result(ctx->request);
++	spdk_json_write_object_begin(w);
++	spdk_json_write_named_bool(w, "resumed", true);
++	spdk_json_write_named_bool(w, "barrier_intact", ctx->barrier_intact);
++	spdk_json_write_object_end(w);
++	spdk_jsonrpc_end_result(ctx->request, w);
++	rpc_resume_ctx_free(ctx);
++}
++
++static void
++resume_send_noop(struct spdk_jsonrpc_request *request)
++{
++	struct spdk_json_write_ctx *w = spdk_jsonrpc_begin_result(request);
++	spdk_json_write_object_begin(w);
++	spdk_json_write_named_bool(w, "resumed", false);
++	spdk_json_write_named_bool(w, "barrier_intact", false);
++	spdk_json_write_object_end(w);
++	spdk_jsonrpc_end_result(request, w);
++}
++
++static void
++rpc_nvmf_subsystem_resume(struct spdk_jsonrpc_request *request,
++			  const struct spdk_json_val *params)
++{
++	struct rpc_resume_ctx *ctx;
++	struct spdk_nvmf_tgt *tgt;
++	struct spdk_nvmf_subsystem *ss;
++	struct paused_subsystem *p;
++	uint64_t tok_inst = 0, tok_epoch = 0;
++	bool have_token, intact;
++	int rc;
++
++	ctx = calloc(1, sizeof(*ctx));
++	if (!ctx) {
++		spdk_jsonrpc_send_error_response(request,
++			SPDK_JSONRPC_ERROR_INTERNAL_ERROR, "out of memory");
++		return;
++	}
++	ctx->request = request;
++	if (spdk_json_decode_object(params, rpc_resume_decoders,
++				    SPDK_COUNTOF(rpc_resume_decoders), ctx)) {
++		spdk_jsonrpc_send_error_response(request,
++			SPDK_JSONRPC_ERROR_INVALID_PARAMS, "decode failed");
++		rpc_resume_ctx_free(ctx);
++		return;
++	}
++	tgt = spdk_nvmf_get_tgt(ctx->tgt_name);
++	if (!tgt) { spdk_jsonrpc_send_error_response(request, -ENODEV, "target not found");
++		    rpc_resume_ctx_free(ctx); return; }
++	ss = spdk_nvmf_tgt_find_subsystem(tgt, ctx->nqn);
++	if (!ss)  { spdk_jsonrpc_send_error_response(request, -ENOENT, "subsystem not found");
++		    rpc_resume_ctx_free(ctx); return; }
++
++	have_token = ctx->token != NULL &&
++		     sscanf(ctx->token, "%" SCNu64 ":%" SCNu64, &tok_inst, &tok_epoch) == 2;
++
++	p = paused_find(ss);
++	if (p == NULL || p->state == PSTATE_RESUMING) {
++		/* already resumed / TTL-healed / crash-cleared, or a resume is already in
++		 * flight → idempotent no-op. Bailing here (not dispatching) is what stops a
++		 * second resume from double-freeing the entry; the barrier did not survive. */
++		resume_send_noop(request);
++		rpc_resume_ctx_free(ctx);
++		return;
++	}
++	/* With a pinned token, only resume the *matching* standing pause: a mismatch means
++	 * our barrier already ended (TTL/crash/other) and a different one may now be live —
++	 * report it broken and leave that one untouched (RISK R1/R3). */
++	intact = !have_token || (tok_inst == g_instance && tok_epoch == p->epoch);
++	if (have_token && !intact) {
++		resume_send_noop(request);
++		rpc_resume_ctx_free(ctx);
++		return;
++	}
++	ctx->entry = p;
++	ctx->barrier_intact = intact;
++	rc = paused_begin_resume(p, resume_done, ctx);
++	if (rc) {
++		/* begin_resume already reverted the entry to Paused + re-armed its TTL */
++		spdk_jsonrpc_send_error_response_fmt(request, rc,
++			"resume dispatch failed: %s", spdk_strerror(-rc));
++		rpc_resume_ctx_free(ctx);
++	}
++}
++SPDK_RPC_REGISTER("nvmf_subsystem_resume", rpc_nvmf_subsystem_resume, SPDK_RPC_RUNTIME)
+-- 
+2.50.1 (Apple Git-155)
+
