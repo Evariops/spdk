@@ -47,15 +47,16 @@ RUN git clone --branch "${SPDK_VERSION}" --depth 1 --recurse-submodules \
 
 WORKDIR /build/spdk
 
-# ── Inject CBT module and RAID patch ──
+# ── Inject CBT + tier modules and patches (SPEC-73 M1-M5) ──
 COPY module/bdev/cbt/ module/bdev/cbt/
+COPY module/bdev/tier/ module/bdev/tier/
 COPY patches/ /build/patches/
 
-# Register CBT in the bdev module build, link list, and deps & apply RAID patch
+# Register CBT + tier in the bdev module build, link list, and deps & apply patches
 # hadolint ignore=SC2016
-RUN sed -i '/^DIRS-y += delay/s/$/ cbt/' module/bdev/Makefile && \
-    sed -i '/^BLOCKDEV_MODULES_LIST += bdev_zone_block/a BLOCKDEV_MODULES_LIST += bdev_cbt' mk/spdk.modules.mk && \
-    sed -i '/^DEPDIRS-bdev_passthru/a DEPDIRS-bdev_cbt := $(BDEV_DEPS_THREAD)' mk/spdk.lib_deps.mk && \
+RUN sed -i '/^DIRS-y += delay/s/$/ cbt tier/' module/bdev/Makefile && \
+    sed -i '/^BLOCKDEV_MODULES_LIST += bdev_zone_block/a BLOCKDEV_MODULES_LIST += bdev_cbt\nBLOCKDEV_MODULES_LIST += bdev_tier' mk/spdk.modules.mk && \
+    sed -i '/^DEPDIRS-bdev_passthru/a DEPDIRS-bdev_cbt := $(BDEV_DEPS_THREAD)\nDEPDIRS-bdev_tier := $(BDEV_DEPS_THREAD)' mk/spdk.lib_deps.mk && \
     for p in /build/patches/*.patch; do echo "Applying ${p}" && git apply "${p}" || exit 1; done
 
 # Fedora's CMake rejects cmake_minimum_required(<3.5) in SPDK subprojects (ISA-L, etc.)
