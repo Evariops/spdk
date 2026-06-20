@@ -77,7 +77,6 @@ struct tier_band {
 	/* Open handle to the underlying disk (NULL while retired). */
 	struct spdk_bdev_desc	*desc;
 
-	struct vbdev_tier	*tier;		/* back-pointer */
 	TAILQ_ENTRY(tier_band)	link;
 };
 
@@ -133,10 +132,15 @@ vbdev_tier_is_md_range(const struct vbdev_tier *t, uint64_t offset, uint64_t num
 
 /* Lifecycle (RPC-driven, SPEC-73A §9.1 / C-MUT-2). */
 struct vbdev_tier *vbdev_tier_create(const char *name, uint64_t md_num_blocks);
+struct vbdev_tier *vbdev_tier_get_by_name(const char *name);
 int vbdev_tier_add_band(struct vbdev_tier *t, const char *base_bdev_name,
 			enum tier_class tier, const char *wwn, const char *serial,
 			uint32_t *out_band_id);
 int vbdev_tier_retire_band(struct vbdev_tier *t, uint32_t band_id);
+/* Register the composite bdev once its bands are configured. */
+int vbdev_tier_register(struct vbdev_tier *t);
+/* Tear down + unregister (cleanup). */
+int vbdev_tier_delete(struct vbdev_tier *t);
 
 /* M2b co-design: quiesce a physical LBA range of THIS composite (only the
  * registering module may call spdk_bdev_quiesce_range — SPEC-73A §5.3). */
