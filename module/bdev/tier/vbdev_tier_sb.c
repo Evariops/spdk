@@ -18,7 +18,7 @@
 /* ---- serialize / validate -------------------------------------------------- */
 
 void
-tier_sb_serialize(struct vbdev_tier *t, struct tier_band *self, struct tier_superblock *sb)
+tier_sb_serialize(struct vbdev_tier *t, struct tier_band *self, uint64_t seq, struct tier_superblock *sb)
 {
 	struct tier_band *b;
 	uint32_t i = 0;
@@ -26,7 +26,7 @@ tier_sb_serialize(struct vbdev_tier *t, struct tier_band *self, struct tier_supe
 	memset(sb, 0, sizeof(*sb));
 	sb->magic = TIER_SB_MAGIC;
 	sb->version = TIER_SB_VERSION;
-	sb->seq = t->seq;
+	sb->seq = seq;		/* F10: the target generation, committed to t->seq only on all-band success */
 	snprintf(sb->composite_name, sizeof(sb->composite_name), "%s", t->bdev.name);
 	sb->md_num_blocks = t->md_num_blocks;
 	sb->md_mirror_a = t->md_mirror_a;
@@ -34,6 +34,7 @@ tier_sb_serialize(struct vbdev_tier *t, struct tier_band *self, struct tier_supe
 	sb->num_bands = t->num_bands;
 	sb->this_band_id = self ? self->band_id : UINT32_MAX;
 	sb->blocklen = t->blocklen;
+	sb->cluster_blocks = (uint32_t)t->cluster_blocks;	/* F1: boundary alignment grain */
 
 	TAILQ_FOREACH(b, &t->bands, link) {
 		if (i >= TIER_MAX_BANDS) {
@@ -72,6 +73,7 @@ tier_sb_valid(const struct tier_superblock *sb)
 
 struct tier_sb_write_ctx {
 	struct vbdev_tier	*t;
+	uint64_t		target_seq;	/* F10: committed to t->seq only if every band write succeeds */
 	int			remaining;
 	int			status;
 	void			(*cb)(void *cb_arg, int rc);
@@ -99,6 +101,12 @@ tier_sb_write_band_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg
 		ctx->status = -EIO;
 	}
 	if (--ctx->remaining == 0) {
+		/* F10: advance the in-memory generation ONLY if every band persisted the new table.
+		 * On any failure t->seq stays put, so the next write retries the same target_seq (no
+		 * spurious generation gap), and the highest-seq on-disk copy remains authoritative. */
+		if (ctx->status == 0) {
+			ctx->t->seq = ctx->target_seq;
+		}
 		if (ctx->cb) {
 			ctx->cb(ctx->cb_arg, ctx->status);
 		}
@@ -127,8 +135,7 @@ tier_sb_write_all(struct vbdev_tier *t, void (*cb)(void *cb_arg, int rc), void *
 	ctx->cb = cb;
 	ctx->cb_arg = cb_arg;
 	ctx->remaining = 1;	/* hold a ref while we launch, released at the end */
-
-	t->seq++;
+	ctx->target_seq = t->seq + 1;	/* F10: committed to t->seq on all-band success only */
 
 	TAILQ_FOREACH(b, &t->bands, link) {
 		struct tier_sb_band_write *bw;
@@ -149,7 +156,7 @@ tier_sb_write_all(struct vbdev_tier *t, void (*cb)(void *cb_arg, int rc), void *
 			free(bw);
 			continue;
 		}
-		tier_sb_serialize(t, b, (struct tier_superblock *)bw->buf);
+		tier_sb_serialize(t, b, ctx->target_seq, (struct tier_superblock *)bw->buf);
 		bw->ch = spdk_bdev_get_io_channel(b->desc);
 		if (bw->ch == NULL) {
 			ctx->status = -ENOMEM;

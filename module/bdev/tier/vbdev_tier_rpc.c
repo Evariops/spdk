@@ -21,11 +21,13 @@
 struct rpc_tier_create {
 	char		*name;
 	uint64_t	md_num_blocks;
+	uint64_t	cluster_blocks;	/* F1: boundary alignment grain (blobstore cluster size in blocks) */
 };
 
 static const struct spdk_json_object_decoder rpc_tier_create_decoders[] = {
 	{"name", offsetof(struct rpc_tier_create, name), spdk_json_decode_string},
 	{"md_num_blocks", offsetof(struct rpc_tier_create, md_num_blocks), spdk_json_decode_uint64},
+	{"cluster_blocks", offsetof(struct rpc_tier_create, cluster_blocks), spdk_json_decode_uint64, true},
 };
 
 static void
@@ -45,7 +47,7 @@ rpc_bdev_tier_create(struct spdk_jsonrpc_request *request, const struct spdk_jso
 		free(req.name);
 		return;
 	}
-	t = vbdev_tier_create(req.name, req.md_num_blocks);
+	t = vbdev_tier_create(req.name, req.md_num_blocks, req.cluster_blocks);
 	free(req.name);
 	if (t == NULL) {
 		spdk_jsonrpc_send_error_response(request, -ENOMEM, "could not create tier");
@@ -370,6 +372,7 @@ rpc_read_sb_done(void *cb_arg, const struct tier_superblock *sb, int rc)
 		spdk_json_write_named_string(w, "composite_name", sb->composite_name);
 		spdk_json_write_named_uint64(w, "seq", sb->seq);
 		spdk_json_write_named_uint64(w, "md_num_blocks", sb->md_num_blocks);
+		spdk_json_write_named_uint32(w, "cluster_blocks", sb->cluster_blocks);
 		spdk_json_write_named_uint32(w, "md_mirror_a", sb->md_mirror_a);
 		spdk_json_write_named_uint32(w, "md_mirror_b", sb->md_mirror_b);
 		spdk_json_write_named_uint32(w, "num_bands", sb->num_bands);

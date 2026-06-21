@@ -92,7 +92,7 @@ struct tier_superblock {
 	uint32_t	num_bands;
 	uint32_t	this_band_id;	/* which band slot this copy physically sits on */
 	uint32_t	blocklen;	/* common block size */
-	uint32_t	reserved1;
+	uint32_t	cluster_blocks;	/* blobstore cluster size in blocks (boundary alignment grain, F1) */
 	struct tier_sb_band bands[TIER_MAX_BANDS];
 };
 
@@ -141,6 +141,9 @@ struct vbdev_tier {
 
 	uint32_t		blocklen;	/* common block size of all bands (must match) */
 	uint32_t		sb_blocks;	/* reserved superblock blocks at the start of EACH base bdev */
+	uint64_t		cluster_blocks;	/* blobstore cluster size in blocks; ALL band/md boundaries are
+						 * aligned to this so no cluster ever straddles a band/region
+						 * boundary (F1) — a straddling cluster would fail I/O (-EIO). */
 	uint64_t		seq;		/* current superblock generation (monotone) */
 	uint64_t		total_num_blocks;	/* md region + Σ data bands (excludes per-disk sb reserve) */
 	bool			registered;
@@ -175,8 +178,22 @@ vbdev_tier_is_md_range(const struct vbdev_tier *t, uint64_t offset, uint64_t num
 	       (offset + num_blocks) <= t->md_num_blocks;
 }
 
+/* Round an LBA/length down/up to the composite cluster grain (F1: keep every band/region
+ * boundary cluster-aligned so no blobstore cluster straddles a boundary). cluster_blocks==0
+ * (legacy) ⇒ no alignment. */
+static inline uint64_t
+tier_align_down(const struct vbdev_tier *t, uint64_t v)
+{
+	return (t->cluster_blocks > 1) ? (v - (v % t->cluster_blocks)) : v;
+}
+static inline uint64_t
+tier_align_up(const struct vbdev_tier *t, uint64_t v)
+{
+	return (t->cluster_blocks > 1) ? tier_align_down(t, v + t->cluster_blocks - 1) : v;
+}
+
 /* Lifecycle (RPC-driven, SPEC-73A §9.1 / C-MUT-2). */
-struct vbdev_tier *vbdev_tier_create(const char *name, uint64_t md_num_blocks);
+struct vbdev_tier *vbdev_tier_create(const char *name, uint64_t md_num_blocks, uint64_t cluster_blocks);
 struct vbdev_tier *vbdev_tier_get_by_name(const char *name);
 int vbdev_tier_add_band(struct vbdev_tier *t, const char *base_bdev_name,
 			enum tier_class tier, const char *wwn, const char *serial,
@@ -192,7 +209,7 @@ int vbdev_tier_register(struct vbdev_tier *t);
 int vbdev_tier_delete(struct vbdev_tier *t);
 
 /* Superblock (vbdev_tier_sb.c) — native-level persistence (INV-T1). */
-void tier_sb_serialize(struct vbdev_tier *t, struct tier_band *self, struct tier_superblock *sb);
+void tier_sb_serialize(struct vbdev_tier *t, struct tier_band *self, uint64_t seq, struct tier_superblock *sb);
 bool tier_sb_valid(const struct tier_superblock *sb);	/* magic + crc check */
 /* Async-write the (serialized) superblock to EVERY active band. cb fires once,
  * with rc != 0 if any band failed. Increments t->seq. cb may be NULL (fire-and-forget). */
