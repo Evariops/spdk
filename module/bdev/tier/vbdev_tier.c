@@ -556,6 +556,21 @@ vbdev_tier_add_band(struct vbdev_tier *t, const char *base_bdev_name, enum tier_
 	uint64_t usable_blocks;
 	int rc;
 
+	/* SPEC-73 (sb-validate): reject a disk identity already present in this composite.
+	 * A duplicate wwn means the same physical disk was enumerated into two bands — that
+	 * would silently double-count capacity and corrupt the concat geometry. Cheap in-memory
+	 * guard; the on-disk superblock additionally guards swap/replacement at assembly. */
+	if (wwn != NULL && wwn[0] != '\0') {
+		struct tier_band *existing;
+		TAILQ_FOREACH(existing, &t->bands, link) {
+			if (strncmp(existing->wwn, wwn, sizeof(existing->wwn)) == 0) {
+				SPDK_ERRLOG("tier: band wwn '%s' already present (duplicate disk '%s')\n",
+					    wwn, base_bdev_name);
+				return -EEXIST;
+			}
+		}
+	}
+
 	band = calloc(1, sizeof(*band));
 	if (band == NULL) {
 		return -ENOMEM;

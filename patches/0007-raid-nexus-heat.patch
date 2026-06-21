@@ -1,15 +1,4 @@
-From 63226e15e02eef0b31d13fb92158e346609d51e9 Mon Sep 17 00:00:00 2001
-From: =?UTF-8?q?Rapha=C3=ABl=20DUCOM?= <raphael.ducom@gmail.com>
-Date: Sun, 21 Jun 2026 14:55:02 +0200
-Subject: [PATCH] m5: nexus logical heat instrumentation
-
----
- module/bdev/raid/Makefile         |   2 +-
- module/bdev/raid/bdev_raid.c      |   8 +
- module/bdev/raid/bdev_raid.h      |   9 ++
- module/bdev/raid/bdev_raid_heat.c | 254 ++++++++++++++++++++++++++++++
- 4 files changed, 272 insertions(+), 1 deletion(-)
- create mode 100644 module/bdev/raid/bdev_raid_heat.c
+Subject: [PATCH] m5: nexus logical heat instrumentation + free-at-destruct (SPEC-73)
 
 diff --git a/module/bdev/raid/Makefile b/module/bdev/raid/Makefile
 index 3dff369dd..cb46945e7 100644
@@ -25,10 +14,20 @@ index 3dff369dd..cb46945e7 100644
  ifeq ($(CONFIG_RAID5F),y)
  C_SRCS += raid5f.c
 diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
-index 94ada40ec..7d2f9cd68 100644
+index 94ada40ec..676a9306c 100644
 --- a/module/bdev/raid/bdev_raid.c
 +++ b/module/bdev/raid/bdev_raid.c
-@@ -968,6 +968,14 @@ static void
+@@ -393,6 +393,9 @@ raid_bdev_cleanup(struct raid_bdev *raid_bdev)
+ static void
+ raid_bdev_free(struct raid_bdev *raid_bdev)
+ {
++	/* SPEC-73 M5: reclaim the logical heat sketch at nexus teardown (no I/O in flight here). */
++	raid_tier_heat_destroy(raid_bdev->tier_heat);
++	raid_bdev->tier_heat = NULL;
+ 	raid_bdev_free_superblock(raid_bdev);
+ 	free(raid_bdev->base_bdev_info);
+ 	free(raid_bdev->bdev.name);
+@@ -968,6 +971,14 @@ static void
  raid_bdev_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
  {
  	struct raid_bdev_io *raid_io = (struct raid_bdev_io *)bdev_io->driver_ctx;
@@ -328,6 +327,3 @@ index 000000000..0749163a0
 +	free(req.name);
 +}
 +SPDK_RPC_REGISTER("vbdev_nexus_get_heat", rpc_vbdev_nexus_get_heat, SPDK_RPC_RUNTIME)
--- 
-2.50.1 (Apple Git-155)
-
