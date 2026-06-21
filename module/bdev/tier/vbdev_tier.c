@@ -23,6 +23,7 @@
 #include "spdk/log.h"
 #include "spdk/util.h"
 #include "spdk/likely.h"
+#include "spdk/crc32.h"
 
 static int vbdev_tier_init(void);
 static void vbdev_tier_finish(void);
@@ -768,15 +769,21 @@ vbdev_tier_register(struct vbdev_tier *t)
  * relocate-quiesce co-design (M2b) — only the registering module may quiesce.
  * -------------------------------------------------------------------------- */
 
-/* M2b: direct base-bdev copy between bands (bypasses the composite/quiesce). */
+/* M2b: direct base-bdev copy between bands (bypasses the composite/quiesce).
+ * C5 (SPEC-73): after writing, the destination is read back and CRC32c-compared with the source so a
+ * silent media/write corruption is detected at relocate time (not later via the upper-layer redundancy).
+ * The copy is disk-to-disk so accel memory-copy offload does not apply; the integrity check does. */
 struct tier_copy_ctx {
 	struct tier_band	*src_band;
 	struct tier_band	*dst_band;
 	struct spdk_io_channel	*src_ch;
 	struct spdk_io_channel	*dst_ch;
-	void			*buf;
+	void			*buf;		/* source data (also the write buffer) */
+	void			*vbuf;		/* read-back verify buffer */
 	uint64_t		dst_phys;
 	uint64_t		num_blocks;
+	uint32_t		blocklen;
+	uint32_t		src_crc;	/* CRC32c of buf, computed after the source read */
 	tier_relocate_cb	cb_fn;
 	void			*cb_arg;
 };
@@ -793,17 +800,57 @@ tier_copy_finish(struct tier_copy_ctx *c, int rc)
 	if (c->buf) {
 		spdk_dma_free(c->buf);
 	}
+	if (c->vbuf) {
+		spdk_dma_free(c->vbuf);
+	}
 	c->cb_fn(c->cb_arg, rc);
 	free(c);
+}
+
+/* C5: destination read-back complete — CRC32c-compare with the source. */
+static void
+tier_copy_verify_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct tier_copy_ctx *c = cb_arg;
+	uint32_t dst_crc;
+
+	spdk_bdev_free_io(bdev_io);
+	if (!success) {
+		tier_copy_finish(c, -EIO);
+		return;
+	}
+	dst_crc = spdk_crc32c_update(c->vbuf, c->num_blocks * (uint64_t)c->blocklen, ~0u);
+	if (dst_crc != c->src_crc) {
+		SPDK_ERRLOG("tier: relocate CRC mismatch (src=%08x dst=%08x) — write corruption\n",
+			    c->src_crc, dst_crc);
+		tier_copy_finish(c, -EIO);
+		return;
+	}
+	tier_copy_finish(c, 0);
 }
 
 static void
 tier_copy_write_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
 	struct tier_copy_ctx *c = cb_arg;
+	int rc;
 
 	spdk_bdev_free_io(bdev_io);
-	tier_copy_finish(c, success ? 0 : -EIO);
+	if (!success) {
+		tier_copy_finish(c, -EIO);
+		return;
+	}
+	/* C5: read the destination back and verify the CRC before declaring the copy good. */
+	c->vbuf = spdk_dma_malloc(c->num_blocks * (uint64_t)c->blocklen, c->blocklen, NULL);
+	if (c->vbuf == NULL) {
+		tier_copy_finish(c, -ENOMEM);
+		return;
+	}
+	rc = spdk_bdev_read_blocks(c->dst_band->desc, c->dst_ch, c->vbuf, c->dst_phys,
+				   c->num_blocks, tier_copy_verify_done, c);
+	if (rc != 0) {
+		tier_copy_finish(c, rc);
+	}
 }
 
 static void
@@ -817,6 +864,8 @@ tier_copy_read_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 		tier_copy_finish(c, -EIO);
 		return;
 	}
+	/* C5: snapshot the source CRC now (under quiesce, so the source is stable). */
+	c->src_crc = spdk_crc32c_update(c->buf, c->num_blocks * (uint64_t)c->blocklen, ~0u);
 	rc = spdk_bdev_write_blocks(c->dst_band->desc, c->dst_ch, c->buf, c->dst_phys,
 				    c->num_blocks, tier_copy_write_done, c);
 	if (rc != 0) {
@@ -847,6 +896,7 @@ vbdev_tier_relocate_copy(struct vbdev_tier *t, uint64_t src_lba, uint64_t dst_lb
 	c->src_band = sb;
 	c->dst_band = db;
 	c->num_blocks = num_blocks;
+	c->blocklen = t->blocklen;
 	c->dst_phys = db->phys_offset + dst_off;
 	c->cb_fn = cb_fn;
 	c->cb_arg = cb_arg;
