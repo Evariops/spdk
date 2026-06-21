@@ -1,0 +1,333 @@
+From 63226e15e02eef0b31d13fb92158e346609d51e9 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Rapha=C3=ABl=20DUCOM?= <raphael.ducom@gmail.com>
+Date: Sun, 21 Jun 2026 14:55:02 +0200
+Subject: [PATCH] m5: nexus logical heat instrumentation
+
+---
+ module/bdev/raid/Makefile         |   2 +-
+ module/bdev/raid/bdev_raid.c      |   8 +
+ module/bdev/raid/bdev_raid.h      |   9 ++
+ module/bdev/raid/bdev_raid_heat.c | 254 ++++++++++++++++++++++++++++++
+ 4 files changed, 272 insertions(+), 1 deletion(-)
+ create mode 100644 module/bdev/raid/bdev_raid_heat.c
+
+diff --git a/module/bdev/raid/Makefile b/module/bdev/raid/Makefile
+index 3dff369dd..cb46945e7 100644
+--- a/module/bdev/raid/Makefile
++++ b/module/bdev/raid/Makefile
+@@ -10,7 +10,7 @@ SO_VER := 7
+ SO_MINOR := 0
+ 
+ CFLAGS += -I$(SPDK_ROOT_DIR)/lib/bdev/
+-C_SRCS = bdev_raid.c bdev_raid_rpc.c bdev_raid_sb.c raid0.c raid1.c concat.c
++C_SRCS = bdev_raid.c bdev_raid_rpc.c bdev_raid_sb.c bdev_raid_heat.c raid0.c raid1.c concat.c
+ 
+ ifeq ($(CONFIG_RAID5F),y)
+ C_SRCS += raid5f.c
+diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
+index 94ada40ec..7d2f9cd68 100644
+--- a/module/bdev/raid/bdev_raid.c
++++ b/module/bdev/raid/bdev_raid.c
+@@ -968,6 +968,14 @@ static void
+ raid_bdev_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
+ {
+ 	struct raid_bdev_io *raid_io = (struct raid_bdev_io *)bdev_io->driver_ctx;
++	struct raid_bdev *raid_bdev = (struct raid_bdev *)bdev_io->bdev->ctxt;
++
++	/* SPEC-73 M5: record logical heat on the hot path (lossy by design). */
++	if (spdk_unlikely(raid_bdev->tier_heat != NULL) &&
++	    (bdev_io->type == SPDK_BDEV_IO_TYPE_READ || bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE)) {
++		raid_tier_heat_record(raid_bdev->tier_heat, bdev_io->u.bdev.offset_blocks,
++				      bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE);
++	}
+ 
+ 	raid_bdev_io_init(raid_io, spdk_io_channel_get_ctx(ch), bdev_io->type,
+ 			  bdev_io->u.bdev.offset_blocks, bdev_io->u.bdev.num_blocks,
+diff --git a/module/bdev/raid/bdev_raid.h b/module/bdev/raid/bdev_raid.h
+index d0484ca5d..e7d7ac5fc 100644
+--- a/module/bdev/raid/bdev_raid.h
++++ b/module/bdev/raid/bdev_raid.h
+@@ -237,6 +237,9 @@ struct raid_bdev {
+ 	/* Private data for the raid module */
+ 	void				*module_private;
+ 
++	/* SPEC-73 M5: logical heat sketch (NULL unless enabled at the nexus). */
++	void				*tier_heat;
++
+ 	/* Superblock */
+ 	bool				superblock_enabled;
+ 	struct raid_bdev_superblock	*sb;
+@@ -570,4 +573,10 @@ struct spdk_raid_bdev_opts {
+ void raid_bdev_get_opts(struct spdk_raid_bdev_opts *opts);
+ int raid_bdev_set_opts(const struct spdk_raid_bdev_opts *opts);
+ 
++/* SPEC-73 M5: logical heat instrumentation (bdev_raid_heat.c). Record an I/O on
++ * the hot path (cheap, lossy by design — INV-52); enable/destroy/query. */
++void raid_tier_heat_record(void *heat, uint64_t offset_blocks, bool is_write);
++void *raid_tier_heat_create(uint64_t num_blocks, uint64_t region_blocks);
++void raid_tier_heat_destroy(void *heat);
++
+ #endif /* SPDK_BDEV_RAID_INTERNAL_H */
+diff --git a/module/bdev/raid/bdev_raid_heat.c b/module/bdev/raid/bdev_raid_heat.c
+new file mode 100644
+index 000000000..0749163a0
+--- /dev/null
++++ b/module/bdev/raid/bdev_raid_heat.c
+@@ -0,0 +1,254 @@
++/*   SPDX-License-Identifier: BSD-3-Clause
++ *   Copyright (C) 2026 Evariops.
++ *   All rights reserved.
++ *
++ *   SPEC-73 M5 (option A): logical heat instrumentation at the nexus (raid bdev).
++ *   A dense per-region counter array, updated on the hot path by
++ *   raid_bdev_submit_request (lossy by design, INV-52). The control-plane reads
++ *   it asynchronously to rank regions for tiering — never on the I/O path (INV-T2).
++ */
++
++#include "bdev_raid.h"
++
++#include "spdk/rpc.h"
++#include "spdk/util.h"
++#include "spdk/string.h"
++#include "spdk/likely.h"
++#include "spdk/log.h"
++#include "spdk/env.h"
++
++struct raid_region_heat {
++	uint64_t	reads;
++	uint64_t	writes;
++	uint64_t	last_tick;
++};
++
++struct raid_tier_heat {
++	uint64_t			region_blocks;
++	uint64_t			num_regions;
++	uint64_t			tick;		/* monotone logical clock */
++	struct raid_region_heat		*regions;
++};
++
++void *
++raid_tier_heat_create(uint64_t num_blocks, uint64_t region_blocks)
++{
++	struct raid_tier_heat *h;
++
++	if (region_blocks == 0) {
++		return NULL;
++	}
++	h = calloc(1, sizeof(*h));
++	if (h == NULL) {
++		return NULL;
++	}
++	h->region_blocks = region_blocks;
++	h->num_regions = spdk_divide_round_up(num_blocks, region_blocks);
++	h->regions = calloc(h->num_regions, sizeof(*h->regions));
++	if (h->regions == NULL) {
++		free(h);
++		return NULL;
++	}
++	return h;
++}
++
++void
++raid_tier_heat_destroy(void *heat)
++{
++	struct raid_tier_heat *h = heat;
++
++	if (h == NULL) {
++		return;
++	}
++	free(h->regions);
++	free(h);
++}
++
++/* Hot path: cheap, racy increment (approximate counts tolerated). */
++void
++raid_tier_heat_record(void *heat, uint64_t offset_blocks, bool is_write)
++{
++	struct raid_tier_heat *h = heat;
++	uint64_t region;
++
++	if (spdk_unlikely(h == NULL)) {
++		return;
++	}
++	region = offset_blocks / h->region_blocks;
++	if (spdk_unlikely(region >= h->num_regions)) {
++		return;
++	}
++	if (is_write) {
++		h->regions[region].writes++;
++	} else {
++		h->regions[region].reads++;
++	}
++	h->regions[region].last_tick = ++h->tick;
++}
++
++/* ---- lookup ---------------------------------------------------------------- */
++
++static struct raid_bdev *
++raid_heat_find(const char *name)
++{
++	struct raid_bdev *raid_bdev;
++
++	TAILQ_FOREACH(raid_bdev, &g_raid_bdev_list, global_link) {
++		if (raid_bdev->bdev.name != NULL && strcmp(raid_bdev->bdev.name, name) == 0) {
++			return raid_bdev;
++		}
++	}
++	return NULL;
++}
++
++/* ---- RPC: vbdev_nexus_enable_heat {name, region_mib} ----------------------- */
++
++struct rpc_heat_enable {
++	char     *name;
++	uint32_t  region_mib;
++};
++
++static const struct spdk_json_object_decoder rpc_heat_enable_decoders[] = {
++	{"name", offsetof(struct rpc_heat_enable, name), spdk_json_decode_string},
++	{"region_mib", offsetof(struct rpc_heat_enable, region_mib), spdk_json_decode_uint32, true},
++};
++
++static void
++rpc_vbdev_nexus_enable_heat(struct spdk_jsonrpc_request *request, const struct spdk_json_val *params)
++{
++	struct rpc_heat_enable req = { .region_mib = 64 };
++	struct raid_bdev *raid_bdev;
++	uint64_t region_blocks;
++
++	if (spdk_json_decode_object(params, rpc_heat_enable_decoders,
++				    SPDK_COUNTOF(rpc_heat_enable_decoders), &req)) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS, "decode failed");
++		goto cleanup;
++	}
++	if (req.region_mib == 0) {
++		req.region_mib = 64;
++	}
++	raid_bdev = raid_heat_find(req.name);
++	if (raid_bdev == NULL) {
++		spdk_jsonrpc_send_error_response(request, -ENODEV, "nexus not found");
++		goto cleanup;
++	}
++	if (raid_bdev->tier_heat == NULL) {
++		region_blocks = ((uint64_t)req.region_mib << 20) / raid_bdev->bdev.blocklen;
++		if (region_blocks == 0) {
++			region_blocks = 1;
++		}
++		raid_bdev->tier_heat = raid_tier_heat_create(raid_bdev->bdev.blockcnt, region_blocks);
++		if (raid_bdev->tier_heat == NULL) {
++			spdk_jsonrpc_send_error_response(request, -ENOMEM, "heat alloc failed");
++			goto cleanup;
++		}
++	}
++	spdk_jsonrpc_send_bool_response(request, true);
++cleanup:
++	free(req.name);
++}
++SPDK_RPC_REGISTER("vbdev_nexus_enable_heat", rpc_vbdev_nexus_enable_heat, SPDK_RPC_RUNTIME)
++
++/* ---- RPC: vbdev_nexus_disable_heat {name} --------------------------------- */
++
++struct rpc_heat_name { char *name; };
++static const struct spdk_json_object_decoder rpc_heat_name_decoders[] = {
++	{"name", offsetof(struct rpc_heat_name, name), spdk_json_decode_string},
++};
++
++static void
++rpc_vbdev_nexus_disable_heat(struct spdk_jsonrpc_request *request, const struct spdk_json_val *params)
++{
++	struct rpc_heat_name req = {};
++	struct raid_bdev *raid_bdev;
++
++	if (spdk_json_decode_object(params, rpc_heat_name_decoders,
++				    SPDK_COUNTOF(rpc_heat_name_decoders), &req)) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS, "decode failed");
++		goto cleanup;
++	}
++	raid_bdev = raid_heat_find(req.name);
++	if (raid_bdev != NULL) {
++		/* Stop the hot path by clearing the pointer. We intentionally do NOT free
++		 * here: an in-flight record() may still hold the old array. The array is
++		 * reclaimed at nexus teardown (no I/O in flight). Disable is a rare admin
++		 * op, so the transient orphan is acceptable (avoids a use-after-free). */
++		raid_bdev->tier_heat = NULL;
++	}
++	spdk_jsonrpc_send_bool_response(request, true);
++cleanup:
++	free(req.name);
++}
++SPDK_RPC_REGISTER("vbdev_nexus_disable_heat", rpc_vbdev_nexus_disable_heat, SPDK_RPC_RUNTIME)
++
++/* ---- RPC: vbdev_nexus_get_heat {name, start_region, max_regions} ----------- */
++
++struct rpc_heat_get {
++	char     *name;
++	uint64_t  start_region;
++	uint32_t  max_regions;
++};
++
++static const struct spdk_json_object_decoder rpc_heat_get_decoders[] = {
++	{"name", offsetof(struct rpc_heat_get, name), spdk_json_decode_string},
++	{"start_region", offsetof(struct rpc_heat_get, start_region), spdk_json_decode_uint64, true},
++	{"max_regions", offsetof(struct rpc_heat_get, max_regions), spdk_json_decode_uint32, true},
++};
++
++#define HEAT_GET_DEFAULT_MAX 8192u
++
++static void
++rpc_vbdev_nexus_get_heat(struct spdk_jsonrpc_request *request, const struct spdk_json_val *params)
++{
++	struct rpc_heat_get req = { .start_region = 0, .max_regions = HEAT_GET_DEFAULT_MAX };
++	struct raid_bdev *raid_bdev;
++	struct raid_tier_heat *h;
++	struct spdk_json_write_ctx *w;
++	uint64_t r, emitted = 0, next_cursor = 0;
++
++	if (spdk_json_decode_object(params, rpc_heat_get_decoders,
++				    SPDK_COUNTOF(rpc_heat_get_decoders), &req)) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS, "decode failed");
++		goto cleanup;
++	}
++	if (req.max_regions == 0) {
++		req.max_regions = HEAT_GET_DEFAULT_MAX;
++	}
++	raid_bdev = raid_heat_find(req.name);
++	if (raid_bdev == NULL || raid_bdev->tier_heat == NULL) {
++		spdk_jsonrpc_send_error_response(request, -ENODEV, "nexus/heat not found");
++		goto cleanup;
++	}
++	h = raid_bdev->tier_heat;
++
++	w = spdk_jsonrpc_begin_result(request);
++	spdk_json_write_object_begin(w);
++	spdk_json_write_named_uint64(w, "region_blocks", h->region_blocks);
++	spdk_json_write_named_uint64(w, "num_regions", h->num_regions);
++	spdk_json_write_named_uint64(w, "tick", h->tick);
++	spdk_json_write_named_array_begin(w, "regions");
++	for (r = req.start_region; r < h->num_regions; r++) {
++		if (h->regions[r].reads == 0 && h->regions[r].writes == 0) {
++			continue;	/* cold/untouched */
++		}
++		if (emitted >= req.max_regions) {
++			next_cursor = r;
++			break;
++		}
++		spdk_json_write_object_begin(w);
++		spdk_json_write_named_uint64(w, "region", r);
++		spdk_json_write_named_uint64(w, "reads", h->regions[r].reads);
++		spdk_json_write_named_uint64(w, "writes", h->regions[r].writes);
++		spdk_json_write_named_uint64(w, "last_tick", h->regions[r].last_tick);
++		spdk_json_write_object_end(w);
++		emitted++;
++	}
++	spdk_json_write_array_end(w);
++	spdk_json_write_named_uint64(w, "next_cursor", next_cursor);
++	spdk_json_write_object_end(w);
++	spdk_jsonrpc_end_result(request, w);
++cleanup:
++	free(req.name);
++}
++SPDK_RPC_REGISTER("vbdev_nexus_get_heat", rpc_vbdev_nexus_get_heat, SPDK_RPC_RUNTIME)
+-- 
+2.50.1 (Apple Git-155)
+
