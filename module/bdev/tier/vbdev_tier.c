@@ -168,7 +168,7 @@ tier_init_ext_io_opts(struct spdk_bdev_io *bdev_io, struct spdk_bdev_ext_io_opts
 /* Submit one read/write leg to a band at the given band-relative offset. */
 static int
 tier_submit_leg(struct vbdev_tier *t, struct tier_io_channel *tch, struct spdk_bdev_io *bdev_io,
-		struct tier_band *band, uint64_t band_offset, bool is_write)
+		struct tier_band *band, uint64_t base_phys, bool is_write)
 {
 	struct spdk_io_channel *base_ch = tch->base_ch[band->band_id];
 	struct spdk_bdev_ext_io_opts io_opts;
@@ -182,12 +182,12 @@ tier_submit_leg(struct vbdev_tier *t, struct tier_io_channel *tch, struct spdk_b
 
 	if (is_write) {
 		return spdk_bdev_writev_blocks_ext(band->desc, base_ch, bdev_io->u.bdev.iovs,
-						   bdev_io->u.bdev.iovcnt, band_offset,
+						   bdev_io->u.bdev.iovcnt, base_phys,
 						   bdev_io->u.bdev.num_blocks, _tier_leg_complete,
 						   bdev_io, &io_opts);
 	}
 	return spdk_bdev_readv_blocks_ext(band->desc, base_ch, bdev_io->u.bdev.iovs,
-					  bdev_io->u.bdev.iovcnt, band_offset,
+					  bdev_io->u.bdev.iovcnt, base_phys,
 					  bdev_io->u.bdev.num_blocks, _tier_leg_complete,
 					  bdev_io, &io_opts);
 }
@@ -218,12 +218,13 @@ tier_route_rw(struct vbdev_tier *t, struct tier_io_channel *tch, struct spdk_bde
 		/* The md region maps to band-relative offset == composite offset for
 		 * both mirror bands (they reserve [0, md_num_blocks) at their start). */
 		if (!is_write) {
-			/* Read from primary; fall back to secondary if primary degraded. */
+			/* Read from primary; fall back to secondary if primary degraded.
+			 * md maps to base-physical [sb_blocks, sb_blocks+md) on both mirror bands. */
 			struct tier_band *src = (band->state == TIER_BAND_ACTIVE) ? band : band_b;
 			io_ctx->remaining = 1;
-			rc = tier_submit_leg(t, tch, bdev_io, src, offset, false);
+			rc = tier_submit_leg(t, tch, bdev_io, src, t->sb_blocks + offset, false);
 			if (rc != 0 && src == band && band_b->state == TIER_BAND_ACTIVE) {
-				rc = tier_submit_leg(t, tch, bdev_io, band_b, offset, false);
+				rc = tier_submit_leg(t, tch, bdev_io, band_b, t->sb_blocks + offset, false);
 			}
 			return rc;
 		}
@@ -239,13 +240,13 @@ tier_route_rw(struct vbdev_tier *t, struct tier_io_channel *tch, struct spdk_bde
 			return -EIO;
 		}
 		if (band->state == TIER_BAND_ACTIVE) {
-			rc = tier_submit_leg(t, tch, bdev_io, band, offset, true);
+			rc = tier_submit_leg(t, tch, bdev_io, band, t->sb_blocks + offset, true);
 			if (rc != 0) {
 				return rc;
 			}
 		}
 		if (band_b->state == TIER_BAND_ACTIVE) {
-			rc = tier_submit_leg(t, tch, bdev_io, band_b, offset, true);
+			rc = tier_submit_leg(t, tch, bdev_io, band_b, t->sb_blocks + offset, true);
 			if (rc != 0) {
 				return rc;
 			}
@@ -265,7 +266,7 @@ tier_route_rw(struct vbdev_tier *t, struct tier_io_channel *tch, struct spdk_bde
 		return -EINVAL;
 	}
 	io_ctx->remaining = 1;
-	return tier_submit_leg(t, tch, bdev_io, band, band_off, is_write);
+	return tier_submit_leg(t, tch, bdev_io, band, band->phys_offset + band_off, is_write);
 }
 
 static void
@@ -333,15 +334,15 @@ vbdev_tier_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_
 		io_ctx->status = SPDK_BDEV_IO_STATUS_SUCCESS;
 		if (bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE_ZEROES) {
 			rc = spdk_bdev_write_zeroes_blocks(band->desc, tch->base_ch[band->band_id],
-							   band_off, bdev_io->u.bdev.num_blocks,
+							   band->phys_offset + band_off, bdev_io->u.bdev.num_blocks,
 							   _tier_leg_complete, bdev_io);
 		} else if (bdev_io->type == SPDK_BDEV_IO_TYPE_UNMAP) {
 			rc = spdk_bdev_unmap_blocks(band->desc, tch->base_ch[band->band_id],
-						    band_off, bdev_io->u.bdev.num_blocks,
+						    band->phys_offset + band_off, bdev_io->u.bdev.num_blocks,
 						    _tier_leg_complete, bdev_io);
 		} else {
 			rc = spdk_bdev_flush_blocks(band->desc, tch->base_ch[band->band_id],
-						    band_off, bdev_io->u.bdev.num_blocks,
+						    band->phys_offset + band_off, bdev_io->u.bdev.num_blocks,
 						    _tier_leg_complete, bdev_io);
 		}
 		break;
@@ -551,8 +552,7 @@ vbdev_tier_add_band(struct vbdev_tier *t, const char *base_bdev_name, enum tier_
 {
 	struct tier_band *band;
 	struct spdk_bdev *base_bdev;
-	uint64_t usable_blocks, lba_start;
-	bool is_md_band;
+	uint64_t usable_blocks;
 	int rc;
 
 	band = calloc(1, sizeof(*band));
@@ -578,6 +578,10 @@ vbdev_tier_add_band(struct vbdev_tier *t, const char *base_bdev_name, enum tier_
 		free(band);
 		return -EINVAL;
 	}
+	/* Reserve a superblock region at the start of EACH base bdev (INV-T1). */
+	if (t->sb_blocks == 0) {
+		t->sb_blocks = spdk_divide_round_up(TIER_SB_RESERVE_BYTES, t->blocklen);
+	}
 
 	rc = spdk_bdev_module_claim_bdev(base_bdev, band->desc, &tier_if);
 	if (rc != 0) {
@@ -598,37 +602,54 @@ vbdev_tier_add_band(struct vbdev_tier *t, const char *base_bdev_name, enum tier_
 		snprintf(band->serial, sizeof(band->serial), "%s", serial);
 	}
 
-	/* The first two bands also host the mirrored md region at their start; the md
-	 * blocks are NOT additionally part of the concat data space for band B (the
-	 * mirror), and for band A the data starts after the md region. */
-	is_md_band = (t->md_mirror_a == UINT32_MAX) || (t->md_mirror_b == UINT32_MAX);
+	/* Geometry. Each disk reserves [0, sb_blocks) for the superblock; usable =
+	 * blockcnt - sb_blocks. The first two bands additionally host the mirrored md
+	 * region [0, md_num_blocks) of the composite at base-physical
+	 * [sb_blocks, sb_blocks+md_num_blocks); their DATA contribution follows. */
+	if (base_bdev->blockcnt <= t->sb_blocks) {
+		SPDK_ERRLOG("tier: band '%s' too small for superblock reserve\n", base_bdev_name);
+		spdk_bdev_module_release_bdev(base_bdev);
+		spdk_bdev_close(band->desc);
+		free(band);
+		return -ENOSPC;
+	}
+	usable_blocks = base_bdev->blockcnt - t->sb_blocks;
 
 	if (t->md_mirror_a == UINT32_MAX) {
+		/* Band A: hosts the md region (counted ONCE in the composite) + a data tail. */
+		if (usable_blocks <= t->md_num_blocks) {
+			SPDK_ERRLOG("tier: band '%s' too small for md region\n", base_bdev_name);
+			spdk_bdev_module_release_bdev(base_bdev);
+			spdk_bdev_close(band->desc);
+			free(band);
+			return -ENOSPC;
+		}
 		t->md_mirror_a = band->band_id;
-		/* Composite md region occupies [0, md_num_blocks); this band's data
-		 * follows it. */
-		lba_start = 0;
-		usable_blocks = base_bdev->blockcnt;	/* md region + its own data tail */
-		band->lba_start = 0;
-		band->num_blocks = usable_blocks;
-		t->total_num_blocks = usable_blocks;
+		t->total_num_blocks = t->md_num_blocks;		/* md region occupies [0, md) */
+		band->lba_start = t->md_num_blocks;		/* this band's data tail follows md */
+		band->num_blocks = usable_blocks - t->md_num_blocks;
+		band->phys_offset = t->sb_blocks + t->md_num_blocks;
+		t->total_num_blocks += band->num_blocks;
 	} else if (t->md_mirror_b == UINT32_MAX) {
+		/* Band B: hosts the md MIRROR (not re-counted) + a data tail. */
+		if (usable_blocks <= t->md_num_blocks) {
+			SPDK_ERRLOG("tier: band '%s' too small for md mirror\n", base_bdev_name);
+			spdk_bdev_module_release_bdev(base_bdev);
+			spdk_bdev_close(band->desc);
+			free(band);
+			return -ENOSPC;
+		}
 		t->md_mirror_b = band->band_id;
-		/* Mirror copy of md lives at this band's [0, md_num_blocks); its data
-		 * contribution to the concat starts at md_num_blocks and is appended. */
-		lba_start = t->total_num_blocks;
-		usable_blocks = (base_bdev->blockcnt > t->md_num_blocks) ?
-				(base_bdev->blockcnt - t->md_num_blocks) : 0;
-		band->lba_start = lba_start;
-		band->num_blocks = usable_blocks;
-		t->total_num_blocks += usable_blocks;
-		(void)is_md_band;
+		band->lba_start = t->total_num_blocks;
+		band->num_blocks = usable_blocks - t->md_num_blocks;
+		band->phys_offset = t->sb_blocks + t->md_num_blocks;
+		t->total_num_blocks += band->num_blocks;
 	} else {
-		lba_start = t->total_num_blocks;
-		usable_blocks = base_bdev->blockcnt;
-		band->lba_start = lba_start;
+		/* Plain concat band. */
+		band->lba_start = t->total_num_blocks;
 		band->num_blocks = usable_blocks;
-		t->total_num_blocks += usable_blocks;
+		band->phys_offset = t->sb_blocks;
+		t->total_num_blocks += band->num_blocks;
 	}
 
 	TAILQ_INSERT_TAIL(&t->bands, band, link);
@@ -669,7 +690,7 @@ vbdev_tier_retire_band(struct vbdev_tier *t, uint32_t band_id)
 int
 vbdev_tier_delete(struct vbdev_tier *t)
 {
-	if (t->bdev.blockcnt != 0) {
+	if (t->registered) {
 		/* registered: unregister triggers destruct (frees bands + node) */
 		spdk_bdev_unregister(&t->bdev, NULL, NULL);
 	} else {
@@ -701,8 +722,9 @@ vbdev_tier_register(struct vbdev_tier *t)
 		spdk_io_device_unregister(t, NULL);
 		return rc;
 	}
-	SPDK_NOTICELOG("tier '%s' registered: %u bands, %" PRIu64 " blocks of %u bytes\n",
-		       t->bdev.name, t->num_bands, t->bdev.blockcnt, t->bdev.blocklen);
+	t->registered = true;
+	SPDK_NOTICELOG("tier '%s' registered: %u bands, %" PRIu64 " blocks of %u bytes (sb_blocks=%u)\n",
+		       t->bdev.name, t->num_bands, t->bdev.blockcnt, t->bdev.blocklen, t->sb_blocks);
 	return 0;
 }
 

@@ -54,7 +54,47 @@ enum tier_band_state {
 
 #define TIER_WWN_LEN		64
 #define TIER_SERIAL_LEN		64
-#define TIER_MAX_BANDS		256
+#define TIER_BDEV_NAME_LEN	64
+#define TIER_MAX_BANDS		64	/* per node; a node won't exceed this many disks */
+
+/* ---- On-disk superblock (INV-T1: at native SPDK level, à la bdev_raid_sb) ----
+ * One copy is written into a RESERVED region at the start of EACH base bdev. Each
+ * copy self-describes the WHOLE composite, so any present band can drive
+ * self-assembly via the examine path (no CSI needed to assemble). The reserved
+ * region falls inside the mirrored md range, so it is itself RAID1-protected.
+ * Disk identity (wwn) is validated at assembly to detect swap/replacement. */
+#define TIER_SB_MAGIC		0x5449455253423031ULL	/* "TIERSB01" */
+#define TIER_SB_VERSION		1u
+#define TIER_SB_RESERVE_BYTES	(256 * 1024)		/* reserved per base bdev for the sb */
+
+/* On-disk band descriptor (packed, stable layout). */
+struct tier_sb_band {
+	uint32_t	band_id;
+	uint32_t	tier;		/* enum tier_class */
+	uint32_t	state;		/* enum tier_band_state */
+	uint32_t	reserved0;
+	uint64_t	lba_start;	/* position in the composite address space */
+	uint64_t	num_blocks;
+	char		wwn[TIER_WWN_LEN];
+	char		serial[TIER_SERIAL_LEN];
+};
+
+/* On-disk superblock (identical content on every band). */
+struct tier_superblock {
+	uint64_t	magic;
+	uint32_t	version;
+	uint32_t	crc;		/* CRC32c over the whole struct with crc field = 0 */
+	uint64_t	seq;		/* monotone; on conflict, highest seq wins */
+	char		composite_name[TIER_BDEV_NAME_LEN];
+	uint64_t	md_num_blocks;	/* size of the mirrored md region (composite blocks) */
+	uint32_t	md_mirror_a;	/* band slot ids holding the md RAID1 pair */
+	uint32_t	md_mirror_b;
+	uint32_t	num_bands;
+	uint32_t	this_band_id;	/* which band slot this copy physically sits on */
+	uint32_t	blocklen;	/* common block size */
+	uint32_t	reserved1;
+	struct tier_sb_band bands[TIER_MAX_BANDS];
+};
 
 /*
  * One band == one physical base bdev. bandId is a STABLE monotone slot,
@@ -66,13 +106,15 @@ struct tier_band {
 	enum tier_class		tier;
 	enum tier_band_state	state;
 
-	char			base_bdev_name[SPDK_BDEV_MAX_NAME_LENGTH];
+	char			base_bdev_name[TIER_BDEV_NAME_LEN];
 	char			wwn[TIER_WWN_LEN];	/* disk identity — detect a swapped disk in a slot */
 	char			serial[TIER_SERIAL_LEN];
 
 	/* Position in the composite linear address space (in blocks). */
-	uint64_t		lba_start;
+	uint64_t		lba_start;	/* composite start of this band's contribution */
 	uint64_t		num_blocks;	/* usable blocks contributed by this band */
+	uint64_t		phys_offset;	/* base-bdev physical block where lba_start maps
+						 * (>= sb_blocks; mirror band A adds md_num_blocks) */
 
 	/* Open handle to the underlying disk (NULL while retired). */
 	struct spdk_bdev_desc	*desc;
@@ -98,7 +140,10 @@ struct vbdev_tier {
 	uint32_t		md_mirror_b;
 
 	uint32_t		blocklen;	/* common block size of all bands (must match) */
-	uint64_t		total_num_blocks;	/* md region + Σ data bands */
+	uint32_t		sb_blocks;	/* reserved superblock blocks at the start of EACH base bdev */
+	uint64_t		seq;		/* current superblock generation (monotone) */
+	uint64_t		total_num_blocks;	/* md region + Σ data bands (excludes per-disk sb reserve) */
+	bool			registered;
 
 	TAILQ_ENTRY(vbdev_tier)	link;
 };
