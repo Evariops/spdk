@@ -52,6 +52,7 @@ struct tier_bdev_io {
 
 static void vbdev_tier_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io);
 static int vbdev_tier_destruct(void *ctx);
+static void tier_sb_persist_cb(void *cb_arg, int rc);
 
 /* --------------------------------------------------------------------------
  * Band table lookups
