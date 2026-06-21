@@ -28,7 +28,7 @@ new file mode 100644
 index 000000000..3caf17bc6
 --- /dev/null
 +++ b/module/bdev/lvol/vbdev_lvol_tier_rpc.c
-@@ -0,0 +1,312 @@
+@@ -0,0 +1,322 @@
 +/*   SPDX-License-Identifier: BSD-3-Clause
 + *   Copyright (C) 2026 Evariops.
 + *   All rights reserved.
@@ -293,6 +293,17 @@ index 000000000..3caf17bc6
 +		goto cleanup;
 +	}
 +	blob = lvol->blob;
++	/* SPEC-73 A1 (data-safety): refuse to relocate a cluster of a SNAPSHOT blob. A snapshot's
++	 * clusters are read-through-shared by its clones via back_bs_dev; moving one would require
++	 * re-resolving every clone's backing device (snapshot tiering, §7.3 — out of v1 scope) and,
++	 * without it, corrupts the clones' view. Owned (non-snapshot) blobs hold private clusters and
++	 * are safe. The md-thread serialization of relocate_commit additionally excludes the transient
++	 * clone/snapshot sharing window of delete_snapshot. */
++	if (spdk_blob_is_snapshot(blob)) {
++		spdk_jsonrpc_send_error_response(request, -EBUSY,
++			"cluster belongs to a snapshot (shared via clones); relocate refused");
++		goto cleanup;
++	}
 +	cluster_size = spdk_bs_get_cluster_size(lvol->lvol_store->blobstore);
 +	blocklen = spdk_bdev_get_block_size(bdev);
 +	if (blocklen == 0) {
