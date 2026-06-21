@@ -18,6 +18,7 @@ on:
     paths:
       - "images/spdk/**"
       - "module/bdev/cbt/**"
+      - "module/bdev/tier/**"
       - "patches/**"
       - ".github/workflows/spdk.yml"
   pull_request:
@@ -25,6 +26,7 @@ on:
     paths:
       - "images/spdk/**"
       - "module/bdev/cbt/**"
+      - "module/bdev/tier/**"
       - "patches/**"
       - ".github/workflows/spdk.yml"
   workflow_dispatch:
