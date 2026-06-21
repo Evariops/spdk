@@ -1,0 +1,55 @@
+diff --git a/module/bdev/raid/raid5f.c b/module/bdev/raid/raid5f.c
+index 0a2274fc2..adb2cfd0b 100644
+--- a/module/bdev/raid/raid5f.c
++++ b/module/bdev/raid/raid5f.c
+@@ -649,15 +649,48 @@ raid5f_submit_write_request(struct raid_bdev_io *raid_io, uint64_t stripe_index)
+ 	return 0;
+ }
+ 
++/* SPEC-73 M3: forward declarations so the read-completion path can fall back to
++ * a degraded reconstruct read (both defined later in this file). */
++static int raid5f_submit_reconstruct_read(struct raid_bdev_io *raid_io, uint64_t stripe_index,
++		uint8_t chunk_idx, uint64_t chunk_offset, stripe_req_xor_cb cb);
++static void raid5f_stripe_request_reconstruct_xor_done(struct stripe_request *stripe_req, int status);
++
+ static void
+ raid5f_chunk_read_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+ {
+ 	struct raid_bdev_io *raid_io = cb_arg;
++	struct raid_bdev *raid_bdev;
++	struct raid5f_info *r5f_info;
++	uint64_t stripe_index, stripe_offset, chunk_offset;
++	uint8_t chunk_data_idx, p_idx, chunk_idx;
++	int ret;
+ 
+ 	spdk_bdev_free_io(bdev_io);
+ 
+-	raid_bdev_io_complete(raid_io, success ? SPDK_BDEV_IO_STATUS_SUCCESS :
+-			      SPDK_BDEV_IO_STATUS_FAILED);
++	if (spdk_likely(success)) {
++		raid_bdev_io_complete(raid_io, SPDK_BDEV_IO_STATUS_SUCCESS);
++		return;
++	}
++
++	/* A PRESENT member returned a read error (e.g. a degraded band of the
++	 * bdev_tier composite). Fall back to a degraded read: reconstruct this chunk
++	 * from the survivors + parity instead of failing. The direct read path did
++	 * not touch base_bdev_io_submitted, so the reconstruct path starts clean. */
++	raid_bdev = raid_io->raid_bdev;
++	r5f_info = raid_bdev->module_private;
++	stripe_index = raid_io->offset_blocks / r5f_info->stripe_blocks;
++	stripe_offset = raid_io->offset_blocks % r5f_info->stripe_blocks;
++	chunk_data_idx = stripe_offset >> raid_bdev->strip_size_shift;
++	p_idx = raid5f_stripe_parity_chunk_index(raid_bdev, stripe_index);
++	chunk_idx = chunk_data_idx < p_idx ? chunk_data_idx : chunk_data_idx + 1;
++	chunk_offset = stripe_offset - ((uint64_t)chunk_data_idx << raid_bdev->strip_size_shift);
++
++	ret = raid5f_submit_reconstruct_read(raid_io, stripe_index, chunk_idx, chunk_offset,
++					     raid5f_stripe_request_reconstruct_xor_done);
++	if (ret != 0) {
++		raid_bdev_io_complete(raid_io, ret == -ENOMEM ? SPDK_BDEV_IO_STATUS_NOMEM :
++				      SPDK_BDEV_IO_STATUS_FAILED);
++	}
+ }
+ 
+ static void raid5f_submit_rw_request(struct raid_bdev_io *raid_io);
