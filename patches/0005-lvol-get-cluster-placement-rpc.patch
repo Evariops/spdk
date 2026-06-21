@@ -1,12 +1,12 @@
 From 906c5213cfc58b0158ea2b6c559760a6e717cf68 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?Rapha=C3=ABl=20DUCOM?= <raphael.ducom@gmail.com>
 Date: Sun, 21 Jun 2026 14:36:21 +0200
-Subject: [PATCH] m2: get_cluster_placement + relocate_cluster RPCs
+Subject: [PATCH] m2: get_cluster_placement + relocate_cluster + remap_cluster RPCs
 
 ---
  module/bdev/lvol/Makefile              |   3 +-
- module/bdev/lvol/vbdev_lvol_tier_rpc.c | 312 +++++++++++++++++++++++++
- 2 files changed, 314 insertions(+), 1 deletion(-)
+ module/bdev/lvol/vbdev_lvol_tier_rpc.c | 500 +++++++++++++++++++++++++
+ 2 files changed, 502 insertions(+), 1 deletion(-)
  create mode 100644 module/bdev/lvol/vbdev_lvol_tier_rpc.c
 
 diff --git a/module/bdev/lvol/Makefile b/module/bdev/lvol/Makefile
@@ -16,24 +16,25 @@ index aba6620dc..a8ed3873d 100644
 @@ -9,7 +9,8 @@ include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
  SO_VER := 7
  SO_MINOR := 0
- 
+
 -C_SRCS = vbdev_lvol.c vbdev_lvol_rpc.c vbdev_lvol_ranges_rpc.c
 +CFLAGS += -I$(SPDK_ROOT_DIR)/module/bdev/tier
 +C_SRCS = vbdev_lvol.c vbdev_lvol_rpc.c vbdev_lvol_ranges_rpc.c vbdev_lvol_tier_rpc.c
  LIBNAME = bdev_lvol
- 
+
  SPDK_MAP_FILE = $(SPDK_ROOT_DIR)/mk/spdk_blank.map
 diff --git a/module/bdev/lvol/vbdev_lvol_tier_rpc.c b/module/bdev/lvol/vbdev_lvol_tier_rpc.c
 new file mode 100644
 index 000000000..3caf17bc6
 --- /dev/null
 +++ b/module/bdev/lvol/vbdev_lvol_tier_rpc.c
-@@ -0,0 +1,320 @@
+@@ -0,0 +1,500 @@
 +/*   SPDX-License-Identifier: BSD-3-Clause
 + *   Copyright (C) 2026 Evariops.
 + *   All rights reserved.
 + *
-+ *   SPEC-73 M2a/M2b: bdev_lvol_get_cluster_placement + bdev_lvol_relocate_cluster.
++ *   SPEC-73 M2a/M2b: bdev_lvol_get_cluster_placement + bdev_lvol_relocate_cluster
++ *   + bdev_lvol_remap_cluster (F6).
 + *
 + *   Placement (M2a): per allocated cluster -> physical LBA on the bs_dev (the
 + *   bdev_tier composite); the control-plane maps LBA->band/tier from its band
@@ -46,10 +47,15 @@ index 000000000..3caf17bc6
 + *     claim dst -> quiesce old (composite) -> copy (base-direct) ->
 + *     commit (md-thread swap+persist+release old) -> unquiesce.
 + *   Crash-safety: invariants A/B inside spdk_blob_relocate_commit.
++ *
++ *   F2: a SNAPSHOT blob's clusters may be shared (clones read through back_bs_dev),
++ *   so relocate/remap REFUSE snapshot blobs (owned-only, the v3 invariant).
++ *   F4: at most one relocate/remap in flight per blob (self-safe primitive).
 + */
 +
 +#include "spdk/rpc.h"
 +#include "spdk/util.h"
++#include "spdk/queue.h"
 +#include "spdk/string.h"
 +#include "spdk/blob.h"
 +#include "spdk/bdev.h"
@@ -59,6 +65,51 @@ index 000000000..3caf17bc6
 +
 +#define RPC_PLACEMENT_DEFAULT_MAX 4096u
 +#define RPC_PLACEMENT_HARD_MAX    1048576u
++
++/* ===================== F4: per-blob relocate serialization ===================== */
++/* Two in-flight relocate/remap ops on the SAME blob can issue two concurrent extent-page device
++ * writes (the commit re-points an extent page); a reordered completion loses one update -> an
++ * orphaned/stale cluster -> corruption. The saga fence serializes per VOLUME, but make the
++ * primitive self-safe too: at most one relocate/remap in flight per blob. The JSON-RPC handlers
++ * run on a single reactor thread, so no lock is needed. */
++struct relocate_inflight {
++	struct spdk_blob		*blob;
++	TAILQ_ENTRY(relocate_inflight)	link;
++};
++static TAILQ_HEAD(, relocate_inflight) g_relocate_inflight = TAILQ_HEAD_INITIALIZER(g_relocate_inflight);
++
++static bool
++relocate_blob_acquire(struct spdk_blob *blob)
++{
++	struct relocate_inflight *e;
++
++	TAILQ_FOREACH(e, &g_relocate_inflight, link) {
++		if (e->blob == blob) {
++			return false;	/* already in flight on this blob */
++		}
++	}
++	e = calloc(1, sizeof(*e));
++	if (e == NULL) {
++		return false;
++	}
++	e->blob = blob;
++	TAILQ_INSERT_TAIL(&g_relocate_inflight, e, link);
++	return true;
++}
++
++static void
++relocate_blob_release(struct spdk_blob *blob)
++{
++	struct relocate_inflight *e;
++
++	TAILQ_FOREACH(e, &g_relocate_inflight, link) {
++		if (e->blob == blob) {
++			TAILQ_REMOVE(&g_relocate_inflight, e, link);
++			free(e);
++			return;
++		}
++	}
++}
 +
 +/* ===================== M2a: get_cluster_placement ===================== */
 +
@@ -138,7 +189,7 @@ index 000000000..3caf17bc6
 +SPDK_RPC_REGISTER("bdev_lvol_get_cluster_placement", rpc_bdev_lvol_get_cluster_placement,
 +		  SPDK_RPC_RUNTIME)
 +
-+/* ===================== M2b: relocate_cluster ========================== */
++/* ===================== M2b: relocate_cluster / remap_cluster shared decode ===== */
 +
 +struct rpc_lvol_relocate {
 +	char     *name;
@@ -175,6 +226,7 @@ index 000000000..3caf17bc6
 +{
 +	struct spdk_json_write_ctx *w;
 +
++	relocate_blob_release(c->blob);	/* F4: clear the per-blob in-flight guard */
 +	if (rc == 0) {
 +		w = spdk_jsonrpc_begin_result(c->request);
 +		spdk_json_write_object_begin(w);
@@ -293,15 +345,16 @@ index 000000000..3caf17bc6
 +		goto cleanup;
 +	}
 +	blob = lvol->blob;
-+	/* SPEC-73 C6 (snapshot tiering, §7.3): relocating a SNAPSHOT blob's cluster is permitted.
-+	 * Coherence for clones reading THROUGH the snapshot (back_bs_dev) holds because: (1) the copy +
-+	 * swap run under quiesce of the composite OLD range, and a clone's read-through resolves to the
-+	 * snapshot blob's bs_dev (this same composite) at old_lba — so it is held by that quiesce until the
-+	 * atomic map swap, then resumes onto new_lba; (2) relocate_commit runs on the md-thread, serialized
-+	 * with snapshot create/delete/decouple, so it never observes the transient delete_snapshot sharing
-+	 * window. The snapshot's own active.clusters map is updated atomically, which is exactly what every
-+	 * read-through clone consults. ⚠️ UNVALIDATED until the S-D-snap spike (read-through under relocate)
-+	 * runs on multi-tier hardware. */
++	/* F2 (reinstates the v3 "owned-only" invariant; reverses C6): a SNAPSHOT blob's clusters may be
++	 * shared with clones reading THROUGH back_bs_dev (and delete_snapshot has a transient sharing
++	 * window). Relocating one would free `old` under a clone -> corruption. The S-D-snap spike (safe
++	 * read-through under relocate) was never validated on multi-tier HW, so refuse snapshot blobs. The
++	 * active leaf lvol's OWN allocated clusters are uniquely owned (CoW already copied), so safe. */
++	if (spdk_blob_is_snapshot(blob)) {
++		spdk_jsonrpc_send_error_response(request, -EBUSY,
++						 "cannot relocate a snapshot blob's cluster (shared with clones; F2)");
++		goto cleanup;
++	}
 +	cluster_size = spdk_bs_get_cluster_size(lvol->lvol_store->blobstore);
 +	blocklen = spdk_bdev_get_block_size(bdev);
 +	if (blocklen == 0) {
@@ -315,8 +368,15 @@ index 000000000..3caf17bc6
 +		goto cleanup;
 +	}
 +
++	if (!relocate_blob_acquire(blob)) {	/* F4: one relocate/remap per blob */
++		spdk_jsonrpc_send_error_response(request, -EBUSY,
++						 "another relocate is in flight on this blob (F4)");
++		goto cleanup;
++	}
++
 +	rc = spdk_blob_claim_cluster_in_range(blob, req.dst_lba_start, req.dst_lba_count, &new_lba);
 +	if (rc != 0) {
++		relocate_blob_release(blob);
 +		spdk_jsonrpc_send_error_response_fmt(request, rc, "no free cluster in target band: %s",
 +						     spdk_strerror(rc < 0 ? -rc : rc));
 +		goto cleanup;
@@ -325,6 +385,7 @@ index 000000000..3caf17bc6
 +	c = calloc(1, sizeof(*c));
 +	if (c == NULL) {
 +		spdk_blob_release_cluster_lba(blob, new_lba);
++		relocate_blob_release(blob);
 +		spdk_jsonrpc_send_error_response(request, -ENOMEM, "oom");
 +		goto cleanup;
 +	}
@@ -341,6 +402,7 @@ index 000000000..3caf17bc6
 +	rc = vbdev_tier_relocate_quiesce(tier, old_lba, c->cluster_blocks, relocate_quiesced, c);
 +	if (rc != 0) {
 +		spdk_blob_release_cluster_lba(blob, new_lba);
++		relocate_blob_release(blob);
 +		spdk_jsonrpc_send_error_response_fmt(request, rc, "quiesce failed: %s",
 +						     spdk_strerror(rc < 0 ? -rc : rc));
 +		free(c);
@@ -350,6 +412,122 @@ index 000000000..3caf17bc6
 +	free(req.tier_name);
 +}
 +SPDK_RPC_REGISTER("bdev_lvol_relocate_cluster", rpc_bdev_lvol_relocate_cluster, SPDK_RPC_RUNTIME)
--- 
++
++/* ===================== F6: remap_cluster (re-home a LOST cluster, no copy) ===== */
++
++struct remap_ctx {
++	struct spdk_jsonrpc_request	*request;
++	struct spdk_blob		*blob;
++	uint64_t			old_lba;
++	uint64_t			new_lba;
++	bool				claimed;
++};
++
++static void
++remap_reply(struct remap_ctx *c, int rc)
++{
++	struct spdk_json_write_ctx *w;
++
++	if (rc != 0 && c->claimed) {
++		spdk_blob_release_cluster_lba(c->blob, c->new_lba);
++	}
++	relocate_blob_release(c->blob);
++	if (rc == 0) {
++		w = spdk_jsonrpc_begin_result(c->request);
++		spdk_json_write_object_begin(w);
++		spdk_json_write_named_uint64(w, "from_lba", c->old_lba);
++		spdk_json_write_named_uint64(w, "to_lba", c->new_lba);
++		spdk_json_write_object_end(w);
++		spdk_jsonrpc_end_result(c->request, w);
++	} else {
++		spdk_jsonrpc_send_error_response_fmt(c->request, rc, "remap failed: %s",
++						     spdk_strerror(rc < 0 ? -rc : rc));
++	}
++	free(c);
++}
++
++static void
++remap_committed(void *cb_arg, int bserrno)
++{
++	struct remap_ctx *c = cb_arg;
++
++	if (bserrno == 0) {
++		c->claimed = false;	/* commit took ownership of new + released old */
++	}
++	remap_reply(c, bserrno);
++}
++
++static void
++rpc_bdev_lvol_remap_cluster(struct spdk_jsonrpc_request *request, const struct spdk_json_val *params)
++{
++	struct rpc_lvol_relocate req = {};
++	struct spdk_bdev *bdev;
++	struct spdk_lvol *lvol;
++	struct spdk_blob *blob;
++	struct remap_ctx *c;
++	uint64_t old_lba, new_lba;
++	int rc;
++
++	if (spdk_json_decode_object(params, rpc_lvol_relocate_decoders,
++				    SPDK_COUNTOF(rpc_lvol_relocate_decoders), &req)) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
++						 "spdk_json_decode_object failed");
++		goto cleanup;
++	}
++	bdev = spdk_bdev_get_by_name(req.name);
++	if (bdev == NULL || (lvol = vbdev_lvol_get_from_bdev(bdev)) == NULL) {
++		spdk_jsonrpc_send_error_response(request, -ENODEV, "lvol not found");
++		goto cleanup;
++	}
++	blob = lvol->blob;
++	if (spdk_blob_is_snapshot(blob)) {	/* F2 */
++		spdk_jsonrpc_send_error_response(request, -EBUSY, "cannot remap a snapshot blob's cluster (F2)");
++		goto cleanup;
++	}
++	/* F6: re-home a cluster whose band DIED (unreadable) onto a healthy band WITHOUT copying — the
++	 * data is reconstructed afterwards by bdev_raid_rebuild_ranges writing through the nexus. We swap
++	 * the L2P to a freshly-claimed cluster on the target band and release the old (dead) cluster.
++	 * Invariant A is intentionally relaxed (no data on new yet): the cluster was ALREADY lost, the
++	 * nexus serves reads from k+m redundancy meanwhile, and the subsequent range rebuild fills new.
++	 * A crash before the rebuild leaves cn->new(uninitialised) = same "local-lost, redundancy-has-it"
++	 * state as before, re-driven next cycle. NO quiesce: the source band is dead (no in-flight to drain). */
++	old_lba = spdk_blob_get_cluster_lba(blob, req.cluster_num);
++	if (old_lba == 0) {
++		spdk_jsonrpc_send_error_response(request, -ENOENT, "cluster not allocated");
++		goto cleanup;
++	}
++	if (!relocate_blob_acquire(blob)) {	/* F4 */
++		spdk_jsonrpc_send_error_response(request, -EBUSY,
++						 "another relocate is in flight on this blob (F4)");
++		goto cleanup;
++	}
++	rc = spdk_blob_claim_cluster_in_range(blob, req.dst_lba_start, req.dst_lba_count, &new_lba);
++	if (rc != 0) {
++		relocate_blob_release(blob);
++		spdk_jsonrpc_send_error_response_fmt(request, rc, "no free cluster in target band: %s",
++						     spdk_strerror(rc < 0 ? -rc : rc));
++		goto cleanup;
++	}
++	c = calloc(1, sizeof(*c));
++	if (c == NULL) {
++		spdk_blob_release_cluster_lba(blob, new_lba);
++		relocate_blob_release(blob);
++		spdk_jsonrpc_send_error_response(request, -ENOMEM, "oom");
++		goto cleanup;
++	}
++	c->request = request;
++	c->blob = blob;
++	c->old_lba = old_lba;
++	c->new_lba = new_lba;
++	c->claimed = true;
++	rc = spdk_blob_relocate_commit(blob, req.cluster_num, new_lba, remap_committed, c);
++	if (rc != 0) {
++		remap_reply(c, rc);
++	}
++cleanup:
++	free(req.name);
++	free(req.tier_name);
++}
++SPDK_RPC_REGISTER("bdev_lvol_remap_cluster", rpc_bdev_lvol_remap_cluster, SPDK_RPC_RUNTIME)
+--
 2.50.1 (Apple Git-155)
-

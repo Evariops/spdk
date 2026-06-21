@@ -519,7 +519,7 @@ tier_base_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev, void 
  * -------------------------------------------------------------------------- */
 
 struct vbdev_tier *
-vbdev_tier_create(const char *name, uint64_t md_num_blocks)
+vbdev_tier_create(const char *name, uint64_t md_num_blocks, uint64_t cluster_blocks)
 {
 	struct vbdev_tier *t;
 
@@ -529,7 +529,10 @@ vbdev_tier_create(const char *name, uint64_t md_num_blocks)
 	}
 	TAILQ_INIT(&t->bands);
 	t->next_band_id = 0;
-	t->md_num_blocks = md_num_blocks;
+	/* F1: the md region is the FIRST boundary the blobstore crosses; round it UP to the cluster
+	 * grain so the md/data boundary is cluster-aligned. Band boundaries are aligned in add_band. */
+	t->cluster_blocks = cluster_blocks;
+	t->md_num_blocks = tier_align_up(t, md_num_blocks);
 	t->md_mirror_a = UINT32_MAX;
 	t->md_mirror_b = UINT32_MAX;
 	t->blocklen = 0;
@@ -644,9 +647,11 @@ vbdev_tier_add_band(struct vbdev_tier *t, const char *base_bdev_name, enum tier_
 			return -ENOSPC;
 		}
 		t->md_mirror_a = band->band_id;
-		t->total_num_blocks = t->md_num_blocks;		/* md region occupies [0, md) */
-		band->lba_start = t->md_num_blocks;		/* this band's data tail follows md */
-		band->num_blocks = usable_blocks - t->md_num_blocks;
+		t->total_num_blocks = t->md_num_blocks;		/* md region occupies [0, md), cluster-aligned */
+		band->lba_start = t->md_num_blocks;		/* this band's data tail follows md (aligned) */
+		/* F1: round the data contribution DOWN to the cluster grain (the trailing remainder is an
+		 * unusable hole) so the NEXT band starts cluster-aligned and no cluster straddles. */
+		band->num_blocks = tier_align_down(t, usable_blocks - t->md_num_blocks);
 		band->phys_offset = t->sb_blocks + t->md_num_blocks;
 		t->total_num_blocks += band->num_blocks;
 	} else if (t->md_mirror_b == UINT32_MAX) {
@@ -659,16 +664,25 @@ vbdev_tier_add_band(struct vbdev_tier *t, const char *base_bdev_name, enum tier_
 			return -ENOSPC;
 		}
 		t->md_mirror_b = band->band_id;
-		band->lba_start = t->total_num_blocks;
-		band->num_blocks = usable_blocks - t->md_num_blocks;
+		band->lba_start = t->total_num_blocks;		/* aligned (prior boundaries aligned) */
+		band->num_blocks = tier_align_down(t, usable_blocks - t->md_num_blocks);	/* F1 */
 		band->phys_offset = t->sb_blocks + t->md_num_blocks;
 		t->total_num_blocks += band->num_blocks;
 	} else {
 		/* Plain concat band. */
-		band->lba_start = t->total_num_blocks;
-		band->num_blocks = usable_blocks;
+		band->lba_start = t->total_num_blocks;		/* aligned */
+		band->num_blocks = tier_align_down(t, usable_blocks);	/* F1 */
 		band->phys_offset = t->sb_blocks;
 		t->total_num_blocks += band->num_blocks;
+	}
+
+	if (band->num_blocks == 0) {
+		SPDK_ERRLOG("tier: band '%s' has no cluster-aligned capacity (cluster_blocks=%" PRIu64 ")\n",
+			    base_bdev_name, t->cluster_blocks);
+		spdk_bdev_module_release_bdev(base_bdev);
+		spdk_bdev_close(band->desc);
+		free(band);
+		return -ENOSPC;
 	}
 
 	TAILQ_INSERT_TAIL(&t->bands, band, link);
@@ -825,6 +839,30 @@ vbdev_tier_register(struct vbdev_tier *t)
 	if (t->num_bands == 0 || t->blocklen == 0) {
 		return -EINVAL;
 	}
+
+	/* F1 guard: every band/region boundary MUST be cluster-aligned, else a blobstore cluster can
+	 * straddle a boundary and its I/O fails -EIO (silent corruption). Refuse to register otherwise —
+	 * turn a latent corruption into an explicit provisioning error. */
+	if (t->cluster_blocks > 1) {
+		struct tier_band *vb;
+		if (t->md_num_blocks % t->cluster_blocks != 0) {
+			SPDK_ERRLOG("tier '%s': md_num_blocks %" PRIu64 " not aligned to cluster %" PRIu64 "\n",
+				    t->bdev.name, t->md_num_blocks, t->cluster_blocks);
+			return -EINVAL;
+		}
+		TAILQ_FOREACH(vb, &t->bands, link) {
+			if (vb->state == TIER_BAND_RETIRED) {
+				continue;
+			}
+			if (vb->lba_start % t->cluster_blocks != 0 || vb->num_blocks % t->cluster_blocks != 0) {
+				SPDK_ERRLOG("tier '%s': band %u geometry (lba_start=%" PRIu64 " num_blocks=%"
+					    PRIu64 ") not cluster-aligned (%" PRIu64 ")\n", t->bdev.name,
+					    vb->band_id, vb->lba_start, vb->num_blocks, t->cluster_blocks);
+				return -EINVAL;
+			}
+		}
+	}
+
 	t->bdev.blocklen = t->blocklen;
 	t->bdev.blockcnt = t->total_num_blocks;
 
@@ -911,6 +949,30 @@ tier_copy_verify_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	tier_copy_finish(c, 0);
 }
 
+/* C5 (F8): destination flushed — now read it back from MEDIA (not the write cache) and verify. */
+static void
+tier_copy_flush_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct tier_copy_ctx *c = cb_arg;
+	int rc;
+
+	spdk_bdev_free_io(bdev_io);
+	if (!success) {
+		tier_copy_finish(c, -EIO);
+		return;
+	}
+	c->vbuf = spdk_dma_malloc(c->num_blocks * (uint64_t)c->blocklen, c->blocklen, NULL);
+	if (c->vbuf == NULL) {
+		tier_copy_finish(c, -ENOMEM);
+		return;
+	}
+	rc = spdk_bdev_read_blocks(c->dst_band->desc, c->dst_ch, c->vbuf, c->dst_phys,
+				   c->num_blocks, tier_copy_verify_done, c);
+	if (rc != 0) {
+		tier_copy_finish(c, rc);
+	}
+}
+
 static void
 tier_copy_write_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
@@ -922,14 +984,10 @@ tier_copy_write_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 		tier_copy_finish(c, -EIO);
 		return;
 	}
-	/* C5: read the destination back and verify the CRC before declaring the copy good. */
-	c->vbuf = spdk_dma_malloc(c->num_blocks * (uint64_t)c->blocklen, c->blocklen, NULL);
-	if (c->vbuf == NULL) {
-		tier_copy_finish(c, -ENOMEM);
-		return;
-	}
-	rc = spdk_bdev_read_blocks(c->dst_band->desc, c->dst_ch, c->vbuf, c->dst_phys,
-				   c->num_blocks, tier_copy_verify_done, c);
+	/* C5 (F8): FLUSH the destination so the read-back hits media (not the base-bdev write cache),
+	 * otherwise a silent MEDIA corruption would be masked by the cache. Then read back + verify CRC. */
+	rc = spdk_bdev_flush_blocks(c->dst_band->desc, c->dst_ch, c->dst_phys, c->num_blocks,
+				    tier_copy_flush_done, c);
 	if (rc != 0) {
 		tier_copy_finish(c, rc);
 	}
@@ -955,6 +1013,12 @@ tier_copy_read_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	}
 }
 
+/* F11 (accepted tradeoff): the caller runs this ENTIRE copy under quiesce of the src range (see
+ * vbdev_lvol_tier_rpc.c). That stalls user I/O on the cluster for read+flush+readback (~3× the
+ * cluster) but makes the move correct WITHOUT the §5.3 copy-then-CRC-reconcile dance (no write can
+ * hit src during the copy ⇒ no lost write). Grain is bounded to one cluster (1 MiB), so the stall
+ * window is small. If latency proves unacceptable (R1/S-D2-conc), switch to copy-outside-quiesce +
+ * re-read-CRC-under-quiesce; until then the simpler, provably-safe model stands. */
 int
 vbdev_tier_relocate_copy(struct vbdev_tier *t, uint64_t src_lba, uint64_t dst_lba,
 			 uint64_t num_blocks, tier_relocate_cb cb_fn, void *cb_arg)
