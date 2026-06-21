@@ -181,6 +181,10 @@ struct vbdev_tier *vbdev_tier_get_by_name(const char *name);
 int vbdev_tier_add_band(struct vbdev_tier *t, const char *base_bdev_name,
 			enum tier_class tier, const char *wwn, const char *serial,
 			uint32_t *out_band_id);
+/* SPEC-73 A2: place a band at explicit stored geometry (superblock-authoritative reassembly). */
+int vbdev_tier_assemble_band(struct vbdev_tier *t, const char *base_bdev_name, uint32_t band_id,
+			     enum tier_class tier, const char *wwn, const char *serial,
+			     uint64_t lba_start, uint64_t num_blocks, enum tier_band_state state, bool is_md);
 int vbdev_tier_retire_band(struct vbdev_tier *t, uint32_t band_id);
 /* Register the composite bdev once its bands are configured. */
 int vbdev_tier_register(struct vbdev_tier *t);
