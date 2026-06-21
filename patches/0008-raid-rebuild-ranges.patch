@@ -18,7 +18,7 @@ new file mode 100644
 index 000000000..0a1b2c3d4
 --- /dev/null
 +++ b/module/bdev/raid/bdev_raid_repair.c
-@@ -0,0 +1,219 @@
+@@ -0,0 +1,261 @@
 +/*   SPDX-License-Identifier: BSD-3-Clause
 + *   Copyright (C) 2026 Evariops.
 + *   All rights reserved.
