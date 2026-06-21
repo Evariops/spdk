@@ -209,32 +209,34 @@ tier_route_rw(struct vbdev_tier *t, struct tier_io_channel *tch, struct spdk_bde
 
 	io_ctx->status = SPDK_BDEV_IO_STATUS_SUCCESS;
 
-	/* Mirrored metadata region: same physical band-relative offset on both legs. */
+	/* Metadata region: RAID1-mirrored across two bands when the composite has ≥2 disks;
+	 * single-copy on the one band when the node has a single disk (band_b == NULL). The md
+	 * maps to base-physical [sb_blocks, sb_blocks+md) on each md band. */
 	if (vbdev_tier_is_md_range(t, offset, num)) {
 		band = vbdev_tier_band_by_id(t, t->md_mirror_a);
-		band_b = vbdev_tier_band_by_id(t, t->md_mirror_b);
-		if (band == NULL || band_b == NULL) {
+		band_b = vbdev_tier_band_by_id(t, t->md_mirror_b);	/* may be NULL: single-band composite */
+		if (band == NULL) {
 			return -EIO;
 		}
-		/* The md region maps to band-relative offset == composite offset for
-		 * both mirror bands (they reserve [0, md_num_blocks) at their start). */
 		if (!is_write) {
-			/* Read from primary; fall back to secondary if primary degraded.
-			 * md maps to base-physical [sb_blocks, sb_blocks+md) on both mirror bands. */
-			struct tier_band *src = (band->state == TIER_BAND_ACTIVE) ? band : band_b;
+			/* Prefer an ACTIVE leg; with a mirror, fall back to the secondary. */
+			struct tier_band *src = band;
+			if (band->state != TIER_BAND_ACTIVE && band_b != NULL && band_b->state == TIER_BAND_ACTIVE) {
+				src = band_b;
+			}
 			io_ctx->remaining = 1;
 			rc = tier_submit_leg(t, tch, bdev_io, src, t->sb_blocks + offset, false);
-			if (rc != 0 && src == band && band_b->state == TIER_BAND_ACTIVE) {
+			if (rc != 0 && src == band && band_b != NULL && band_b->state == TIER_BAND_ACTIVE) {
 				rc = tier_submit_leg(t, tch, bdev_io, band_b, t->sb_blocks + offset, false);
 			}
 			return rc;
 		}
-		/* Write: fan out to both legs that are still active. */
+		/* Write: fan out to every ACTIVE md leg that exists (1 leg when unmirrored). */
 		io_ctx->remaining = 0;
 		if (band->state == TIER_BAND_ACTIVE) {
 			io_ctx->remaining++;
 		}
-		if (band_b->state == TIER_BAND_ACTIVE) {
+		if (band_b != NULL && band_b->state == TIER_BAND_ACTIVE) {
 			io_ctx->remaining++;
 		}
 		if (io_ctx->remaining == 0) {
@@ -246,7 +248,7 @@ tier_route_rw(struct vbdev_tier *t, struct tier_io_channel *tch, struct spdk_bde
 				return rc;
 			}
 		}
-		if (band_b->state == TIER_BAND_ACTIVE) {
+		if (band_b != NULL && band_b->state == TIER_BAND_ACTIVE) {
 			rc = tier_submit_leg(t, tch, bdev_io, band_b, t->sb_blocks + offset, true);
 			if (rc != 0) {
 				return rc;
