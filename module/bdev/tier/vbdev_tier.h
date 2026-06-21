@@ -198,6 +198,13 @@ int tier_sb_write_all(struct vbdev_tier *t, void (*cb)(void *cb_arg, int rc), vo
 int tier_sb_read_desc(struct spdk_bdev_desc *desc, uint32_t blocklen,
 		      void (*cb)(void *cb_arg, const struct tier_superblock *sb, int rc), void *cb_arg);
 
+/* M2b: copy num_blocks from src composite-LBA to dst composite-LBA by resolving
+ * each to its band + physical offset and doing a direct base-bdev read+write
+ * (bypasses the composite, so it is NOT blocked by a quiesce on the src range). */
+typedef void (*tier_relocate_cb)(void *cb_arg, int status);
+int vbdev_tier_relocate_copy(struct vbdev_tier *t, uint64_t src_lba, uint64_t dst_lba,
+			     uint64_t num_blocks, tier_relocate_cb cb_fn, void *cb_arg);
+
 /* M2b co-design: quiesce a physical LBA range of THIS composite (only the
  * registering module may call spdk_bdev_quiesce_range — SPEC-73A §5.3). */
 int vbdev_tier_relocate_quiesce(struct vbdev_tier *t, uint64_t lba, uint64_t num_blocks,

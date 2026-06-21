@@ -751,6 +751,104 @@ vbdev_tier_register(struct vbdev_tier *t)
  * relocate-quiesce co-design (M2b) — only the registering module may quiesce.
  * -------------------------------------------------------------------------- */
 
+/* M2b: direct base-bdev copy between bands (bypasses the composite/quiesce). */
+struct tier_copy_ctx {
+	struct tier_band	*src_band;
+	struct tier_band	*dst_band;
+	struct spdk_io_channel	*src_ch;
+	struct spdk_io_channel	*dst_ch;
+	void			*buf;
+	uint64_t		dst_phys;
+	uint64_t		num_blocks;
+	tier_relocate_cb	cb_fn;
+	void			*cb_arg;
+};
+
+static void
+tier_copy_finish(struct tier_copy_ctx *c, int rc)
+{
+	if (c->src_ch) {
+		spdk_put_io_channel(c->src_ch);
+	}
+	if (c->dst_ch) {
+		spdk_put_io_channel(c->dst_ch);
+	}
+	if (c->buf) {
+		spdk_dma_free(c->buf);
+	}
+	c->cb_fn(c->cb_arg, rc);
+	free(c);
+}
+
+static void
+tier_copy_write_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct tier_copy_ctx *c = cb_arg;
+
+	spdk_bdev_free_io(bdev_io);
+	tier_copy_finish(c, success ? 0 : -EIO);
+}
+
+static void
+tier_copy_read_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct tier_copy_ctx *c = cb_arg;
+	int rc;
+
+	spdk_bdev_free_io(bdev_io);
+	if (!success) {
+		tier_copy_finish(c, -EIO);
+		return;
+	}
+	rc = spdk_bdev_write_blocks(c->dst_band->desc, c->dst_ch, c->buf, c->dst_phys,
+				    c->num_blocks, tier_copy_write_done, c);
+	if (rc != 0) {
+		tier_copy_finish(c, rc);
+	}
+}
+
+int
+vbdev_tier_relocate_copy(struct vbdev_tier *t, uint64_t src_lba, uint64_t dst_lba,
+			 uint64_t num_blocks, tier_relocate_cb cb_fn, void *cb_arg)
+{
+	struct tier_copy_ctx *c;
+	struct tier_band *sb, *db;
+	uint64_t src_off, dst_off;
+	int rc;
+
+	sb = vbdev_tier_band_of_lba(t, src_lba, &src_off);
+	db = vbdev_tier_band_of_lba(t, dst_lba, &dst_off);
+	if (sb == NULL || db == NULL || sb->state != TIER_BAND_ACTIVE ||
+	    db->state != TIER_BAND_ACTIVE || sb->desc == NULL || db->desc == NULL) {
+		return -EIO;
+	}
+
+	c = calloc(1, sizeof(*c));
+	if (c == NULL) {
+		return -ENOMEM;
+	}
+	c->src_band = sb;
+	c->dst_band = db;
+	c->num_blocks = num_blocks;
+	c->dst_phys = db->phys_offset + dst_off;
+	c->cb_fn = cb_fn;
+	c->cb_arg = cb_arg;
+	c->buf = spdk_dma_malloc(num_blocks * (uint64_t)t->blocklen, t->blocklen, NULL);
+	c->src_ch = spdk_bdev_get_io_channel(sb->desc);
+	c->dst_ch = spdk_bdev_get_io_channel(db->desc);
+	if (c->buf == NULL || c->src_ch == NULL || c->dst_ch == NULL) {
+		tier_copy_finish(c, -ENOMEM);
+		return 0;
+	}
+
+	rc = spdk_bdev_read_blocks(sb->desc, c->src_ch, c->buf, sb->phys_offset + src_off,
+				   num_blocks, tier_copy_read_done, c);
+	if (rc != 0) {
+		tier_copy_finish(c, rc);
+	}
+	return 0;
+}
+
 int
 vbdev_tier_relocate_quiesce(struct vbdev_tier *t, uint64_t lba, uint64_t num_blocks,
 			    spdk_bdev_quiesce_cb cb_fn, void *cb_arg)

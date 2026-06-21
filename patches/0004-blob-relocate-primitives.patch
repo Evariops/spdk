@@ -1,8 +1,8 @@
 diff --git a/include/spdk/blob.h b/include/spdk/blob.h
-index fe982157b..c18b986c5 100644
+index fe982157b..93cba5f5d 100644
 --- a/include/spdk/blob.h
 +++ b/include/spdk/blob.h
-@@ -544,6 +544,32 @@ uint64_t spdk_blob_get_num_allocated_clusters(struct spdk_blob *blob);
+@@ -544,6 +544,38 @@ uint64_t spdk_blob_get_num_allocated_clusters(struct spdk_blob *blob);
   */
  uint64_t spdk_blob_get_next_allocated_io_unit(struct spdk_blob *blob, uint64_t offset);
  
@@ -32,11 +32,17 @@ index fe982157b..c18b986c5 100644
 +int spdk_blob_relocate_commit(struct spdk_blob *blob, uint64_t cluster_num, uint64_t new_lba,
 +			      spdk_blob_op_complete cb_fn, void *cb_arg);
 +
++/**
++ * SPEC-73 M2b: release a cluster claimed via spdk_blob_claim_cluster_in_range that
++ * was not committed (relocate abort), avoiding a leak until reboot.
++ */
++void spdk_blob_release_cluster_lba(struct spdk_blob *blob, uint64_t lba);
++
  /**
   * Get next unallocated io_unit
   *
 diff --git a/lib/blob/blobstore.c b/lib/blob/blobstore.c
-index 7ae791ca2..3a0caed2e 100644
+index 7ae791ca2..5aa024c8b 100644
 --- a/lib/blob/blobstore.c
 +++ b/lib/blob/blobstore.c
 @@ -6246,6 +6246,20 @@ spdk_blob_get_next_unallocated_io_unit(struct spdk_blob *blob, uint64_t offset)
@@ -60,7 +66,7 @@ index 7ae791ca2..3a0caed2e 100644
  /* START spdk_bs_create_blob */
  
  static void
-@@ -9030,6 +9044,152 @@ blob_insert_cluster_on_md_thread(struct spdk_blob *blob, uint32_t cluster_num,
+@@ -9030,6 +9044,171 @@ blob_insert_cluster_on_md_thread(struct spdk_blob *blob, uint32_t cluster_num,
  	spdk_thread_send_msg(blob->bs->md_thread, blob_insert_cluster_msg, ctx);
  }
  
@@ -105,6 +111,25 @@ index 7ae791ca2..3a0caed2e 100644
 +	}
 +	spdk_spin_unlock(&bs->used_lock);
 +	return rc;
++}
++
++/* SPEC-73 M2b: release a cluster claimed by spdk_blob_claim_cluster_in_range that
++ * was NOT committed (relocate abort), so it is not leaked until the next reboot. */
++void
++spdk_blob_release_cluster_lba(struct spdk_blob *blob, uint64_t lba)
++{
++	struct spdk_blob_store *bs = blob->bs;
++	uint32_t cluster_num;
++
++	if (lba == 0) {
++		return;
++	}
++	cluster_num = (uint32_t)bs_lba_to_cluster(bs, lba);
++	spdk_spin_lock(&bs->used_lock);
++	if (spdk_bit_pool_is_allocated(bs->used_clusters, cluster_num)) {
++		bs_release_cluster(bs, cluster_num);
++	}
++	spdk_spin_unlock(&bs->used_lock);
 +}
 +
 +struct blob_relocate_ctx {
@@ -214,16 +239,17 @@ index 7ae791ca2..3a0caed2e 100644
  blob_free_cluster_msg(void *arg)
  {
 diff --git a/lib/blob/spdk_blob.map b/lib/blob/spdk_blob.map
-index d4d85c2b6..c4eb26471 100644
+index d4d85c2b6..44db84f51 100644
 --- a/lib/blob/spdk_blob.map
 +++ b/lib/blob/spdk_blob.map
-@@ -24,6 +24,9 @@
+@@ -24,6 +24,10 @@
  	spdk_blob_get_num_allocated_clusters;
  	spdk_blob_get_next_allocated_io_unit;
  	spdk_blob_get_next_unallocated_io_unit;
 +	spdk_blob_get_cluster_lba;
 +	spdk_blob_claim_cluster_in_range;
 +	spdk_blob_relocate_commit;
++	spdk_blob_release_cluster_lba;
  	spdk_blob_opts_init;
  	spdk_bs_create_blob_ext;
  	spdk_bs_create_blob;

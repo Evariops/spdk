@@ -1,41 +1,51 @@
-From abb0a4a0c035d317d77f04d9a6a282b62a82281e Mon Sep 17 00:00:00 2001
+From 906c5213cfc58b0158ea2b6c559760a6e717cf68 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?Rapha=C3=ABl=20DUCOM?= <raphael.ducom@gmail.com>
-Date: Sun, 21 Jun 2026 14:20:33 +0200
-Subject: [PATCH] m2a: bdev_lvol_get_cluster_placement RPC
+Date: Sun, 21 Jun 2026 14:36:21 +0200
+Subject: [PATCH] m2: get_cluster_placement + relocate_cluster RPCs
 
 ---
- module/bdev/lvol/Makefile              |  2 +-
- module/bdev/lvol/vbdev_lvol_tier_rpc.c | 96 ++++++++++++++++++++++++++
- 2 files changed, 97 insertions(+), 1 deletion(-)
+ module/bdev/lvol/Makefile              |   3 +-
+ module/bdev/lvol/vbdev_lvol_tier_rpc.c | 312 +++++++++++++++++++++++++
+ 2 files changed, 314 insertions(+), 1 deletion(-)
  create mode 100644 module/bdev/lvol/vbdev_lvol_tier_rpc.c
 
 diff --git a/module/bdev/lvol/Makefile b/module/bdev/lvol/Makefile
-index aba6620dc..30e78438c 100644
+index aba6620dc..a8ed3873d 100644
 --- a/module/bdev/lvol/Makefile
 +++ b/module/bdev/lvol/Makefile
-@@ -9,7 +9,7 @@ include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
+@@ -9,7 +9,8 @@ include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
  SO_VER := 7
  SO_MINOR := 0
  
 -C_SRCS = vbdev_lvol.c vbdev_lvol_rpc.c vbdev_lvol_ranges_rpc.c
++CFLAGS += -I$(SPDK_ROOT_DIR)/module/bdev/tier
 +C_SRCS = vbdev_lvol.c vbdev_lvol_rpc.c vbdev_lvol_ranges_rpc.c vbdev_lvol_tier_rpc.c
  LIBNAME = bdev_lvol
  
  SPDK_MAP_FILE = $(SPDK_ROOT_DIR)/mk/spdk_blank.map
 diff --git a/module/bdev/lvol/vbdev_lvol_tier_rpc.c b/module/bdev/lvol/vbdev_lvol_tier_rpc.c
 new file mode 100644
-index 000000000..8c662f864
+index 000000000..3caf17bc6
 --- /dev/null
 +++ b/module/bdev/lvol/vbdev_lvol_tier_rpc.c
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,312 @@
 +/*   SPDX-License-Identifier: BSD-3-Clause
 + *   Copyright (C) 2026 Evariops.
 + *   All rights reserved.
 + *
-+ *   SPEC-73 M2a: bdev_lvol_get_cluster_placement RPC.
-+ *   Per allocated cluster, reports its physical LBA on the bs_dev (the bdev_tier
-+ *   composite). The control-plane maps each LBA to a band/tier using the band
-+ *   table it already holds (bdev_tier_get_bands). Read-only; no hot-path impact.
++ *   SPEC-73 M2a/M2b: bdev_lvol_get_cluster_placement + bdev_lvol_relocate_cluster.
++ *
++ *   Placement (M2a): per allocated cluster -> physical LBA on the bs_dev (the
++ *   bdev_tier composite); the control-plane maps LBA->band/tier from its band
++ *   table. Read-only.
++ *
++ *   Relocate (M2b): move one cluster to a destination band, fully in the
++ *   data-plane (INV-T2). Coherence (D6): the copy reads the SOURCE band's base
++ *   bdev DIRECTLY (bypasses the composite), so a quiesce on the composite's old
++ *   range holds upper-layer I/O without dead-locking the copy. Order:
++ *     claim dst -> quiesce old (composite) -> copy (base-direct) ->
++ *     commit (md-thread swap+persist+release old) -> unquiesce.
++ *   Crash-safety: invariants A/B inside spdk_blob_relocate_commit.
 + */
 +
 +#include "spdk/rpc.h"
@@ -45,9 +55,12 @@ index 000000000..8c662f864
 +#include "spdk/bdev.h"
 +#include "spdk/log.h"
 +#include "vbdev_lvol.h"
++#include "vbdev_tier.h"
 +
 +#define RPC_PLACEMENT_DEFAULT_MAX 4096u
 +#define RPC_PLACEMENT_HARD_MAX    1048576u
++
++/* ===================== M2a: get_cluster_placement ===================== */
 +
 +struct rpc_lvol_placement {
 +	char     *name;
@@ -124,6 +137,210 @@ index 000000000..8c662f864
 +}
 +SPDK_RPC_REGISTER("bdev_lvol_get_cluster_placement", rpc_bdev_lvol_get_cluster_placement,
 +		  SPDK_RPC_RUNTIME)
++
++/* ===================== M2b: relocate_cluster ========================== */
++
++struct rpc_lvol_relocate {
++	char     *name;
++	char     *tier_name;
++	uint64_t  cluster_num;
++	uint64_t  dst_lba_start;
++	uint64_t  dst_lba_count;
++};
++
++static const struct spdk_json_object_decoder rpc_lvol_relocate_decoders[] = {
++	{"name", offsetof(struct rpc_lvol_relocate, name), spdk_json_decode_string},
++	{"tier_name", offsetof(struct rpc_lvol_relocate, tier_name), spdk_json_decode_string},
++	{"cluster_num", offsetof(struct rpc_lvol_relocate, cluster_num), spdk_json_decode_uint64},
++	{"dst_lba_start", offsetof(struct rpc_lvol_relocate, dst_lba_start), spdk_json_decode_uint64},
++	{"dst_lba_count", offsetof(struct rpc_lvol_relocate, dst_lba_count), spdk_json_decode_uint64},
++};
++
++struct relocate_ctx {
++	struct spdk_jsonrpc_request	*request;
++	struct spdk_blob		*blob;
++	struct vbdev_tier		*tier;
++	uint64_t			cluster_num;
++	uint64_t			old_lba;
++	uint64_t			new_lba;
++	uint64_t			cluster_blocks;
++	bool				quiesced;
++	bool				claimed;
++	bool				committed;
++	int				rc;
++};
++
++static void
++relocate_reply(struct relocate_ctx *c, int rc)
++{
++	struct spdk_json_write_ctx *w;
++
++	if (rc == 0) {
++		w = spdk_jsonrpc_begin_result(c->request);
++		spdk_json_write_object_begin(w);
++		spdk_json_write_named_uint64(w, "from_lba", c->old_lba);
++		spdk_json_write_named_uint64(w, "to_lba", c->new_lba);
++		spdk_json_write_object_end(w);
++		spdk_jsonrpc_end_result(c->request, w);
++	} else {
++		spdk_jsonrpc_send_error_response_fmt(c->request, rc, "relocate failed: %s",
++						     spdk_strerror(rc < 0 ? -rc : rc));
++	}
++	free(c);
++}
++
++static void
++relocate_unquiesced(void *cb_arg, int status)
++{
++	struct relocate_ctx *c = cb_arg;
++
++	(void)status;	/* best-effort unquiesce; the relocate outcome is c->rc */
++	relocate_reply(c, c->rc);
++}
++
++/* Final stage once we are (or were) quiesced: release the dst on failure, then
++ * unquiesce and reply. */
++static void
++relocate_finish_quiesced(struct relocate_ctx *c, int rc)
++{
++	c->rc = rc;
++	if (rc != 0 && c->claimed && !c->committed) {
++		spdk_blob_release_cluster_lba(c->blob, c->new_lba);
++		c->claimed = false;
++	}
++	if (vbdev_tier_relocate_unquiesce(c->tier, c->old_lba, c->cluster_blocks,
++					  relocate_unquiesced, c) != 0) {
++		relocate_reply(c, rc);
++	}
++}
++
++static void
++relocate_committed(void *cb_arg, int bserrno)
++{
++	struct relocate_ctx *c = cb_arg;
++
++	if (bserrno == 0) {
++		c->committed = true;	/* commit took ownership of new + released old */
++	}
++	relocate_finish_quiesced(c, bserrno);
++}
++
++static void
++relocate_copied(void *cb_arg, int status)
++{
++	struct relocate_ctx *c = cb_arg;
++	int rc;
++
++	if (status != 0) {
++		relocate_finish_quiesced(c, status);
++		return;
++	}
++	/* Data is on new (invariant A). Swap the map + persist + release old. */
++	rc = spdk_blob_relocate_commit(c->blob, c->cluster_num, c->new_lba, relocate_committed, c);
++	if (rc != 0) {
++		relocate_finish_quiesced(c, rc);
++	}
++}
++
++static void
++relocate_quiesced(void *cb_arg, int status)
++{
++	struct relocate_ctx *c = cb_arg;
++	int rc;
++
++	if (status != 0) {
++		relocate_finish_quiesced(c, status);
++		return;
++	}
++	c->quiesced = true;
++	/* Copy reads the source band's base bdev directly (bypasses the composite,
++	 * so it is NOT held by the quiesce on the composite old range). */
++	rc = vbdev_tier_relocate_copy(c->tier, c->old_lba, c->new_lba, c->cluster_blocks,
++				      relocate_copied, c);
++	if (rc != 0) {
++		relocate_finish_quiesced(c, rc);
++	}
++}
++
++static void
++rpc_bdev_lvol_relocate_cluster(struct spdk_jsonrpc_request *request,
++			       const struct spdk_json_val *params)
++{
++	struct rpc_lvol_relocate req = {};
++	struct spdk_bdev *bdev;
++	struct spdk_lvol *lvol;
++	struct spdk_blob *blob;
++	struct vbdev_tier *tier;
++	struct relocate_ctx *c;
++	uint64_t cluster_size, blocklen, old_lba, new_lba;
++	int rc;
++
++	if (spdk_json_decode_object(params, rpc_lvol_relocate_decoders,
++				    SPDK_COUNTOF(rpc_lvol_relocate_decoders), &req)) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
++						 "spdk_json_decode_object failed");
++		goto cleanup;
++	}
++
++	bdev = spdk_bdev_get_by_name(req.name);
++	if (bdev == NULL || (lvol = vbdev_lvol_get_from_bdev(bdev)) == NULL) {
++		spdk_jsonrpc_send_error_response(request, -ENODEV, "lvol not found");
++		goto cleanup;
++	}
++	tier = vbdev_tier_get_by_name(req.tier_name);
++	if (tier == NULL) {
++		spdk_jsonrpc_send_error_response(request, -ENODEV, "tier not found");
++		goto cleanup;
++	}
++	blob = lvol->blob;
++	cluster_size = spdk_bs_get_cluster_size(lvol->lvol_store->blobstore);
++	blocklen = spdk_bdev_get_block_size(bdev);
++	if (blocklen == 0) {
++		spdk_jsonrpc_send_error_response(request, -EINVAL, "bad blocklen");
++		goto cleanup;
++	}
++
++	old_lba = spdk_blob_get_cluster_lba(blob, req.cluster_num);
++	if (old_lba == 0) {
++		spdk_jsonrpc_send_error_response(request, -ENOENT, "cluster not allocated");
++		goto cleanup;
++	}
++
++	rc = spdk_blob_claim_cluster_in_range(blob, req.dst_lba_start, req.dst_lba_count, &new_lba);
++	if (rc != 0) {
++		spdk_jsonrpc_send_error_response_fmt(request, rc, "no free cluster in target band: %s",
++						     spdk_strerror(rc < 0 ? -rc : rc));
++		goto cleanup;
++	}
++
++	c = calloc(1, sizeof(*c));
++	if (c == NULL) {
++		spdk_blob_release_cluster_lba(blob, new_lba);
++		spdk_jsonrpc_send_error_response(request, -ENOMEM, "oom");
++		goto cleanup;
++	}
++	c->request = request;
++	c->blob = blob;
++	c->tier = tier;
++	c->cluster_num = req.cluster_num;
++	c->old_lba = old_lba;
++	c->new_lba = new_lba;
++	c->cluster_blocks = cluster_size / blocklen;
++	c->claimed = true;
++
++	/* Quiesce the composite's old range, then copy + commit + unquiesce. */
++	rc = vbdev_tier_relocate_quiesce(tier, old_lba, c->cluster_blocks, relocate_quiesced, c);
++	if (rc != 0) {
++		spdk_blob_release_cluster_lba(blob, new_lba);
++		spdk_jsonrpc_send_error_response_fmt(request, rc, "quiesce failed: %s",
++						     spdk_strerror(rc < 0 ? -rc : rc));
++		free(c);
++	}
++cleanup:
++	free(req.name);
++	free(req.tier_name);
++}
++SPDK_RPC_REGISTER("bdev_lvol_relocate_cluster", rpc_bdev_lvol_relocate_cluster, SPDK_RPC_RUNTIME)
 -- 
 2.50.1 (Apple Git-155)
 
