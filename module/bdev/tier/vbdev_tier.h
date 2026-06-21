@@ -187,6 +187,17 @@ int vbdev_tier_register(struct vbdev_tier *t);
 /* Tear down + unregister (cleanup). */
 int vbdev_tier_delete(struct vbdev_tier *t);
 
+/* Superblock (vbdev_tier_sb.c) — native-level persistence (INV-T1). */
+void tier_sb_serialize(struct vbdev_tier *t, struct tier_band *self, struct tier_superblock *sb);
+bool tier_sb_valid(const struct tier_superblock *sb);	/* magic + crc check */
+/* Async-write the (serialized) superblock to EVERY active band. cb fires once,
+ * with rc != 0 if any band failed. Increments t->seq. cb may be NULL (fire-and-forget). */
+int tier_sb_write_all(struct vbdev_tier *t, void (*cb)(void *cb_arg, int rc), void *cb_arg);
+/* Async-read the superblock from a base bdev desc into a freshly-allocated buffer;
+ * cb receives the parsed sb (NULL + rc on failure) and owns freeing nothing (sb is on stack-copy). */
+int tier_sb_read_desc(struct spdk_bdev_desc *desc, uint32_t blocklen,
+		      void (*cb)(void *cb_arg, const struct tier_superblock *sb, int rc), void *cb_arg);
+
 /* M2b co-design: quiesce a physical LBA range of THIS composite (only the
  * registering module may call spdk_bdev_quiesce_range — SPEC-73A §5.3). */
 int vbdev_tier_relocate_quiesce(struct vbdev_tier *t, uint64_t lba, uint64_t num_blocks,

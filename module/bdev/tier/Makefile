@@ -14,7 +14,7 @@ SO_MINOR := 0
 
 CFLAGS += -I$(SPDK_ROOT_DIR)/lib/bdev/
 
-C_SRCS = vbdev_tier.c vbdev_tier_rpc.c
+C_SRCS = vbdev_tier.c vbdev_tier_sb.c vbdev_tier_rpc.c
 LIBNAME = bdev_tier
 
 SPDK_MAP_FILE = $(SPDK_ROOT_DIR)/mk/spdk_blank.map

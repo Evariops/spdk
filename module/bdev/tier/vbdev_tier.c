@@ -678,6 +678,11 @@ vbdev_tier_retire_band(struct vbdev_tier *t, uint32_t band_id)
 	/* The CSI brain guarantees the band was evacuated (clusters relocated) before
 	 * retiring. We keep the slot and its LBA range as an unreclaimable hole. */
 	band->state = TIER_BAND_RETIRED;
+	/* Persist the new band table to the SURVIVING bands BEFORE closing the retired
+	 * one's desc (so the seq bump records the retirement). */
+	if (t->registered) {
+		tier_sb_write_all(t, tier_sb_persist_cb, NULL);
+	}
 	if (band->desc != NULL) {
 		spdk_bdev_module_release_bdev(spdk_bdev_desc_get_bdev(band->desc));
 		spdk_bdev_close(band->desc);
@@ -699,6 +704,15 @@ vbdev_tier_delete(struct vbdev_tier *t)
 		_tier_device_unregister_cb(t);
 	}
 	return 0;
+}
+
+/* Fire-and-forget superblock persistence completion (logs failures). */
+static void
+tier_sb_persist_cb(void *cb_arg, int rc)
+{
+	if (rc != 0) {
+		SPDK_ERRLOG("tier: superblock persist failed rc=%d\n", rc);
+	}
 }
 
 /* Register the composite bdev once its bands are configured (called by RPC). */
@@ -725,6 +739,10 @@ vbdev_tier_register(struct vbdev_tier *t)
 	t->registered = true;
 	SPDK_NOTICELOG("tier '%s' registered: %u bands, %" PRIu64 " blocks of %u bytes (sb_blocks=%u)\n",
 		       t->bdev.name, t->num_bands, t->bdev.blockcnt, t->bdev.blocklen, t->sb_blocks);
+
+	/* Persist the superblock to every band (INV-T1). CRD is a backup source of
+	 * truth; a failed sb write is logged. */
+	tier_sb_write_all(t, tier_sb_persist_cb, NULL);
 	return 0;
 }
 
