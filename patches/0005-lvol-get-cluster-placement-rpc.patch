@@ -1,0 +1,129 @@
+From abb0a4a0c035d317d77f04d9a6a282b62a82281e Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Rapha=C3=ABl=20DUCOM?= <raphael.ducom@gmail.com>
+Date: Sun, 21 Jun 2026 14:20:33 +0200
+Subject: [PATCH] m2a: bdev_lvol_get_cluster_placement RPC
+
+---
+ module/bdev/lvol/Makefile              |  2 +-
+ module/bdev/lvol/vbdev_lvol_tier_rpc.c | 96 ++++++++++++++++++++++++++
+ 2 files changed, 97 insertions(+), 1 deletion(-)
+ create mode 100644 module/bdev/lvol/vbdev_lvol_tier_rpc.c
+
+diff --git a/module/bdev/lvol/Makefile b/module/bdev/lvol/Makefile
+index aba6620dc..30e78438c 100644
+--- a/module/bdev/lvol/Makefile
++++ b/module/bdev/lvol/Makefile
+@@ -9,7 +9,7 @@ include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
+ SO_VER := 7
+ SO_MINOR := 0
+ 
+-C_SRCS = vbdev_lvol.c vbdev_lvol_rpc.c vbdev_lvol_ranges_rpc.c
++C_SRCS = vbdev_lvol.c vbdev_lvol_rpc.c vbdev_lvol_ranges_rpc.c vbdev_lvol_tier_rpc.c
+ LIBNAME = bdev_lvol
+ 
+ SPDK_MAP_FILE = $(SPDK_ROOT_DIR)/mk/spdk_blank.map
+diff --git a/module/bdev/lvol/vbdev_lvol_tier_rpc.c b/module/bdev/lvol/vbdev_lvol_tier_rpc.c
+new file mode 100644
+index 000000000..8c662f864
+--- /dev/null
++++ b/module/bdev/lvol/vbdev_lvol_tier_rpc.c
+@@ -0,0 +1,96 @@
++/*   SPDX-License-Identifier: BSD-3-Clause
++ *   Copyright (C) 2026 Evariops.
++ *   All rights reserved.
++ *
++ *   SPEC-73 M2a: bdev_lvol_get_cluster_placement RPC.
++ *   Per allocated cluster, reports its physical LBA on the bs_dev (the bdev_tier
++ *   composite). The control-plane maps each LBA to a band/tier using the band
++ *   table it already holds (bdev_tier_get_bands). Read-only; no hot-path impact.
++ */
++
++#include "spdk/rpc.h"
++#include "spdk/util.h"
++#include "spdk/string.h"
++#include "spdk/blob.h"
++#include "spdk/bdev.h"
++#include "spdk/log.h"
++#include "vbdev_lvol.h"
++
++#define RPC_PLACEMENT_DEFAULT_MAX 4096u
++#define RPC_PLACEMENT_HARD_MAX    1048576u
++
++struct rpc_lvol_placement {
++	char     *name;
++	uint64_t  start_cluster;
++	uint32_t  max_clusters;
++};
++
++static const struct spdk_json_object_decoder rpc_lvol_placement_decoders[] = {
++	{"name", offsetof(struct rpc_lvol_placement, name), spdk_json_decode_string},
++	{"start_cluster", offsetof(struct rpc_lvol_placement, start_cluster), spdk_json_decode_uint64, true},
++	{"max_clusters", offsetof(struct rpc_lvol_placement, max_clusters), spdk_json_decode_uint32, true},
++};
++
++static void
++rpc_bdev_lvol_get_cluster_placement(struct spdk_jsonrpc_request *request,
++				    const struct spdk_json_val *params)
++{
++	struct rpc_lvol_placement req = { .start_cluster = 0, .max_clusters = RPC_PLACEMENT_DEFAULT_MAX };
++	struct spdk_json_write_ctx *w;
++	struct spdk_bdev *bdev;
++	struct spdk_lvol *lvol;
++	struct spdk_blob *blob;
++	uint64_t cluster_size, num_clusters, c, emitted = 0, next_cursor = 0, lba;
++
++	if (spdk_json_decode_object(params, rpc_lvol_placement_decoders,
++				    SPDK_COUNTOF(rpc_lvol_placement_decoders), &req)) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
++						 "spdk_json_decode_object failed");
++		goto cleanup;
++	}
++	if (req.max_clusters == 0 || req.max_clusters > RPC_PLACEMENT_HARD_MAX) {
++		req.max_clusters = RPC_PLACEMENT_DEFAULT_MAX;
++	}
++
++	bdev = spdk_bdev_get_by_name(req.name);
++	if (bdev == NULL || (lvol = vbdev_lvol_get_from_bdev(bdev)) == NULL) {
++		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
++		goto cleanup;
++	}
++
++	blob = lvol->blob;
++	cluster_size = spdk_bs_get_cluster_size(lvol->lvol_store->blobstore);
++	num_clusters = spdk_blob_get_num_clusters(blob);
++
++	w = spdk_jsonrpc_begin_result(request);
++	spdk_json_write_object_begin(w);
++	spdk_json_write_named_string(w, "name", req.name);
++	spdk_json_write_named_uint64(w, "cluster_size_bytes", cluster_size);
++	spdk_json_write_named_uint64(w, "num_clusters", num_clusters);
++	spdk_json_write_named_array_begin(w, "clusters");
++
++	for (c = req.start_cluster; c < num_clusters; c++) {
++		lba = spdk_blob_get_cluster_lba(blob, c);
++		if (lba == 0) {
++			continue;	/* unallocated */
++		}
++		if (emitted >= req.max_clusters) {
++			next_cursor = c;
++			break;
++		}
++		spdk_json_write_object_begin(w);
++		spdk_json_write_named_uint64(w, "index", c);
++		spdk_json_write_named_uint64(w, "lba", lba);
++		spdk_json_write_object_end(w);
++		emitted++;
++	}
++
++	spdk_json_write_array_end(w);
++	spdk_json_write_named_uint64(w, "next_cursor", next_cursor);
++	spdk_json_write_object_end(w);
++	spdk_jsonrpc_end_result(request, w);
++cleanup:
++	free(req.name);
++}
++SPDK_RPC_REGISTER("bdev_lvol_get_cluster_placement", rpc_bdev_lvol_get_cluster_placement,
++		  SPDK_RPC_RUNTIME)
+-- 
+2.50.1 (Apple Git-155)
+
