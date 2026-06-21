@@ -245,7 +245,8 @@ rpc_bdev_tier_get_bands(struct spdk_jsonrpc_request *request, const struct spdk_
 	}
 
 	w = spdk_jsonrpc_begin_result(request);
-	spdk_json_write_array_begin(w);
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_array_begin(w, "bands");
 	TAILQ_FOREACH(b, &t->bands, link) {
 		capacity_blocks = b->num_blocks;
 		/* used_blocks is tracked by the blobstore (allocator), not the composite;
@@ -266,6 +267,7 @@ rpc_bdev_tier_get_bands(struct spdk_jsonrpc_request *request, const struct spdk_
 		spdk_json_write_object_end(w);
 	}
 	spdk_json_write_array_end(w);
+	spdk_json_write_object_end(w);
 	spdk_jsonrpc_end_result(request, w);
 }
 SPDK_RPC_REGISTER("bdev_tier_get_bands", rpc_bdev_tier_get_bands, SPDK_RPC_RUNTIME)
