@@ -1,0 +1,229 @@
+diff --git a/include/spdk/blob.h b/include/spdk/blob.h
+index fe982157b..c18b986c5 100644
+--- a/include/spdk/blob.h
++++ b/include/spdk/blob.h
+@@ -544,6 +544,32 @@ uint64_t spdk_blob_get_num_allocated_clusters(struct spdk_blob *blob);
+  */
+ uint64_t spdk_blob_get_next_allocated_io_unit(struct spdk_blob *blob, uint64_t offset);
+ 
++/**
++ * SPEC-73 M2a: physical LBA of a cluster on the bs_dev (bdev_tier composite),
++ * so the control-plane can map clusters to bands/tiers.
++ * \return physical LBA, or 0 if unallocated / out of range.
++ */
++uint64_t spdk_blob_get_cluster_lba(struct spdk_blob *blob, uint64_t cluster_num);
++
++/**
++ * SPEC-73 M2b: claim a free cluster whose physical LBA falls within
++ * [lba_start, lba_start+lba_count) (a band's range). The destination of a
++ * relocate. Returns the new physical LBA via new_lba. Caller must copy the data
++ * to new_lba then call spdk_blob_relocate_commit().
++ * \return 0 on success, -ENOSPC if the band has no free cluster.
++ */
++int spdk_blob_claim_cluster_in_range(struct spdk_blob *blob, uint64_t lba_start,
++				     uint64_t lba_count, uint64_t *new_lba);
++
++/**
++ * SPEC-73 M2b: atomically re-point a cluster to new_lba (swap in-place, no count
++ * change), persist the extent page, and release the old cluster ONLY after the
++ * extent is durable (crash-safe; native replay reclaims any orphan). Runs on the
++ * metadata thread. The caller must have copied the data to new_lba first.
++ */
++int spdk_blob_relocate_commit(struct spdk_blob *blob, uint64_t cluster_num, uint64_t new_lba,
++			      spdk_blob_op_complete cb_fn, void *cb_arg);
++
+ /**
+  * Get next unallocated io_unit
+  *
+diff --git a/lib/blob/blobstore.c b/lib/blob/blobstore.c
+index 7ae791ca2..3a0caed2e 100644
+--- a/lib/blob/blobstore.c
++++ b/lib/blob/blobstore.c
+@@ -6246,6 +6246,20 @@ spdk_blob_get_next_unallocated_io_unit(struct spdk_blob *blob, uint64_t offset)
+ 	return blob_find_io_unit(blob, offset, false);
+ }
+ 
++/* SPEC-73 M2a: physical LBA of a cluster on the underlying bs_dev (the bdev_tier
++ * composite). Returns 0 if the cluster is unallocated or out of range. Lets the
++ * control-plane map each cluster to a band/tier (LBA -> band) for placement. */
++uint64_t
++spdk_blob_get_cluster_lba(struct spdk_blob *blob, uint64_t cluster_num)
++{
++	assert(blob != NULL);
++
++	if (cluster_num >= blob->active.num_clusters) {
++		return 0;
++	}
++	return blob->active.clusters[cluster_num];
++}
++
+ /* START spdk_bs_create_blob */
+ 
+ static void
+@@ -9030,6 +9044,152 @@ blob_insert_cluster_on_md_thread(struct spdk_blob *blob, uint32_t cluster_num,
+ 	spdk_thread_send_msg(blob->bs->md_thread, blob_insert_cluster_msg, ctx);
+ }
+ 
++/* ===== SPEC-73 M2b: cluster relocation primitives =====================
++ * The relocate orchestration lives in the data-plane (bdev_tier control):
++ *   1. old_lba = spdk_blob_get_cluster_lba(blob, cn)
++ *   2. spdk_blob_claim_cluster_in_range(blob, band_lba_start, band_lba_count, &new_lba)
++ *   3. copy old_lba -> new_lba (accel) ; quiesce old range ; reconcile (CRC)
++ *   4. spdk_blob_relocate_commit(blob, cn, new_lba, cb)  [swap + persist + release old]
++ *   5. unquiesce
++ * Crash-safety (invariants A/B): data is written to new BEFORE the extent is
++ * re-pointed (step 3 precedes step 4); old is released ONLY after the extent is
++ * durable (below). A crash in any window leaves an orphan auto-reclaimed by the
++ * native replay (used_clusters rebuilt from extents). */
++
++int
++spdk_blob_claim_cluster_in_range(struct spdk_blob *blob, uint64_t lba_start,
++				 uint64_t lba_count, uint64_t *new_lba)
++{
++	struct spdk_blob_store *bs = blob->bs;
++	uint32_t c_start, c_end, cap, c;
++	int rc = -ENOSPC;
++
++	assert(new_lba != NULL);
++
++	c_start = (uint32_t)bs_lba_to_cluster(bs, lba_start);
++	c_end = (uint32_t)bs_lba_to_cluster(bs, lba_start + lba_count);
++	cap = spdk_bit_pool_capacity(bs->used_clusters);
++	if (c_end > cap) {
++		c_end = cap;
++	}
++
++	spdk_spin_lock(&bs->used_lock);
++	for (c = c_start; c < c_end; c++) {
++		if (!spdk_bit_pool_is_allocated(bs->used_clusters, c)) {
++			spdk_bit_pool_set_bit_allocated(bs->used_clusters, c);
++			bs->num_free_clusters--;
++			*new_lba = bs_cluster_to_lba(bs, c);
++			rc = 0;
++			break;
++		}
++	}
++	spdk_spin_unlock(&bs->used_lock);
++	return rc;
++}
++
++struct blob_relocate_ctx {
++	struct spdk_blob		*blob;
++	uint64_t			cluster_num;
++	uint64_t			new_lba;
++	uint64_t			old_lba;
++	struct spdk_blob_md_page	*page;
++	struct spdk_thread		*orig_thread;
++	spdk_blob_op_complete		cb_fn;
++	void				*cb_arg;
++	int				rc;
++};
++
++static void
++blob_relocate_done(void *arg)
++{
++	struct blob_relocate_ctx *ctx = arg;
++
++	ctx->cb_fn(ctx->cb_arg, ctx->rc);
++	free(ctx);
++}
++
++static void
++blob_relocate_extent_written(void *cb_arg, int bserrno)
++{
++	struct blob_relocate_ctx *ctx = cb_arg;
++	struct spdk_blob_store *bs = ctx->blob->bs;
++
++	if (bserrno == 0 && ctx->old_lba != 0) {
++		/* Invariant B: release old ONLY after the extent is durable. */
++		spdk_spin_lock(&bs->used_lock);
++		bs_release_cluster(bs, (uint32_t)bs_lba_to_cluster(bs, ctx->old_lba));
++		spdk_spin_unlock(&bs->used_lock);
++	}
++	ctx->rc = bserrno;
++	if (ctx->page != NULL) {
++		spdk_free(ctx->page);
++		ctx->page = NULL;
++	}
++	spdk_thread_send_msg(ctx->orig_thread, blob_relocate_done, ctx);
++}
++
++static void
++blob_relocate_commit_msg(void *arg)
++{
++	struct blob_relocate_ctx *ctx = arg;
++	struct spdk_blob *blob = ctx->blob;
++	uint32_t *extent_page;
++
++	ctx->old_lba = blob->active.clusters[ctx->cluster_num];
++
++	if (blob->use_extent_table == false) {
++		blob->active.clusters[ctx->cluster_num] = ctx->new_lba;
++		blob->state = SPDK_BLOB_STATE_DIRTY;
++		blob_sync_md(blob, blob_relocate_extent_written, ctx);
++		return;
++	}
++
++	extent_page = bs_cluster_to_extent_page(blob, ctx->cluster_num);
++	if (extent_page == NULL || *extent_page == 0) {
++		/* Relocating an allocated cluster must have an existing extent page. */
++		ctx->rc = -EINVAL;
++		spdk_free(ctx->page);
++		ctx->page = NULL;
++		spdk_thread_send_msg(ctx->orig_thread, blob_relocate_done, ctx);
++		return;
++	}
++	/* Invariant A holds (caller copied data to new before this). Swap in-place
++	 * (overwrite map entry; cluster count unchanged) then persist the extent. */
++	blob->active.clusters[ctx->cluster_num] = ctx->new_lba;
++	blob_write_extent_page(blob, *extent_page, ctx->cluster_num, ctx->page,
++			       blob_relocate_extent_written, ctx);
++}
++
++int
++spdk_blob_relocate_commit(struct spdk_blob *blob, uint64_t cluster_num, uint64_t new_lba,
++			  spdk_blob_op_complete cb_fn, void *cb_arg)
++{
++	struct blob_relocate_ctx *ctx;
++
++	if (cluster_num >= blob->active.num_clusters || blob->active.clusters[cluster_num] == 0) {
++		return -ENOENT;
++	}
++
++	ctx = calloc(1, sizeof(*ctx));
++	if (ctx == NULL) {
++		return -ENOMEM;
++	}
++	ctx->blob = blob;
++	ctx->cluster_num = cluster_num;
++	ctx->new_lba = new_lba;
++	ctx->orig_thread = spdk_get_thread();
++	ctx->cb_fn = cb_fn;
++	ctx->cb_arg = cb_arg;
++	ctx->page = spdk_zmalloc(blob->bs->md_page_size, 0, NULL, SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_DMA);
++	if (ctx->page == NULL) {
++		free(ctx);
++		return -ENOMEM;
++	}
++
++	spdk_thread_send_msg(blob->bs->md_thread, blob_relocate_commit_msg, ctx);
++	return 0;
++}
++
+ static void
+ blob_free_cluster_msg(void *arg)
+ {
+diff --git a/lib/blob/spdk_blob.map b/lib/blob/spdk_blob.map
+index d4d85c2b6..c4eb26471 100644
+--- a/lib/blob/spdk_blob.map
++++ b/lib/blob/spdk_blob.map
+@@ -24,6 +24,9 @@
+ 	spdk_blob_get_num_allocated_clusters;
+ 	spdk_blob_get_next_allocated_io_unit;
+ 	spdk_blob_get_next_unallocated_io_unit;
++	spdk_blob_get_cluster_lba;
++	spdk_blob_claim_cluster_in_range;
++	spdk_blob_relocate_commit;
+ 	spdk_blob_opts_init;
+ 	spdk_bs_create_blob_ext;
+ 	spdk_bs_create_blob;
