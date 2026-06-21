@@ -683,6 +683,88 @@ vbdev_tier_add_band(struct vbdev_tier *t, const char *base_bdev_name, enum tier_
 	return 0;
 }
 
+/* SPEC-73 A2: place a band at an EXPLICIT stored geometry (from the on-disk superblock), instead of the
+ * add_band auto-layout. The CSI agent uses this to reassemble a composite IDENTICALLY across reboots
+ * (stable slot→lba_start, regardless of disk enumeration order) and to detect a swapped disk (its live
+ * wwn won't match the slot's stored wwn). is_md ⇒ this band hosts the mirrored md region. */
+int
+vbdev_tier_assemble_band(struct vbdev_tier *t, const char *base_bdev_name, uint32_t band_id,
+			 enum tier_class tier, const char *wwn, const char *serial,
+			 uint64_t lba_start, uint64_t num_blocks, enum tier_band_state state, bool is_md)
+{
+	struct tier_band *band;
+	struct spdk_bdev *base_bdev;
+	int rc;
+
+	if (vbdev_tier_band_by_id(t, band_id) != NULL) {
+		return -EEXIST;
+	}
+	band = calloc(1, sizeof(*band));
+	if (band == NULL) {
+		return -ENOMEM;
+	}
+	rc = spdk_bdev_open_ext(base_bdev_name, true, tier_base_event_cb, band, &band->desc);
+	if (rc != 0) {
+		SPDK_ERRLOG("tier: assemble cannot open '%s' rc=%d\n", base_bdev_name, rc);
+		free(band);
+		return rc;
+	}
+	base_bdev = spdk_bdev_desc_get_bdev(band->desc);
+	if (t->blocklen == 0) {
+		t->blocklen = base_bdev->blocklen;
+	} else if (base_bdev->blocklen != t->blocklen) {
+		SPDK_ERRLOG("tier: assemble band '%s' blocklen %u != composite %u\n",
+			    base_bdev_name, base_bdev->blocklen, t->blocklen);
+		spdk_bdev_close(band->desc);
+		free(band);
+		return -EINVAL;
+	}
+	if (t->sb_blocks == 0) {
+		t->sb_blocks = spdk_divide_round_up(TIER_SB_RESERVE_BYTES, t->blocklen);
+	}
+	rc = spdk_bdev_module_claim_bdev(base_bdev, band->desc, &tier_if);
+	if (rc != 0) {
+		SPDK_ERRLOG("tier: assemble cannot claim '%s' rc=%d\n", base_bdev_name, rc);
+		spdk_bdev_close(band->desc);
+		free(band);
+		return rc;
+	}
+	band->band_id = band_id;
+	band->tier = tier;
+	band->state = state;
+	snprintf(band->base_bdev_name, sizeof(band->base_bdev_name), "%s", base_bdev_name);
+	if (wwn) {
+		snprintf(band->wwn, sizeof(band->wwn), "%s", wwn);
+	}
+	if (serial) {
+		snprintf(band->serial, sizeof(band->serial), "%s", serial);
+	}
+	band->lba_start = lba_start;
+	band->num_blocks = num_blocks;
+	/* md-hosting bands carry the mirrored md region at base-physical [sb_blocks, sb_blocks+md); their
+	 * data tail starts after it. Plain bands start at sb_blocks. (Matches vbdev_tier_add_band.) */
+	band->phys_offset = is_md ? (t->sb_blocks + t->md_num_blocks) : t->sb_blocks;
+	if (is_md) {
+		if (t->md_mirror_a == UINT32_MAX) {
+			t->md_mirror_a = band_id;
+		} else if (t->md_mirror_b == UINT32_MAX) {
+			t->md_mirror_b = band_id;
+		}
+	}
+	if (band_id >= t->next_band_id) {
+		t->next_band_id = band_id + 1;
+	}
+	if (lba_start + num_blocks > t->total_num_blocks) {
+		t->total_num_blocks = lba_start + num_blocks;
+	}
+	TAILQ_INSERT_TAIL(&t->bands, band, link);
+	t->num_bands++;
+	SPDK_NOTICELOG("tier '%s': assembled band %u ('%s', tier=%d, state=%d) lba_start=%" PRIu64
+		       " num_blocks=%" PRIu64 " is_md=%d\n", t->bdev.name, band_id, base_bdev_name,
+		       tier, state, lba_start, num_blocks, is_md);
+	return 0;
+}
+
 int
 vbdev_tier_retire_band(struct vbdev_tier *t, uint32_t band_id)
 {
