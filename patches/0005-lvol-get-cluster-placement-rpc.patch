@@ -5,8 +5,8 @@ Subject: [PATCH 05/11] 0005-lvol-get-cluster-placement-rpc.patch
 
 ---
  module/bdev/lvol/Makefile              |    3 +-
- module/bdev/lvol/vbdev_lvol_tier_rpc.c | 1277 ++++++++++++++++++++++++
- 2 files changed, 1279 insertions(+), 1 deletion(-)
+ module/bdev/lvol/vbdev_lvol_tier_rpc.c | 1309 ++++++++++++++++++++++++
+ 2 files changed, 1311 insertions(+), 1 deletion(-)
  create mode 100644 module/bdev/lvol/vbdev_lvol_tier_rpc.c
 
 diff --git a/module/bdev/lvol/Makefile b/module/bdev/lvol/Makefile
@@ -25,10 +25,10 @@ index aba6620..a8ed387 100644
  SPDK_MAP_FILE = $(SPDK_ROOT_DIR)/mk/spdk_blank.map
 diff --git a/module/bdev/lvol/vbdev_lvol_tier_rpc.c b/module/bdev/lvol/vbdev_lvol_tier_rpc.c
 new file mode 100644
-index 0000000..ac46c8d
+index 0000000..6142d29
 --- /dev/null
 +++ b/module/bdev/lvol/vbdev_lvol_tier_rpc.c
-@@ -0,0 +1,1277 @@
+@@ -0,0 +1,1309 @@
 +/*   SPDX-License-Identifier: BSD-3-Clause
 + *   Copyright (C) 2026 Evariops.
 + *   All rights reserved.
@@ -517,6 +517,29 @@ index 0000000..ac46c8d
 +	uint64_t dst_lba_count;
 +};
 +
++/* Deferred #4: per-band resume cursor for a batch claim. Threading a cursor into
++ * spdk_blob_claim_cluster_in_range_from turns an N-cluster campaign filling ONE
++ * band from O(N^2) into O(bandsize + N). claim_cursor_for() advances the cursor
++ * while consecutive items target the SAME dst window and RESETS it (pos = 0) when
++ * the window changes, so a stale hint from a previous window can never spuriously
++ * -ENOSPC — correctness always comes from the live windowed scan, this is a hint. */
++struct claim_cursor {
++	uint64_t	win_start;
++	uint64_t	win_count;
++	uint32_t	pos;
++};
++
++static uint32_t *
++claim_cursor_for(struct claim_cursor *cc, uint64_t win_start, uint64_t win_count)
++{
++	if (win_start != cc->win_start || win_count != cc->win_count) {
++		cc->win_start = win_start;
++		cc->win_count = win_count;
++		cc->pos = 0;
++	}
++	return &cc->pos;
++}
++
 +struct batch_ctx {
 +	struct spdk_jsonrpc_request	*request;
 +	struct spdk_blob		*blob;
@@ -532,6 +555,7 @@ index 0000000..ac46c8d
 +	bool				cur_claimed;
 +	bool				frozen;
 +	bool				ref_held;
++	struct claim_cursor		cc;		/* deferred #4: resume hint */
 +	int				rc;		/* first fatal error */
 +};
 +
@@ -652,8 +676,9 @@ index 0000000..ac46c8d
 +		batch_finish(c, -ENOENT);	/* cluster not allocated */
 +		return;
 +	}
-+	rc = spdk_blob_claim_cluster_in_range(c->blob, it->dst_lba_start, it->dst_lba_count,
-+					      &c->cur_new_lba);
++	rc = spdk_blob_claim_cluster_in_range_from(c->blob, it->dst_lba_start, it->dst_lba_count,
++			claim_cursor_for(&c->cc, it->dst_lba_start, it->dst_lba_count),
++			&c->cur_new_lba);
 +	if (rc != 0) {
 +		batch_finish(c, rc);
 +		return;
@@ -842,10 +867,13 @@ index 0000000..ac46c8d
 + * failed after the claim). Does NOT take the F4 in-flight guard nor the P-2/F2
 + * blob-level checks — those are batch-wide and stay in the callers. Guards, in
 + * order: cluster allocated (ENOENT) -> source band DEGRADED (N-7/W6, EINVAL) ->
-+ * claim a dst cluster (ENOSPC/…) -> destination band ACTIVE (EINVAL). */
++ * claim a dst cluster (ENOSPC/…) -> destination band ACTIVE (EINVAL).
++ * cursor (deferred #4): in/out resume hint for the word-wise claim, NULL for the
++ * single form (no campaign to resume). */
 +static int
 +remap_one_precheck(struct vbdev_tier *tier, struct spdk_blob *blob,
-+		   const struct batch_item *it, uint64_t *old_lba, uint64_t *new_lba)
++		   const struct batch_item *it, uint32_t *cursor,
++		   uint64_t *old_lba, uint64_t *new_lba)
 +{
 +	struct tier_band *src_band, *dst_band;
 +	uint64_t band_off, o, n;
@@ -867,7 +895,8 @@ index 0000000..ac46c8d
 +	if (src_band == NULL || src_band->state != TIER_BAND_DEGRADED) {
 +		return -EINVAL;			/* source band not DEGRADED */
 +	}
-+	rc = spdk_blob_claim_cluster_in_range(blob, it->dst_lba_start, it->dst_lba_count, &n);
++	rc = spdk_blob_claim_cluster_in_range_from(blob, it->dst_lba_start, it->dst_lba_count,
++			cursor, &n);
 +	if (rc != 0) {
 +		return rc;			/* no free cluster in target band */
 +	}
@@ -1029,7 +1058,7 @@ index 0000000..ac46c8d
 +	item = (struct batch_item){ .cluster_num = req.cluster_num,
 +				    .dst_lba_start = req.dst_lba_start,
 +				    .dst_lba_count = req.dst_lba_count };
-+	rc = remap_one_precheck(tier, blob, &item, &old_lba, &new_lba);
++	rc = remap_one_precheck(tier, blob, &item, NULL, &old_lba, &new_lba);
 +	if (rc != 0) {
 +		relocate_blob_release(blob);
 +		spdk_jsonrpc_send_error_response_fmt(request, rc, "remap failed: %s",
@@ -1085,6 +1114,7 @@ index 0000000..ac46c8d
 +	uint64_t			cur_new_lba;
 +	bool				cur_claimed;
 +	bool				ref_held;	/* N-2 */
++	struct claim_cursor		cc;		/* deferred #4: resume hint */
 +	int				rc;		/* first fatal error */
 +};
 +
@@ -1168,7 +1198,9 @@ index 0000000..ac46c8d
 +		return;
 +	}
 +	it = &c->items[c->cur];
-+	rc = remap_one_precheck(c->tier, c->blob, it, &c->cur_old_lba, &c->cur_new_lba);
++	rc = remap_one_precheck(c->tier, c->blob, it,
++				claim_cursor_for(&c->cc, it->dst_lba_start, it->dst_lba_count),
++				&c->cur_old_lba, &c->cur_new_lba);
 +	if (rc != 0) {
 +		remap_batch_finish(c, rc);	/* stop at first per-item error */
 +		return;

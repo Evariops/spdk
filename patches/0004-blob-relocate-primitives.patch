@@ -8,16 +8,46 @@ spdk_blob_freeze_io/spdk_blob_unfreeze_io - the blob-level barrier that
 closes the C1 lost-write (held I/O re-translates through the updated L2P on
 release). m8: assert the bit-pool claim invariant.
 ---
- include/spdk/blob.h    |  54 ++++++++
- lib/blob/blobstore.c   | 289 +++++++++++++++++++++++++++++++++++++++++
- lib/blob/spdk_blob.map |   6 +
- 3 files changed, 349 insertions(+)
+ include/spdk/bit_pool.h |  16 ++
+ include/spdk/blob.h     |  69 +++++++++
+ lib/blob/blobstore.c    | 323 ++++++++++++++++++++++++++++++++++++++++
+ lib/blob/spdk_blob.map  |   7 +
+ lib/util/bit_array.c    |   6 +
+ lib/util/spdk_util.map  |   1 +
+ 6 files changed, 422 insertions(+)
 
+diff --git a/include/spdk/bit_pool.h b/include/spdk/bit_pool.h
+index 316c66a..81297f1 100644
+--- a/include/spdk/bit_pool.h
++++ b/include/spdk/bit_pool.h
+@@ -94,6 +94,22 @@ int spdk_bit_pool_resize(struct spdk_bit_pool **pool, uint32_t num_bits);
+  */
+ bool spdk_bit_pool_is_allocated(const struct spdk_bit_pool *pool, uint32_t bit_index);
+ 
++/**
++ * Find the index of the first free (clear) bit at or after start_bit_index,
++ * scanning word-wise (fully-allocated 64-bit words are skipped in one step).
++ * Read-only: does NOT allocate — a windowed/resumable caller claims the returned
++ * index itself via spdk_bit_pool_set_bit_allocated so the pool's free-count
++ * invariant is maintained. Unlike spdk_bit_pool_allocate_bit (global lowest free
++ * bit), this scans from an arbitrary start so a caller can bound it to a window.
++ *
++ * \param pool Bit pool to search.
++ * \param start_bit_index Index to start searching from.
++ *
++ * \return index of the first free bit >= start_bit_index, or UINT32_MAX if none.
++ */
++uint32_t spdk_bit_pool_find_first_free_from(const struct spdk_bit_pool *pool,
++		uint32_t start_bit_index);
++
+ /**
+  * Allocate a bit from the bit pool.
+  *
 diff --git a/include/spdk/blob.h b/include/spdk/blob.h
-index fe98215..93c2680 100644
+index fe98215..9cebfc8 100644
 --- a/include/spdk/blob.h
 +++ b/include/spdk/blob.h
-@@ -544,6 +544,60 @@ uint64_t spdk_blob_get_num_allocated_clusters(struct spdk_blob *blob);
+@@ -544,6 +544,75 @@ uint64_t spdk_blob_get_num_allocated_clusters(struct spdk_blob *blob);
   */
  uint64_t spdk_blob_get_next_allocated_io_unit(struct spdk_blob *blob, uint64_t offset);
  
@@ -37,6 +67,21 @@ index fe98215..93c2680 100644
 + */
 +int spdk_blob_claim_cluster_in_range(struct spdk_blob *blob, uint64_t lba_start,
 +				     uint64_t lba_count, uint64_t *new_lba);
++
++/**
++ * SPEC-73 (deferred #4): resumable variant of spdk_blob_claim_cluster_in_range for
++ * a campaign that claims MANY clusters into the same band window (batch relocate/
++ * remap). cursor is an in/out CLUSTER-index hint: the scan starts at
++ * max(window_start, *cursor) and, on success, *cursor is set to claimed+1 so the
++ * next call skips the just-claimed prefix — turning an N-claim campaign into one
++ * band from O(N^2) into O(bandsize + N). cursor == NULL behaves exactly like the
++ * legacy entry point (start at the window start). PERF ONLY: the cursor is a hint;
++ * the scan always honors [window_start, window_end) and never returns an
++ * already-allocated or out-of-window cluster, so a stale cursor is always safe.
++ * \return 0 on success, -ENOSPC if no free cluster at/after the hint in the window.
++ */
++int spdk_blob_claim_cluster_in_range_from(struct spdk_blob *blob, uint64_t lba_start,
++		uint64_t lba_count, uint32_t *cursor, uint64_t *new_lba);
 +
 +/**
 + * SPEC-73 M2b: atomically re-point a cluster to new_lba (swap in-place, no count
@@ -79,7 +124,7 @@ index fe98215..93c2680 100644
   * Get next unallocated io_unit
   *
 diff --git a/lib/blob/blobstore.c b/lib/blob/blobstore.c
-index 7ae791c..ea3f883 100644
+index 7ae791c..cda5eee 100644
 --- a/lib/blob/blobstore.c
 +++ b/lib/blob/blobstore.c
 @@ -6246,6 +6246,20 @@ spdk_blob_get_next_unallocated_io_unit(struct spdk_blob *blob, uint64_t offset)
@@ -103,7 +148,7 @@ index 7ae791c..ea3f883 100644
  /* START spdk_bs_create_blob */
  
  static void
-@@ -9030,6 +9044,281 @@ blob_insert_cluster_on_md_thread(struct spdk_blob *blob, uint32_t cluster_num,
+@@ -9030,6 +9044,315 @@ blob_insert_cluster_on_md_thread(struct spdk_blob *blob, uint32_t cluster_num,
  	spdk_thread_send_msg(blob->bs->md_thread, blob_insert_cluster_msg, ctx);
  }
  
@@ -119,12 +164,22 @@ index 7ae791c..ea3f883 100644
 + * durable (below). A crash in any window leaves an orphan auto-reclaimed by the
 + * native replay (used_clusters rebuilt from extents). */
 +
-+int
-+spdk_blob_claim_cluster_in_range(struct spdk_blob *blob, uint64_t lba_start,
-+				 uint64_t lba_count, uint64_t *new_lba)
++/* Deferred #4: word-wise + resume-cursor cluster claim. The old body probed the
++ * used_clusters bit-pool one BIT at a time from c_start on every call, so a
++ * campaign filling one band re-scanned its allocated prefix each time -> O(N^2).
++ * Now: (1) spdk_bit_pool_find_first_free_from skips fully-allocated 64-bit words
++ * in one step, and (2) an optional in/out `cursor` lets a campaign resume past the
++ * last claimed bit instead of restarting at c_start -> O(bandsize + N). Semantics
++ * are unchanged: first free cluster at/after the start hint within the window,
++ * under used_lock, -ENOSPC when none. The cursor is a HINT only — the live scan
++ * still bounds to [c_start, c_end) and set_bit_allocated re-checks the bit, so a
++ * stale/over-shot cursor can never yield an allocated or out-of-window cluster. */
++static int
++blob_claim_cluster_in_range(struct spdk_blob *blob, uint64_t lba_start, uint64_t lba_count,
++			    uint32_t *cursor, uint64_t *new_lba)
 +{
 +	struct spdk_blob_store *bs = blob->bs;
-+	uint32_t c_start, c_end, cap, c;
++	uint32_t c_start, c_end, cap, start, idx;
 +	int rc = -ENOSPC;
 +
 +	assert(new_lba != NULL);
@@ -136,23 +191,47 @@ index 7ae791c..ea3f883 100644
 +		c_end = cap;
 +	}
 +
-+	spdk_spin_lock(&bs->used_lock);
-+	for (c = c_start; c < c_end; c++) {
-+		if (!spdk_bit_pool_is_allocated(bs->used_clusters, c)) {
-+			int claim_rc = spdk_bit_pool_set_bit_allocated(bs->used_clusters, c);
++	/* Resume hint: start at the cursor if it points past c_start (never before,
++	 * so the window's lower bound is always honored). */
++	start = c_start;
++	if (cursor != NULL && *cursor > start) {
++		start = *cursor;
++	}
 +
-+			/* m8: cannot fail — c < capacity and the bit is free, both checked
-+			 * under used_lock. Assert the invariant instead of ignoring it. */
++	spdk_spin_lock(&bs->used_lock);
++	if (start < c_end) {
++		idx = spdk_bit_pool_find_first_free_from(bs->used_clusters, start);
++		if (idx != UINT32_MAX && idx < c_end) {
++			int claim_rc = spdk_bit_pool_set_bit_allocated(bs->used_clusters, idx);
++
++			/* m8: cannot fail — idx < capacity and the bit is free, both under
++			 * used_lock. Assert the invariant instead of ignoring it. */
 +			assert(claim_rc == 0);
 +			(void)claim_rc;
 +			bs->num_free_clusters--;
-+			*new_lba = bs_cluster_to_lba(bs, c);
++			*new_lba = bs_cluster_to_lba(bs, idx);
++			if (cursor != NULL) {
++				*cursor = idx + 1;	/* next candidate; skip the claimed prefix */
++			}
 +			rc = 0;
-+			break;
 +		}
 +	}
 +	spdk_spin_unlock(&bs->used_lock);
 +	return rc;
++}
++
++int
++spdk_blob_claim_cluster_in_range(struct spdk_blob *blob, uint64_t lba_start,
++				 uint64_t lba_count, uint64_t *new_lba)
++{
++	return blob_claim_cluster_in_range(blob, lba_start, lba_count, NULL, new_lba);
++}
++
++int
++spdk_blob_claim_cluster_in_range_from(struct spdk_blob *blob, uint64_t lba_start,
++				      uint64_t lba_count, uint32_t *cursor, uint64_t *new_lba)
++{
++	return blob_claim_cluster_in_range(blob, lba_start, lba_count, cursor, new_lba);
 +}
 +
 +/* SPEC-73 M2b: release a cluster claimed by spdk_blob_claim_cluster_in_range that
@@ -386,15 +465,16 @@ index 7ae791c..ea3f883 100644
  blob_free_cluster_msg(void *arg)
  {
 diff --git a/lib/blob/spdk_blob.map b/lib/blob/spdk_blob.map
-index d4d85c2..071cfe9 100644
+index d4d85c2..5a03b76 100644
 --- a/lib/blob/spdk_blob.map
 +++ b/lib/blob/spdk_blob.map
-@@ -24,6 +24,12 @@
+@@ -24,6 +24,13 @@
  	spdk_blob_get_num_allocated_clusters;
  	spdk_blob_get_next_allocated_io_unit;
  	spdk_blob_get_next_unallocated_io_unit;
 +	spdk_blob_get_cluster_lba;
 +	spdk_blob_claim_cluster_in_range;
++	spdk_blob_claim_cluster_in_range_from;
 +	spdk_blob_relocate_commit;
 +	spdk_blob_release_cluster_lba;
 +	spdk_blob_freeze_io;
@@ -402,6 +482,35 @@ index d4d85c2..071cfe9 100644
  	spdk_blob_opts_init;
  	spdk_bs_create_blob_ext;
  	spdk_bs_create_blob;
+diff --git a/lib/util/bit_array.c b/lib/util/bit_array.c
+index ff51705..067b25a 100644
+--- a/lib/util/bit_array.c
++++ b/lib/util/bit_array.c
+@@ -431,6 +431,12 @@ spdk_bit_pool_is_allocated(const struct spdk_bit_pool *pool, uint32_t bit_index)
+ 	return spdk_bit_array_get(pool->array, bit_index);
+ }
+ 
++uint32_t
++spdk_bit_pool_find_first_free_from(const struct spdk_bit_pool *pool, uint32_t start_bit_index)
++{
++	return spdk_bit_array_find_first_clear(pool->array, start_bit_index);
++}
++
+ uint32_t
+ spdk_bit_pool_allocate_bit(struct spdk_bit_pool *pool)
+ {
+diff --git a/lib/util/spdk_util.map b/lib/util/spdk_util.map
+index bf2df25..40ee55b 100644
+--- a/lib/util/spdk_util.map
++++ b/lib/util/spdk_util.map
+@@ -30,6 +30,7 @@
+ 	spdk_bit_pool_free;
+ 	spdk_bit_pool_resize;
+ 	spdk_bit_pool_is_allocated;
++	spdk_bit_pool_find_first_free_from;
+ 	spdk_bit_pool_allocate_bit;
+ 	spdk_bit_pool_set_bit_allocated;
+ 	spdk_bit_pool_free_bit;
 -- 
 2.50.1 (Apple Git-155)
 
