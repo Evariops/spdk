@@ -11,11 +11,11 @@ chunk are held and replayed after the write-back. P-3: stripe alignment
 validated for parity raids, ranges heap-allocated. N-6: REMOVE aborts.
 ---
  include/spdk/bdev_module.h          |  17 ++
- lib/bdev/bdev.c                     |  22 ++
+ lib/bdev/bdev.c                     |  25 ++
  lib/bdev/spdk_bdev.map              |   2 +
  module/bdev/raid/Makefile           |   2 +-
  module/bdev/raid/bdev_raid_repair.c | 393 ++++++++++++++++++++++++++++
- 5 files changed, 435 insertions(+), 1 deletion(-)
+ 5 files changed, 438 insertions(+), 1 deletion(-)
  create mode 100644 module/bdev/raid/bdev_raid_repair.c
 
 diff --git a/include/spdk/bdev_module.h b/include/spdk/bdev_module.h
@@ -47,10 +47,10 @@ index fce200b..79b43f0 100644
   *  Macro used to register module for later initialization.
   */
 diff --git a/lib/bdev/bdev.c b/lib/bdev/bdev.c
-index 98e01ca..047f97c 100644
+index 98e01ca..80f0cf7 100644
 --- a/lib/bdev/bdev.c
 +++ b/lib/bdev/bdev.c
-@@ -11189,6 +11189,28 @@ spdk_bdev_unquiesce_range(struct spdk_bdev *bdev, struct spdk_bdev_module *modul
+@@ -11189,6 +11189,31 @@ spdk_bdev_unquiesce_range(struct spdk_bdev *bdev, struct spdk_bdev_module *modul
  	return _spdk_bdev_quiesce(bdev, module, offset, length, cb_fn, cb_arg, true);
  }
  
@@ -65,7 +65,10 @@ index 98e01ca..047f97c 100644
 +			 uint64_t offset, uint64_t length,
 +			 spdk_bdev_lba_range_cb cb_fn, void *cb_arg)
 +{
-+	return bdev_lock_lba_range(desc, ch, offset, length, (lock_range_cb)cb_fn, cb_arg);
++	/* No cast: spdk_bdev_lba_range_cb and the internal lock_range_cb have identical
++	 * signatures, so this compiles as compatible types. Casting instead would hide a
++	 * future divergence of the internal typedef behind a silent runtime mismatch. */
++	return bdev_lock_lba_range(desc, ch, offset, length, cb_fn, cb_arg);
 +}
 +
 +int
@@ -73,7 +76,7 @@ index 98e01ca..047f97c 100644
 +			   uint64_t offset, uint64_t length,
 +			   spdk_bdev_lba_range_cb cb_fn, void *cb_arg)
 +{
-+	return bdev_unlock_lba_range(desc, ch, offset, length, (lock_range_cb)cb_fn, cb_arg);
++	return bdev_unlock_lba_range(desc, ch, offset, length, cb_fn, cb_arg);
 +}
 +
  int

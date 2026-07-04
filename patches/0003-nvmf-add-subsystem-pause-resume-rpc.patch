@@ -10,8 +10,8 @@ subsystem can no longer end up without entry+TTL on OOM), UUID-based
 per-process nonce (P-6), loud TTL clamp (S-8 follow-up).
 ---
  lib/nvmf/Makefile         |   2 +-
- lib/nvmf/nvmf_pause_rpc.c | 442 ++++++++++++++++++++++++++++++++++++++
- 2 files changed, 443 insertions(+), 1 deletion(-)
+ lib/nvmf/nvmf_pause_rpc.c | 458 ++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 459 insertions(+), 1 deletion(-)
  create mode 100644 lib/nvmf/nvmf_pause_rpc.c
 
 diff --git a/lib/nvmf/Makefile b/lib/nvmf/Makefile
@@ -29,10 +29,10 @@ index 3136f7a..0af5836 100644
  C_SRCS-$(CONFIG_HAVE_EVP_MAC) += auth.c
 diff --git a/lib/nvmf/nvmf_pause_rpc.c b/lib/nvmf/nvmf_pause_rpc.c
 new file mode 100644
-index 0000000..fbf6996
+index 0000000..63de22e
 --- /dev/null
 +++ b/lib/nvmf/nvmf_pause_rpc.c
-@@ -0,0 +1,442 @@
+@@ -0,0 +1,458 @@
 +/* lib/nvmf/nvmf_pause_rpc.c — SPDX-License-Identifier: BSD-3-Clause
 + * Evariops fork — companion of spdk-csi SPEC-66 (H10).
 + * nvmf_subsystem_pause / nvmf_subsystem_resume: a STANDING, drain-certified,
@@ -61,6 +61,9 @@ index 0000000..fbf6996
 +
 +struct paused_subsystem {
 +	struct spdk_nvmf_subsystem    *subsystem;
++	struct spdk_nvmf_tgt          *tgt;         /* re-resolve `subsystem` by NQN before the TTL
++						     * resume dereferences it — a subsystem destroyed
++						     * while paused would otherwise be a use-after-free */
 +	char                           nqn[SPDK_NVMF_NQN_MAX_LEN + 1];
 +	uint32_t                       nsid;
 +	uint32_t                       ttl_ms;       /* remembered to re-arm the TTL on a failed resume */
@@ -174,6 +177,16 @@ index 0000000..fbf6996
 +ttl_expired(void *arg)
 +{
 +	struct paused_subsystem *p = arg;
++	/* The registry holds only a raw subsystem pointer; the subsystem may have been
++	 * stopped/destroyed since the pause was armed. Re-resolve by NQN and confirm
++	 * identity before touching it — a vanished or replaced subsystem must be dropped,
++	 * never resumed (that would dereference freed memory). */
++	if (spdk_nvmf_tgt_find_subsystem(p->tgt, p->nqn) != p->subsystem) {
++		SPDK_WARNLOG("nvmf pause: subsystem %s gone before TTL; dropping stale pause\n",
++			     p->nqn);
++		paused_entry_free(p);
++		return SPDK_POLLER_BUSY;
++	}
 +	/* one-shot: paused_begin_resume unregisters this poller (or, on the rare
 +	 * dispatch failure, re-arms a fresh one). */
 +	if (paused_begin_resume(p, auto_resume_done, p)) {
@@ -189,6 +202,7 @@ index 0000000..fbf6996
 +	char     *tgt_name;
 +	uint32_t  nsid;          /* 0 => resolve to first namespace */
 +	uint32_t  ttl_ms;
++	struct spdk_nvmf_tgt *tgt;
 +	struct spdk_nvmf_subsystem *subsystem;
 +	/* Registry entry PREALLOCATED before the pause dispatch: a post-drain alloc
 +	 * failure used to leave the subsystem Paused with no registry entry and no
@@ -233,6 +247,7 @@ index 0000000..fbf6996
 +		ctx->prealloc = NULL;
 +		assert(p != NULL);
 +		p->subsystem = ss;
++		p->tgt = ctx->tgt;
 +		p->nsid = ctx->nsid;
 +		p->epoch = ++g_epoch;   /* new barrier → new token */
 +		snprintf(p->nqn, sizeof(p->nqn), "%s", spdk_nvmf_subsystem_get_nqn(ss));
@@ -298,6 +313,7 @@ index 0000000..fbf6996
 +	tgt = spdk_nvmf_get_tgt(ctx->tgt_name);   /* NULL name => the single default tgt */
 +	if (!tgt) { spdk_jsonrpc_send_error_response(request, -ENODEV, "target not found");
 +		    rpc_pause_ctx_free(ctx); return; }
++	ctx->tgt = tgt;
 +	ss = spdk_nvmf_tgt_find_subsystem(tgt, ctx->nqn);
 +	if (!ss)  { spdk_jsonrpc_send_error_response(request, -ENOENT, "subsystem not found");
 +		    rpc_pause_ctx_free(ctx); return; }
