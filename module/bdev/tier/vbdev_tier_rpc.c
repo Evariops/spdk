@@ -47,6 +47,21 @@ rpc_bdev_tier_create(struct spdk_jsonrpc_request *request, const struct spdk_jso
 		free(req.name);
 		return;
 	}
+	/* A composite without an md region silently disables the mirrored-L2P design
+	 * (D1): vbdev_tier_is_md_range() would never match. Refuse it. */
+	if (req.md_num_blocks == 0) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "md_num_blocks must be > 0");
+		free(req.name);
+		return;
+	}
+	/* F-3: the on-disk superblock stores cluster_blocks as u32 (v1). */
+	if (req.cluster_blocks > UINT32_MAX) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "cluster_blocks exceeds UINT32_MAX (v1 on-disk limit)");
+		free(req.name);
+		return;
+	}
 	t = vbdev_tier_create(req.name, req.md_num_blocks, req.cluster_blocks);
 	free(req.name);
 	if (t == NULL) {
@@ -193,6 +208,22 @@ static const struct spdk_json_object_decoder rpc_tier_retire_decoders[] = {
 	{"band_id", offsetof(struct rpc_tier_retire, band_id), spdk_json_decode_uint32},
 };
 
+/* MJ6: the RPC acks only once the retirement is durably persisted to the
+ * surviving bands' superblocks (rc != 0 ⇒ retry the idempotent retire). */
+static void
+rpc_tier_retire_done(void *cb_arg, int rc)
+{
+	struct spdk_jsonrpc_request *request = cb_arg;
+
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response_fmt(request, rc,
+						     "retire_band not durable (retry): %s",
+						     spdk_strerror(-rc));
+		return;
+	}
+	spdk_jsonrpc_send_bool_response(request, true);
+}
+
 static void
 rpc_bdev_tier_retire_band(struct spdk_jsonrpc_request *request, const struct spdk_json_val *params)
 {
@@ -212,13 +243,13 @@ rpc_bdev_tier_retire_band(struct spdk_jsonrpc_request *request, const struct spd
 		spdk_jsonrpc_send_error_response(request, -ENODEV, "tier not found");
 		return;
 	}
-	rc = vbdev_tier_retire_band(t, req.band_id);
+	rc = vbdev_tier_retire_band(t, req.band_id, rpc_tier_retire_done, request);
 	if (rc != 0) {
 		spdk_jsonrpc_send_error_response_fmt(request, rc, "retire_band failed: %s",
 						     spdk_strerror(-rc));
 		return;
 	}
-	spdk_jsonrpc_send_bool_response(request, true);
+	/* Response sent from rpc_tier_retire_done after persistence. */
 }
 SPDK_RPC_REGISTER("bdev_tier_retire_band", rpc_bdev_tier_retire_band, SPDK_RPC_RUNTIME)
 
@@ -341,6 +372,50 @@ cleanup:
 }
 SPDK_RPC_REGISTER("bdev_tier_assemble_band", rpc_bdev_tier_assemble_band, SPDK_RPC_RUNTIME)
 
+/* ---- C3: bdev_tier_resync_md {name, band_id} — rebuild a DEGRADED md leg ---- */
+
+static void
+rpc_tier_resync_md_done(void *cb_arg, int rc)
+{
+	struct spdk_jsonrpc_request *request = cb_arg;
+
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response_fmt(request, rc, "resync_md failed: %s",
+						     spdk_strerror(-rc));
+		return;
+	}
+	spdk_jsonrpc_send_bool_response(request, true);
+}
+
+static void
+rpc_bdev_tier_resync_md(struct spdk_jsonrpc_request *request, const struct spdk_json_val *params)
+{
+	struct rpc_tier_retire req = {};
+	struct vbdev_tier *t;
+	int rc;
+
+	if (spdk_json_decode_object(params, rpc_tier_retire_decoders,
+				    SPDK_COUNTOF(rpc_tier_retire_decoders), &req)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "invalid parameters");
+		return;
+	}
+	t = vbdev_tier_get_by_name(req.name);
+	free(req.name);
+	if (t == NULL) {
+		spdk_jsonrpc_send_error_response(request, -ENODEV, "tier not found");
+		return;
+	}
+	rc = vbdev_tier_resync_md(t, req.band_id, rpc_tier_resync_md_done, request);
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response_fmt(request, rc, "resync_md failed: %s",
+						     spdk_strerror(-rc));
+		return;
+	}
+	/* Response sent from rpc_tier_resync_md_done. */
+}
+SPDK_RPC_REGISTER("bdev_tier_resync_md", rpc_bdev_tier_resync_md, SPDK_RPC_RUNTIME)
+
 /* ---- SPEC-73 A2: bdev_tier_read_sb {name=base_bdev} -> the on-disk superblock (swap detection) ---- */
 
 struct rpc_read_sb_ctx {
@@ -351,8 +426,13 @@ struct rpc_read_sb_ctx {
 static void
 rpc_read_sb_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev, void *ctx)
 {
-	(void)type;
-	(void)bdev;
+	/* m7: the desc lives only for the duration of one async SB read and is closed
+	 * in rpc_read_sb_done. A REMOVE during that window just delays the base
+	 * bdev's unregister until the read completes (bounded); log it. */
+	if (type == SPDK_BDEV_EVENT_REMOVE) {
+		SPDK_WARNLOG("tier read_sb: '%s' removed mid-read; desc closes at read completion\n",
+			     bdev->name);
+	}
 	(void)ctx;
 }
 

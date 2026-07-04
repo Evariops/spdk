@@ -27,6 +27,7 @@
 #define SPDK_VBDEV_TIER_H
 
 #include "spdk/stdinc.h"
+#include "spdk/assert.h"
 #include "spdk/bdev.h"
 #include "spdk/bdev_module.h"
 
@@ -59,10 +60,14 @@ enum tier_band_state {
 
 /* ---- On-disk superblock (INV-T1: at native SPDK level, à la bdev_raid_sb) ----
  * One copy is written into a RESERVED region at the start of EACH base bdev. Each
- * copy self-describes the WHOLE composite, so any present band can drive
- * self-assembly via the examine path (no CSI needed to assemble). The reserved
- * region falls inside the mirrored md range, so it is itself RAID1-protected.
- * Disk identity (wwn) is validated at assembly to detect swap/replacement. */
+ * copy self-describes the WHOLE composite. There is NO examine path: assembly is
+ * driven by the CSI agent (SPEC-73 A2), which reads every disk's SB via
+ * bdev_tier_read_sb, picks the highest-seq copy, and replays
+ * create + assemble_band at the stored geometry. Swap/replacement detection
+ * (live wwn vs the slot's stored wwn) is done by the CSI during that replay;
+ * in-module the only wwn guard is the duplicate-wwn rejection at add/assemble.
+ * The reserved region is per-disk (NOT inside the mirrored md range).
+ * Format: little-endian only (F-4); layout locked by the static asserts below (F-1). */
 #define TIER_SB_MAGIC		0x5449455253423031ULL	/* "TIERSB01" */
 #define TIER_SB_VERSION		1u
 #define TIER_SB_RESERVE_BYTES	(256 * 1024)		/* reserved per base bdev for the sb */
@@ -96,6 +101,13 @@ struct tier_superblock {
 	struct tier_sb_band bands[TIER_MAX_BANDS];
 };
 
+/* F-1: lock the on-disk ABI. The layout was historically stable only by LP64
+ * alignment luck; these asserts turn any layout drift into a compile error. */
+SPDK_STATIC_ASSERT(sizeof(struct tier_sb_band) == 160, "tier_sb_band on-disk ABI changed");
+SPDK_STATIC_ASSERT(offsetof(struct tier_superblock, bands) == 120,
+		   "tier_superblock header on-disk ABI changed");
+SPDK_STATIC_ASSERT(sizeof(struct tier_superblock) == 10360, "tier_superblock on-disk ABI changed");
+
 /*
  * One band == one physical base bdev. bandId is a STABLE monotone slot,
  * never reused (a retired disk keeps its slot) — same model as a raid
@@ -116,8 +128,12 @@ struct tier_band {
 	uint64_t		phys_offset;	/* base-bdev physical block where lba_start maps
 						 * (>= sb_blocks; mirror band A adds md_num_blocks) */
 
-	/* Open handle to the underlying disk (NULL while retired). */
+	/* Open handle to the underlying disk (NULL while retired or hot-removed). */
 	struct spdk_bdev_desc	*desc;
+
+	/* Back-pointer to the composite (needed by the hot-remove event callback,
+	 * which only receives the band as event_ctx). */
+	struct vbdev_tier	*t;
 
 	TAILQ_ENTRY(tier_band)	link;
 };
@@ -144,11 +160,28 @@ struct vbdev_tier {
 	uint64_t		cluster_blocks;	/* blobstore cluster size in blocks; ALL band/md boundaries are
 						 * aligned to this so no cluster ever straddles a band/region
 						 * boundary (F1) — a straddling cluster would fail I/O (-EIO). */
-	uint64_t		seq;		/* current superblock generation (monotone) */
+	uint64_t		seq;		/* current superblock generation (monotone). M5(a): RESERVED
+						 * (incremented) at write_all entry, so no two write_all
+						 * generations can ever share a seq — gaps are harmless
+						 * ("highest seq wins"), duplicates are fatal. */
 	uint64_t		total_num_blocks;	/* md region + Σ data bands (excludes per-disk sb reserve) */
 	bool			registered;
 
+	/* M5(a): serialize tier_sb_write_all — one fan-out in flight at a time;
+	 * concurrent requests queue their callbacks and are coalesced into ONE
+	 * follow-up fan-out that persists the latest state. */
+	bool			sb_write_inflight;
+	bool			sb_write_queued;
+	TAILQ_HEAD(, tier_sb_pending_cb) sb_pending_cbs;
+
 	TAILQ_ENTRY(vbdev_tier)	link;
+};
+
+/* Queued completion callback for a serialized tier_sb_write_all request. */
+struct tier_sb_pending_cb {
+	void	(*cb)(void *cb_arg, int rc);
+	void	*cb_arg;
+	TAILQ_ENTRY(tier_sb_pending_cb) link;
 };
 
 /*
@@ -202,7 +235,18 @@ int vbdev_tier_add_band(struct vbdev_tier *t, const char *base_bdev_name,
 int vbdev_tier_assemble_band(struct vbdev_tier *t, const char *base_bdev_name, uint32_t band_id,
 			     enum tier_class tier, const char *wwn, const char *serial,
 			     uint64_t lba_start, uint64_t num_blocks, enum tier_band_state state, bool is_md);
-int vbdev_tier_retire_band(struct vbdev_tier *t, uint32_t band_id);
+/* MJ6: async — cb fires AFTER the retirement is persisted to the surviving bands'
+ * superblocks (rc != 0 ⇒ NOT durable, caller must retry; in-memory state is
+ * already RETIRED). T-7: retiring an md-mirror band is refused (-EBUSY). */
+int vbdev_tier_retire_band(struct vbdev_tier *t, uint32_t band_id,
+			   void (*cb)(void *cb_arg, int rc), void *cb_arg);
+/* C3: resync the mirrored md region onto a DEGRADED md leg (typically a
+ * replacement disk assembled DEGRADED into an md slot), then activate it and
+ * persist. Runs under a quiesce of the composite md range (identity-mapped, so
+ * held writes replay correctly to BOTH legs after activation). Async; cb gets
+ * rc != 0 on failure (leg left DEGRADED — retry). */
+int vbdev_tier_resync_md(struct vbdev_tier *t, uint32_t target_band_id,
+			 void (*cb)(void *cb_arg, int rc), void *cb_arg);
 /* Register the composite bdev once its bands are configured. */
 int vbdev_tier_register(struct vbdev_tier *t);
 /* Tear down + unregister (cleanup). */
@@ -210,9 +254,12 @@ int vbdev_tier_delete(struct vbdev_tier *t);
 
 /* Superblock (vbdev_tier_sb.c) — native-level persistence (INV-T1). */
 void tier_sb_serialize(struct vbdev_tier *t, struct tier_band *self, uint64_t seq, struct tier_superblock *sb);
-bool tier_sb_valid(const struct tier_superblock *sb);	/* magic + crc check */
-/* Async-write the (serialized) superblock to EVERY active band. cb fires once,
- * with rc != 0 if any band failed. Increments t->seq. cb may be NULL (fire-and-forget). */
+bool tier_sb_valid(const struct tier_superblock *sb);	/* magic + crc check (LE-only, F-4) */
+/* Async-write the (serialized) superblock to every ACTIVE band (M5(b): DEGRADED
+ * bands are excluded — their stale copy is out-voted by seq at reassembly), then
+ * FLUSH each copy (F-6). Serialized (M5(a)): a call while a fan-out is in flight
+ * queues cb and coalesces into one follow-up fan-out of the LATEST state.
+ * cb fires once, rc != 0 if any band failed. cb may be NULL (fire-and-forget). */
 int tier_sb_write_all(struct vbdev_tier *t, void (*cb)(void *cb_arg, int rc), void *cb_arg);
 /* Async-read the superblock from a base bdev desc into a freshly-allocated buffer;
  * cb receives the parsed sb (NULL + rc on failure) and owns freeing nothing (sb is on stack-copy). */
@@ -221,17 +268,13 @@ int tier_sb_read_desc(struct spdk_bdev_desc *desc, uint32_t blocklen,
 
 /* M2b: copy num_blocks from src composite-LBA to dst composite-LBA by resolving
  * each to its band + physical offset and doing a direct base-bdev read+write
- * (bypasses the composite, so it is NOT blocked by a quiesce on the src range). */
+ * (bypasses the composite, so it is NOT held by the caller's blob-level freeze).
+ * C1: the caller must hold spdk_blob_freeze_io on the owning blob for the whole
+ * copy+commit — a composite-level quiesce is NOT a valid barrier here (it holds
+ * writes below the blob→LBA translation and replays them to the OLD lba). */
 typedef void (*tier_relocate_cb)(void *cb_arg, int status);
 int vbdev_tier_relocate_copy(struct vbdev_tier *t, uint64_t src_lba, uint64_t dst_lba,
 			     uint64_t num_blocks, tier_relocate_cb cb_fn, void *cb_arg);
-
-/* M2b co-design: quiesce a physical LBA range of THIS composite (only the
- * registering module may call spdk_bdev_quiesce_range — SPEC-73A §5.3). */
-int vbdev_tier_relocate_quiesce(struct vbdev_tier *t, uint64_t lba, uint64_t num_blocks,
-				spdk_bdev_quiesce_cb cb_fn, void *cb_arg);
-int vbdev_tier_relocate_unquiesce(struct vbdev_tier *t, uint64_t lba, uint64_t num_blocks,
-				  spdk_bdev_quiesce_cb cb_fn, void *cb_arg);
 
 #ifdef __cplusplus
 }
