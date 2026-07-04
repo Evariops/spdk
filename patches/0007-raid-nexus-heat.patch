@@ -11,8 +11,8 @@ period (the old "reclaimed at teardown" claim was false - it leaked).
  module/bdev/raid/Makefile         |   2 +-
  module/bdev/raid/bdev_raid.c      |  17 ++
  module/bdev/raid/bdev_raid.h      |   9 +
- module/bdev/raid/bdev_raid_heat.c | 312 ++++++++++++++++++++++++++++++
- 4 files changed, 339 insertions(+), 1 deletion(-)
+ module/bdev/raid/bdev_raid_heat.c | 311 ++++++++++++++++++++++++++++++
+ 4 files changed, 338 insertions(+), 1 deletion(-)
  create mode 100644 module/bdev/raid/bdev_raid_heat.c
 
 diff --git a/module/bdev/raid/Makefile b/module/bdev/raid/Makefile
@@ -90,10 +90,10 @@ index d0484ca..e7d7ac5 100644
  #endif /* SPDK_BDEV_RAID_INTERNAL_H */
 diff --git a/module/bdev/raid/bdev_raid_heat.c b/module/bdev/raid/bdev_raid_heat.c
 new file mode 100644
-index 0000000..4e456e3
+index 0000000..027a55d
 --- /dev/null
 +++ b/module/bdev/raid/bdev_raid_heat.c
-@@ -0,0 +1,312 @@
+@@ -0,0 +1,311 @@
 +/*   SPDX-License-Identifier: BSD-3-Clause
 + *   Copyright (C) 2026 Evariops.
 + *   All rights reserved.
@@ -117,10 +117,14 @@ index 0000000..4e456e3
 +	uint64_t	reads;
 +	uint64_t	writes;
 +	uint64_t	last_tick;
++	/* Pad each entry to a full cacheline: adjacent regions touched by different
++	 * reactors must not share a line, or every I/O false-shares with its neighbour. */
++	uint8_t		pad[64 - 3 * sizeof(uint64_t)];
 +};
 +
 +struct raid_tier_heat {
-+	uint64_t			region_blocks;
++	uint64_t			region_blocks;	/* power of two (see create) */
++	uint32_t			region_shift;	/* log2(region_blocks): hot path shifts, never divides */
 +	uint64_t			num_regions;
 +	struct raid_region_heat		*regions;
 +};
@@ -137,8 +141,12 @@ index 0000000..4e456e3
 +	if (h == NULL) {
 +		return NULL;
 +	}
-+	h->region_blocks = region_blocks;
-+	h->num_regions = spdk_divide_round_up(num_blocks, region_blocks);
++	/* Round the region size DOWN to a power of two so raid_tier_heat_record maps
++	 * offset->region with a shift instead of a per-I/O 64-bit divide. region_blocks
++	 * is >= 1 here (guarded above), so the builtin is well-defined. */
++	h->region_shift = 63u - (uint32_t)__builtin_clzll(region_blocks);
++	h->region_blocks = (uint64_t)1 << h->region_shift;
++	h->num_regions = spdk_divide_round_up(num_blocks, h->region_blocks);
 +	h->regions = calloc(h->num_regions, sizeof(*h->regions));
 +	if (h->regions == NULL) {
 +		free(h);
@@ -173,7 +181,7 @@ index 0000000..4e456e3
 +	if (spdk_unlikely(h == NULL)) {
 +		return;
 +	}
-+	region = offset_blocks / h->region_blocks;
++	region = offset_blocks >> h->region_shift;
 +	if (spdk_unlikely(region >= h->num_regions)) {
 +		return;
 +	}
@@ -183,21 +191,6 @@ index 0000000..4e456e3
 +		h->regions[region].reads++;
 +	}
 +	h->regions[region].last_tick = spdk_get_ticks();
-+}
-+
-+/* ---- lookup ---------------------------------------------------------------- */
-+
-+static struct raid_bdev *
-+raid_heat_find(const char *name)
-+{
-+	struct raid_bdev *raid_bdev;
-+
-+	TAILQ_FOREACH(raid_bdev, &g_raid_bdev_list, global_link) {
-+		if (raid_bdev->bdev.name != NULL && strcmp(raid_bdev->bdev.name, name) == 0) {
-+			return raid_bdev;
-+		}
-+	}
-+	return NULL;
 +}
 +
 +/* ---- RPC: vbdev_nexus_enable_heat {name, region_mib} ----------------------- */
@@ -227,9 +220,15 @@ index 0000000..4e456e3
 +	if (req.region_mib == 0) {
 +		req.region_mib = 64;
 +	}
-+	raid_bdev = raid_heat_find(req.name);
++	raid_bdev = raid_bdev_find_by_name(req.name);
 +	if (raid_bdev == NULL) {
 +		spdk_jsonrpc_send_error_response(request, -ENODEV, "nexus not found");
++		goto cleanup;
++	}
++	if (raid_bdev->bdev.blocklen == 0) {
++		/* A nexus that exists but is not yet configured has blocklen 0 — dividing
++		 * by it below would fault. Refuse until the nexus is online. */
++		spdk_jsonrpc_send_error_response(request, -EINVAL, "nexus not ready (blocklen unset)");
 +		goto cleanup;
 +	}
 +	if (__atomic_load_n(&raid_bdev->tier_heat, __ATOMIC_RELAXED) == NULL) {
@@ -300,7 +299,7 @@ index 0000000..4e456e3
 +		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS, "decode failed");
 +		goto cleanup;
 +	}
-+	raid_bdev = raid_heat_find(req.name);
++	raid_bdev = raid_bdev_find_by_name(req.name);
 +	if (raid_bdev != NULL) {
 +		old = __atomic_exchange_n(&raid_bdev->tier_heat, NULL, __ATOMIC_ACQ_REL);
 +	}
@@ -367,7 +366,7 @@ index 0000000..4e456e3
 +	if (req.max_regions == 0) {
 +		req.max_regions = HEAT_GET_DEFAULT_MAX;
 +	}
-+	raid_bdev = raid_heat_find(req.name);
++	raid_bdev = raid_bdev_find_by_name(req.name);
 +	h = raid_bdev != NULL ?
 +	    __atomic_load_n(&raid_bdev->tier_heat, __ATOMIC_ACQUIRE) : NULL;
 +	if (h == NULL) {

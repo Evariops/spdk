@@ -8,8 +8,9 @@
 # files) as a real risk: `sed`/hand edits silently corrupt offsets and only
 # surface at build time. This script makes the round trip mechanical:
 #
-#   patches.sh check   [<spdk_src>]   apply every patch with `git apply --check`
-#                                      in order; report the first that fails.
+#   patches.sh check   <spdk_src>     verify the whole series applies in order
+#                                      (non-destructive: checks against a scratch
+#                                      index, never touches the caller's tree).
 #   patches.sh apply   <spdk_src>     git-apply the series into an SPDK checkout.
 #   patches.sh regen   <spdk_worktree>   regenerate patches/*.patch from a
 #                                      worktree whose commits (one per patch,
@@ -30,32 +31,44 @@ DOCKERFILE="$REPO_ROOT/images/spdk/Dockerfile"
 pinned_sha() { sed -n 's/^ARG SPDK_COMMIT_SHA=\([0-9a-f]\{7,\}\).*/\1/p' "$DOCKERFILE"; }
 pinned_tag() { sed -n 's/^ARG SPDK_VERSION=\(v[^ ]*\).*/\1/p' "$DOCKERFILE"; }
 
-patches() { ls "$PATCH_DIR"/[0-9]*.patch | sort; }
+# NUL-delimited list so a patch path with spaces/globs is never word-split.
+patches() { find "$PATCH_DIR" -maxdepth 1 -name '[0-9]*.patch' -print0 | sort -z; }
+patches_count() { patches | tr -cd '\0' | wc -c | tr -d ' '; }
 
+# Non-destructive: `git apply --check` verifies the WHOLE series applies in order
+# without touching the caller's tree. --check alone stops at the first patch, so
+# each subsequent patch is checked against a scratch index (git apply --cached
+# into a temporary index copied from HEAD), leaving the working tree untouched.
 cmd_check() {
 	local src="${1:?usage: patches.sh check <spdk_src>}"
-	git -C "$src" reset --hard >/dev/null 2>&1 || true
-	local p
-	for p in $(patches); do
-		if git -C "$src" apply --check "$p" 2>/tmp/patcherr; then
-			git -C "$src" apply "$p"
+	local tmpidx err p rc=0
+	tmpidx="$(mktemp)"
+	err="$(mktemp)"
+	# Seed the scratch index from HEAD so --cached checks stack in order.
+	GIT_INDEX_FILE="$tmpidx" git -C "$src" read-tree HEAD
+	while IFS= read -r -d '' p; do
+		if GIT_INDEX_FILE="$tmpidx" git -C "$src" apply --cached --check "$p" 2>"$err"; then
+			GIT_INDEX_FILE="$tmpidx" git -C "$src" apply --cached "$p"
 			echo "OK   $(basename "$p")"
 		else
 			echo "FAIL $(basename "$p")"
-			sed 's/^/     /' /tmp/patcherr
-			return 1
+			sed 's/^/     /' "$err"
+			rc=1
+			break
 		fi
-	done
-	echo "All $(patches | wc -l | tr -d ' ') patches apply cleanly."
+	done < <(patches)
+	rm -f "$tmpidx" "$err"
+	[ "$rc" -eq 0 ] && echo "All $(patches_count) patches apply cleanly."
+	return "$rc"
 }
 
 cmd_apply() {
 	local src="${1:?usage: patches.sh apply <spdk_src>}"
 	local p
-	for p in $(patches); do
+	while IFS= read -r -d '' p; do
 		echo "Applying $(basename "$p")"
 		git -C "$src" apply "$p"
-	done
+	done < <(patches)
 }
 
 cmd_regen() {
@@ -63,10 +76,10 @@ cmd_regen() {
 	local base
 	base="$(pinned_sha)"
 	local n
-	n="$(patches | wc -l | tr -d ' ')"
+	n="$(patches_count)"
 	rm -f "$PATCH_DIR"/[0-9]*.patch
 	git -C "$wt" format-patch --zero-commit "$base..HEAD" -o "$PATCH_DIR" >/dev/null
-	echo "Regenerated $(patches | wc -l | tr -d ' ') patches from $wt ($base..HEAD); was $n."
+	echo "Regenerated $(patches_count) patches from $wt ($base..HEAD); was $n."
 }
 
 cmd_verify() {

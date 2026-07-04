@@ -880,9 +880,13 @@ bdev_cbt_epoch_open(const char *cbt_name, const char *epoch_id,
 		if (generation > ep->generation) {
 			/* c5 (requalified): a higher-generation takeover must NOT rip the
 			 * epoch away from a rebuild that is scanning/writing its frozen
-			 * bitmap — that corrupts the state machine and opens the CBT-1 UAF. */
-			if (ep->state == CBT_EPOCH_REBUILDING ||
-			    cbt_rebuild_find_active_for_epoch(cbt, epoch_id) != NULL) {
+			 * bitmap — that corrupts the state machine and opens the CBT-1 UAF.
+			 * Gate on an ACTUALLY-RUNNING rebuild, not on ep->state: a COMPLETED
+			 * rebuild deliberately leaves the epoch in REBUILDING (finalize keeps
+			 * it there), so keying on the state would refuse every later takeover
+			 * forever (cancel_rebuild returns -EINVAL — no running rebuild — so
+			 * the flow would deadlock). */
+			if (cbt_rebuild_find_active_for_epoch(cbt, epoch_id) != NULL) {
 				SPDK_ERRLOG("CBT: epoch_open gen=%lu refused: epoch '%s' has an "
 					    "active rebuild\n", (unsigned long)generation, epoch_id);
 				return -EBUSY;
@@ -2029,6 +2033,9 @@ bdev_cbt_start_rebuild(const char *cbt_name, const char *epoch_id,
 			       source_bdev_name, max_bw_mb_sec,
 			       queue_depth, NULL, 0, out_rebuild_id, NULL, NULL);
 	if (rc != 0) {
+		/* No rebuild was created — clear the pre-stamped id so a caller that
+		 * ignores rc cannot query/persist a phantom "rebuild-N". */
+		out_rebuild_id[0] = '\0';
 		return rc;
 	}
 	return 0;

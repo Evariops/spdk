@@ -9,9 +9,9 @@ closes the C1 lost-write (held I/O re-translates through the updated L2P on
 release). m8: assert the bit-pool claim invariant.
 ---
  include/spdk/blob.h    |  48 ++++++++
- lib/blob/blobstore.c   | 263 +++++++++++++++++++++++++++++++++++++++++
+ lib/blob/blobstore.c   | 272 +++++++++++++++++++++++++++++++++++++++++
  lib/blob/spdk_blob.map |   6 +
- 3 files changed, 317 insertions(+)
+ 3 files changed, 326 insertions(+)
 
 diff --git a/include/spdk/blob.h b/include/spdk/blob.h
 index fe98215..ad6510d 100644
@@ -73,7 +73,7 @@ index fe98215..ad6510d 100644
   * Get next unallocated io_unit
   *
 diff --git a/lib/blob/blobstore.c b/lib/blob/blobstore.c
-index 7ae791c..69ea43e 100644
+index 7ae791c..d51b7d4 100644
 --- a/lib/blob/blobstore.c
 +++ b/lib/blob/blobstore.c
 @@ -6246,6 +6246,20 @@ spdk_blob_get_next_unallocated_io_unit(struct spdk_blob *blob, uint64_t offset)
@@ -97,7 +97,7 @@ index 7ae791c..69ea43e 100644
  /* START spdk_bs_create_blob */
  
  static void
-@@ -9030,6 +9044,255 @@ blob_insert_cluster_on_md_thread(struct spdk_blob *blob, uint32_t cluster_num,
+@@ -9030,6 +9044,264 @@ blob_insert_cluster_on_md_thread(struct spdk_blob *blob, uint32_t cluster_num,
  	spdk_thread_send_msg(blob->bs->md_thread, blob_insert_cluster_msg, ctx);
  }
  
@@ -195,11 +195,20 @@ index 7ae791c..69ea43e 100644
 +	struct blob_relocate_ctx *ctx = cb_arg;
 +	struct spdk_blob_store *bs = ctx->blob->bs;
 +
-+	if (bserrno == 0 && ctx->old_lba != 0) {
-+		/* Invariant B: release old ONLY after the extent is durable. */
-+		spdk_spin_lock(&bs->used_lock);
-+		bs_release_cluster(bs, (uint32_t)bs_lba_to_cluster(bs, ctx->old_lba));
-+		spdk_spin_unlock(&bs->used_lock);
++	if (bserrno == 0) {
++		if (ctx->old_lba != 0) {
++			/* Invariant B: release old ONLY after the extent is durable. */
++			spdk_spin_lock(&bs->used_lock);
++			bs_release_cluster(bs, (uint32_t)bs_lba_to_cluster(bs, ctx->old_lba));
++			spdk_spin_unlock(&bs->used_lock);
++		}
++	} else {
++		/* Persist failed: roll the in-memory swap back to old_lba. commit_msg
++		 * already overwrote active.clusters[cluster_num] with new_lba, but the
++		 * caller releases the uncommitted new cluster on error — leaving the map
++		 * pointing at new_lba would let a later allocation re-claim it (two blobs
++		 * sharing one cluster, silent corruption). */
++		ctx->blob->active.clusters[ctx->cluster_num] = ctx->old_lba;
 +	}
 +	ctx->rc = bserrno;
 +	if (ctx->page != NULL) {

@@ -56,13 +56,7 @@ rpc_bdev_tier_create(struct spdk_jsonrpc_request *request, const struct spdk_jso
 		free(req.name);
 		return;
 	}
-	/* F-3: the on-disk superblock stores cluster_blocks as u32 (v1). */
-	if (req.cluster_blocks > UINT32_MAX) {
-		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
-						 "cluster_blocks exceeds UINT32_MAX (v1 on-disk limit)");
-		free(req.name);
-		return;
-	}
+	/* F-3: cluster_blocks is stored as u64 on disk since superblock v2 — no u32 cap. */
 	t = vbdev_tier_create(req.name, req.md_num_blocks, req.cluster_blocks);
 	free(req.name);
 	if (t == NULL) {
@@ -263,7 +257,6 @@ rpc_bdev_tier_get_bands(struct spdk_jsonrpc_request *request, const struct spdk_
 	struct vbdev_tier *t;
 	struct tier_band *b;
 	struct spdk_json_write_ctx *w;
-	uint64_t capacity_blocks, used_blocks;
 
 	if (spdk_json_decode_object(params, rpc_tier_name_decoders,
 				    SPDK_COUNTOF(rpc_tier_name_decoders), &req)) {
@@ -282,11 +275,9 @@ rpc_bdev_tier_get_bands(struct spdk_jsonrpc_request *request, const struct spdk_
 	spdk_json_write_object_begin(w);
 	spdk_json_write_named_array_begin(w, "bands");
 	TAILQ_FOREACH(b, &t->bands, link) {
-		capacity_blocks = b->num_blocks;
-		/* used_blocks is tracked by the blobstore (allocator), not the composite;
-		 * the CSI brain derives fill from get_cluster_placement (C-OBS-1). Here we
-		 * expose geometry + state; capacity accounting is logical. */
-		used_blocks = 0;
+		/* Geometry + state only. Fill accounting (used/capacity) is logical and
+		 * lives in the blobstore; the CSI derives it from get_cluster_placement
+		 * (C-OBS-1), so the composite does not emit a duplicate/always-zero copy. */
 		spdk_json_write_object_begin(w);
 		spdk_json_write_named_uint32(w, "band_id", b->band_id);
 		spdk_json_write_named_uint32(w, "tier", b->tier);
@@ -296,8 +287,6 @@ rpc_bdev_tier_get_bands(struct spdk_jsonrpc_request *request, const struct spdk_
 		spdk_json_write_named_string(w, "serial", b->serial);
 		spdk_json_write_named_uint64(w, "lba_start", b->lba_start);
 		spdk_json_write_named_uint64(w, "num_blocks", b->num_blocks);
-		spdk_json_write_named_uint64(w, "capacity_blocks", capacity_blocks);
-		spdk_json_write_named_uint64(w, "used_blocks", used_blocks);
 		spdk_json_write_object_end(w);
 	}
 	spdk_json_write_array_end(w);
