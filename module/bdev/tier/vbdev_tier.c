@@ -880,8 +880,14 @@ tier_base_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev, void 
 		tier_sb_write_all(t, tier_sb_persist_cb, NULL);
 	}
 	/* C3(1): close the desc (after the channel drain) or the removed base
-	 * bdev's unregister pends forever. */
-	if (tier_band_drain_and_close(t, band, NULL, NULL) != 0) {
+	 * bdev's unregister pends forever. T-4b: if an SB fan-out is in flight it may
+	 * hold an in-flight write on THIS band's desc (the band was ACTIVE when the
+	 * fan-out launched, and the DEGRADED persist above may itself be that
+	 * fan-out). Closing the desc now would violate the channel-before-desc
+	 * ownership contract, so defer the drain+close to vbdev_tier_sb_fanout_idle. */
+	if (t->sb_write_inflight || t->sb_write_queued) {
+		band->close_pending = true;
+	} else if (tier_band_drain_and_close(t, band, NULL, NULL) != 0) {
 		SPDK_ERRLOG("tier: cannot drain band %u after hot-remove (out of memory); "
 			    "desc left open\n", band->band_id);
 	}
@@ -1338,6 +1344,15 @@ vbdev_tier_retire_band(struct vbdev_tier *t, uint32_t band_id,
 int
 vbdev_tier_delete(struct vbdev_tier *t)
 {
+	/* T-4b: an SB fan-out holds this composite's base-band descriptors and
+	 * channels; unregistering now would free `t` and close those descs under the
+	 * in-flight writes (UAF + close-with-I/O). Defer the teardown until the
+	 * fan-out drains (vbdev_tier_sb_fanout_idle). sb_write_queued is included:
+	 * the coalesced follow-up will hold descriptors again. */
+	if (t->sb_write_inflight || t->sb_write_queued) {
+		t->delete_pending = true;
+		return 0;
+	}
 	if (t->registered) {
 		/* registered: unregister triggers destruct (frees bands + node) */
 		spdk_bdev_unregister(&t->bdev, NULL, NULL);
@@ -1347,6 +1362,39 @@ vbdev_tier_delete(struct vbdev_tier *t)
 		_tier_device_unregister_cb(t);
 	}
 	return 0;
+}
+
+/* T-4b: run any teardown deferred behind an SB fan-out, now that it has drained.
+ * Called from tier_sb_fanout_complete. Returns true if a deferred delete consumed
+ * the composite (caller must not touch `t`). */
+bool
+vbdev_tier_sb_fanout_idle(struct vbdev_tier *t)
+{
+	struct tier_band *b, *tmp;
+
+	/* A delete deferred behind the fan-out wins: nothing to persist to a
+	 * composite being torn down, and the teardown closes every band's desc. */
+	if (t->delete_pending) {
+		t->delete_pending = false;
+		t->sb_write_queued = false;
+		vbdev_tier_delete(t);	/* fan-out idle now → proceeds to unregister */
+		return true;
+	}
+	/* A base hot-remove that landed during the fan-out deferred the degraded
+	 * band's channel-drain+close. The fan-out has drained, so the desc no longer
+	 * has an in-flight SB write — close it now (the band is DEGRADED, hence
+	 * excluded from any follow-up fan-out). */
+	TAILQ_FOREACH_SAFE(b, &t->bands, link, tmp) {
+		if (!b->close_pending) {
+			continue;
+		}
+		b->close_pending = false;
+		if (tier_band_drain_and_close(t, b, NULL, NULL) != 0) {
+			SPDK_ERRLOG("tier: deferred drain of band %u failed (out of memory); "
+				    "desc left open\n", b->band_id);
+		}
+	}
+	return false;
 }
 
 /* Fire-and-forget superblock persistence completion (logs failures). */

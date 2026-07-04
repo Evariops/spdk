@@ -1,0 +1,169 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Evariops <dev@evariops.com>
+Date: Sat, 4 Jul 2026 19:16:48 +0200
+Subject: [PATCH 11/11] jsonrpc: SO_PEERCRED peer-credential audit hook
+ (Evariops 0011, SEC1)
+
+Capture the RPC client's Unix-socket credentials (SO_PEERCRED) at accept and
+expose spdk_jsonrpc_request_get_peer_ucred() + spdk_jsonrpc_request_audit(), so
+destructive mutation handlers (bdev_tier_delete/retire, relocate/remap, pause,
+rebuild_ranges) log pid/uid/gid + operation. Applied with the series; earlier
+patches (0003/0005/0008) call the helper defined here.
+---
+ include/spdk/jsonrpc.h           | 27 ++++++++++++++++++++++
+ lib/jsonrpc/jsonrpc_internal.h   |  7 ++++++
+ lib/jsonrpc/jsonrpc_server.c     | 39 ++++++++++++++++++++++++++++++++
+ lib/jsonrpc/jsonrpc_server_tcp.c | 17 ++++++++++++++
+ lib/jsonrpc/spdk_jsonrpc.map     |  2 ++
+ 5 files changed, 92 insertions(+)
+
+diff --git a/include/spdk/jsonrpc.h b/include/spdk/jsonrpc.h
+index 760039d..7a157ad 100644
+--- a/include/spdk/jsonrpc.h
++++ b/include/spdk/jsonrpc.h
+@@ -124,6 +124,33 @@ void spdk_jsonrpc_server_shutdown(struct spdk_jsonrpc_server *server);
+  */
+ struct spdk_jsonrpc_server_conn *spdk_jsonrpc_get_conn(struct spdk_jsonrpc_request *request);
+ 
++/**
++ * SPEC-73 SEC1: peer credentials of the client that issued \c request, captured
++ * with SO_PEERCRED at connection accept. Only meaningful over a Unix-domain
++ * socket on Linux; a TCP transport or a non-Linux build has none.
++ *
++ * \param request JSON-RPC request
++ * \param pid  filled with the peer PID (may be NULL)
++ * \param uid  filled with the peer UID (may be NULL)
++ * \param gid  filled with the peer GID (may be NULL)
++ * \return 0 on success; -ENOTSUP if peer credentials are unavailable
++ */
++int spdk_jsonrpc_request_get_peer_ucred(struct spdk_jsonrpc_request *request,
++					pid_t *pid, uid_t *uid, gid_t *gid);
++
++/**
++ * SPEC-73 SEC1: emit an audit NOTICELOG line for a destructive RPC, prefixed
++ * with the caller's peer credentials (pid/uid/gid, or "unknown"). Intended to be
++ * called at the top of every mutation handler (delete, retire, relocate/remap,
++ * pause, rebuild). \c detail is an optional pre-formatted parameter string.
++ *
++ * \param request JSON-RPC request being served
++ * \param method  RPC method name (for the log line)
++ * \param detail  optional extra context (may be NULL)
++ */
++void spdk_jsonrpc_request_audit(struct spdk_jsonrpc_request *request,
++				const char *method, const char *detail);
++
+ /**
+  * Add callback called when connection is closed. Pair of  \c cb and \c ctx must be unique or error is returned.
+  * Registered callback is called only once and there is no need to call  \c spdk_jsonrpc_conn_del_close_cb
+diff --git a/lib/jsonrpc/jsonrpc_internal.h b/lib/jsonrpc/jsonrpc_internal.h
+index d13ec7a..81a17a4 100644
+--- a/lib/jsonrpc/jsonrpc_internal.h
++++ b/lib/jsonrpc/jsonrpc_internal.h
+@@ -49,6 +49,13 @@ struct spdk_jsonrpc_server_conn {
+ 	struct spdk_jsonrpc_server *server;
+ 	int sockfd;
+ 	bool closed;
++	/* SPEC-73 SEC1: peer credentials captured at accept (SO_PEERCRED on a Unix
++	 * socket, Linux only). peer_cred_valid is false for a TCP transport or a
++	 * platform without SO_PEERCRED. */
++	bool peer_cred_valid;
++	pid_t peer_pid;
++	uid_t peer_uid;
++	gid_t peer_gid;
+ 	size_t recv_len;
+ 	uint8_t recv_buf[SPDK_JSONRPC_RECV_BUF_SIZE];
+ 	uint32_t outstanding_requests;
+diff --git a/lib/jsonrpc/jsonrpc_server.c b/lib/jsonrpc/jsonrpc_server.c
+index c122613..158ed7f 100644
+--- a/lib/jsonrpc/jsonrpc_server.c
++++ b/lib/jsonrpc/jsonrpc_server.c
+@@ -278,6 +278,45 @@ spdk_jsonrpc_get_conn(struct spdk_jsonrpc_request *request)
+ 	return request->conn;
+ }
+ 
++int
++spdk_jsonrpc_request_get_peer_ucred(struct spdk_jsonrpc_request *request,
++				    pid_t *pid, uid_t *uid, gid_t *gid)
++{
++	struct spdk_jsonrpc_server_conn *conn = request ? request->conn : NULL;
++
++	if (conn == NULL || !conn->peer_cred_valid) {
++		return -ENOTSUP;
++	}
++	if (pid != NULL) {
++		*pid = conn->peer_pid;
++	}
++	if (uid != NULL) {
++		*uid = conn->peer_uid;
++	}
++	if (gid != NULL) {
++		*gid = conn->peer_gid;
++	}
++	return 0;
++}
++
++void
++spdk_jsonrpc_request_audit(struct spdk_jsonrpc_request *request, const char *method,
++			   const char *detail)
++{
++	pid_t pid = 0;
++	uid_t uid = 0;
++	gid_t gid = 0;
++
++	if (spdk_jsonrpc_request_get_peer_ucred(request, &pid, &uid, &gid) == 0) {
++		SPDK_NOTICELOG("audit rpc=%s peer=pid:%d,uid:%u,gid:%u%s%s\n",
++			       method, (int)pid, (unsigned)uid, (unsigned)gid,
++			       detail != NULL ? " " : "", detail != NULL ? detail : "");
++	} else {
++		SPDK_NOTICELOG("audit rpc=%s peer=unknown%s%s\n", method,
++			       detail != NULL ? " " : "", detail != NULL ? detail : "");
++	}
++}
++
+ /* Never return NULL */
+ static struct spdk_json_write_ctx *
+ begin_response(struct spdk_jsonrpc_request *request)
+diff --git a/lib/jsonrpc/jsonrpc_server_tcp.c b/lib/jsonrpc/jsonrpc_server_tcp.c
+index e30f37f..4312469 100644
+--- a/lib/jsonrpc/jsonrpc_server_tcp.c
++++ b/lib/jsonrpc/jsonrpc_server_tcp.c
+@@ -192,6 +192,23 @@ jsonrpc_server_accept(struct spdk_jsonrpc_server *server)
+ 		conn->server = server;
+ 		conn->sockfd = rc;
+ 		conn->closed = false;
++		/* SPEC-73 SEC1: capture the client's credentials for the audit trail. Works
++		 * for a Unix-domain socket (the default SPDK RPC transport); a TCP peer or a
++		 * non-Linux build simply has none (peer_cred_valid stays false). */
++		conn->peer_cred_valid = false;
++#ifdef __linux__
++		{
++			struct ucred cred;
++			socklen_t clen = sizeof(cred);
++
++			if (getsockopt(conn->sockfd, SOL_SOCKET, SO_PEERCRED, &cred, &clen) == 0) {
++				conn->peer_cred_valid = true;
++				conn->peer_pid = cred.pid;
++				conn->peer_uid = cred.uid;
++				conn->peer_gid = cred.gid;
++			}
++		}
++#endif
+ 		conn->recv_len = 0;
+ 		conn->outstanding_requests = 0;
+ 		STAILQ_INIT(&conn->send_queue);
+diff --git a/lib/jsonrpc/spdk_jsonrpc.map b/lib/jsonrpc/spdk_jsonrpc.map
+index a62f4a4..5555990 100644
+--- a/lib/jsonrpc/spdk_jsonrpc.map
++++ b/lib/jsonrpc/spdk_jsonrpc.map
+@@ -6,6 +6,8 @@
+ 	spdk_jsonrpc_server_poll;
+ 	spdk_jsonrpc_server_shutdown;
+ 	spdk_jsonrpc_get_conn;
++	spdk_jsonrpc_request_get_peer_ucred;
++	spdk_jsonrpc_request_audit;
+ 	spdk_jsonrpc_conn_add_close_cb;
+ 	spdk_jsonrpc_conn_del_close_cb;
+ 	spdk_jsonrpc_begin_result;
+-- 
+2.50.1 (Apple Git-155)
+

@@ -180,6 +180,8 @@ rpc_bdev_tier_delete(struct spdk_jsonrpc_request *request, const struct spdk_jso
 						 "invalid parameters");
 		return;
 	}
+	/* SEC1: audit this destructive op (tears down the whole composite). */
+	spdk_jsonrpc_request_audit(request, "bdev_tier_delete", req.name);
 	t = vbdev_tier_get_by_name(req.name);
 	free(req.name);
 	if (t == NULL) {
@@ -231,6 +233,13 @@ rpc_bdev_tier_retire_band(struct spdk_jsonrpc_request *request, const struct spd
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 "invalid parameters");
 		return;
+	}
+	/* SEC1: audit this destructive op (evacuates + removes a band). */
+	{
+		char detail[128];
+
+		snprintf(detail, sizeof(detail), "name=%s band_id=%u", req.name, req.band_id);
+		spdk_jsonrpc_request_audit(request, "bdev_tier_retire_band", detail);
 	}
 	t = vbdev_tier_get_by_name(req.name);
 	free(req.name);
@@ -389,6 +398,13 @@ rpc_bdev_tier_resync_md(struct spdk_jsonrpc_request *request, const struct spdk_
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 "invalid parameters");
 		return;
+	}
+	/* SEC1: audit this op (rewrites redundancy state of the mirrored md region). */
+	{
+		char detail[128];
+
+		snprintf(detail, sizeof(detail), "name=%s target_band_id=%u", req.name, req.band_id);
+		spdk_jsonrpc_request_audit(request, "bdev_tier_resync_md", detail);
 	}
 	t = vbdev_tier_get_by_name(req.name);
 	free(req.name);

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Evariops <dev@evariops.com>
 Date: Sat, 4 Jul 2026 10:58:26 +0200
-Subject: [PATCH 08/10] raid: bdev_raid_rebuild_ranges
+Subject: [PATCH 08/11] raid: bdev_raid_rebuild_ranges
  read-reconstruct-writeback repair
 
 Evariops 0008. C2: every read/write-back chunk runs under a channel-owned
@@ -14,8 +14,9 @@ validated for parity raids, ranges heap-allocated. N-6: REMOVE aborts.
  lib/bdev/bdev.c                     |  25 ++
  lib/bdev/spdk_bdev.map              |   2 +
  module/bdev/raid/Makefile           |   2 +-
- module/bdev/raid/bdev_raid_repair.c | 393 ++++++++++++++++++++++++++++
- 5 files changed, 438 insertions(+), 1 deletion(-)
+ module/bdev/raid/bdev_raid.c        |  11 +
+ module/bdev/raid/bdev_raid_repair.c | 406 ++++++++++++++++++++++++++++
+ 6 files changed, 462 insertions(+), 1 deletion(-)
  create mode 100644 module/bdev/raid/bdev_raid_repair.c
 
 diff --git a/include/spdk/bdev_module.h b/include/spdk/bdev_module.h
@@ -108,12 +109,34 @@ index cb46945..e118002 100644
  
  ifeq ($(CONFIG_RAID5F),y)
  C_SRCS += raid5f.c
+diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
+index 636eda1..53b88bc 100644
+--- a/module/bdev/raid/bdev_raid.c
++++ b/module/bdev/raid/bdev_raid.c
+@@ -1122,6 +1122,17 @@ raid_bdev_write_info_json(struct raid_bdev *raid_bdev, struct spdk_json_write_ct
+ 	spdk_json_write_named_uint32(w, "num_base_bdevs_discovered", raid_bdev->num_base_bdevs_discovered);
+ 	spdk_json_write_named_uint32(w, "num_base_bdevs_operational",
+ 				     raid_bdev->num_base_bdevs_operational);
++	/* SPEC-73 C3: expose the full-stripe size (in blocks) that bdev_raid_rebuild_ranges
++	 * requires its ranges to be aligned to, so the control-plane reads it instead of
++	 * re-deriving `k` (data chunks) per raid level. This is EXACTLY the value the repair
++	 * validates: strip_size × min_base_bdevs_operational (for raid5f, min == num-1 == the
++	 * data-chunk count `k`; for a striped non-parity raid, min == num == k). Emitted only
++	 * for striped raids — raid1/concat (strip_size == 0) have no full-stripe constraint. */
++	if (raid_bdev->strip_size > 0) {
++		spdk_json_write_named_uint64(w, "full_stripe_blocks",
++					     (uint64_t)raid_bdev->strip_size *
++					     raid_bdev->min_base_bdevs_operational);
++	}
+ 	if (raid_bdev->process) {
+ 		struct raid_bdev_process *process = raid_bdev->process;
+ 		uint64_t offset = process->window_offset;
 diff --git a/module/bdev/raid/bdev_raid_repair.c b/module/bdev/raid/bdev_raid_repair.c
 new file mode 100644
-index 0000000..1b947e4
+index 0000000..f0aff59
 --- /dev/null
 +++ b/module/bdev/raid/bdev_raid_repair.c
-@@ -0,0 +1,393 @@
+@@ -0,0 +1,406 @@
 +/*   SPDX-License-Identifier: BSD-3-Clause
 + *   Copyright (C) 2026 Evariops.
 + *   All rights reserved.
@@ -282,7 +305,12 @@ index 0000000..1b947e4
 +	spdk_bdev_free_io(bdev_io);
 +	if (!success) {
 +		/* M3 should have reconstructed a degraded read; a hard failure here means the stripe
-+		 * is unrecoverable (>1 fault) — fail cleanly, the data is still protected elsewhere. */
++		 * is unrecoverable (>1 fault) — fail cleanly, the data is still protected elsewhere.
++		 * Name the offending chunk so operators can pinpoint the unrecoverable stripe (which
++		 * range/LBA lost redundancy) instead of seeing an opaque -EIO from the RPC. */
++		SPDK_ERRLOG("raid repair: unrecoverable read at chunk [%" PRIu64 ", +%" PRIu64
++			    ") (range %u/%u) — stripe has >1 fault, aborting\n",
++			    c->io_lba, c->io_blocks, c->cur, c->num_ranges);
 +		raid_repair_finish(c, -EIO);
 +		return;
 +	}
@@ -497,6 +525,14 @@ index 0000000..1b947e4
 +		goto cleanup;
 +	}
 +
++	/* SEC1: audit this data-mutating repair (reads+rewrites full stripes). */
++	{
++		char detail[128];
++
++		snprintf(detail, sizeof(detail), "name=%s ranges=%u chunk_blocks=%" PRIu64,
++			 req.name, c->num_ranges, stripe_blocks);
++		spdk_jsonrpc_request_audit(request, "bdev_raid_rebuild_ranges", detail);
++	}
 +	SPDK_NOTICELOG("raid '%s': rebuild_ranges over %u range(s), chunk=%" PRIu64
 +		       " blocks (per-chunk LBA lock)\n", req.name, c->num_ranges, stripe_blocks);
 +	raid_repair_next(c);

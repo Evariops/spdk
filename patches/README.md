@@ -8,7 +8,7 @@ upstream paths. The two out-of-tree bdev **modules** (`module/bdev/cbt`,
 
 ## Application order (U-5/U-6)
 
-Patches are applied in **lexicographic order of filename** (`0001` … `0010`) —
+Patches are applied in **lexicographic order of filename** (`0001` … `0011`) —
 the Dockerfile globs `patches/*.patch` and `git apply`s each. The numeric prefix
 IS the contract; do not rely on any other ordering. Order matters:
 
@@ -16,17 +16,27 @@ IS the contract; do not rely on any other ordering. Order matters:
 |--:|:------|:--------|:-----------|
 | 0001 | raid skip_rebuild | bdev_raid | — |
 | 0002 | lvol get_allocated_ranges | bdev_lvol | — |
-| 0003 | nvmf pause/resume | lib/nvmf | — |
+| 0003 | nvmf pause/resume | lib/nvmf | 0011 (audit hook) |
 | 0004 | blob relocate primitives + freeze_io | lib/blob | — |
-| 0005 | lvol placement/relocate/remap RPCs | bdev_lvol, module/bdev/tier | 0004, tier module |
+| 0005 | lvol placement/relocate/remap RPCs | bdev_lvol, module/bdev/tier | 0004, 0011, tier module |
 | 0006 | raid5f degraded-read | bdev_raid | — |
 | 0007 | raid nexus heat | bdev_raid | — |
-| 0008 | raid rebuild_ranges | bdev_raid, lib/bdev (lock_lba_range) | 0006 |
+| 0008 | raid rebuild_ranges + full_stripe_blocks (C3) | bdev_raid, lib/bdev (lock_lba_range) | 0006, 0011 |
 | 0009 | ENOSPC → CAPACITY_EXCEEDED | bdev_lvol, bdev_raid | — |
 | 0010 | rpc socket chmod 0600 | lib/rpc | — |
+| 0011 | jsonrpc SO_PEERCRED audit hook (SEC1) | lib/jsonrpc | — |
 
 0005 `#include`s `vbdev_tier.h`; the Dockerfile adds `-I module/bdev/tier` to the
 lvol module CFLAGS and injects the module dirs before applying patches.
+
+**0011 is a shared substrate, not a leaf.** It adds `spdk_jsonrpc_request_audit()`
++ `spdk_jsonrpc_request_get_peer_ucred()` to `lib/jsonrpc`, which the destructive
+handlers in 0003 (pause), 0005 (relocate/remap), and 0008 (rebuild_ranges) call —
+so those numerically-earlier patches reference a symbol added by 0011. This is
+sound because the series is applied **as a whole** before anything is compiled
+(the Dockerfile `git apply`s all of `patches/*.patch`, then builds once); the
+number is a *filename apply order*, not an incremental-compile order. It sits last
+to avoid renumbering the existing `Evariops 000X` labels baked into every commit.
 
 ## Makefile / build wiring (NOT patches)
 

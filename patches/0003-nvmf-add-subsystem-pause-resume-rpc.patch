@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Evariops <dev@evariops.com>
 Date: Sat, 4 Jul 2026 10:58:26 +0200
-Subject: [PATCH 03/10] nvmf: add nvmf_subsystem_pause / nvmf_subsystem_resume
+Subject: [PATCH 03/11] nvmf: add nvmf_subsystem_pause / nvmf_subsystem_resume
  RPC
 
 Evariops 0003. Standing, drain-certified, TTL-guarded I/O barrier.
@@ -10,8 +10,8 @@ subsystem can no longer end up without entry+TTL on OOM), UUID-based
 per-process nonce (P-6), loud TTL clamp (S-8 follow-up).
 ---
  lib/nvmf/Makefile         |   2 +-
- lib/nvmf/nvmf_pause_rpc.c | 458 ++++++++++++++++++++++++++++++++++++++
- 2 files changed, 459 insertions(+), 1 deletion(-)
+ lib/nvmf/nvmf_pause_rpc.c | 467 ++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 468 insertions(+), 1 deletion(-)
  create mode 100644 lib/nvmf/nvmf_pause_rpc.c
 
 diff --git a/lib/nvmf/Makefile b/lib/nvmf/Makefile
@@ -29,10 +29,10 @@ index 3136f7a..0af5836 100644
  C_SRCS-$(CONFIG_HAVE_EVP_MAC) += auth.c
 diff --git a/lib/nvmf/nvmf_pause_rpc.c b/lib/nvmf/nvmf_pause_rpc.c
 new file mode 100644
-index 0000000..63de22e
+index 0000000..a162553
 --- /dev/null
 +++ b/lib/nvmf/nvmf_pause_rpc.c
-@@ -0,0 +1,458 @@
+@@ -0,0 +1,467 @@
 +/* lib/nvmf/nvmf_pause_rpc.c — SPDX-License-Identifier: BSD-3-Clause
 + * Evariops fork — companion of spdk-csi SPEC-66 (H10).
 + * nvmf_subsystem_pause / nvmf_subsystem_resume: a STANDING, drain-certified,
@@ -330,6 +330,15 @@ index 0000000..63de22e
 +			"subsystem has no namespace to drain");
 +		rpc_pause_ctx_free(ctx);
 +		return;
++	}
++
++	/* SEC1: audit this drain barrier (pauses host I/O to a subsystem). */
++	{
++		char detail[320];
++
++		snprintf(detail, sizeof(detail), "nqn=%s nsid=%u ttl_ms=%u",
++			 ctx->nqn ? ctx->nqn : "(default)", ctx->nsid, ctx->ttl_ms);
++		spdk_jsonrpc_request_audit(request, "nvmf_subsystem_pause", detail);
 +	}
 +
 +	/* Preallocate the registry entry (see struct comment): fail BEFORE pausing,
