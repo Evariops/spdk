@@ -1,12 +1,12 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Evariops <dev@evariops.com>
 Date: Sat, 4 Jul 2026 15:26:58 +0200
-Subject: [PATCH 05/10] 0005-lvol-get-cluster-placement-rpc.patch
+Subject: [PATCH 05/11] 0005-lvol-get-cluster-placement-rpc.patch
 
 ---
  module/bdev/lvol/Makefile              |   3 +-
- module/bdev/lvol/vbdev_lvol_tier_rpc.c | 963 +++++++++++++++++++++++++
- 2 files changed, 965 insertions(+), 1 deletion(-)
+ module/bdev/lvol/vbdev_lvol_tier_rpc.c | 993 +++++++++++++++++++++++++
+ 2 files changed, 995 insertions(+), 1 deletion(-)
  create mode 100644 module/bdev/lvol/vbdev_lvol_tier_rpc.c
 
 diff --git a/module/bdev/lvol/Makefile b/module/bdev/lvol/Makefile
@@ -25,10 +25,10 @@ index aba6620..a8ed387 100644
  SPDK_MAP_FILE = $(SPDK_ROOT_DIR)/mk/spdk_blank.map
 diff --git a/module/bdev/lvol/vbdev_lvol_tier_rpc.c b/module/bdev/lvol/vbdev_lvol_tier_rpc.c
 new file mode 100644
-index 0000000..79408c2
+index 0000000..20e794a
 --- /dev/null
 +++ b/module/bdev/lvol/vbdev_lvol_tier_rpc.c
-@@ -0,0 +1,963 @@
+@@ -0,0 +1,993 @@
 +/*   SPDX-License-Identifier: BSD-3-Clause
 + *   Copyright (C) 2026 Evariops.
 + *   All rights reserved.
@@ -406,6 +406,17 @@ index 0000000..79408c2
 +		goto cleanup;
 +	}
 +
++	/* SEC1: audit this L2P mutation (copies a cluster's data + swaps its mapping). */
++	{
++		char detail[256];
++
++		snprintf(detail, sizeof(detail),
++			 "lvol=%s tier=%s cluster=%" PRIu64 " dst_lba=%" PRIu64 "+%" PRIu64,
++			 req.name ? req.name : "?", req.tier_name ? req.tier_name : "?",
++			 req.cluster_num, req.dst_lba_start, req.dst_lba_count);
++		spdk_jsonrpc_request_audit(request, "bdev_lvol_relocate_cluster", detail);
++	}
++
 +	bdev = spdk_bdev_get_by_name(req.name);
 +	if (bdev == NULL || (lvol = vbdev_lvol_get_from_bdev(bdev)) == NULL) {
 +		spdk_jsonrpc_send_error_response(request, -ENODEV, "lvol not found");
@@ -748,6 +759,15 @@ index 0000000..79408c2
 +		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS, "no clusters");
 +		goto cleanup;
 +	}
++	/* SEC1: audit this batch L2P mutation (copies + remaps N clusters). */
++	{
++		char detail[192];
++
++		snprintf(detail, sizeof(detail), "lvol=%s tier=%s clusters=%zu verify=%d",
++			 req.name ? req.name : "?", req.tier_name ? req.tier_name : "?",
++			 req.num_items, req.verify ? 1 : 0);
++		spdk_jsonrpc_request_audit(request, "bdev_lvol_relocate_clusters", detail);
++	}
 +	bdev = spdk_bdev_get_by_name(req.name);
 +	if (bdev == NULL || (lvol = vbdev_lvol_get_from_bdev(bdev)) == NULL) {
 +		spdk_jsonrpc_send_error_response(request, -ENODEV, "lvol not found");
@@ -909,6 +929,16 @@ index 0000000..79408c2
 +		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 +						 "spdk_json_decode_object failed");
 +		goto cleanup;
++	}
++	/* SEC1: audit this L2P remap (rewrites a cluster's mapping to a new band). */
++	{
++		char detail[256];
++
++		snprintf(detail, sizeof(detail),
++			 "lvol=%s tier=%s cluster=%" PRIu64 " dst_lba=%" PRIu64 "+%" PRIu64,
++			 req.name ? req.name : "?", req.tier_name ? req.tier_name : "?",
++			 req.cluster_num, req.dst_lba_start, req.dst_lba_count);
++		spdk_jsonrpc_request_audit(request, "bdev_lvol_remap_cluster", detail);
 +	}
 +	bdev = spdk_bdev_get_by_name(req.name);
 +	if (bdev == NULL || (lvol = vbdev_lvol_get_from_bdev(bdev)) == NULL) {

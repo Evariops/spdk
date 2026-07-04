@@ -1208,6 +1208,14 @@ struct cbt_rebuild_ctx {
 	struct cbt_epoch         *epoch;
 	struct spdk_bdev_desc    *src_desc;
 	struct spdk_bdev_desc    *dst_desc;
+	/* Lifetime pin (UAF guard): `cbt` and `epoch`/`bitmap` are BARE pointers into
+	 * the cbt vbdev, but the rebuild reads its geometry/bitmap on every chunk. A
+	 * base hot-remove unregisters+frees the cbt vbdev; when the read source is the
+	 * cbt bdev itself (default) src_desc already pins it, but with a source_bdev_name
+	 * OVERRIDE nothing did, so the free raced the rebuild. This extra descriptor on
+	 * the cbt bdev makes SPDK defer the cbt destruct until the rebuild's cleanup
+	 * closes it. NULL when src_desc already covers the cbt bdev. */
+	struct spdk_bdev_desc    *cbt_pin_desc;
 	struct spdk_io_channel   *src_ch;
 	struct spdk_io_channel   *dst_ch;
 
@@ -1317,6 +1325,12 @@ cbt_rebuild_registry_cleanup(struct cbt_rebuild_ctx *ctx)
 	if (ctx->dst_desc) {
 		spdk_bdev_close(ctx->dst_desc);
 	}
+	if (ctx->cbt_pin_desc) {
+		/* Releasing the lifetime pin: lets a cbt destruct deferred by a hot-remove
+		 * finally proceed (see cbt_pin_desc). */
+		spdk_bdev_close(ctx->cbt_pin_desc);
+		ctx->cbt_pin_desc = NULL;
+	}
 	for (int i = 0; i < ctx->num_slots; i++) {
 		if (ctx->slots[i].buf) {
 			spdk_dma_free(ctx->slots[i].buf);
@@ -1393,9 +1407,20 @@ static void
 cbt_rebuild_base_event_cb(enum spdk_bdev_event_type type,
 			  struct spdk_bdev *bdev, void *event_ctx)
 {
-	/* If the bdev is removed mid-rebuild, the IO callbacks will
-	 * return failure and the rebuild will abort gracefully.
-	 */
+	struct cbt_rebuild_ctx *ctx = event_ctx;
+
+	/* A REMOVE of the source, target, OR the pinned cbt bdev aborts the rebuild.
+	 * Marking aborted stops it at the next chunk boundary; the in-flight I/O
+	 * drains and the terminal path closes every descriptor (including the cbt
+	 * lifetime pin) — only then does a hot-remove-driven cbt destruct proceed.
+	 * When the read source is the cbt bdev itself and no I/O is in flight the old
+	 * "let the I/O fail" heuristic could stall, so set the flag explicitly. */
+	if (type == SPDK_BDEV_EVENT_REMOVE && ctx != NULL &&
+	    ctx->state == CBT_REBUILD_RUNNING) {
+		SPDK_WARNLOG("CBT rebuild: bdev '%s' removed — aborting\n",
+			     spdk_bdev_get_name(bdev));
+		ctx->aborted = true;
+	}
 }
 
 /* Maximum number of chunks to coalesce into a single I/O.
@@ -1895,17 +1920,34 @@ cbt_rebuild_start(const char *cbt_name, const char *epoch_id,
 	src_name = source_bdev_name ? source_bdev_name :
 		   spdk_bdev_get_name(&cbt->cbt_bdev);
 	rc = spdk_bdev_open_ext(src_name, false,
-				cbt_rebuild_base_event_cb, NULL, &ctx->src_desc);
+				cbt_rebuild_base_event_cb, ctx, &ctx->src_desc);
 	if (rc != 0) {
 		free(ctx->override_ranges);
 		free(ctx);
 		return rc;
 	}
 
+	/* UAF guard: pin the cbt vbdev's lifetime for the whole rebuild. `ctx->cbt`
+	 * / `ctx->epoch` / `ctx->bitmap` are bare pointers into it, dereferenced on
+	 * every chunk; a base hot-remove would otherwise free the cbt vbdev underneath
+	 * a running rebuild. When the read source IS the cbt bdev, src_desc already
+	 * pins it — only a source override needs a dedicated pin descriptor. */
+	if (strcmp(src_name, spdk_bdev_get_name(&cbt->cbt_bdev)) != 0) {
+		rc = spdk_bdev_open_ext(spdk_bdev_get_name(&cbt->cbt_bdev), false,
+					cbt_rebuild_base_event_cb, ctx, &ctx->cbt_pin_desc);
+		if (rc != 0) {
+			spdk_bdev_close(ctx->src_desc);
+			free(ctx->override_ranges);
+			free(ctx);
+			return rc;
+		}
+	}
+
 	/* Open target bdev. */
 	rc = spdk_bdev_open_ext(target_bdev_name, true,
-				cbt_rebuild_base_event_cb, NULL, &ctx->dst_desc);
+				cbt_rebuild_base_event_cb, ctx, &ctx->dst_desc);
 	if (rc != 0) {
+		if (ctx->cbt_pin_desc) spdk_bdev_close(ctx->cbt_pin_desc);
 		spdk_bdev_close(ctx->src_desc);
 		free(ctx->override_ranges);
 		free(ctx);
@@ -1918,6 +1960,7 @@ cbt_rebuild_start(const char *cbt_name, const char *epoch_id,
 	if (!ctx->src_ch || !ctx->dst_ch) {
 		if (ctx->src_ch) spdk_put_io_channel(ctx->src_ch);
 		if (ctx->dst_ch) spdk_put_io_channel(ctx->dst_ch);
+		if (ctx->cbt_pin_desc) spdk_bdev_close(ctx->cbt_pin_desc);
 		spdk_bdev_close(ctx->src_desc);
 		spdk_bdev_close(ctx->dst_desc);
 		free(ctx->override_ranges);
@@ -1935,6 +1978,7 @@ cbt_rebuild_start(const char *cbt_name, const char *epoch_id,
 	if (!ctx->slots) {
 		spdk_put_io_channel(ctx->src_ch);
 		spdk_put_io_channel(ctx->dst_ch);
+		if (ctx->cbt_pin_desc) spdk_bdev_close(ctx->cbt_pin_desc);
 		spdk_bdev_close(ctx->src_desc);
 		spdk_bdev_close(ctx->dst_desc);
 		free(ctx->override_ranges);
@@ -1952,6 +1996,7 @@ cbt_rebuild_start(const char *cbt_name, const char *epoch_id,
 			free(ctx->slots);
 			spdk_put_io_channel(ctx->src_ch);
 			spdk_put_io_channel(ctx->dst_ch);
+			if (ctx->cbt_pin_desc) spdk_bdev_close(ctx->cbt_pin_desc);
 			spdk_bdev_close(ctx->src_desc);
 			spdk_bdev_close(ctx->dst_desc);
 			free(ctx->override_ranges);

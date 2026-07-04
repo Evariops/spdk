@@ -19,6 +19,14 @@ these exist — on vanilla SPDK they return JSON-RPC -32601.
 - **Volatile state dies with the process.** Standing pauses, in-flight
   relocations, cbt epochs and rebuilds are RAM-only. A target restart loses them
   all — detect it via `boot_id` (below) and reconcile.
+- **SEC1 — destructive RPCs are audited.** Every mutation handler
+  (`bdev_tier_delete`, `bdev_tier_retire_band`, `bdev_tier_resync_md`,
+  `bdev_lvol_relocate_cluster` / `_clusters` / `remap_cluster`,
+  `bdev_raid_rebuild_ranges`, `nvmf_subsystem_pause`) emits an
+  `audit rpc=<method> peer=pid:…,uid:…,gid:… <params>` NOTICELOG line, with the
+  caller's Unix-socket credentials (SO_PEERCRED, patch 0011). `peer=unknown` over
+  a TCP transport. This is an audit trail, **not** an authorization gate — access
+  control is still the socket mode (0600, patch 0010) + a NetworkPolicy (D4).
 
 ## evariops_get_capabilities
 
@@ -72,6 +80,18 @@ a split-brain across disks.
   control-plane MUST journal the remap durably BEFORE calling and re-drive the
   range rebuild at restart until confirmed (**PR3**, remap-before-rebuild).
 
+## Capacity / ENOSPC (patch 0009)
+
+- A raid1 write to a **thin** member that is full returns NVMe
+  `CAPACITY_EXCEEDED` to the host **without** failing the member (**G3** — no
+  silent degradation). The write is NACKed.
+- **Divergence, by design.** Both legs stay ONLINE, but the leg whose write
+  failed and the leg whose write succeeded now **disagree on that block**. This
+  is correct block semantics (a NACKed write has indeterminate content) but the
+  fork does **NOT** auto-reconverge. The control-plane must treat that LBA's
+  content as undefined until it is rewritten, and must keep thin reservations
+  symmetric across legs (placement-side) so the case stays rare.
+
 ## Repair / rebuild
 
 - `bdev_raid_rebuild_ranges {name, ranges:[{start_lba,num_blocks}]}` — **C2**:
@@ -79,6 +99,28 @@ a split-brain across disks.
   replayed). **P-3**: parity raids require **full-stripe-aligned** ranges
   (-EINVAL else); the caller must align. **N-6**: a REMOVE aborts at the next
   chunk (-ENODEV) — re-drive.
+  - **C3 — geometry is published, not guessed.** Read `full_stripe_blocks` from
+    the raid bdev's `bdev_get_bdevs` → `driver_specific.raid` (emitted for any
+    striped raid). It is EXACTLY the alignment `rebuild_ranges` validates:
+    `strip_size × min_base_bdevs_operational` (for raid5f, `min == num-1 == k`,
+    the data-chunk count). Align every range to it. Do **not** re-derive `k`
+    from `num_base_bdevs_operational` — for a healthy raid5f that field is `n`
+    (all members), not `k`; only `full_stripe_blocks` (or `min_base_bdevs_operational`)
+    gives the data-chunk count. `strip_size_kb`, `num_base_bdevs`,
+    `num_base_bdevs_operational` remain available for cross-checks.
+  - **EC reconstruct precondition (load-bearing).** The repair reconstructs a
+    lost chunk only because the degraded member returns **read errors** (present
+    band DEGRADED, patch 0006) or is **absent** (NULL channel, upstream) — either
+    triggers a parity reconstruct-read that the write-back then re-lays with fresh
+    parity. A member replaced by a **healthy, zeroed** disk reads its zeros
+    *successfully*, so no reconstruct fires and the repair would rewrite zeros.
+    The control-plane MUST therefore drive `rebuild_ranges` while the target
+    member is still **DEGRADED/absent** (the `remap → rebuild` order, PR3), NOT
+    after swapping in a fresh member. See
+    `docs/audits/2026-07-04_revue-ec-rebuild-ranges.md`.
+  - An unrecoverable stripe (>1 fault) fails the whole call with -EIO; the target
+    logs the offending chunk LBA/range (`raid repair: unrecoverable read at
+    chunk …`). Repair is idempotent — re-drive the tail after fixing redundancy.
 - `bdev_raid_add_base_bdev {…, skip_rebuild}` — **CBT-3/P5**: skip_rebuild is a
   "trust me" primitive; the control-plane MUST prove the residual delta is zero
   (garde résidu-nul + INV-37) before calling. **CBT-6**: a channel-promotion

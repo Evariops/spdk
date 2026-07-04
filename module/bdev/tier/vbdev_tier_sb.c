@@ -144,6 +144,9 @@ tier_sb_fanout_complete(struct tier_sb_write_ctx *ctx)
 	struct tier_sb_pending_cb *p;
 	int status = ctx->status;
 
+	/* Run the callbacks queued behind this fan-out. A callback may request a
+	 * teardown (bdev_tier_delete) — that is DEFERRED (delete_pending), never run
+	 * synchronously here, so `t` is guaranteed to survive this loop. */
 	while ((p = TAILQ_FIRST(&ctx->cbs)) != NULL) {
 		TAILQ_REMOVE(&ctx->cbs, p, link);
 		p->cb(p->cb_arg, status);
@@ -151,6 +154,13 @@ tier_sb_fanout_complete(struct tier_sb_write_ctx *ctx)
 	}
 	free(ctx);
 	t->sb_write_inflight = false;
+
+	/* T-4b: honor teardown deferred behind this fan-out (a pending delete, or a
+	 * hot-removed band's drain+close). If a deferred delete consumed the
+	 * composite, `t` is gone/unregistering — do not touch it. */
+	if (vbdev_tier_sb_fanout_idle(t)) {
+		return;
+	}
 	if (t->sb_write_queued) {
 		t->sb_write_queued = false;
 		tier_sb_write_start(t);

@@ -157,6 +157,12 @@ struct tier_band {
 	/* Open handle to the underlying disk (NULL while retired or hot-removed). */
 	struct spdk_bdev_desc	*desc;
 
+	/* Lifecycle (T-4b): a hot-remove that lands while an SB fan-out is in flight
+	 * defers this band's channel-drain+close (closing the desc under an in-flight
+	 * SB write on it would violate the channel-before-desc contract). Resolved by
+	 * vbdev_tier_sb_fanout_idle() once the fan-out drains. */
+	bool			close_pending;
+
 	/* Back-pointer to the composite (needed by the hot-remove event callback,
 	 * which only receives the band as event_ctx). */
 	struct vbdev_tier	*t;
@@ -200,6 +206,11 @@ struct vbdev_tier {
 	 * follow-up fan-out that persists the latest state. */
 	bool			sb_write_inflight;
 	bool			sb_write_queued;
+	/* T-4b: a bdev_tier_delete that arrives while an SB fan-out holds this
+	 * composite's base-band descriptors is deferred here (tearing down now would
+	 * free `t` and close those descs under the in-flight writes). Honored by
+	 * vbdev_tier_sb_fanout_idle() once the fan-out drains. */
+	bool			delete_pending;
 	TAILQ_HEAD(, tier_sb_pending_cb) sb_pending_cbs;
 
 	TAILQ_ENTRY(vbdev_tier)	link;
@@ -277,8 +288,14 @@ int vbdev_tier_resync_md(struct vbdev_tier *t, uint32_t target_band_id,
 			 void (*cb)(void *cb_arg, int rc), void *cb_arg);
 /* Register the composite bdev once its bands are configured. */
 int vbdev_tier_register(struct vbdev_tier *t);
-/* Tear down + unregister (cleanup). */
+/* Tear down + unregister (cleanup). If an SB fan-out is in flight the teardown is
+ * deferred (T-4b) — see delete_pending. */
 int vbdev_tier_delete(struct vbdev_tier *t);
+/* T-4b: called by tier_sb_write_all's fan-out completion once the fan-out has
+ * drained. Runs any teardown deferred behind the fan-out (a pending delete, or a
+ * hot-removed band's channel-drain+close). Returns true if the composite was
+ * consumed by a deferred delete — the caller must not touch `t` afterward. */
+bool vbdev_tier_sb_fanout_idle(struct vbdev_tier *t);
 
 /* Superblock (vbdev_tier_sb.c) — native-level persistence (INV-T1). */
 void tier_sb_serialize(struct vbdev_tier *t, struct tier_band *self, uint64_t seq,
