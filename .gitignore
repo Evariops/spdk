@@ -7,3 +7,8 @@ module/bdev/cbt/test_cbt_props
 module/bdev/cbt/test_cbt_resilience
 module/bdev/cbt/test_cbt_postfix
 module/bdev/cbt/*.dSYM/
+module/bdev/tier/test/test_tier_sb
+module/bdev/tier/test/*.dSYM/
+
+# Audit reports & plans (local only)
+docs/audits/

@@ -33,6 +33,10 @@ FROM docker.io/library/fedora:43 AS builder
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 ARG SPDK_VERSION=v26.01
+# W4 (supply chain): a git TAG is mutable — pin the exact upstream commit and
+# verify it after clone, so a moved/replaced tag fails the build instead of
+# silently shipping different sources. Must match vendor/spdk (v26.01).
+ARG SPDK_COMMIT_SHA=2ef883e
 ARG TARGETARCH
 ARG BUILD_TYPE=release
 
@@ -43,7 +47,12 @@ RUN dnf install -y --setopt=install_weak_deps=False --nodocs git && \
     dnf clean all && rm -rf /var/cache/dnf
 
 RUN git clone --branch "${SPDK_VERSION}" --depth 1 --recurse-submodules \
-        https://github.com/spdk/spdk.git
+        https://github.com/spdk/spdk.git && \
+    ACTUAL="$(git -C spdk rev-parse --short=7 HEAD)" && \
+    if [ "${ACTUAL}" != "${SPDK_COMMIT_SHA}" ]; then \
+        echo "FATAL: tag ${SPDK_VERSION} resolves to ${ACTUAL}, expected ${SPDK_COMMIT_SHA} (tag moved?)" >&2; \
+        exit 1; \
+    fi
 
 WORKDIR /build/spdk
 
