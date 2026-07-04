@@ -8,16 +8,16 @@ spdk_blob_freeze_io/spdk_blob_unfreeze_io - the blob-level barrier that
 closes the C1 lost-write (held I/O re-translates through the updated L2P on
 release). m8: assert the bit-pool claim invariant.
 ---
- include/spdk/blob.h    |  48 ++++++++
- lib/blob/blobstore.c   | 272 +++++++++++++++++++++++++++++++++++++++++
+ include/spdk/blob.h    |  54 ++++++++
+ lib/blob/blobstore.c   | 289 +++++++++++++++++++++++++++++++++++++++++
  lib/blob/spdk_blob.map |   6 +
- 3 files changed, 326 insertions(+)
+ 3 files changed, 349 insertions(+)
 
 diff --git a/include/spdk/blob.h b/include/spdk/blob.h
-index fe98215..ad6510d 100644
+index fe98215..93c2680 100644
 --- a/include/spdk/blob.h
 +++ b/include/spdk/blob.h
-@@ -544,6 +544,54 @@ uint64_t spdk_blob_get_num_allocated_clusters(struct spdk_blob *blob);
+@@ -544,6 +544,60 @@ uint64_t spdk_blob_get_num_allocated_clusters(struct spdk_blob *blob);
   */
  uint64_t spdk_blob_get_next_allocated_io_unit(struct spdk_blob *blob, uint64_t offset);
  
@@ -43,9 +43,15 @@ index fe98215..ad6510d 100644
 + * change), persist the extent page, and release the old cluster ONLY after the
 + * extent is durable (crash-safe; native replay reclaims any orphan). Runs on the
 + * metadata thread. The caller must have copied the data to new_lba first.
++ *
++ * release_old (R11): true for a normal relocate (old cluster on a healthy band,
++ * return it to the pool). false for a REMAP (old cluster on a DEGRADED/dead band) —
++ * the old cluster is QUARANTINED (kept marked-allocated) so the thin allocator
++ * never re-serves that bit into the dead band (which would -EIO). Refuses -EBUSY on
++ * a snapshot blob (F2 made intrinsic, deferred #5).
 + */
 +int spdk_blob_relocate_commit(struct spdk_blob *blob, uint64_t cluster_num, uint64_t new_lba,
-+			      spdk_blob_op_complete cb_fn, void *cb_arg);
++			      bool release_old, spdk_blob_op_complete cb_fn, void *cb_arg);
 +
 +/**
 + * SPEC-73 M2b: release a cluster claimed via spdk_blob_claim_cluster_in_range that
@@ -73,7 +79,7 @@ index fe98215..ad6510d 100644
   * Get next unallocated io_unit
   *
 diff --git a/lib/blob/blobstore.c b/lib/blob/blobstore.c
-index 7ae791c..d51b7d4 100644
+index 7ae791c..ea3f883 100644
 --- a/lib/blob/blobstore.c
 +++ b/lib/blob/blobstore.c
 @@ -6246,6 +6246,20 @@ spdk_blob_get_next_unallocated_io_unit(struct spdk_blob *blob, uint64_t offset)
@@ -97,7 +103,7 @@ index 7ae791c..d51b7d4 100644
  /* START spdk_bs_create_blob */
  
  static void
-@@ -9030,6 +9044,264 @@ blob_insert_cluster_on_md_thread(struct spdk_blob *blob, uint32_t cluster_num,
+@@ -9030,6 +9044,281 @@ blob_insert_cluster_on_md_thread(struct spdk_blob *blob, uint32_t cluster_num,
  	spdk_thread_send_msg(blob->bs->md_thread, blob_insert_cluster_msg, ctx);
  }
  
@@ -177,6 +183,7 @@ index 7ae791c..d51b7d4 100644
 +	struct spdk_thread		*orig_thread;
 +	spdk_blob_op_complete		cb_fn;
 +	void				*cb_arg;
++	bool				release_old;	/* R11: false = quarantine old (remap) */
 +	int				rc;
 +};
 +
@@ -196,12 +203,20 @@ index 7ae791c..d51b7d4 100644
 +	struct spdk_blob_store *bs = ctx->blob->bs;
 +
 +	if (bserrno == 0) {
-+		if (ctx->old_lba != 0) {
++		if (ctx->old_lba != 0 && ctx->release_old) {
 +			/* Invariant B: release old ONLY after the extent is durable. */
 +			spdk_spin_lock(&bs->used_lock);
 +			bs_release_cluster(bs, (uint32_t)bs_lba_to_cluster(bs, ctx->old_lba));
 +			spdk_spin_unlock(&bs->used_lock);
 +		}
++		/* R11 (remap): release_old == false QUARANTINES the old cluster instead of
++		 * returning it to the pool. A remap re-homes a cluster whose OLD copy sits on
++		 * a DEGRADED/dead band; releasing that bit would let the thin allocator
++		 * re-serve it to a normal host write → routed into the dead band → -EIO on an
++		 * otherwise-healthy volume. Leaving it marked-allocated is a bounded, in-RAM
++		 * leak for THIS instance only: a reboot rebuilds used_clusters from the blob
++		 * extents (which now point at new_lba), and the control-plane reassembles the
++		 * dead band DEGRADED/RETIRED so its range is not re-served. */
 +	} else {
 +		/* Persist failed: roll the in-memory swap back to old_lba. commit_msg
 +		 * already overwrote active.clusters[cluster_num] with new_lba, but the
@@ -252,10 +267,17 @@ index 7ae791c..d51b7d4 100644
 +
 +int
 +spdk_blob_relocate_commit(struct spdk_blob *blob, uint64_t cluster_num, uint64_t new_lba,
-+			  spdk_blob_op_complete cb_fn, void *cb_arg)
++			  bool release_old, spdk_blob_op_complete cb_fn, void *cb_arg)
 +{
 +	struct blob_relocate_ctx *ctx;
 +
++	/* Deferred #5 (F2 made intrinsic): refuse to relocate/remap a snapshot's cluster
++	 * from ANY caller, not only the RPC handler. A snapshot's clusters are shared
++	 * copy-on-write with its clones; re-pointing one would corrupt the clone that
++	 * reads it. Same -EBUSY the RPC layer already returns (errno contract preserved). */
++	if (spdk_blob_is_snapshot(blob)) {
++		return -EBUSY;
++	}
 +	if (cluster_num >= blob->active.num_clusters || blob->active.clusters[cluster_num] == 0) {
 +		return -ENOENT;
 +	}
@@ -267,6 +289,7 @@ index 7ae791c..d51b7d4 100644
 +	ctx->blob = blob;
 +	ctx->cluster_num = cluster_num;
 +	ctx->new_lba = new_lba;
++	ctx->release_old = release_old;
 +	ctx->orig_thread = spdk_get_thread();
 +	ctx->cb_fn = cb_fn;
 +	ctx->cb_arg = cb_arg;

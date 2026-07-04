@@ -35,6 +35,10 @@ enum cbt_rebuild_state {
 	CBT_REBUILD_COMPLETED = 1,
 	CBT_REBUILD_FAILED    = 2,
 	CBT_REBUILD_CANCELLED = 3,
+	/* R1: a rebuild aborted by a source/target/cbt hot-remove mid-flight. Distinct
+	 * from FAILED (an I/O error) and COMPLETED: the delta was NOT fully copied, so
+	 * the control-plane must RESUME it, not treat the member as synced. */
+	CBT_REBUILD_ABORTED   = 4,
 };
 
 /* ── Epoch lifecycle ───────────────────────────────────────────────── */

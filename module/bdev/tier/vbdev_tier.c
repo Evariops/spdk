@@ -144,6 +144,38 @@ tier_md_other_leg(struct vbdev_tier *t, struct tier_band *b)
 	return vbdev_tier_band_by_id(t, other);
 }
 
+/* R4/R5/M3: a WRITE/UNMAP/WRITE_ZEROES/FLUSH to a mirrored-md leg that does NOT
+ * land (submission OR completion failure) while the sibling leg DID leaves the two
+ * L2P copies divergent and both ACTIVE — resync_md (which only targets DEGRADED)
+ * would never repair them, and a reboot could prefer the stale copy. Degrade the
+ * failing leg (reads stop preferring it) and persist DEGRADED (M5(b) excludes it
+ * from the SB fan-out). Idempotent: a leg already non-ACTIVE is a no-op. */
+static void
+tier_degrade_md_leg(struct vbdev_tier *t, struct tier_band *leg)
+{
+	if (leg == NULL || leg->state != TIER_BAND_ACTIVE) {
+		return;
+	}
+	SPDK_ERRLOG("tier '%s': md write failed on band %u — degrading leg\n",
+		    t->bdev.name, leg->band_id);
+	leg->state = TIER_BAND_DEGRADED;
+	if (t->registered) {
+		tier_sb_write_all(t, tier_sb_persist_cb, NULL);
+	}
+}
+
+/* True iff `band` is an md-mirror leg and the base-physical offset `base_phys`
+ * lands inside the mirrored md region [sb_blocks, sb_blocks+md). Used to classify
+ * a completing/failing leg per-leg (NOT from the whole orig_io range, which
+ * mis-classifies a whole-device op — R5) without a per-leg context allocation. */
+static inline bool
+tier_leg_is_md(const struct vbdev_tier *t, const struct tier_band *band, uint64_t base_phys)
+{
+	return band != NULL &&
+	       (band->band_id == t->md_mirror_a || band->band_id == t->md_mirror_b) &&
+	       base_phys >= t->sb_blocks && base_phys < t->sb_blocks + t->md_num_blocks;
+}
+
 static void
 _tier_leg_complete(struct spdk_bdev_io *leg_io, bool success, void *cb_arg)
 {
@@ -157,8 +189,10 @@ _tier_leg_complete(struct spdk_bdev_io *leg_io, bool success, void *cb_arg)
 		io_ctx->good_legs++;
 	} else {
 		struct tier_band *fb = tier_band_by_base_bdev(t, leg_io->bdev);
+		/* R5: classify THIS leg from its own base offset, not orig_io's range. */
+		bool leg_md = tier_leg_is_md(t, fb, leg_io->u.bdev.offset_blocks);
 
-		if (md_range && orig_io->type == SPDK_BDEV_IO_TYPE_READ && !io_ctx->md_retry_done) {
+		if (leg_md && orig_io->type == SPDK_BDEV_IO_TYPE_READ && !io_ctx->md_retry_done) {
 			/* M2: async media error on one md leg — the mirror holds a healthy
 			 * copy; fail over instead of failing the read. */
 			struct tier_band *alt = tier_md_other_leg(t, fb);
@@ -183,18 +217,9 @@ _tier_leg_complete(struct spdk_bdev_io *leg_io, bool success, void *cb_arg)
 				return;
 			}
 		}
-		if (md_range && orig_io->type != SPDK_BDEV_IO_TYPE_READ &&
-		    fb != NULL && fb->state == TIER_BAND_ACTIVE) {
-			/* M3: a failed md-mirror write leg leaves the two copies divergent.
-			 * Degrade the failing leg so reads stop preferring it, and persist
-			 * DEGRADED (M5(b) excludes it from the SB fan-out) so a reboot
-			 * cannot resurrect its stale L2P copy. */
-			SPDK_ERRLOG("tier '%s': md write failed on band %u — degrading leg\n",
-				    t->bdev.name, fb->band_id);
-			fb->state = TIER_BAND_DEGRADED;
-			if (t->registered) {
-				tier_sb_write_all(t, tier_sb_persist_cb, NULL);
-			}
+		if (leg_md && orig_io->type != SPDK_BDEV_IO_TYPE_READ) {
+			/* M3/R5: a failed md-mirror WRITE/mgmt leg diverges — degrade + persist. */
+			tier_degrade_md_leg(t, fb);
 		}
 		io_ctx->status = SPDK_BDEV_IO_STATUS_FAILED;
 	}
@@ -282,9 +307,10 @@ tier_route_md_fanout(struct vbdev_tier *t, struct tier_io_channel *tch,
 {
 	struct tier_bdev_io *io_ctx = (struct tier_bdev_io *)bdev_io->driver_ctx;
 	struct tier_band *legs[2];
+	struct tier_band *failed[2];
 	struct tier_band *a = vbdev_tier_band_by_id(t, t->md_mirror_a);
 	struct tier_band *b = vbdev_tier_band_by_id(t, t->md_mirror_b);
-	int nlegs = 0, submitted = 0, i, rc = -EIO;
+	int nlegs = 0, submitted = 0, nfailed = 0, i, rc = -EIO;
 
 	if (a != NULL && a->state == TIER_BAND_ACTIVE) {
 		legs[nlegs++] = a;
@@ -303,12 +329,20 @@ tier_route_md_fanout(struct vbdev_tier *t, struct tier_io_channel *tch,
 			io_ctx->status = SPDK_BDEV_IO_STATUS_FAILED;
 			io_ctx->submit_failed = true;
 			io_ctx->remaining--;
+			failed[nfailed++] = legs[i];
 		} else {
 			submitted++;
 		}
 	}
 	if (submitted == 0) {
-		return rc;	/* nothing in flight; the caller completes the orig_io */
+		return rc;	/* nothing in flight; caller completes/requeues, no leg wrote */
+	}
+	/* R4: a sibling leg is in flight and WILL write the new md data, so any md leg
+	 * that failed to submit now diverges from it — degrade it (+ persist). Without
+	 * this both legs stay ACTIVE and resync_md (DEGRADED-only) never repairs the
+	 * silent divergence; a reboot could then prefer the stale copy. */
+	for (i = 0; i < nfailed; i++) {
+		tier_degrade_md_leg(t, failed[i]);
 	}
 	return 0;
 }
@@ -390,13 +424,34 @@ tier_submit_mgmt_range(struct tier_band *band, struct spdk_io_channel *base_ch,
 	}
 }
 
+/* R6: a RETIRED band keeps its composite LBA range as an unreclaimable HOLE
+ * (vbdev_tier_band_of_lba skips RETIRED). For a FLUSH/UNMAP/WRITE_ZEROES a hole is
+ * a durable NO-OP (reads of the range already -EIO), so the mgmt router skips it
+ * instead of failing the whole op. Return the end LBA of the retired band covering
+ * `lba` so the caller can advance past the hole; 0 if `lba` is not inside any
+ * retired band (a genuine unmapped gap → still an error). */
+static uint64_t
+tier_retired_hole_end(struct vbdev_tier *t, uint64_t lba)
+{
+	struct tier_band *b;
+
+	TAILQ_FOREACH(b, &t->bands, link) {
+		if (b->state == TIER_BAND_RETIRED &&
+		    lba >= b->lba_start && lba < b->lba_start + b->num_blocks) {
+			return b->lba_start + b->num_blocks;
+		}
+	}
+	return 0;
+}
+
 /* Route a FLUSH/UNMAP/WRITE_ZEROES over ANY composite range, splitting it into
  * one leg per covered region: the mirrored md portion fans out to both md legs
  * (m6 — a single-leg unmap would desync the L2P copies), and each data band the
  * range crosses gets its own leg. This is what makes a whole-device FLUSH (the
  * canonical NVMe Flush, offset 0..blockcnt) work — it spans md + every band.
  * Reuses the io_ctx leg-count machinery; the orig completes only from the last
- * _tier_leg_complete. Returns 0 if any leg is in flight, -errno otherwise. */
+ * _tier_leg_complete. Returns 0 if any leg is in flight (or the op no-ops over a
+ * hole and was completed here), -errno otherwise. */
 static int
 tier_route_mgmt(struct vbdev_tier *t, struct tier_io_channel *tch, struct spdk_bdev_io *bdev_io)
 {
@@ -407,8 +462,10 @@ tier_route_mgmt(struct vbdev_tier *t, struct tier_io_channel *tch, struct spdk_b
 		struct tier_band	*band;
 		uint64_t		base_phys;
 		uint64_t		num;
+		bool			is_md;	/* R4/R5: md-region leg (degrade sibling on divergence) */
 	} segs[2 + TIER_MAX_BANDS];
-	int nseg = 0, submitted = 0, i, rc = -EIO;
+	struct tier_band *md_failed[2];
+	int nseg = 0, submitted = 0, md_submitted = 0, md_nfailed = 0, i, rc = -EIO;
 	uint64_t pos;
 
 	/* md-covered portion [offset, min(end, md)) — mirrored across the active md legs. */
@@ -424,6 +481,7 @@ tier_route_mgmt(struct vbdev_tier *t, struct tier_io_channel *tch, struct spdk_b
 				segs[nseg].band = legs[k];
 				segs[nseg].base_phys = t->sb_blocks + offset;
 				segs[nseg].num = md_num;
+				segs[nseg].is_md = true;
 				nseg++;
 				n++;
 			}
@@ -433,25 +491,41 @@ tier_route_mgmt(struct vbdev_tier *t, struct tier_io_channel *tch, struct spdk_b
 		}
 	}
 
-	/* data portion [max(offset, md), end) — one leg per owning band segment. */
+	/* data portion [max(offset, md), end) — one leg per owning band segment.
+	 * R6: a RETIRED band's range is a hole — skip it (mgmt no-op) instead of
+	 * failing, so a whole-device FLUSH/UNMAP/WRITE_ZEROES survives a retired band. */
 	pos = spdk_max(offset, t->md_num_blocks);
 	while (pos < end) {
 		uint64_t band_off, seg_num;
 		struct tier_band *band = vbdev_tier_band_of_lba(t, pos, &band_off);
 
-		if (band == NULL || nseg >= (int)SPDK_COUNTOF(segs)) {
-			return -EIO;	/* unmapped gap or too many segments */
+		if (band == NULL) {
+			uint64_t hole_end = tier_retired_hole_end(t, pos);
+
+			if (hole_end > pos) {
+				pos = spdk_min(hole_end, end);	/* skip the retired hole */
+				continue;
+			}
+			return -EIO;	/* a genuinely unmapped gap is still an error */
+		}
+		if (nseg >= (int)SPDK_COUNTOF(segs)) {
+			return -EIO;	/* too many segments */
 		}
 		seg_num = spdk_min(end - pos, band->num_blocks - band_off);
 		segs[nseg].band = band;
 		segs[nseg].base_phys = band->phys_offset + band_off;
 		segs[nseg].num = seg_num;
+		segs[nseg].is_md = false;
 		nseg++;
 		pos += seg_num;
 	}
 
 	if (nseg == 0) {
-		return -EIO;
+		/* R6: the whole range fell inside retired hole(s) (offset >= md, all data
+		 * retired) — a mgmt op over a hole is a durable no-op. Complete SUCCESS here
+		 * (returning 0; the single caller does nothing more on rc == 0). */
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+		return 0;
 	}
 	io_ctx->remaining = nseg;
 	for (i = 0; i < nseg; i++) {
@@ -470,12 +544,26 @@ tier_route_mgmt(struct vbdev_tier *t, struct tier_io_channel *tch, struct spdk_b
 			io_ctx->status = SPDK_BDEV_IO_STATUS_FAILED;
 			io_ctx->submit_failed = true;
 			io_ctx->remaining--;
+			if (segs[i].is_md && md_nfailed < (int)SPDK_COUNTOF(md_failed)) {
+				md_failed[md_nfailed++] = band;
+			}
 		} else {
 			submitted++;
+			if (segs[i].is_md) {
+				md_submitted++;
+			}
 		}
 	}
 	if (submitted == 0) {
 		return rc;	/* nothing in flight; caller completes the orig_io */
+	}
+	/* R4: if at least one md leg took the md-region write, any md leg whose md-region
+	 * seg failed to submit now diverges — degrade it (+ persist). If NO md leg took it
+	 * (md_submitted == 0), the two legs are still identical, so leave them ACTIVE. */
+	if (md_submitted > 0) {
+		for (i = 0; i < md_nfailed; i++) {
+			tier_degrade_md_leg(t, md_failed[i]);
+		}
 	}
 	return 0;
 }
@@ -1002,6 +1090,19 @@ vbdev_tier_add_band(struct vbdev_tier *t, const char *base_bdev_name, enum tier_
 	/* All bands must share the block size (mixing 512/4096 corrupts geometry). */
 	if (t->blocklen == 0) {
 		t->blocklen = base_bdev->blocklen;
+		/* R7: the superblock is written as whole TIER_SB_SLOT_BYTES slots, so the
+		 * slot must be an integral number of blocks. A T10-DIF blocklen (520/4160)
+		 * that does not divide the slot would make the FIRST SB write fail -EINVAL at
+		 * register — leaving a registered-but-superblock-less composite that no
+		 * reassembly can find (read_sb → -EILSEQ). Reject the incompatible base here. */
+		if (TIER_SB_SLOT_BYTES % t->blocklen != 0) {
+			SPDK_ERRLOG("tier: band '%s' blocklen %u cannot host the superblock slot "
+				    "(%d not a multiple)\n", base_bdev_name, t->blocklen,
+				    TIER_SB_SLOT_BYTES);
+			spdk_bdev_close(band->desc);
+			free(band);
+			return -EINVAL;
+		}
 	} else if (base_bdev->blocklen != t->blocklen) {
 		SPDK_ERRLOG("tier: band '%s' blocklen %u != composite %u\n",
 			    base_bdev_name, base_bdev->blocklen, t->blocklen);
@@ -1120,6 +1221,16 @@ vbdev_tier_assemble_band(struct vbdev_tier *t, const char *base_bdev_name, uint3
 	uint64_t phys_offset;
 	int rc;
 
+	/* R8: the band table is FROZEN at register (blockcnt + per-reactor base
+	 * channels are fixed there). add_band already refuses a post-register add;
+	 * assemble_band did the same TAILQ insert without the guard, so a runtime
+	 * bdev_tier_assemble_band (SPDK_RPC_RUNTIME) could splice into t->bands while
+	 * reactors walk it lock-free — a torn `next` pointer. Assembly is always
+	 * create → assemble → register (CSI contract); enforce it. */
+	if (t->registered) {
+		SPDK_ERRLOG("tier '%s': assemble_band after register is not allowed\n", t->bdev.name);
+		return -EBUSY;
+	}
 	/* M6/T-3/W7: the RPC decodes band_id/state as raw u32 — bound BOTH before
 	 * they index base_ch[] or route I/O (state=5 would route like ACTIVE). */
 	if (band_id >= TIER_MAX_BANDS) {
@@ -1191,6 +1302,17 @@ vbdev_tier_assemble_band(struct vbdev_tier *t, const char *base_bdev_name, uint3
 	base_bdev = spdk_bdev_desc_get_bdev(band->desc);
 	if (t->blocklen == 0) {
 		t->blocklen = base_bdev->blocklen;
+		/* R7: reject a blocklen that cannot host the fixed superblock slot (see
+		 * vbdev_tier_add_band) — else the first SB persist fails and the composite
+		 * is unrecoverable. */
+		if (TIER_SB_SLOT_BYTES % t->blocklen != 0) {
+			SPDK_ERRLOG("tier: assemble band '%s' blocklen %u cannot host the superblock "
+				    "slot (%d not a multiple)\n", base_bdev_name, t->blocklen,
+				    TIER_SB_SLOT_BYTES);
+			spdk_bdev_close(band->desc);
+			free(band);
+			return -EINVAL;
+		}
 	} else if (base_bdev->blocklen != t->blocklen) {
 		SPDK_ERRLOG("tier: assemble band '%s' blocklen %u != composite %u\n",
 			    base_bdev_name, base_bdev->blocklen, t->blocklen);
@@ -1344,12 +1466,13 @@ vbdev_tier_retire_band(struct vbdev_tier *t, uint32_t band_id,
 int
 vbdev_tier_delete(struct vbdev_tier *t)
 {
-	/* T-4b: an SB fan-out holds this composite's base-band descriptors and
-	 * channels; unregistering now would free `t` and close those descs under the
-	 * in-flight writes (UAF + close-with-I/O). Defer the teardown until the
-	 * fan-out drains (vbdev_tier_sb_fanout_idle). sb_write_queued is included:
-	 * the coalesced follow-up will hold descriptors again. */
-	if (t->sb_write_inflight || t->sb_write_queued) {
+	/* T-4b/R9: an in-flight async op — an SB fan-out, a relocate copy, an md
+	 * resync, or the register-time seq rehydrate — holds this composite's base-band
+	 * descriptors and/or pointers into `t`. Unregistering now would free `t` and its
+	 * bands under the op (UAF + close-with-I/O). Defer the teardown: the SB fan-out
+	 * completes it via vbdev_tier_sb_fanout_idle, the others via tier_async_op_end.
+	 * sb_write_queued is included: the coalesced follow-up will hold descriptors. */
+	if (t->sb_write_inflight || t->sb_write_queued || t->async_inflight > 0) {
 		t->delete_pending = true;
 		return 0;
 	}
@@ -1364,6 +1487,40 @@ vbdev_tier_delete(struct vbdev_tier *t)
 	return 0;
 }
 
+/* R9: run a teardown deferred behind async work, but only once EVERYTHING that
+ * pins `t` has drained (no SB fan-out in flight/queued, no relocate/resync/
+ * rehydrate). Returns true if it ran the teardown — the caller must not touch `t`. */
+static bool
+tier_run_deferred_delete(struct vbdev_tier *t)
+{
+	if (t->delete_pending && t->async_inflight == 0 &&
+	    !t->sb_write_inflight && !t->sb_write_queued) {
+		t->delete_pending = false;
+		vbdev_tier_delete(t);
+		return true;
+	}
+	return false;
+}
+
+/* R9: bracket a composite async op (relocate / resync / register seq-rehydrate)
+ * whose context holds pointers into `t`. Call _begin before launching the async
+ * chain and _end at its terminal completion. _end may run a delete deferred behind
+ * the op — after it returns, the caller must not touch `t`. */
+static void
+tier_async_op_begin(struct vbdev_tier *t)
+{
+	t->async_inflight++;
+}
+
+static void
+tier_async_op_end(struct vbdev_tier *t)
+{
+	if (t->async_inflight > 0) {
+		t->async_inflight--;
+	}
+	tier_run_deferred_delete(t);
+}
+
 /* T-4b: run any teardown deferred behind an SB fan-out, now that it has drained.
  * Called from tier_sb_fanout_complete. Returns true if a deferred delete consumed
  * the composite (caller must not touch `t`). */
@@ -1372,12 +1529,20 @@ vbdev_tier_sb_fanout_idle(struct vbdev_tier *t)
 {
 	struct tier_band *b, *tmp;
 
-	/* A delete deferred behind the fan-out wins: nothing to persist to a
-	 * composite being torn down, and the teardown closes every band's desc. */
+	/* A delete is deferred behind the fan-out. If a follow-up fan-out is queued it
+	 * still OWNS callbacks coalesced behind this fan-out — e.g. an md resync's
+	 * persist (tier_md_resync_persisted), whose terminal handler releases the
+	 * resync's async_inflight ref (R9). DROPPING the follow-up would strand those
+	 * cbs, leak the ref, and the deferred delete would NEVER run (composite + descs
+	 * leaked, delete/resync RPCs hung). So DON'T drop it: return false and let the
+	 * caller run the follow-up, which serves the cbs; the served op's terminal then
+	 * releases its ref and (eventually) runs the deferred delete. Only when no
+	 * follow-up remains do we try to tear down here. */
 	if (t->delete_pending) {
-		t->delete_pending = false;
-		t->sb_write_queued = false;
-		vbdev_tier_delete(t);	/* fan-out idle now → proceeds to unregister */
+		if (t->sb_write_queued) {
+			return false;	/* caller runs the queued follow-up (serves the cbs) */
+		}
+		tier_run_deferred_delete(t);	/* runs iff async_inflight == 0 */
 		return true;
 	}
 	/* A base hot-remove that landed during the fan-out deferred the degraded
@@ -1403,6 +1568,87 @@ tier_sb_persist_cb(void *cb_arg, int rc)
 {
 	if (rc != 0) {
 		SPDK_ERRLOG("tier: superblock persist failed rc=%d\n", rc);
+	}
+}
+
+/* R2: at register the CSI does not thread the on-disk `seq` back down — it reads
+ * seq only to arbitrate the authoritative SB (control-plane side), never through
+ * create/assemble/register — so the FORK owns seq monotonicity across a restart. A
+ * fresh composite starts t->seq = 0; without rehydration, register's first persist
+ * writes seq 1, which a pre-restart SB sitting at a high seq out-votes FOREVER
+ * (tier_sb_select is highest-seq-wins) — the composite then reassembles to the
+ * STALE geometry, silently undoing every retire/relocate persisted at the high seq.
+ * Fix: re-read every band's on-disk SB, seed t->seq to the highest seq found, THEN
+ * persist (its seq is max+1, so it wins). Best-effort: if no read can be launched,
+ * persist at the current seq. */
+struct tier_register_seed_ctx {
+	struct vbdev_tier	*t;
+	int			remaining;
+	uint64_t		max_seq;
+};
+
+static void
+tier_register_seed_finish(struct tier_register_seed_ctx *ctx)
+{
+	struct vbdev_tier *t = ctx->t;
+
+	if (ctx->max_seq > t->seq) {
+		t->seq = ctx->max_seq;	/* the persist below reserves seq max+1 (monotone) */
+	}
+	free(ctx);
+	/* Launch the persist BEFORE releasing the rehydrate ref: tier_sb_write_all sets
+	 * sb_write_inflight synchronously, so a bdev_tier_delete deferred behind the
+	 * rehydrate is then held by the fan-out (run by vbdev_tier_sb_fanout_idle),
+	 * never freed out from under us here. */
+	if (tier_sb_write_all(t, tier_sb_persist_cb, NULL) != 0) {
+		SPDK_ERRLOG("tier '%s': initial superblock persist could not be launched\n",
+			    t->bdev.name);
+	}
+	tier_async_op_end(t);	/* R9 */
+}
+
+static void
+tier_register_seed_read_cb(void *cb_arg, const struct tier_superblock *sb, int rc)
+{
+	struct tier_register_seed_ctx *ctx = cb_arg;
+
+	if (rc == 0 && sb != NULL && sb->seq > ctx->max_seq) {
+		ctx->max_seq = sb->seq;
+	}
+	if (--ctx->remaining == 0) {
+		tier_register_seed_finish(ctx);
+	}
+}
+
+static void
+tier_register_seed_seq_and_persist(struct vbdev_tier *t)
+{
+	struct tier_register_seed_ctx *ctx;
+	struct tier_band *b;
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		/* Fallback: persist at the current seq (may lose cross-restart monotonicity). */
+		if (tier_sb_write_all(t, tier_sb_persist_cb, NULL) != 0) {
+			SPDK_ERRLOG("tier '%s': initial superblock persist could not be launched\n",
+				    t->bdev.name);
+		}
+		return;
+	}
+	ctx->t = t;
+	ctx->remaining = 1;	/* hold a ref while launching the per-band reads */
+	tier_async_op_begin(t);	/* R9: defer any delete until the rehydrate + persist drains */
+	TAILQ_FOREACH(b, &t->bands, link) {
+		if (b->desc == NULL) {
+			continue;	/* DEGRADED/absent leg — nothing to read */
+		}
+		ctx->remaining++;
+		if (tier_sb_read_desc(b->desc, t->blocklen, tier_register_seed_read_cb, ctx) != 0) {
+			ctx->remaining--;	/* this read did not launch */
+		}
+	}
+	if (--ctx->remaining == 0) {
+		tier_register_seed_finish(ctx);
 	}
 }
 
@@ -1461,9 +1707,10 @@ vbdev_tier_register(struct vbdev_tier *t)
 	SPDK_NOTICELOG("tier '%s' registered: %u bands, %" PRIu64 " blocks of %u bytes (sb_blocks=%u)\n",
 		       t->bdev.name, t->num_bands, t->bdev.blockcnt, t->bdev.blocklen, t->sb_blocks);
 
-	/* Persist the superblock to every band (INV-T1). CRD is a backup source of
-	 * truth; a failed sb write is logged. */
-	tier_sb_write_all(t, tier_sb_persist_cb, NULL);
+	/* R2: rehydrate t->seq from the on-disk SBs, THEN persist the superblock to every
+	 * band (INV-T1). This makes the generation monotone across a restart (the CSI
+	 * replays create+assemble with t->seq=0). Async + best-effort; failures logged. */
+	tier_register_seed_seq_and_persist(t);
 	return 0;
 }
 
@@ -1476,6 +1723,7 @@ vbdev_tier_register(struct vbdev_tier *t)
  * silent media/write corruption is detected at relocate time (not later via the upper-layer redundancy).
  * The copy is disk-to-disk so accel memory-copy offload does not apply; the integrity check does. */
 struct tier_copy_ctx {
+	struct vbdev_tier	*t;		/* R9: for the async-op lifecycle ref */
 	struct tier_band	*src_band;
 	struct tier_band	*dst_band;
 	struct spdk_io_channel	*src_ch;
@@ -1494,6 +1742,8 @@ struct tier_copy_ctx {
 static void
 tier_copy_finish(struct tier_copy_ctx *c, int rc)
 {
+	struct vbdev_tier *t = c->t;
+
 	if (c->src_ch) {
 		spdk_put_io_channel(c->src_ch);
 	}
@@ -1508,6 +1758,9 @@ tier_copy_finish(struct tier_copy_ctx *c, int rc)
 	}
 	c->cb_fn(c->cb_arg, rc);
 	free(c);
+	/* R9: release the composite async ref LAST — this may run a bdev_tier_delete
+	 * that was deferred behind this relocate, so `t` must not be touched after. */
+	tier_async_op_end(t);
 }
 
 /* A band's desc is NULLed by tier_band_drain_and_close on hot-remove. Each async
@@ -1541,7 +1794,10 @@ tier_copy_verify_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	tier_copy_finish(c, 0);
 }
 
-/* C5 (F8): destination flushed — now read it back from MEDIA (not the write cache) and verify. */
+/* R3/F-6: destination flushed — durability is now satisfied on EVERY path. If the
+ * C5 verify is off (PF4), the relocate is done; otherwise read the destination
+ * back from MEDIA (the flush guaranteed it landed, not just the write cache) and
+ * CRC-compare with the source. */
 static void
 tier_copy_flush_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
@@ -1551,6 +1807,14 @@ tier_copy_flush_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	spdk_bdev_free_io(bdev_io);
 	if (!success) {
 		tier_copy_finish(c, -EIO);
+		return;
+	}
+	/* PF4: the C5 read-back+verify is optional per disk class — on media the
+	 * control-plane trusts, skip the extra read (the durability flush already ran).
+	 * The blob-freeze (C1) already makes the move correct; verify only detects a
+	 * SILENT media/write corruption at relocate time. */
+	if (!c->verify) {
+		tier_copy_finish(c, 0);
 		return;
 	}
 	c->vbuf = spdk_dma_malloc(c->num_blocks * (uint64_t)c->blocklen, c->blocklen, NULL);
@@ -1580,20 +1844,16 @@ tier_copy_write_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 		tier_copy_finish(c, -EIO);
 		return;
 	}
-	/* PF4: the C5 read-back+verify is optional per disk class — on media the
-	 * control-plane trusts, skip the extra flush+read (halves the relocate I/O).
-	 * The blob-freeze (C1) already makes the move correct; verify only detects a
-	 * SILENT media/write corruption at relocate time. */
-	if (!c->verify) {
-		tier_copy_finish(c, 0);
-		return;
-	}
 	if (!tier_copy_dst_alive(c)) {
 		tier_copy_finish(c, -EIO);	/* destination hot-removed mid-copy */
 		return;
 	}
-	/* C5 (F8): FLUSH the destination so the read-back hits media (not the base-bdev write cache),
-	 * otherwise a silent MEDIA corruption would be masked by the cache. Then read back + verify CRC. */
+	/* R3: FLUSH the destination on EVERY path (durability, F-6), not only under
+	 * `verify`. The caller swaps the L2P and frees the SOURCE cluster the moment
+	 * this relocate ACKs; if the moved data is still in the destination's volatile
+	 * write cache, a power cut before the cache drains LOSES the cluster. Durability
+	 * (flush-before-commit) is unconditional; the C5 read-back+CRC (which also needs
+	 * this flush so the read hits media) stays opt-in per disk class (PF4). */
 	rc = spdk_bdev_flush_blocks(c->dst_band->desc, c->dst_ch, c->dst_phys, c->num_blocks,
 				    tier_copy_flush_done, c);
 	if (rc != 0) {
@@ -1662,6 +1922,8 @@ vbdev_tier_relocate_copy(struct vbdev_tier *t, uint64_t src_lba, uint64_t dst_lb
 	if (c == NULL) {
 		return -ENOMEM;
 	}
+	c->t = t;
+	tier_async_op_begin(t);	/* R9: defer any bdev_tier_delete until this copy drains */
 	c->src_band = sb;
 	c->dst_band = db;
 	c->num_blocks = num_blocks;
@@ -1720,6 +1982,7 @@ static void
 tier_md_resync_unquiesced(void *cb_arg, int status)
 {
 	struct tier_md_resync_ctx *c = cb_arg;
+	struct vbdev_tier *t = c->t;
 
 	(void)status;	/* best-effort; the resync outcome is c->rc */
 	if (c->src_ch) {
@@ -1733,6 +1996,9 @@ tier_md_resync_unquiesced(void *cb_arg, int status)
 	}
 	c->cb(c->cb_arg, c->rc);
 	free(c);
+	/* R9: release the composite async ref LAST — may run a deferred bdev_tier_delete
+	 * (do not touch `t` afterward). */
+	tier_async_op_end(t);
 }
 
 static void
@@ -1916,6 +2182,7 @@ vbdev_tier_resync_md(struct vbdev_tier *t, uint32_t target_band_id,
 	}
 	chunk_blocks = spdk_max(1, (1024u * 1024u) / t->blocklen);	/* 1 MiB chunks */
 	c->t = t;
+	tier_async_op_begin(t);	/* R9: defer any bdev_tier_delete until this resync drains */
 	c->src = src;
 	c->dst = dst;
 	c->chunk_blocks = chunk_blocks;

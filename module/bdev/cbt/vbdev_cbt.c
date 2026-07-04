@@ -1608,10 +1608,18 @@ cbt_rebuild_throttle_poller_fn(void *arg)
 		ctx->window_start_tsc = now;
 		if (ctx->throttled) {
 			ctx->throttled = false;
+			/* R10: on the legacy path cbt_rebuild_submit_next may drain the last
+			 * outstanding I/O and free(ctx) (submit_next → finish → finalize →
+			 * TAILQ_REMOVE + free). Do NOT dereference ctx afterward. We un-throttled
+			 * and drove work, so report BUSY without touching ctx; finalize already
+			 * unregistered this poller, so the return value is only ever consumed
+			 * while ctx is still alive. */
 			cbt_rebuild_submit_next(ctx);
+			return SPDK_POLLER_BUSY;
 		}
 	}
 
+	/* Not reached via submit_next → ctx is alive here. */
 	return ctx->throttled ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
 }
 
@@ -1751,7 +1759,10 @@ cbt_rebuild_finalize(struct cbt_rebuild_ctx *ctx)
 	result.bytes_copied = ctx->bytes_copied;
 	result.duration_ms = elapsed_tsc * 1000 / hz;
 	result.error = ctx->error;
-	result.completed = (ctx->error == 0 && !ctx->cancelled);
+	/* R1: an ABORTED rebuild (hot-remove mid-flight) is neither a success nor a
+	 * plain I/O error. It must NOT report completed, or the control-plane marks the
+	 * member fully synced after a mid-rebuild abort → silent under-replication. */
+	result.completed = (ctx->error == 0 && !ctx->cancelled && !ctx->aborted);
 
 	/* ── Instrumentation report ── */
 	avg_read_us = ctx->chunks_copied ?
@@ -1800,11 +1811,16 @@ cbt_rebuild_finalize(struct cbt_rebuild_ctx *ctx)
 	/* Cleanup I/O resources. */
 	cbt_rebuild_registry_cleanup(ctx);
 
-	/* ── Finalize state for the registry ── */
+	/* ── Finalize state for the registry ──
+	 * R1: order matters. An I/O failure sets BOTH error and aborted (read/write_cb),
+	 * so check error before aborted → it maps to FAILED. A hot-remove abort sets
+	 * ONLY aborted (error == 0) → ABORTED. Neither is COMPLETED. */
 	if (ctx->cancelled) {
 		ctx->state = CBT_REBUILD_CANCELLED;
 	} else if (ctx->error != 0) {
 		ctx->state = CBT_REBUILD_FAILED;
+	} else if (ctx->aborted) {
+		ctx->state = CBT_REBUILD_ABORTED;
 	} else {
 		ctx->state = CBT_REBUILD_COMPLETED;
 	}

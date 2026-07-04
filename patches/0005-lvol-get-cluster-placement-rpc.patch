@@ -4,9 +4,9 @@ Date: Sat, 4 Jul 2026 15:26:58 +0200
 Subject: [PATCH 05/11] 0005-lvol-get-cluster-placement-rpc.patch
 
 ---
- module/bdev/lvol/Makefile              |   3 +-
- module/bdev/lvol/vbdev_lvol_tier_rpc.c | 993 +++++++++++++++++++++++++
- 2 files changed, 995 insertions(+), 1 deletion(-)
+ module/bdev/lvol/Makefile              |    3 +-
+ module/bdev/lvol/vbdev_lvol_tier_rpc.c | 1001 ++++++++++++++++++++++++
+ 2 files changed, 1003 insertions(+), 1 deletion(-)
  create mode 100644 module/bdev/lvol/vbdev_lvol_tier_rpc.c
 
 diff --git a/module/bdev/lvol/Makefile b/module/bdev/lvol/Makefile
@@ -25,10 +25,10 @@ index aba6620..a8ed387 100644
  SPDK_MAP_FILE = $(SPDK_ROOT_DIR)/mk/spdk_blank.map
 diff --git a/module/bdev/lvol/vbdev_lvol_tier_rpc.c b/module/bdev/lvol/vbdev_lvol_tier_rpc.c
 new file mode 100644
-index 0000000..20e794a
+index 0000000..797d6a3
 --- /dev/null
 +++ b/module/bdev/lvol/vbdev_lvol_tier_rpc.c
-@@ -0,0 +1,993 @@
+@@ -0,0 +1,1001 @@
 +/*   SPDX-License-Identifier: BSD-3-Clause
 + *   Copyright (C) 2026 Evariops.
 + *   All rights reserved.
@@ -339,8 +339,9 @@ index 0000000..20e794a
 +		relocate_finish(c, status);
 +		return;
 +	}
-+	/* Data is on new (invariant A). Swap the map + persist + release old. */
-+	rc = spdk_blob_relocate_commit(c->blob, c->cluster_num, c->new_lba, relocate_committed, c);
++	/* Data is on new (invariant A). Swap the map + persist + release old (relocate:
++	 * old is on a healthy band → return it to the pool, R11 release_old=true). */
++	rc = spdk_blob_relocate_commit(c->blob, c->cluster_num, c->new_lba, true, relocate_committed, c);
 +	if (rc != 0) {
 +		relocate_finish(c, rc);
 +	}
@@ -628,7 +629,7 @@ index 0000000..20e794a
 +		return;
 +	}
 +	rc = spdk_blob_relocate_commit(c->blob, c->items[c->cur].cluster_num, c->cur_new_lba,
-+				       batch_committed, c);
++				       true, batch_committed, c);	/* R11: batch is relocate → release old */
 +	if (rc != 0) {
 +		batch_finish(c, rc);
 +	}
@@ -722,9 +723,14 @@ index 0000000..20e794a
 +{
 +	struct rpc_lvol_relocate_batch *req = SPDK_CONTAINEROF(out, struct rpc_lvol_relocate_batch, items);
 +
-+	req->items = calloc(RPC_BATCH_MAX, sizeof(struct batch_item));
++	/* R16: a duplicate "clusters" JSON key calls this decoder twice; without the
++	 * guard the second calloc overwrites req->items and leaks the first array
++	 * (~RPC_BATCH_MAX entries). Allocate once, mirroring decode_repair_ranges. */
 +	if (req->items == NULL) {
-+		return -1;
++		req->items = calloc(RPC_BATCH_MAX, sizeof(struct batch_item));
++		if (req->items == NULL) {
++			return -1;
++		}
 +	}
 +	return spdk_json_decode_array(val, decode_batch_item, req->items, RPC_BATCH_MAX,
 +				      &req->num_items, sizeof(struct batch_item));
@@ -905,7 +911,9 @@ index 0000000..20e794a
 +	}
 +	assert(blob == c->blob);
 +	c->ref_held = true;
-+	rc = spdk_blob_relocate_commit(c->blob, c->cluster_num, c->new_lba, remap_committed, c);
++	/* R11: remap re-homes a cluster whose OLD copy is on a DEGRADED band → QUARANTINE
++	 * the old cluster (release_old=false), never return it to the thin pool. */
++	rc = spdk_blob_relocate_commit(c->blob, c->cluster_num, c->new_lba, false, remap_committed, c);
 +	if (rc != 0) {
 +		remap_finish(c, rc);
 +	}
