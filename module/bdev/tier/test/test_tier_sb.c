@@ -73,6 +73,16 @@ spdk_bdev_get_io_channel(struct spdk_bdev_desc *desc)
 	return NULL;
 }
 
+/* T-4b: lives in vbdev_tier.c (not host-compilable). The SB serialize/valid/select
+ * tests never drive a fan-out to completion, so a no-op that reports "nothing
+ * deferred" (false) is sufficient to satisfy the link. */
+bool
+vbdev_tier_sb_fanout_idle(struct vbdev_tier *t)
+{
+	(void)t;
+	return false;
+}
+
 void
 spdk_put_io_channel(struct spdk_io_channel *ch)
 {
