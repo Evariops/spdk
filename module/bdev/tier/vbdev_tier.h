@@ -58,7 +58,9 @@ enum tier_band_state {
 #define TIER_BDEV_NAME_LEN	64
 #define TIER_MAX_BANDS		64	/* per node; a node won't exceed this many disks */
 
-/* ---- On-disk superblock (INV-T1: at native SPDK level, à la bdev_raid_sb) ----
+/* ---- On-disk superblock v2 (INV-T1: at native SPDK level, à la bdev_raid_sb) ----
+ * See docs/FORMAT-tier-superblock.md for the authoritative layout description.
+ *
  * One copy is written into a RESERVED region at the start of EACH base bdev. Each
  * copy self-describes the WHOLE composite. There is NO examine path: assembly is
  * driven by the CSI agent (SPEC-73 A2), which reads every disk's SB via
@@ -67,12 +69,25 @@ enum tier_band_state {
  * (live wwn vs the slot's stored wwn) is done by the CSI during that replay;
  * in-module the only wwn guard is the duplicate-wwn rejection at add/assemble.
  * The reserved region is per-disk (NOT inside the mirrored md range).
+ *
+ * v2 (clean break — v1 disks are NOT readable; the project pre-dates any public
+ * deployment, redeploys are wipe+reinstall by design, so no migration path):
+ *  - F-5: the 256 KiB reserve holds TWO 128 KiB SLOTS (A at 0, B at 128 KiB).
+ *    Generation seq N is written to slot N%2, so a torn write destroys at most
+ *    one slot; readers validate both and take the highest-seq valid one.
+ *  - F-3: cluster_blocks widened to u64.
+ *  - F-2: generation_uuid (fencing: identifies the composite INSTANCE — a
+ *    re-created composite mints a new uuid, so stale disks from a previous
+ *    life cannot be cross-assembled), created_epoch_sec (informative wall
+ *    clock), plus 96 B of header reserve and 32 B per band descriptor.
  * Format: little-endian only (F-4); layout locked by the static asserts below (F-1). */
-#define TIER_SB_MAGIC		0x5449455253423031ULL	/* "TIERSB01" */
-#define TIER_SB_VERSION		1u
+#define TIER_SB_MAGIC		0x5449455253423032ULL	/* "TIERSB02" */
+#define TIER_SB_VERSION		2u
 #define TIER_SB_RESERVE_BYTES	(256 * 1024)		/* reserved per base bdev for the sb */
+#define TIER_SB_SLOT_BYTES	(128 * 1024)		/* F-5: two A/B slots inside the reserve */
+#define TIER_SB_GEN_UUID_LEN	16
 
-/* On-disk band descriptor (packed, stable layout). */
+/* On-disk band descriptor (192 B, stable layout). */
 struct tier_sb_band {
 	uint32_t	band_id;
 	uint32_t	tier;		/* enum tier_class */
@@ -82,31 +97,42 @@ struct tier_sb_band {
 	uint64_t	num_blocks;
 	char		wwn[TIER_WWN_LEN];
 	char		serial[TIER_SERIAL_LEN];
+	uint8_t		reserved[32];	/* F-2 */
 };
 
-/* On-disk superblock (identical content on every band). */
+/* On-disk superblock (identical content on every band; 256 B header + bands). */
 struct tier_superblock {
 	uint64_t	magic;
 	uint32_t	version;
 	uint32_t	crc;		/* CRC32c over the whole struct with crc field = 0 */
 	uint64_t	seq;		/* monotone; on conflict, highest seq wins */
+	uint64_t	created_epoch_sec;	/* wall clock at serialization (informative) */
+	uint8_t		generation_uuid[TIER_SB_GEN_UUID_LEN];	/* composite instance (fencing, F-2) */
 	char		composite_name[TIER_BDEV_NAME_LEN];
 	uint64_t	md_num_blocks;	/* size of the mirrored md region (composite blocks) */
+	uint64_t	cluster_blocks;	/* blobstore cluster size in blocks (grain, F1; u64 since v2) */
 	uint32_t	md_mirror_a;	/* band slot ids holding the md RAID1 pair */
 	uint32_t	md_mirror_b;
 	uint32_t	num_bands;
 	uint32_t	this_band_id;	/* which band slot this copy physically sits on */
 	uint32_t	blocklen;	/* common block size */
-	uint32_t	cluster_blocks;	/* blobstore cluster size in blocks (boundary alignment grain, F1) */
+	uint32_t	reserved0;
+	uint8_t		reserved[104];	/* F-2 (pads the header to exactly 256 B) */
 	struct tier_sb_band bands[TIER_MAX_BANDS];
 };
 
-/* F-1: lock the on-disk ABI. The layout was historically stable only by LP64
- * alignment luck; these asserts turn any layout drift into a compile error. */
-SPDK_STATIC_ASSERT(sizeof(struct tier_sb_band) == 160, "tier_sb_band on-disk ABI changed");
-SPDK_STATIC_ASSERT(offsetof(struct tier_superblock, bands) == 120,
+/* F-1: lock the on-disk ABI — any layout drift is a compile error. */
+SPDK_STATIC_ASSERT(sizeof(struct tier_sb_band) == 192, "tier_sb_band on-disk ABI changed");
+SPDK_STATIC_ASSERT(offsetof(struct tier_superblock, bands) == 256,
 		   "tier_superblock header on-disk ABI changed");
-SPDK_STATIC_ASSERT(sizeof(struct tier_superblock) == 10360, "tier_superblock on-disk ABI changed");
+SPDK_STATIC_ASSERT(sizeof(struct tier_superblock) == 12544, "tier_superblock on-disk ABI changed");
+
+/* F-5: generation seq N lives in slot N%2 — alternating slots survive torn writes. */
+static inline uint32_t
+tier_sb_slot_for_seq(uint64_t seq)
+{
+	return (uint32_t)(seq & 1);
+}
 
 /*
  * One band == one physical base bdev. bandId is a STABLE monotone slot,
@@ -157,6 +183,8 @@ struct vbdev_tier {
 
 	uint32_t		blocklen;	/* common block size of all bands (must match) */
 	uint32_t		sb_blocks;	/* reserved superblock blocks at the start of EACH base bdev */
+	uint8_t			gen_uuid[TIER_SB_GEN_UUID_LEN];	/* composite instance uuid (minted at
+							 * create, stored in every SB copy — F-2 fencing) */
 	uint64_t		cluster_blocks;	/* blobstore cluster size in blocks; ALL band/md boundaries are
 						 * aligned to this so no cluster ever straddles a band/region
 						 * boundary (F1) — a straddling cluster would fail I/O (-EIO). */
@@ -253,16 +281,23 @@ int vbdev_tier_register(struct vbdev_tier *t);
 int vbdev_tier_delete(struct vbdev_tier *t);
 
 /* Superblock (vbdev_tier_sb.c) — native-level persistence (INV-T1). */
-void tier_sb_serialize(struct vbdev_tier *t, struct tier_band *self, uint64_t seq, struct tier_superblock *sb);
+void tier_sb_serialize(struct vbdev_tier *t, struct tier_band *self, uint64_t seq,
+		       uint64_t created_epoch_sec, struct tier_superblock *sb);
 bool tier_sb_valid(const struct tier_superblock *sb);	/* magic + crc check (LE-only, F-4) */
+/* F-5: pick the best (valid, highest-seq) slot inside a full reserve buffer
+ * (slot A at 0, slot B at TIER_SB_SLOT_BYTES). NULL if neither is valid.
+ * Pure — unit-tested host-side. */
+const struct tier_superblock *tier_sb_select(const void *reserve_buf, size_t reserve_len);
 /* Async-write the (serialized) superblock to every ACTIVE band (M5(b): DEGRADED
  * bands are excluded — their stale copy is out-voted by seq at reassembly), then
- * FLUSH each copy (F-6). Serialized (M5(a)): a call while a fan-out is in flight
- * queues cb and coalesces into one follow-up fan-out of the LATEST state.
- * cb fires once, rc != 0 if any band failed. cb may be NULL (fire-and-forget). */
+ * FLUSH the written slot (F-6). Generation seq N goes to slot N%2 (F-5), so a
+ * torn write can only destroy one slot. Serialized (M5(a)): a call while a
+ * fan-out is in flight queues cb and coalesces into one follow-up fan-out of the
+ * LATEST state. cb fires once, rc != 0 if any band failed. cb may be NULL. */
 int tier_sb_write_all(struct vbdev_tier *t, void (*cb)(void *cb_arg, int rc), void *cb_arg);
-/* Async-read the superblock from a base bdev desc into a freshly-allocated buffer;
- * cb receives the parsed sb (NULL + rc on failure) and owns freeing nothing (sb is on stack-copy). */
+/* Async-read BOTH superblock slots from a base bdev desc; cb receives the best
+ * valid slot per tier_sb_select (NULL + rc on failure). The sb pointer is only
+ * valid for the duration of the callback. */
 int tier_sb_read_desc(struct spdk_bdev_desc *desc, uint32_t blocklen,
 		      void (*cb)(void *cb_arg, const struct tier_superblock *sb, int rc), void *cb_arg);
 
@@ -273,8 +308,10 @@ int tier_sb_read_desc(struct spdk_bdev_desc *desc, uint32_t blocklen,
  * copy+commit — a composite-level quiesce is NOT a valid barrier here (it holds
  * writes below the blob→LBA translation and replays them to the OLD lba). */
 typedef void (*tier_relocate_cb)(void *cb_arg, int status);
+/* verify (PF4): run the C5 read-back + CRC32c check after the write (detects a
+ * silent media/write corruption at relocate time). Optional per disk class. */
 int vbdev_tier_relocate_copy(struct vbdev_tier *t, uint64_t src_lba, uint64_t dst_lba,
-			     uint64_t num_blocks, tier_relocate_cb cb_fn, void *cb_arg);
+			     uint64_t num_blocks, bool verify, tier_relocate_cb cb_fn, void *cb_arg);
 
 #ifdef __cplusplus
 }

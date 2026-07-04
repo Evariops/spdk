@@ -11,6 +11,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <time.h>
 #include <sys/queue.h>
 
 /* glibc's sys/queue.h lacks a few BSD macros; provide what the tier code uses. */
