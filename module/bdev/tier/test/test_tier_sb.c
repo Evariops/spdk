@@ -127,6 +127,20 @@ make_composite(struct vbdev_tier *t)
 	t->total_num_blocks = 4096 + 100352 + 50176 + 25088;
 }
 
+/* Free the bands make_composite/add_band allocated (the composite `t` itself is
+ * stack-owned; only the band nodes are heap). Keeps the ASAN+LSAN build clean. */
+static void
+free_composite(struct vbdev_tier *t)
+{
+	struct tier_band *b;
+
+	while ((b = TAILQ_FIRST(&t->bands)) != NULL) {
+		TAILQ_REMOVE(&t->bands, b, link);
+		free(b);
+	}
+	t->num_bands = 0;
+}
+
 /* ---- tests ------------------------------------------------------------------- */
 
 static void
@@ -192,6 +206,7 @@ test_serialize_roundtrip(void)
 	tier_sb_serialize(&t, NULL, 43, 0, &sb);
 	CHECK(sb.this_band_id == UINT32_MAX);
 	CHECK(tier_sb_valid(&sb));
+	free_composite(&t);
 }
 
 static void
@@ -231,6 +246,7 @@ test_reject_corruption(void)
 
 	sb.magic = __builtin_bswap64(TIER_SB_MAGIC);	/* F-4 big-endian writer */
 	CHECK(!tier_sb_valid(&sb));
+	free_composite(&t);
 }
 
 /* F-5: two-slot selection. */
@@ -274,6 +290,7 @@ test_slot_select(void)
 	CHECK(tier_sb_select(NULL, TIER_SB_RESERVE_BYTES) == NULL);
 
 	free(reserve);
+	free_composite(&t);
 }
 
 static void
@@ -297,6 +314,7 @@ test_geometry_inlines(void)
 	CHECK(!vbdev_tier_is_md_range(&t, 4096, 1));
 	t.md_num_blocks = 0;
 	CHECK(!vbdev_tier_is_md_range(&t, 0, 1));
+	free_composite(&t);
 }
 
 /* Binary golden vector: pin the serialized header bytes so a field reorder that
@@ -323,6 +341,7 @@ test_golden_header(void)
 	CHECK(p[32] == 0xA0 && p[47] == 0xAF);
 	/* composite_name "tier0" at offset 48. */
 	CHECK(p[48] == 't' && p[49] == 'i' && p[52] == '0' && p[53] == '\0');
+	free_composite(&t);
 }
 
 int
