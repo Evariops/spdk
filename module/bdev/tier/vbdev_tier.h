@@ -206,11 +206,20 @@ struct vbdev_tier {
 	 * follow-up fan-out that persists the latest state. */
 	bool			sb_write_inflight;
 	bool			sb_write_queued;
-	/* T-4b: a bdev_tier_delete that arrives while an SB fan-out holds this
-	 * composite's base-band descriptors is deferred here (tearing down now would
-	 * free `t` and close those descs under the in-flight writes). Honored by
-	 * vbdev_tier_sb_fanout_idle() once the fan-out drains. */
+	/* T-4b / R9: a bdev_tier_delete that arrives while ANY async op holds this
+	 * composite is deferred here (tearing down now would free `t` and its bands
+	 * under the in-flight op). Honored once every async op drains — by
+	 * vbdev_tier_sb_fanout_idle() for an SB fan-out, or by the last relocate/resync/
+	 * seq-rehydrate completion. */
 	bool			delete_pending;
+	/* R9: count of in-flight composite async ops whose context holds pointers into
+	 * `t` (bands/descs) but which do NOT run through `t`'s io_device (so the SPDK
+	 * io_device refcount does not defer the teardown for them): relocate copies, md
+	 * resyncs, and the register-time seq rehydrate reads. bdev_tier_delete defers
+	 * while this is > 0; the last op to finish runs the deferred teardown. (Retire /
+	 * hot-remove drains use spdk_for_each_channel on `t`'s io_device and ARE covered
+	 * by the io_device refcount, so they are NOT counted here.) */
+	uint32_t		async_inflight;
 	TAILQ_HEAD(, tier_sb_pending_cb) sb_pending_cbs;
 
 	TAILQ_ENTRY(vbdev_tier)	link;

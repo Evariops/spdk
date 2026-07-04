@@ -91,6 +91,15 @@ Total = 256 + 64 × 192 = **12544 bytes** (fits one 128 KiB slot with room to sp
 - **Generation uniqueness (M5)**: `seq` is reserved (`t->seq++`) at the entry of
   `tier_sb_write_all`, before any I/O. Two concurrent fan-outs can never share a
   `seq`; gaps are harmless ("highest seq wins"), duplicates would be fatal.
+- **Cross-restart monotonicity (R2)**: `bdev_tier_register` re-reads every band's
+  on-disk SB and seeds `t->seq` to the highest seq found **before** the first
+  persist. A fresh in-RAM composite starts at `seq 0` (the CSI replays
+  `create`+`assemble` without threading seq); without rehydration the first persist
+  writes `seq 1`, which a pre-restart SB at a high seq out-votes forever, so the
+  composite would reassemble the STALE geometry. Rehydration makes the first
+  post-register persist `max_on_disk + 1`, which wins. The generation_uuid still
+  changes each `create` (F-2), but after rehydration the current instance always
+  holds the highest seq, so its slot wins per disk.
 - **Durability (F-6)**: each written slot is FLUSHed before the generation is
   considered committed.
 - **DEGRADED exclusion (M5b)**: only `ACTIVE` bands are written; a DEGRADED

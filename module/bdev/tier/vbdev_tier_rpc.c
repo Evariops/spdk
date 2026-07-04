@@ -41,6 +41,7 @@ rpc_bdev_tier_create(struct spdk_jsonrpc_request *request, const struct spdk_jso
 				    SPDK_COUNTOF(rpc_tier_create_decoders), &req)) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 "invalid parameters");
+		free(req.name);	/* R15: decode may have strdup'd name before a later field failed */
 		return;
 	}
 	if (vbdev_tier_get_by_name(req.name) != NULL) {
@@ -53,6 +54,29 @@ rpc_bdev_tier_create(struct spdk_jsonrpc_request *request, const struct spdk_jso
 	if (req.md_num_blocks == 0) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 "md_num_blocks must be > 0");
+		free(req.name);
+		return;
+	}
+	/* R13: cluster_blocks is the F1 alignment grain (blobstore cluster size in
+	 * blocks). 0 is the ONLY legacy value the control-plane replays verbatim for a
+	 * pre-F1 composite (alignment intentionally dormant); >= 2 is a real grain.
+	 * 1 is neither: it silently no-ops tier_align_* AND the register alignment guard
+	 * (t->cluster_blocks > 1), so an unaligned composite registers and later fails
+	 * -EIO on a straddling blobstore cluster. Fresh provisioning always passes the
+	 * real grain (>= 2, in practice >= 256). Reject the ambiguous 1. */
+	if (req.cluster_blocks == 1) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "cluster_blocks must be 0 (legacy, no alignment) or >= 2");
+		free(req.name);
+		return;
+	}
+	/* R17: reject an md_num_blocks so large the cluster-align round-up
+	 * (tier_align_up: v + cluster_blocks - 1) would overflow u64 and wrap the md
+	 * region to a tiny value — silently disabling the mirrored L2P. A real md region
+	 * is a few GiB; anything near UINT64_MAX is a caller error. */
+	if (req.cluster_blocks > 1 && req.md_num_blocks > UINT64_MAX - (req.cluster_blocks - 1)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "md_num_blocks too large (cluster-align overflow)");
 		free(req.name);
 		return;
 	}
@@ -149,6 +173,7 @@ rpc_bdev_tier_register(struct spdk_jsonrpc_request *request, const struct spdk_j
 				    SPDK_COUNTOF(rpc_tier_name_decoders), &req)) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 "invalid parameters");
+		free(req.name);	/* R15 */
 		return;
 	}
 	t = vbdev_tier_get_by_name(req.name);
@@ -178,6 +203,7 @@ rpc_bdev_tier_delete(struct spdk_jsonrpc_request *request, const struct spdk_jso
 				    SPDK_COUNTOF(rpc_tier_name_decoders), &req)) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 "invalid parameters");
+		free(req.name);	/* R15 */
 		return;
 	}
 	/* SEC1: audit this destructive op (tears down the whole composite). */
@@ -232,6 +258,7 @@ rpc_bdev_tier_retire_band(struct spdk_jsonrpc_request *request, const struct spd
 				    SPDK_COUNTOF(rpc_tier_retire_decoders), &req)) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 "invalid parameters");
+		free(req.name);	/* R15 */
 		return;
 	}
 	/* SEC1: audit this destructive op (evacuates + removes a band). */
@@ -271,6 +298,7 @@ rpc_bdev_tier_get_bands(struct spdk_jsonrpc_request *request, const struct spdk_
 				    SPDK_COUNTOF(rpc_tier_name_decoders), &req)) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 "invalid parameters");
+		free(req.name);	/* R15 */
 		return;
 	}
 	t = vbdev_tier_get_by_name(req.name);
@@ -397,6 +425,7 @@ rpc_bdev_tier_resync_md(struct spdk_jsonrpc_request *request, const struct spdk_
 				    SPDK_COUNTOF(rpc_tier_retire_decoders), &req)) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 "invalid parameters");
+		free(req.name);	/* R15 */
 		return;
 	}
 	/* SEC1: audit this op (rewrites redundancy state of the mirrored md region). */
@@ -504,6 +533,7 @@ rpc_bdev_tier_read_sb(struct spdk_jsonrpc_request *request, const struct spdk_js
 	if (spdk_json_decode_object(params, rpc_tier_name_decoders,
 				    SPDK_COUNTOF(rpc_tier_name_decoders), &req)) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS, "invalid parameters");
+		free(req.name);	/* R15 */
 		return;
 	}
 	rc = spdk_bdev_open_ext(req.name, false, rpc_read_sb_event_cb, NULL, &desc);
@@ -534,8 +564,14 @@ SPDK_RPC_REGISTER("bdev_tier_read_sb", rpc_bdev_tier_read_sb, SPDK_RPC_RUNTIME)
 
 extern char g_tier_boot_id[];	/* minted at module init (vbdev_tier.c) */
 
-/* The Evariops-fork RPC surface the control-plane probes for. Presence here is a
- * capability signal; the CSI checks membership rather than relying on a build tag. */
+/* Candidate list of the Evariops-fork RPC surface the control-plane probes for.
+ * Deferred #3: this is NOT emitted verbatim — each entry is filtered through the
+ * LIVE RPC registry (spdk_rpc_get_method_state_mask) so `methods[]` reflects what
+ * is actually registered in this binary, never a stale hand-maintained list. This
+ * kills the false POSITIVE the CSI cannot tolerate (a method left here but not
+ * built in → the CSI gates a path "present" that then fails -32601 at runtime).
+ * The list scopes WHICH methods to report as fork-capabilities; the registry is
+ * the source of truth for WHETHER each is present. */
 static const char *g_evariops_methods[] = {
 	"bdev_tier_create", "bdev_tier_add_band", "bdev_tier_assemble_band",
 	"bdev_tier_register", "bdev_tier_delete", "bdev_tier_retire_band",
@@ -579,7 +615,16 @@ rpc_evariops_get_capabilities(struct spdk_jsonrpc_request *request,
 	spdk_json_write_named_bool(w, "single_reactor_assumed", true);	/* D5 (see RPC-CONTRACT) */
 	spdk_json_write_named_array_begin(w, "methods");
 	for (i = 0; i < SPDK_COUNTOF(g_evariops_methods); i++) {
-		spdk_json_write_string(w, g_evariops_methods[i]);
+		uint32_t state_mask;
+
+		/* Deferred #3: emit only methods present in the LIVE registry. A method
+		 * built in but forgotten from the candidate list is a false NEGATIVE —
+		 * harmless: the CSI falls back to its per-call -32601 probe. Fully removing
+		 * false negatives would need a public registry iterator, which upstream does
+		 * not expose; filtering the candidate list closes the dangerous direction. */
+		if (spdk_rpc_get_method_state_mask(g_evariops_methods[i], &state_mask) == 0) {
+			spdk_json_write_string(w, g_evariops_methods[i]);
+		}
 	}
 	spdk_json_write_array_end(w);
 	spdk_json_write_object_end(w);

@@ -26,7 +26,10 @@ these exist — on vanilla SPDK they return JSON-RPC -32601.
   `audit rpc=<method> peer=pid:…,uid:…,gid:… <params>` NOTICELOG line, with the
   caller's Unix-socket credentials (SO_PEERCRED, patch 0011). `peer=unknown` over
   a TCP transport. This is an audit trail, **not** an authorization gate — access
-  control is still the socket mode (0600, patch 0010) + a NetworkPolicy (D4).
+  control is still the socket mode (0600, patch 0010) + a NetworkPolicy (D4). The
+  socket is created owner-only **atomically** — `umask(077)` wraps the `bind()`
+  (R14), closing the TOCTOU window that a chmod-after-listen left open; the chmod
+  stays as belt-and-braces.
 
 ## evariops_get_capabilities
 
@@ -35,16 +38,21 @@ these exist — on vanilla SPDK they return JSON-RPC -32601.
   `capabilities_schema`, `single_reactor_assumed`, `methods[]`.
 - **Use**: a changed `boot_id` across polls ⇒ the target restarted ⇒ treat all
   volatile state as lost. `methods[]` membership is the capability probe.
+- `methods[]` is **filtered through the live RPC registry** (deferred #3): a fork
+  method left in the candidate list but not built into this binary is NOT emitted,
+  so `methods[]` never yields a false positive (a method reported present that then
+  fails -32601). A method built in but absent from the list is a harmless false
+  negative — the control-plane's per-call -32601 probe remains the ground truth.
 - Idempotent, read-only.
 
 ## Lifecycle — tier
 
 | RPC | Preconditions | Idempotence | Crash behavior |
 |:----|:--------------|:------------|:---------------|
-| `bdev_tier_create` | name free; `md_num_blocks>0` | -EEXIST if name taken | in-RAM only until first SB write |
-| `bdev_tier_add_band` | tier exists, not registered; unique wwn; disk ≥ sb+md | band_id auto-assigned; caller replays deterministically | — |
-| `bdev_tier_assemble_band` | band_id<64; state≤RETIRED; no overlap; fits disk; unique wwn | -EEXIST on duplicate band_id | places at stored geometry |
-| `bdev_tier_register` | ≥1 band, cluster-aligned geometry | **-EEXIST if already registered (W1)** | persists SB on success |
+| `bdev_tier_create` | name free; `md_num_blocks>0`; `cluster_blocks` is 0 (legacy, no alignment) or ≥2 — **1 is rejected** (R13); `md_num_blocks` bounded (no align overflow, R17) | -EEXIST if name taken | in-RAM only until first SB write |
+| `bdev_tier_add_band` | tier exists, **not registered**; unique wwn; disk ≥ sb+md; blocklen divides the 128 KiB SB slot (R7 — T10-DIF 520/4160 rejected) | band_id auto-assigned; caller replays deterministically | — |
+| `bdev_tier_assemble_band` | **not registered (R8)**; band_id<64; state≤RETIRED; no overlap; fits disk; unique wwn; blocklen divides SB slot (R7) | -EEXIST on duplicate band_id; **-EBUSY after register (R8)** | places at stored geometry |
+| `bdev_tier_register` | ≥1 band, cluster-aligned geometry | **-EEXIST if already registered (W1)** | **rehydrates `t->seq` from the on-disk SBs (R2), then persists SB** on success |
 | `bdev_tier_retire_band` | not an md-mirror band (-EBUSY, T-7) | **idempotent**: re-run re-persists + re-closes | **async: acks only after SB durable (MJ6)**; rc≠0 ⇒ retry |
 | `bdev_tier_resync_md` | target is a DEGRADED md leg; healthy source leg exists | re-runnable (leg stays DEGRADED on failure) | copy under md-range quiesce; acks after activate+persist |
 | `bdev_tier_delete` | — | -ENODEV if absent | unregister → destruct |
@@ -57,6 +65,15 @@ instance), take the highest `seq` per band, and if the two md legs disagree on
 `seq`, assemble the higher one ACTIVE and the other DEGRADED then
 `bdev_tier_resync_md` (G-CSI-2). The fork persists DEGRADED but cannot arbitrate
 a split-brain across disks.
+
+- **Seq monotonicity across a restart is fork-owned (R2).** The control-plane
+  does NOT thread `seq` back through `create`/`assemble`/`register` (it reads seq
+  only to pick the authoritative SB). So `bdev_tier_register` **re-reads the bands'
+  on-disk SBs and seeds `t->seq` above the highest seq found** before its first
+  persist. Without this the fresh instance would write `seq 1`, which a pre-restart
+  SB at a high seq out-votes forever (highest-seq-wins), reassembling the STALE
+  geometry and silently undoing every retire/relocate persisted at the high seq. No
+  CSI change is required; this is the behavior the contract already assumed.
 
 ## Data-plane — relocate / remap (patch 0005)
 
@@ -79,6 +96,15 @@ a split-brain across disks.
   already lost; the subsequent `bdev_raid_rebuild_ranges` fills the new one). The
   control-plane MUST journal the remap durably BEFORE calling and re-drive the
   range rebuild at restart until confirmed (**PR3**, remap-before-rebuild).
+  - **R11 — the old cluster is QUARANTINED, not freed.** A remap re-homes a cluster
+    whose old copy is on the DEGRADED band; the commit keeps that old cluster
+    marked-allocated (`release_old=false`) rather than returning it to the thin
+    pool. Otherwise the allocator could re-serve that LBA to a normal host write,
+    routing it back into the dead band → `-EIO` on a healthy volume. The quarantine
+    is in-RAM for the running instance; a reboot rebuilds `used_clusters` from the
+    blob extents (now pointing at the new cluster) and the control-plane reassembles
+    the dead band DEGRADED/RETIRED so its range is not re-served. Relocate (copy,
+    healthy source) still frees the old cluster normally (`release_old=true`).
 
 ## Capacity / ENOSPC (patch 0009)
 
@@ -137,6 +163,12 @@ a split-brain across disks.
 - `bdev_cbt_partial_rebuild` / `bdev_cbt_start_rebuild`: one rebuild per
   (cbt, epoch); a second returns -EBUSY (interpret as "already running", not a
   failure). **CBT-4**: the rebuild FLUSHes the target before COMPLETED.
+  - **R1 — an aborted rebuild is NOT `completed`.** A source/target/cbt hot-remove
+    mid-rebuild yields `bdev_cbt_get_rebuild_status` state **`aborted`** (distinct
+    from `failed` = an I/O error, and `completed`) with `completed: false`. The
+    delta was NOT fully copied, so the control-plane must **resume** the rebuild,
+    never treat the member as synced. (Previously a mid-rebuild abort with no failed
+    I/O reported `completed` → silent under-replication.)
 - `bdev_cbt_reset`: refused while any epoch is active. Bitmap clearing is
   reset-driven (**D3** — no automatic healthy-clear).
 - After a base-bdev hot-remove the cbt vbdev is NOT silently recreated with a

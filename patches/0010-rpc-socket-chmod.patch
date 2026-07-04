@@ -5,20 +5,55 @@ Subject: [PATCH 10/11] rpc: chmod 0600 the unix socket after bind (Evariops
  0010, S-2)
 
 ---
- lib/rpc/rpc.c | 13 +++++++++++++
- 1 file changed, 13 insertions(+)
+ lib/rpc/rpc.c | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
 
 diff --git a/lib/rpc/rpc.c b/lib/rpc/rpc.c
-index ead7c66..9e3a88f 100644
+index ead7c66..7af1f9c 100644
 --- a/lib/rpc/rpc.c
 +++ b/lib/rpc/rpc.c
-@@ -205,6 +205,19 @@ spdk_rpc_server_listen(const char *listen_addr)
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <sys/file.h>
++#include <sys/stat.h>	/* Evariops R14: umask() / mode_t for atomic owner-only socket */
+ 
+ #include "spdk/stdinc.h"
+ 
+@@ -147,6 +148,7 @@ struct spdk_rpc_server *
+ spdk_rpc_server_listen(const char *listen_addr)
+ {
+ 	struct spdk_rpc_server *server;
++	mode_t saved_umask;
+ 	int rc;
+ 
+ 	server = calloc(1, sizeof(struct spdk_rpc_server));
+@@ -194,10 +196,18 @@ spdk_rpc_server_listen(const char *listen_addr)
+ 	 */
+ 	unlink(server->listen_addr_unix.sun_path);
+ 
++	/* Evariops R14 (TOCTOU): bind() (inside spdk_jsonrpc_server_listen) creates the
++	 * socket file with the process umask — often 0755/0775 in a shared /var/tmp — and
++	 * the socket is CONNECTABLE the instant it is bound+listening. A chmod done AFTER
++	 * leaves a window in which a local unprivileged process can connect() and issue
++	 * destructive RPCs. Force umask 077 across the bind so the socket is created
++	 * owner-only (0600 = 0666 & ~077) ATOMICALLY; restore the umask right after. */
++	saved_umask = umask(077);
+ 	server->jsonrpc_server = spdk_jsonrpc_server_listen(AF_UNIX, 0,
+ 				 (struct sockaddr *) & server->listen_addr_unix,
+ 				 sizeof(server->listen_addr_unix),
+ 				 jsonrpc_handler);
++	umask(saved_umask);
+ 	if (server->jsonrpc_server == NULL) {
+ 		SPDK_ERRLOG("spdk_jsonrpc_server_listen() failed\n");
+ 		close(server->lock_fd);
+@@ -205,6 +215,19 @@ spdk_rpc_server_listen(const char *listen_addr)
  		goto ret;
  	}
  
-+	/* Evariops S-2: this socket is FULL data-plane control (create/delete/relocate
-+	 * of volumes). Its mode was whatever umask produced — often 0755/0775 in a
-+	 * shared /var/tmp. Owner-only, explicitly. */
++	/* Evariops S-2 / R14 (belt-and-braces): the umask above already created the
++	 * socket 0600; re-assert it in case the platform's bind() ignores umask for
++	 * AF_UNIX. This chmod is no longer the primary control (it closed a TOCTOU). */
 +	if (chmod(server->listen_addr_unix.sun_path, 0600) != 0) {
 +		SPDK_ERRLOG("Cannot chmod 0600 RPC socket %s: %s\n",
 +			    server->listen_addr_unix.sun_path, spdk_strerror(errno));

@@ -891,6 +891,7 @@ rpc_bdev_cbt_get_rebuild_status(struct spdk_jsonrpc_request *request,
 	case CBT_REBUILD_COMPLETED: state_str = "completed"; break;
 	case CBT_REBUILD_FAILED:    state_str = "failed";    break;
 	case CBT_REBUILD_CANCELLED: state_str = "cancelled"; break;
+	case CBT_REBUILD_ABORTED:   state_str = "aborted";   break;	/* R1 */
 	default:                    state_str = "unknown";    break;
 	}
 	spdk_json_write_named_string(w, "state", state_str);
