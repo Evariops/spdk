@@ -10,9 +10,10 @@
  *       survives a single disk loss (D1). The rest is a pure CONCAT.
  *     - Per-band failure isolation (C-FAIL-1): an I/O addressed to a DEGRADED
  *       band's range completes -EIO; the vbdev never reports a global failure.
- *     - The band table is NOT persisted on disk: the CSI control-plane is the
- *       source of truth (CRD) and deterministically replays create + add_band
- *       (+ retire_band) on agent startup, reproducing the identical layout.
+ *     - The band table IS persisted on disk (INV-T1): one superblock copy per
+ *       band, "highest seq wins" (vbdev_tier_sb.c). The SB is authoritative for
+ *       geometry; the CSI control-plane (CRD = intent) replays create +
+ *       assemble_band from the highest-seq SB on agent startup (SPEC-73 A2).
  */
 
 #include "vbdev_tier.h"
@@ -43,12 +44,15 @@ SPDK_BDEV_MODULE_REGISTER(tier, &tier_if)
 static TAILQ_HEAD(, vbdev_tier) g_tier_nodes = TAILQ_HEAD_INITIALIZER(g_tier_nodes);
 
 /* Per-IO context. For a mirrored md write we fan out to 2 bands and complete the
- * original only when both legs are done (remaining counter + worst status). */
+ * original only when the LAST leg is done (M1: never while a submitted leg is in
+ * flight — the leg callback holds cb_arg == orig_io). */
 struct tier_bdev_io {
 	struct spdk_io_channel	*ch;
 	int			remaining;	/* outstanding legs (1 for concat, 2 for md mirror write) */
+	uint8_t			good_legs;	/* legs completed successfully (md mirror fan-out) */
+	bool			md_retry_done;	/* M2: at most one mirror-failover retry per md read */
+	bool			submit_failed;	/* a leg SUBMISSION failed (no degrade; orig fails) */
 	enum spdk_bdev_io_status status;	/* worst-of across legs */
-	struct spdk_bdev_io_wait_entry bdev_io_wait;
 };
 
 static void vbdev_tier_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io);
@@ -108,47 +112,95 @@ vbdev_tier_band_of_lba(struct vbdev_tier *t, uint64_t lba, uint64_t *band_offset
  * I/O completion
  * -------------------------------------------------------------------------- */
 
+static int tier_submit_leg(struct vbdev_tier *t, struct tier_io_channel *tch,
+			   struct spdk_bdev_io *bdev_io, struct tier_band *band,
+			   uint64_t base_phys);
+
+/* Map a base bdev back to its band (leg completions only carry the base bdev_io). */
+static struct tier_band *
+tier_band_by_base_bdev(struct vbdev_tier *t, struct spdk_bdev *base)
+{
+	struct tier_band *b;
+
+	TAILQ_FOREACH(b, &t->bands, link) {
+		if (b->desc != NULL && spdk_bdev_desc_get_bdev(b->desc) == base) {
+			return b;
+		}
+	}
+	return NULL;
+}
+
+/* The md-mirror leg that is NOT `b` (NULL if unmirrored / not found). */
+static struct tier_band *
+tier_md_other_leg(struct vbdev_tier *t, struct tier_band *b)
+{
+	uint32_t other = (b != NULL && b->band_id == t->md_mirror_a) ? t->md_mirror_b
+			 : t->md_mirror_a;
+
+	if (other == UINT32_MAX) {
+		return NULL;
+	}
+	return vbdev_tier_band_by_id(t, other);
+}
+
 static void
 _tier_leg_complete(struct spdk_bdev_io *leg_io, bool success, void *cb_arg)
 {
 	struct spdk_bdev_io *orig_io = cb_arg;
 	struct tier_bdev_io *io_ctx = (struct tier_bdev_io *)orig_io->driver_ctx;
+	struct vbdev_tier *t = SPDK_CONTAINEROF(orig_io->bdev, struct vbdev_tier, bdev);
+	bool md_range = vbdev_tier_is_md_range(t, orig_io->u.bdev.offset_blocks,
+					       orig_io->u.bdev.num_blocks);
 
-	if (!success) {
+	if (success) {
+		io_ctx->good_legs++;
+	} else {
+		struct tier_band *fb = tier_band_by_base_bdev(t, leg_io->bdev);
+
+		if (md_range && orig_io->type == SPDK_BDEV_IO_TYPE_READ && !io_ctx->md_retry_done) {
+			/* M2: async media error on one md leg — the mirror holds a healthy
+			 * copy; fail over instead of failing the read. */
+			struct tier_band *alt = tier_md_other_leg(t, fb);
+
+			if (alt != NULL && alt != fb && alt->state == TIER_BAND_ACTIVE &&
+			    alt->desc != NULL) {
+				struct tier_io_channel *tch = spdk_io_channel_get_ctx(io_ctx->ch);
+
+				io_ctx->md_retry_done = true;
+				spdk_bdev_free_io(leg_io);
+				if (tier_submit_leg(t, tch, orig_io, alt,
+						    t->sb_blocks + orig_io->u.bdev.offset_blocks) == 0) {
+					return;	/* retry in flight; completion re-enters here */
+				}
+			}
+		}
+		if (md_range && orig_io->type != SPDK_BDEV_IO_TYPE_READ &&
+		    fb != NULL && fb->state == TIER_BAND_ACTIVE) {
+			/* M3: a failed md-mirror write leg leaves the two copies divergent.
+			 * Degrade the failing leg so reads stop preferring it, and persist
+			 * DEGRADED (M5(b) excludes it from the SB fan-out) so a reboot
+			 * cannot resurrect its stale L2P copy. */
+			SPDK_ERRLOG("tier '%s': md write failed on band %u — degrading leg\n",
+				    t->bdev.name, fb->band_id);
+			fb->state = TIER_BAND_DEGRADED;
+			if (t->registered) {
+				tier_sb_write_all(t, tier_sb_persist_cb, NULL);
+			}
+		}
 		io_ctx->status = SPDK_BDEV_IO_STATUS_FAILED;
 	}
 	spdk_bdev_free_io(leg_io);
 
 	if (--io_ctx->remaining == 0) {
+		/* An md-mirror WRITE/mgmt op succeeds when at least one leg persisted it
+		 * (the failed leg was degraded above — raid1 semantics). A leg whose
+		 * SUBMISSION failed got no data and no degrade, so the orig must fail. */
+		if (md_range && orig_io->type != SPDK_BDEV_IO_TYPE_READ &&
+		    io_ctx->good_legs > 0 && !io_ctx->submit_failed) {
+			spdk_bdev_io_complete(orig_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+			return;
+		}
 		spdk_bdev_io_complete(orig_io, io_ctx->status);
-	}
-}
-
-static void
-vbdev_tier_resubmit_io(void *arg)
-{
-	struct spdk_bdev_io *bdev_io = (struct spdk_bdev_io *)arg;
-	struct tier_bdev_io *io_ctx = (struct tier_bdev_io *)bdev_io->driver_ctx;
-
-	vbdev_tier_submit_request(io_ctx->ch, bdev_io);
-}
-
-static void
-vbdev_tier_queue_io(struct spdk_bdev_io *bdev_io, struct tier_band *band,
-		    struct spdk_io_channel *base_ch)
-{
-	struct tier_bdev_io *io_ctx = (struct tier_bdev_io *)bdev_io->driver_ctx;
-	int rc;
-
-	io_ctx->bdev_io_wait.bdev = spdk_bdev_desc_get_bdev(band->desc);
-	io_ctx->bdev_io_wait.cb_fn = vbdev_tier_resubmit_io;
-	io_ctx->bdev_io_wait.cb_arg = bdev_io;
-
-	rc = spdk_bdev_queue_io_wait(spdk_bdev_desc_get_bdev(band->desc), base_ch,
-				     &io_ctx->bdev_io_wait);
-	if (rc != 0) {
-		SPDK_ERRLOG("tier: queue_io_wait failed rc=%d\n", rc);
-		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 	}
 }
 
@@ -167,31 +219,89 @@ tier_init_ext_io_opts(struct spdk_bdev_io *bdev_io, struct spdk_bdev_ext_io_opts
  * I/O submission — translate composite LBA -> band(s)
  * -------------------------------------------------------------------------- */
 
-/* Submit one read/write leg to a band at the given band-relative offset. */
+/* Submit one leg of the original I/O (any supported type) to a band at the given
+ * base-physical offset. */
 static int
 tier_submit_leg(struct vbdev_tier *t, struct tier_io_channel *tch, struct spdk_bdev_io *bdev_io,
-		struct tier_band *band, uint64_t base_phys, bool is_write)
+		struct tier_band *band, uint64_t base_phys)
 {
 	struct spdk_io_channel *base_ch = tch->base_ch[band->band_id];
 	struct spdk_bdev_ext_io_opts io_opts;
 
-	if (spdk_unlikely(band->state == TIER_BAND_DEGRADED || band->desc == NULL ||
+	if (spdk_unlikely(band->state != TIER_BAND_ACTIVE || band->desc == NULL ||
 			  base_ch == NULL)) {
 		return -EIO;	/* per-band isolation: caller fails THIS io, not the chunk */
 	}
 
-	tier_init_ext_io_opts(bdev_io, &io_opts);
-
-	if (is_write) {
+	switch (bdev_io->type) {
+	case SPDK_BDEV_IO_TYPE_READ:
+		tier_init_ext_io_opts(bdev_io, &io_opts);
+		return spdk_bdev_readv_blocks_ext(band->desc, base_ch, bdev_io->u.bdev.iovs,
+						  bdev_io->u.bdev.iovcnt, base_phys,
+						  bdev_io->u.bdev.num_blocks, _tier_leg_complete,
+						  bdev_io, &io_opts);
+	case SPDK_BDEV_IO_TYPE_WRITE:
+		tier_init_ext_io_opts(bdev_io, &io_opts);
 		return spdk_bdev_writev_blocks_ext(band->desc, base_ch, bdev_io->u.bdev.iovs,
 						   bdev_io->u.bdev.iovcnt, base_phys,
 						   bdev_io->u.bdev.num_blocks, _tier_leg_complete,
 						   bdev_io, &io_opts);
+	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
+		return spdk_bdev_write_zeroes_blocks(band->desc, base_ch, base_phys,
+						     bdev_io->u.bdev.num_blocks,
+						     _tier_leg_complete, bdev_io);
+	case SPDK_BDEV_IO_TYPE_UNMAP:
+		return spdk_bdev_unmap_blocks(band->desc, base_ch, base_phys,
+					      bdev_io->u.bdev.num_blocks,
+					      _tier_leg_complete, bdev_io);
+	case SPDK_BDEV_IO_TYPE_FLUSH:
+		return spdk_bdev_flush_blocks(band->desc, base_ch, base_phys,
+					      bdev_io->u.bdev.num_blocks,
+					      _tier_leg_complete, bdev_io);
+	default:
+		return -EINVAL;
 	}
-	return spdk_bdev_readv_blocks_ext(band->desc, base_ch, bdev_io->u.bdev.iovs,
-					  bdev_io->u.bdev.iovcnt, base_phys,
-					  bdev_io->u.bdev.num_blocks, _tier_leg_complete,
-					  bdev_io, &io_opts);
+}
+
+/* Fan an md-region WRITE / WRITE_ZEROES / UNMAP / FLUSH out to every ACTIVE md
+ * leg. M1: once one leg is submitted, the orig_io completes ONLY from
+ * _tier_leg_complete — a later submission failure just drops that leg's count.
+ * Returns 0 if at least one leg is in flight, -errno if none was submitted. */
+static int
+tier_route_md_fanout(struct vbdev_tier *t, struct tier_io_channel *tch,
+		     struct spdk_bdev_io *bdev_io)
+{
+	struct tier_bdev_io *io_ctx = (struct tier_bdev_io *)bdev_io->driver_ctx;
+	struct tier_band *legs[2];
+	struct tier_band *a = vbdev_tier_band_by_id(t, t->md_mirror_a);
+	struct tier_band *b = vbdev_tier_band_by_id(t, t->md_mirror_b);
+	int nlegs = 0, submitted = 0, i, rc = -EIO;
+
+	if (a != NULL && a->state == TIER_BAND_ACTIVE) {
+		legs[nlegs++] = a;
+	}
+	if (b != NULL && b->state == TIER_BAND_ACTIVE) {
+		legs[nlegs++] = b;
+	}
+	if (nlegs == 0) {
+		return -EIO;
+	}
+	io_ctx->remaining = nlegs;
+	for (i = 0; i < nlegs; i++) {
+		rc = tier_submit_leg(t, tch, bdev_io, legs[i],
+				     t->sb_blocks + bdev_io->u.bdev.offset_blocks);
+		if (rc != 0) {
+			io_ctx->status = SPDK_BDEV_IO_STATUS_FAILED;
+			io_ctx->submit_failed = true;
+			io_ctx->remaining--;
+		} else {
+			submitted++;
+		}
+	}
+	if (submitted == 0) {
+		return rc;	/* nothing in flight; the caller completes the orig_io */
+	}
+	return 0;
 }
 
 /* Route a read or write to the band(s) owning [offset, offset+num). Handles the
@@ -214,48 +324,28 @@ tier_route_rw(struct vbdev_tier *t, struct tier_io_channel *tch, struct spdk_bde
 	 * single-copy on the one band when the node has a single disk (band_b == NULL). The md
 	 * maps to base-physical [sb_blocks, sb_blocks+md) on each md band. */
 	if (vbdev_tier_is_md_range(t, offset, num)) {
-		band = vbdev_tier_band_by_id(t, t->md_mirror_a);
-		band_b = vbdev_tier_band_by_id(t, t->md_mirror_b);	/* may be NULL: single-band composite */
-		if (band == NULL) {
-			return -EIO;
-		}
 		if (!is_write) {
-			/* Prefer an ACTIVE leg; with a mirror, fall back to the secondary. */
+			band = vbdev_tier_band_by_id(t, t->md_mirror_a);
+			band_b = vbdev_tier_band_by_id(t, t->md_mirror_b);	/* may be NULL: single-band composite */
+			if (band == NULL) {
+				return -EIO;
+			}
+			/* Prefer an ACTIVE leg; with a mirror, fall back to the secondary.
+			 * (An ASYNC media error on the chosen leg is retried on the mirror
+			 * by _tier_leg_complete — M2.) */
 			struct tier_band *src = band;
 			if (band->state != TIER_BAND_ACTIVE && band_b != NULL && band_b->state == TIER_BAND_ACTIVE) {
 				src = band_b;
 			}
 			io_ctx->remaining = 1;
-			rc = tier_submit_leg(t, tch, bdev_io, src, t->sb_blocks + offset, false);
+			rc = tier_submit_leg(t, tch, bdev_io, src, t->sb_blocks + offset);
 			if (rc != 0 && src == band && band_b != NULL && band_b->state == TIER_BAND_ACTIVE) {
-				rc = tier_submit_leg(t, tch, bdev_io, band_b, t->sb_blocks + offset, false);
+				rc = tier_submit_leg(t, tch, bdev_io, band_b, t->sb_blocks + offset);
 			}
 			return rc;
 		}
-		/* Write: fan out to every ACTIVE md leg that exists (1 leg when unmirrored). */
-		io_ctx->remaining = 0;
-		if (band->state == TIER_BAND_ACTIVE) {
-			io_ctx->remaining++;
-		}
-		if (band_b != NULL && band_b->state == TIER_BAND_ACTIVE) {
-			io_ctx->remaining++;
-		}
-		if (io_ctx->remaining == 0) {
-			return -EIO;
-		}
-		if (band->state == TIER_BAND_ACTIVE) {
-			rc = tier_submit_leg(t, tch, bdev_io, band, t->sb_blocks + offset, true);
-			if (rc != 0) {
-				return rc;
-			}
-		}
-		if (band_b != NULL && band_b->state == TIER_BAND_ACTIVE) {
-			rc = tier_submit_leg(t, tch, bdev_io, band_b, t->sb_blocks + offset, true);
-			if (rc != 0) {
-				return rc;
-			}
-		}
-		return 0;
+		/* Write: fan out to every ACTIVE md leg (M1-safe). */
+		return tier_route_md_fanout(t, tch, bdev_io);
 	}
 
 	/* Data region: single band. Reject a straddle of band boundary (defensive;
@@ -270,7 +360,7 @@ tier_route_rw(struct vbdev_tier *t, struct tier_io_channel *tch, struct spdk_bde
 		return -EINVAL;
 	}
 	io_ctx->remaining = 1;
-	return tier_submit_leg(t, tch, bdev_io, band, band->phys_offset + band_off, is_write);
+	return tier_submit_leg(t, tch, bdev_io, band, band->phys_offset + band_off);
 }
 
 static void
@@ -278,7 +368,6 @@ tier_read_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, b
 {
 	struct vbdev_tier *t = SPDK_CONTAINEROF(bdev_io->bdev, struct vbdev_tier, bdev);
 	struct tier_io_channel *tch = spdk_io_channel_get_ctx(ch);
-	struct tier_bdev_io *io_ctx = (struct tier_bdev_io *)bdev_io->driver_ctx;
 	int rc;
 
 	if (!success) {
@@ -288,17 +377,11 @@ tier_read_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, b
 
 	rc = tier_route_rw(t, tch, bdev_io, false);
 	if (rc != 0) {
-		if (rc == -ENOMEM) {
-			io_ctx->ch = ch;
-			/* requeue on the owning band */
-			uint64_t off;
-			struct tier_band *b = vbdev_tier_band_of_lba(t, bdev_io->u.bdev.offset_blocks, &off);
-			if (b) {
-				vbdev_tier_queue_io(bdev_io, b, tch->base_ch[b->band_id]);
-				return;
-			}
-		}
-		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		/* M4: -ENOMEM completes NOMEM so the bdev core requeues + retries the
+		 * whole submit (works for md reads too — the old queue_io path resolved
+		 * the band via band_of_lba, which never covers [0, md)). */
+		spdk_bdev_io_complete(bdev_io, rc == -ENOMEM ? SPDK_BDEV_IO_STATUS_NOMEM :
+				      SPDK_BDEV_IO_STATUS_FAILED);
 	}
 }
 
@@ -313,6 +396,10 @@ vbdev_tier_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_
 	int rc = 0;
 
 	io_ctx->ch = ch;
+	io_ctx->status = SPDK_BDEV_IO_STATUS_SUCCESS;
+	io_ctx->good_legs = 0;
+	io_ctx->md_retry_done = false;
+	io_ctx->submit_failed = false;
 
 	switch (bdev_io->type) {
 	case SPDK_BDEV_IO_TYPE_READ:
@@ -325,30 +412,30 @@ vbdev_tier_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_
 	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
 	case SPDK_BDEV_IO_TYPE_UNMAP:
 	case SPDK_BDEV_IO_TYPE_FLUSH:
-		/* Management ops on the data region: route to the owning band. md region
-		 * management ops would need the mirror fan-out; blobstore issues these on
-		 * data clusters, so route single-band (md uses write/read). */
+		/* m6: management ops on the md region are MUTATIONS of the mirrored
+		 * range — fan them out to both md legs like writes (a single-leg unmap
+		 * would silently desynchronize the L2P copies). */
+		if (vbdev_tier_is_md_range(t, bdev_io->u.bdev.offset_blocks,
+					   bdev_io->u.bdev.num_blocks)) {
+			rc = tier_route_md_fanout(t, tch, bdev_io);
+			break;
+		}
+		/* Data region: single owning band + straddle check (m6). */
 		band = vbdev_tier_band_of_lba(t, bdev_io->u.bdev.offset_blocks, &band_off);
-		if (band == NULL || band->state != TIER_BAND_ACTIVE || band->desc == NULL ||
-		    tch->base_ch[band->band_id] == NULL) {
+		if (band == NULL) {
+			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+			return;
+		}
+		if (bdev_io->u.bdev.offset_blocks + bdev_io->u.bdev.num_blocks >
+		    band->lba_start + band->num_blocks) {
+			SPDK_ERRLOG("tier: mgmt op straddles band boundary (off=%" PRIu64
+				    " num=%" PRIu64 ")\n", bdev_io->u.bdev.offset_blocks,
+				    bdev_io->u.bdev.num_blocks);
 			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 			return;
 		}
 		io_ctx->remaining = 1;
-		io_ctx->status = SPDK_BDEV_IO_STATUS_SUCCESS;
-		if (bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE_ZEROES) {
-			rc = spdk_bdev_write_zeroes_blocks(band->desc, tch->base_ch[band->band_id],
-							   band->phys_offset + band_off, bdev_io->u.bdev.num_blocks,
-							   _tier_leg_complete, bdev_io);
-		} else if (bdev_io->type == SPDK_BDEV_IO_TYPE_UNMAP) {
-			rc = spdk_bdev_unmap_blocks(band->desc, tch->base_ch[band->band_id],
-						    band->phys_offset + band_off, bdev_io->u.bdev.num_blocks,
-						    _tier_leg_complete, bdev_io);
-		} else {
-			rc = spdk_bdev_flush_blocks(band->desc, tch->base_ch[band->band_id],
-						    band->phys_offset + band_off, bdev_io->u.bdev.num_blocks,
-						    _tier_leg_complete, bdev_io);
-		}
+		rc = tier_submit_leg(t, tch, bdev_io, band, band->phys_offset + band_off);
 		break;
 	default:
 		SPDK_ERRLOG("tier: unsupported I/O type %d\n", bdev_io->type);
@@ -357,8 +444,9 @@ vbdev_tier_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_
 	}
 
 	if (rc != 0) {
-		spdk_bdev_io_complete(bdev_io,
-				      rc == -EIO ? SPDK_BDEV_IO_STATUS_FAILED : SPDK_BDEV_IO_STATUS_FAILED);
+		/* M4: propagate -ENOMEM as NOMEM (bdev-core retry), everything else fails. */
+		spdk_bdev_io_complete(bdev_io, rc == -ENOMEM ? SPDK_BDEV_IO_STATUS_NOMEM :
+				      SPDK_BDEV_IO_STATUS_FAILED);
 	}
 }
 
@@ -500,17 +588,110 @@ vbdev_tier_destruct(void *ctx)
 	return 0;
 }
 
-/* Base bdev hot-remove: mark the band degraded (per-band isolation), do NOT tear
- * down the composite. The CSI brain reacts via tier events + rebuild-by-range. */
+/* --------------------------------------------------------------------------
+ * Band drain + close (C3 / T-4): remove the band's per-reactor base channels,
+ * THEN close its desc. Closing without the drain violates the SPDK ownership
+ * contract (channels outlive the desc) and, on hot-remove, leaves the base
+ * bdev's unregister pending forever.
+ * -------------------------------------------------------------------------- */
+
+struct tier_band_drain_ctx {
+	struct vbdev_tier	*t;
+	struct tier_band	*band;
+	void			(*cb)(void *cb_arg, int rc);
+	void			*cb_arg;
+};
+
+static void
+tier_band_drain_ch_iter(struct spdk_io_channel_iter *i)
+{
+	struct tier_band_drain_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
+	struct spdk_io_channel *_ch = spdk_io_channel_iter_get_channel(i);
+	struct tier_io_channel *tch = spdk_io_channel_get_ctx(_ch);
+	uint32_t id = ctx->band->band_id;
+
+	if (id < TIER_MAX_BANDS && tch->base_ch[id] != NULL) {
+		spdk_put_io_channel(tch->base_ch[id]);
+		tch->base_ch[id] = NULL;
+	}
+	spdk_for_each_channel_continue(i, 0);
+}
+
+static void
+tier_band_drain_done(struct spdk_io_channel_iter *i, int status)
+{
+	struct tier_band_drain_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
+	struct tier_band *band = ctx->band;
+
+	(void)status;
+	if (band->desc != NULL) {
+		spdk_bdev_module_release_bdev(spdk_bdev_desc_get_bdev(band->desc));
+		spdk_bdev_close(band->desc);
+		band->desc = NULL;
+	}
+	if (ctx->cb) {
+		ctx->cb(ctx->cb_arg, 0);
+	}
+	free(ctx);
+}
+
+static int
+tier_band_drain_and_close(struct vbdev_tier *t, struct tier_band *band,
+			  void (*cb)(void *cb_arg, int rc), void *cb_arg)
+{
+	struct tier_band_drain_ctx *ctx;
+
+	if (!t->registered) {
+		/* No io_device / channels yet: close directly. */
+		if (band->desc != NULL) {
+			spdk_bdev_module_release_bdev(spdk_bdev_desc_get_bdev(band->desc));
+			spdk_bdev_close(band->desc);
+			band->desc = NULL;
+		}
+		if (cb) {
+			cb(cb_arg, 0);
+		}
+		return 0;
+	}
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		return -ENOMEM;
+	}
+	ctx->t = t;
+	ctx->band = band;
+	ctx->cb = cb;
+	ctx->cb_arg = cb_arg;
+	spdk_for_each_channel(t, tier_band_drain_ch_iter, ctx, tier_band_drain_done);
+	return 0;
+}
+
+/* Base bdev hot-remove (C3): degrade the band (per-band isolation, do NOT tear
+ * down the composite), PERSIST the degradation, and honor the SPDK REMOVE
+ * contract (drain channels + close desc). The CSI brain reacts via tier events
+ * + rebuild-by-range. */
 static void
 tier_base_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev, void *event_ctx)
 {
 	struct tier_band *band = event_ctx;
+	struct vbdev_tier *t = band->t;
 
-	if (type == SPDK_BDEV_EVENT_REMOVE) {
-		SPDK_WARNLOG("tier: base bdev '%s' removed, marking band %u DEGRADED\n",
-			     bdev->name, band->band_id);
-		band->state = TIER_BAND_DEGRADED;
+	if (type != SPDK_BDEV_EVENT_REMOVE) {
+		return;
+	}
+	SPDK_WARNLOG("tier: base bdev '%s' removed, degrading band %u\n",
+		     bdev->name, band->band_id);
+	band->state = TIER_BAND_DEGRADED;
+	/* C3(2): persist DEGRADED to the surviving bands (M5(b) excludes this band
+	 * from the fan-out) — otherwise a reboot reassembles the band ACTIVE and md
+	 * reads can prefer its STALE L2P copy (silent corruption). */
+	if (t->registered) {
+		tier_sb_write_all(t, tier_sb_persist_cb, NULL);
+	}
+	/* C3(1): close the desc (after the channel drain) or the removed base
+	 * bdev's unregister pends forever. */
+	if (tier_band_drain_and_close(t, band, NULL, NULL) != 0) {
+		SPDK_ERRLOG("tier: cannot drain band %u after hot-remove (out of memory); "
+			    "desc left open\n", band->band_id);
 	}
 }
 
@@ -528,6 +709,7 @@ vbdev_tier_create(const char *name, uint64_t md_num_blocks, uint64_t cluster_blo
 		return NULL;
 	}
 	TAILQ_INIT(&t->bands);
+	TAILQ_INIT(&t->sb_pending_cbs);
 	t->next_band_id = 0;
 	/* F1: the md region is the FIRST boundary the blobstore crosses; round it UP to the cluster
 	 * grain so the md/data boundary is cluster-aligned. Band boundaries are aligned in add_band. */
@@ -581,6 +763,7 @@ vbdev_tier_add_band(struct vbdev_tier *t, const char *base_bdev_name, enum tier_
 	if (band == NULL) {
 		return -ENOMEM;
 	}
+	band->t = t;
 
 	rc = spdk_bdev_open_ext(base_bdev_name, true, tier_base_event_cb, band, &band->desc);
 	if (rc != 0) {
@@ -706,17 +889,65 @@ vbdev_tier_assemble_band(struct vbdev_tier *t, const char *base_bdev_name, uint3
 			 enum tier_class tier, const char *wwn, const char *serial,
 			 uint64_t lba_start, uint64_t num_blocks, enum tier_band_state state, bool is_md)
 {
-	struct tier_band *band;
+	struct tier_band *band, *existing;
 	struct spdk_bdev *base_bdev;
+	uint64_t phys_offset;
 	int rc;
 
+	/* M6/T-3/W7: the RPC decodes band_id/state as raw u32 — bound BOTH before
+	 * they index base_ch[] or route I/O (state=5 would route like ACTIVE). */
+	if (band_id >= TIER_MAX_BANDS) {
+		SPDK_ERRLOG("tier: assemble band_id %u out of range (max %d)\n",
+			    band_id, TIER_MAX_BANDS - 1);
+		return -EINVAL;
+	}
+	if (state > TIER_BAND_RETIRED) {
+		SPDK_ERRLOG("tier: assemble band %u invalid state %d\n", band_id, state);
+		return -EINVAL;
+	}
+	if (num_blocks == 0) {
+		return -EINVAL;
+	}
+	/* M6: the data region starts after the mirrored md region; a band placed
+	 * inside [0, md) would shadow the mirrored L2P range. */
+	if (lba_start < t->md_num_blocks) {
+		SPDK_ERRLOG("tier: assemble band %u lba_start %" PRIu64 " inside md region\n",
+			    band_id, lba_start);
+		return -EINVAL;
+	}
+	if (is_md && t->md_num_blocks == 0) {
+		SPDK_ERRLOG("tier: assemble band %u is_md on a composite without md region\n", band_id);
+		return -EINVAL;
+	}
+	if (is_md && t->md_mirror_a != UINT32_MAX && t->md_mirror_b != UINT32_MAX) {
+		SPDK_ERRLOG("tier: assemble band %u — both md mirror slots already assigned\n", band_id);
+		return -EINVAL;
+	}
 	if (vbdev_tier_band_by_id(t, band_id) != NULL) {
 		return -EEXIST;
+	}
+	/* M6: no two bands may overlap in the composite address space (a retired
+	 * slot keeps its range as an unreclaimable hole, so it counts too). */
+	TAILQ_FOREACH(existing, &t->bands, link) {
+		if (lba_start < existing->lba_start + existing->num_blocks &&
+		    existing->lba_start < lba_start + num_blocks) {
+			SPDK_ERRLOG("tier: assemble band %u [%" PRIu64 ", +%" PRIu64
+				    ") overlaps band %u\n", band_id, lba_start, num_blocks,
+				    existing->band_id);
+			return -EEXIST;
+		}
+		/* Same duplicate-disk guard as add_band. */
+		if (wwn != NULL && wwn[0] != '\0' &&
+		    strncmp(existing->wwn, wwn, sizeof(existing->wwn)) == 0) {
+			SPDK_ERRLOG("tier: assemble band wwn '%s' already present\n", wwn);
+			return -EEXIST;
+		}
 	}
 	band = calloc(1, sizeof(*band));
 	if (band == NULL) {
 		return -ENOMEM;
 	}
+	band->t = t;
 	rc = spdk_bdev_open_ext(base_bdev_name, true, tier_base_event_cb, band, &band->desc);
 	if (rc != 0) {
 		SPDK_ERRLOG("tier: assemble cannot open '%s' rc=%d\n", base_bdev_name, rc);
@@ -735,6 +966,17 @@ vbdev_tier_assemble_band(struct vbdev_tier *t, const char *base_bdev_name, uint3
 	}
 	if (t->sb_blocks == 0) {
 		t->sb_blocks = spdk_divide_round_up(TIER_SB_RESERVE_BYTES, t->blocklen);
+	}
+	/* New: the stored geometry must FIT the real disk (the F1 register guard only
+	 * checks alignment) — otherwise the band's tail returns -EIO at runtime. */
+	phys_offset = is_md ? (t->sb_blocks + t->md_num_blocks) : t->sb_blocks;
+	if (phys_offset + num_blocks > base_bdev->blockcnt) {
+		SPDK_ERRLOG("tier: assemble band %u geometry (phys_off=%" PRIu64 " num=%" PRIu64
+			    ") exceeds disk '%s' capacity %" PRIu64 "\n", band_id, phys_offset,
+			    num_blocks, base_bdev_name, base_bdev->blockcnt);
+		spdk_bdev_close(band->desc);
+		free(band);
+		return -ENOSPC;
 	}
 	rc = spdk_bdev_module_claim_bdev(base_bdev, band->desc, &tier_if);
 	if (rc != 0) {
@@ -779,31 +1021,88 @@ vbdev_tier_assemble_band(struct vbdev_tier *t, const char *base_bdev_name, uint3
 	return 0;
 }
 
+struct tier_retire_ctx {
+	struct vbdev_tier	*t;
+	struct tier_band	*band;
+	void			(*cb)(void *cb_arg, int rc);
+	void			*cb_arg;
+	int			persist_rc;
+};
+
+static void
+tier_retire_drained(void *cb_arg, int rc)
+{
+	struct tier_retire_ctx *ctx = cb_arg;
+
+	(void)rc;
+	SPDK_NOTICELOG("tier '%s': retired band %u (persist rc=%d)\n",
+		       ctx->t->bdev.name, ctx->band->band_id, ctx->persist_rc);
+	if (ctx->cb) {
+		ctx->cb(ctx->cb_arg, ctx->persist_rc);
+	}
+	free(ctx);
+}
+
+static void
+tier_retire_persisted(void *cb_arg, int rc)
+{
+	struct tier_retire_ctx *ctx = cb_arg;
+
+	ctx->persist_rc = rc;
+	/* T-4: drain the band's per-reactor channels BEFORE closing its desc (the
+	 * old direct close raced live channels — UAF at the deferred put). On a
+	 * persist failure we still drain+close, but report the error so the CSI
+	 * retries the (idempotent) retire until the SB is durable (MJ6). */
+	if (tier_band_drain_and_close(ctx->t, ctx->band, tier_retire_drained, ctx) != 0) {
+		if (ctx->cb) {
+			ctx->cb(ctx->cb_arg, rc != 0 ? rc : -ENOMEM);
+		}
+		free(ctx);
+	}
+}
+
 int
-vbdev_tier_retire_band(struct vbdev_tier *t, uint32_t band_id)
+vbdev_tier_retire_band(struct vbdev_tier *t, uint32_t band_id,
+		       void (*cb)(void *cb_arg, int rc), void *cb_arg)
 {
 	struct tier_band *band = vbdev_tier_band_by_id(t, band_id);
+	struct tier_retire_ctx *ctx;
 
 	if (band == NULL) {
 		return -ENODEV;
 	}
-	if (band->state == TIER_BAND_RETIRED) {
-		return 0;	/* idempotent */
+	/* T-7: an md-mirror band holds one of the two L2P copies; retiring it would
+	 * destroy the blobstore-metadata redundancy with no rebuild path. */
+	if (band_id == t->md_mirror_a || band_id == t->md_mirror_b) {
+		SPDK_ERRLOG("tier '%s': refusing to retire md-mirror band %u\n",
+			    t->bdev.name, band_id);
+		return -EBUSY;
 	}
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		return -ENOMEM;
+	}
+	ctx->t = t;
+	ctx->band = band;
+	ctx->cb = cb;
+	ctx->cb_arg = cb_arg;
+
 	/* The CSI brain guarantees the band was evacuated (clusters relocated) before
-	 * retiring. We keep the slot and its LBA range as an unreclaimable hole. */
+	 * retiring. We keep the slot and its LBA range as an unreclaimable hole.
+	 * Re-running the flow on an already-RETIRED band is the idempotent retry
+	 * path: it re-persists (in case the first persist failed) and re-closes. */
 	band->state = TIER_BAND_RETIRED;
-	/* Persist the new band table to the SURVIVING bands BEFORE closing the retired
-	 * one's desc (so the seq bump records the retirement). */
+	/* Persist to the SURVIVING bands BEFORE closing the retired one's desc (so
+	 * the seq bump durably records the retirement), then drain+close, then
+	 * complete (MJ6: the caller acks only a durable retirement). */
 	if (t->registered) {
-		tier_sb_write_all(t, tier_sb_persist_cb, NULL);
+		if (tier_sb_write_all(t, tier_retire_persisted, ctx) != 0) {
+			free(ctx);
+			return -ENOMEM;
+		}
+	} else {
+		tier_retire_persisted(ctx, 0);
 	}
-	if (band->desc != NULL) {
-		spdk_bdev_module_release_bdev(spdk_bdev_desc_get_bdev(band->desc));
-		spdk_bdev_close(band->desc);
-		band->desc = NULL;
-	}
-	SPDK_NOTICELOG("tier '%s': retired band %u\n", t->bdev.name, band_id);
 	return 0;
 }
 
@@ -836,6 +1135,12 @@ vbdev_tier_register(struct vbdev_tier *t)
 {
 	int rc;
 
+	/* W1: a re-register would fail spdk_bdev_register with -EEXIST and the error
+	 * path would then spdk_io_device_unregister() the io_device of the LIVE bdev
+	 * (demolition in service). Refuse up front. */
+	if (t->registered) {
+		return -EEXIST;
+	}
 	if (t->num_bands == 0 || t->blocklen == 0) {
 		return -EINVAL;
 	}
@@ -1013,12 +1318,15 @@ tier_copy_read_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	}
 }
 
-/* F11 (accepted tradeoff): the caller runs this ENTIRE copy under quiesce of the src range (see
- * vbdev_lvol_tier_rpc.c). That stalls user I/O on the cluster for read+flush+readback (~3× the
- * cluster) but makes the move correct WITHOUT the §5.3 copy-then-CRC-reconcile dance (no write can
- * hit src during the copy ⇒ no lost write). Grain is bounded to one cluster (1 MiB), so the stall
- * window is small. If latency proves unacceptable (R1/S-D2-conc), switch to copy-outside-quiesce +
- * re-read-CRC-under-quiesce; until then the simpler, provably-safe model stands. */
+/* F11 / C1 (fixed): the caller (vbdev_lvol_tier_rpc.c) runs this ENTIRE copy under a BLOB-level
+ * freeze (spdk_blob_freeze_io), NOT a composite-level quiesce. The distinction is what closed the
+ * C1 lost-write: a composite quiesce holds host writes BELOW the blob→LBA translation, so a held
+ * write replays to the OLD lba after the L2P swap (ACKed write lands on a freed cluster). The blob
+ * freeze holds writes ABOVE the translation; on unfreeze they re-translate through the updated L2P
+ * and land on the NEW cluster. The freeze stalls the blob's I/O for read+flush+readback+commit
+ * (~3× one cluster, 1 MiB grain) — accepted tradeoff; if latency proves unacceptable, switch to
+ * copy-outside-freeze + re-read-CRC-under-freeze. This copy path reads the base bdevs DIRECTLY, so
+ * it is not itself held by the freeze. */
 int
 vbdev_tier_relocate_copy(struct vbdev_tier *t, uint64_t src_lba, uint64_t dst_lba,
 			 uint64_t num_blocks, tier_relocate_cb cb_fn, void *cb_arg)
@@ -1033,6 +1341,12 @@ vbdev_tier_relocate_copy(struct vbdev_tier *t, uint64_t src_lba, uint64_t dst_lb
 	if (sb == NULL || db == NULL || sb->state != TIER_BAND_ACTIVE ||
 	    db->state != TIER_BAND_ACTIVE || sb->desc == NULL || db->desc == NULL) {
 		return -EIO;
+	}
+	/* m2: the copy must stay inside both bands (a straddling range would read or
+	 * write a NEIGHBOUR band's blocks through the wrong phys mapping). */
+	if (src_off + num_blocks > sb->num_blocks || dst_off + num_blocks > db->num_blocks) {
+		SPDK_ERRLOG("tier: relocate copy range straddles a band boundary\n");
+		return -EINVAL;
 	}
 
 	c = calloc(1, sizeof(*c));
@@ -1062,18 +1376,254 @@ vbdev_tier_relocate_copy(struct vbdev_tier *t, uint64_t src_lba, uint64_t dst_lb
 	return 0;
 }
 
-int
-vbdev_tier_relocate_quiesce(struct vbdev_tier *t, uint64_t lba, uint64_t num_blocks,
-			    spdk_bdev_quiesce_cb cb_fn, void *cb_arg)
+/* --------------------------------------------------------------------------
+ * C3: md-mirror resync — rebuild a replacement md leg from the healthy one.
+ *
+ * The target band is typically a replacement disk assembled DEGRADED into an
+ * md slot (assemble_band is_md=true). The copy runs under a QUIESCE of the
+ * composite md range: unlike the relocate path (C1), the md region is
+ * IDENTITY-mapped (no L2P swap), so held writes replay to the same LBA — and
+ * they replay AFTER the target is activated, reaching both legs. The direct
+ * base-bdev copy below is not held by the composite quiesce.
+ * Stall bound: one full md-region copy (size the md region accordingly).
+ * -------------------------------------------------------------------------- */
+
+struct tier_md_resync_ctx {
+	struct vbdev_tier	*t;
+	struct tier_band	*src;
+	struct tier_band	*dst;
+	struct spdk_io_channel	*src_ch;
+	struct spdk_io_channel	*dst_ch;
+	void			*buf;
+	uint64_t		chunk_blocks;
+	uint64_t		off;		/* md-region blocks copied so far */
+	uint64_t		io_blocks;	/* size of the in-flight chunk */
+	int			rc;
+	bool			quiesced;
+	void			(*cb)(void *cb_arg, int rc);
+	void			*cb_arg;
+};
+
+static void tier_md_resync_next(struct tier_md_resync_ctx *c);
+
+static void
+tier_md_resync_unquiesced(void *cb_arg, int status)
 {
-	return spdk_bdev_quiesce_range(&t->bdev, &tier_if, lba, num_blocks, cb_fn, cb_arg);
+	struct tier_md_resync_ctx *c = cb_arg;
+
+	(void)status;	/* best-effort; the resync outcome is c->rc */
+	if (c->src_ch) {
+		spdk_put_io_channel(c->src_ch);
+	}
+	if (c->dst_ch) {
+		spdk_put_io_channel(c->dst_ch);
+	}
+	if (c->buf) {
+		spdk_dma_free(c->buf);
+	}
+	c->cb(c->cb_arg, c->rc);
+	free(c);
+}
+
+static void
+tier_md_resync_finish(struct tier_md_resync_ctx *c, int rc)
+{
+	c->rc = rc;
+	if (c->quiesced) {
+		if (spdk_bdev_unquiesce_range(&c->t->bdev, &tier_if, 0, c->t->md_num_blocks,
+					      tier_md_resync_unquiesced, c) == 0) {
+			return;
+		}
+		SPDK_ERRLOG("tier '%s': md resync unquiesce dispatch failed\n", c->t->bdev.name);
+	}
+	tier_md_resync_unquiesced(c, 0);
+}
+
+static void
+tier_md_resync_persisted(void *cb_arg, int rc)
+{
+	struct tier_md_resync_ctx *c = cb_arg;
+
+	if (rc != 0) {
+		/* Not durable: revert so the CSI retries (the copy itself is redoable). */
+		c->dst->state = TIER_BAND_DEGRADED;
+	}
+	tier_md_resync_finish(c, rc);
+}
+
+/* Open the resynced leg's base channel on every EXISTING tier io_channel (they
+ * were created before this band was assembled/degraded, so base_ch[id] is NULL
+ * there — activating without this would fail every md write leg to it). A
+ * per-reactor open failure is PROPAGATED (the leg stays DEGRADED) — never
+ * activate a leg only some reactors can reach. */
+static void
+tier_md_resync_ch_open_iter(struct spdk_io_channel_iter *i)
+{
+	struct tier_md_resync_ctx *c = spdk_io_channel_iter_get_ctx(i);
+	struct spdk_io_channel *_ch = spdk_io_channel_iter_get_channel(i);
+	struct tier_io_channel *tch = spdk_io_channel_get_ctx(_ch);
+	uint32_t id = c->dst->band_id;
+	int rc = 0;
+
+	if (tch->base_ch[id] == NULL && c->dst->desc != NULL) {
+		tch->base_ch[id] = spdk_bdev_get_io_channel(c->dst->desc);
+		if (tch->base_ch[id] == NULL) {
+			rc = -ENOMEM;
+		}
+	}
+	spdk_for_each_channel_continue(i, rc);
+}
+
+static void
+tier_md_resync_ch_open_done(struct spdk_io_channel_iter *i, int status)
+{
+	struct tier_md_resync_ctx *c = spdk_io_channel_iter_get_ctx(i);
+
+	if (status != 0) {
+		tier_md_resync_finish(c, status);
+		return;
+	}
+	/* Copy durable + channels reachable: activate the leg, persist, unquiesce. */
+	c->dst->state = TIER_BAND_ACTIVE;
+	if (tier_sb_write_all(c->t, tier_md_resync_persisted, c) != 0) {
+		c->dst->state = TIER_BAND_DEGRADED;
+		tier_md_resync_finish(c, -ENOMEM);
+	}
+}
+
+static void
+tier_md_resync_flush_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct tier_md_resync_ctx *c = cb_arg;
+
+	spdk_bdev_free_io(bdev_io);
+	if (!success) {
+		tier_md_resync_finish(c, -EIO);
+		return;
+	}
+	spdk_for_each_channel(c->t, tier_md_resync_ch_open_iter, c,
+			      tier_md_resync_ch_open_done);
+}
+
+static void
+tier_md_resync_write_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct tier_md_resync_ctx *c = cb_arg;
+
+	spdk_bdev_free_io(bdev_io);
+	if (!success) {
+		tier_md_resync_finish(c, -EIO);
+		return;
+	}
+	c->off += c->io_blocks;
+	tier_md_resync_next(c);
+}
+
+static void
+tier_md_resync_read_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct tier_md_resync_ctx *c = cb_arg;
+	int rc;
+
+	spdk_bdev_free_io(bdev_io);
+	if (!success) {
+		tier_md_resync_finish(c, -EIO);
+		return;
+	}
+	rc = spdk_bdev_write_blocks(c->dst->desc, c->dst_ch, c->buf,
+				    c->t->sb_blocks + c->off, c->io_blocks,
+				    tier_md_resync_write_done, c);
+	if (rc != 0) {
+		tier_md_resync_finish(c, rc);
+	}
+}
+
+static void
+tier_md_resync_next(struct tier_md_resync_ctx *c)
+{
+	int rc;
+
+	if (c->off >= c->t->md_num_blocks) {
+		rc = spdk_bdev_flush_blocks(c->dst->desc, c->dst_ch, c->t->sb_blocks,
+					    c->t->md_num_blocks, tier_md_resync_flush_done, c);
+		if (rc != 0) {
+			tier_md_resync_finish(c, rc);
+		}
+		return;
+	}
+	c->io_blocks = spdk_min(c->chunk_blocks, c->t->md_num_blocks - c->off);
+	rc = spdk_bdev_read_blocks(c->src->desc, c->src_ch, c->buf,
+				   c->t->sb_blocks + c->off, c->io_blocks,
+				   tier_md_resync_read_done, c);
+	if (rc != 0) {
+		tier_md_resync_finish(c, rc);
+	}
+}
+
+static void
+tier_md_resync_quiesced(void *cb_arg, int status)
+{
+	struct tier_md_resync_ctx *c = cb_arg;
+
+	if (status != 0) {
+		tier_md_resync_finish(c, status);
+		return;
+	}
+	c->quiesced = true;
+	tier_md_resync_next(c);
 }
 
 int
-vbdev_tier_relocate_unquiesce(struct vbdev_tier *t, uint64_t lba, uint64_t num_blocks,
-			      spdk_bdev_quiesce_cb cb_fn, void *cb_arg)
+vbdev_tier_resync_md(struct vbdev_tier *t, uint32_t target_band_id,
+		     void (*cb)(void *cb_arg, int rc), void *cb_arg)
 {
-	return spdk_bdev_unquiesce_range(&t->bdev, &tier_if, lba, num_blocks, cb_fn, cb_arg);
+	struct tier_md_resync_ctx *c;
+	struct tier_band *dst = vbdev_tier_band_by_id(t, target_band_id);
+	struct tier_band *src;
+	uint64_t chunk_blocks;
+	int rc;
+
+	if (!t->registered || t->md_num_blocks == 0) {
+		return -EINVAL;
+	}
+	if (dst == NULL || dst->desc == NULL) {
+		return -ENODEV;
+	}
+	if (target_band_id != t->md_mirror_a && target_band_id != t->md_mirror_b) {
+		return -EINVAL;	/* only md legs carry the mirrored region */
+	}
+	if (dst->state != TIER_BAND_DEGRADED) {
+		return -EINVAL;	/* resync only rebuilds a degraded/replacement leg */
+	}
+	src = tier_md_other_leg(t, dst);
+	if (src == NULL || src->state != TIER_BAND_ACTIVE || src->desc == NULL) {
+		return -EIO;	/* no healthy leg to copy from */
+	}
+
+	c = calloc(1, sizeof(*c));
+	if (c == NULL) {
+		return -ENOMEM;
+	}
+	chunk_blocks = spdk_max(1, (1024u * 1024u) / t->blocklen);	/* 1 MiB chunks */
+	c->t = t;
+	c->src = src;
+	c->dst = dst;
+	c->chunk_blocks = chunk_blocks;
+	c->cb = cb;
+	c->cb_arg = cb_arg;
+	c->buf = spdk_dma_malloc(chunk_blocks * (uint64_t)t->blocklen, t->blocklen, NULL);
+	c->src_ch = spdk_bdev_get_io_channel(src->desc);
+	c->dst_ch = spdk_bdev_get_io_channel(dst->desc);
+	if (c->buf == NULL || c->src_ch == NULL || c->dst_ch == NULL) {
+		tier_md_resync_finish(c, -ENOMEM);
+		return 0;
+	}
+	rc = spdk_bdev_quiesce_range(&t->bdev, &tier_if, 0, t->md_num_blocks,
+				     tier_md_resync_quiesced, c);
+	if (rc != 0) {
+		tier_md_resync_finish(c, rc);
+	}
+	return 0;
 }
 
 /* --------------------------------------------------------------------------

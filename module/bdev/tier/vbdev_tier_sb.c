@@ -26,7 +26,7 @@ tier_sb_serialize(struct vbdev_tier *t, struct tier_band *self, uint64_t seq, st
 	memset(sb, 0, sizeof(*sb));
 	sb->magic = TIER_SB_MAGIC;
 	sb->version = TIER_SB_VERSION;
-	sb->seq = seq;		/* F10: the target generation, committed to t->seq only on all-band success */
+	sb->seq = seq;		/* M5(a): generation RESERVED at write_all entry (t->seq already bumped) */
 	snprintf(sb->composite_name, sizeof(sb->composite_name), "%s", t->bdev.name);
 	sb->md_num_blocks = t->md_num_blocks;
 	sb->md_mirror_a = t->md_mirror_a;
@@ -34,6 +34,9 @@ tier_sb_serialize(struct vbdev_tier *t, struct tier_band *self, uint64_t seq, st
 	sb->num_bands = t->num_bands;
 	sb->this_band_id = self ? self->band_id : UINT32_MAX;
 	sb->blocklen = t->blocklen;
+	/* F-3: the on-disk field is u32 (v1); the RPC refuses cluster_blocks > UINT32_MAX
+	 * at create, so a silent truncation here is impossible — assert the invariant. */
+	assert(t->cluster_blocks <= UINT32_MAX);
 	sb->cluster_blocks = (uint32_t)t->cluster_blocks;	/* F1: boundary alignment grain */
 
 	TAILQ_FOREACH(b, &t->bands, link) {
@@ -60,6 +63,13 @@ tier_sb_valid(const struct tier_superblock *sb)
 	struct tier_superblock tmp;
 	uint32_t crc;
 
+	/* F-4: the format is declared little-endian only (amd64/arm64 targets). A
+	 * byte-swapped magic means the SB was written by a big-endian host — refuse
+	 * loudly instead of failing the CRC silently. */
+	if (sb->magic == __builtin_bswap64(TIER_SB_MAGIC)) {
+		SPDK_ERRLOG("tier sb: byte-swapped magic (big-endian writer?) — refusing\n");
+		return false;
+	}
 	if (sb->magic != TIER_SB_MAGIC || sb->version != TIER_SB_VERSION) {
 		return false;
 	}
@@ -69,79 +79,144 @@ tier_sb_valid(const struct tier_superblock *sb)
 	return crc == sb->crc;
 }
 
-/* ---- async write to all bands ---------------------------------------------- */
+/* ---- async write to all bands ----------------------------------------------
+ *
+ * M5(a): serialized. One fan-out in flight per composite; requests arriving
+ * meanwhile queue their callback on t->sb_pending_cbs and are coalesced into
+ * ONE follow-up fan-out of the latest in-memory state. The generation is
+ * RESERVED (t->seq++) at fan-out start: a partially-failed fan-out can never
+ * share a seq with a later, different table ("highest seq wins" stays sound —
+ * gaps are harmless, duplicates are fatal).
+ * M5(b): only ACTIVE bands are written. The old `!= RETIRED` filter included
+ * DEGRADED bands whose write always fails → status stuck at -EIO → a
+ * retirement was never observed as persisted once any band degraded.
+ * F-6: each copy is FLUSHed after the write — a "committed" seq sitting in a
+ * volatile write cache is not a commit. */
 
 struct tier_sb_write_ctx {
 	struct vbdev_tier	*t;
-	uint64_t		target_seq;	/* F10: committed to t->seq only if every band write succeeds */
 	int			remaining;
 	int			status;
-	void			(*cb)(void *cb_arg, int rc);
-	void			*cb_arg;
+	TAILQ_HEAD(, tier_sb_pending_cb) cbs;	/* callbacks served by THIS fan-out */
 };
 
 struct tier_sb_band_write {
 	struct tier_sb_write_ctx *parent;
+	struct spdk_bdev_desc	*desc;
 	struct spdk_io_channel	*ch;
 	void			*buf;
+	uint32_t		sb_blocks;
 };
+
+static void tier_sb_write_start(struct vbdev_tier *t);
+
+static void
+tier_sb_fanout_complete(struct tier_sb_write_ctx *ctx)
+{
+	struct vbdev_tier *t = ctx->t;
+	struct tier_sb_pending_cb *p;
+	int status = ctx->status;
+
+	while ((p = TAILQ_FIRST(&ctx->cbs)) != NULL) {
+		TAILQ_REMOVE(&ctx->cbs, p, link);
+		p->cb(p->cb_arg, status);
+		free(p);
+	}
+	free(ctx);
+	t->sb_write_inflight = false;
+	if (t->sb_write_queued) {
+		t->sb_write_queued = false;
+		tier_sb_write_start(t);
+	}
+}
+
+static void
+tier_sb_band_io_done(struct tier_sb_band_write *bw, bool success)
+{
+	struct tier_sb_write_ctx *ctx = bw->parent;
+
+	spdk_put_io_channel(bw->ch);
+	spdk_dma_free(bw->buf);
+	free(bw);
+	if (!success) {
+		ctx->status = -EIO;
+	}
+	if (--ctx->remaining == 0) {
+		tier_sb_fanout_complete(ctx);
+	}
+}
+
+static void
+tier_sb_flush_band_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	spdk_bdev_free_io(bdev_io);
+	tier_sb_band_io_done(cb_arg, success);
+}
 
 static void
 tier_sb_write_band_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
 	struct tier_sb_band_write *bw = cb_arg;
-	struct tier_sb_write_ctx *ctx = bw->parent;
+	int rc;
 
 	spdk_bdev_free_io(bdev_io);
-	spdk_put_io_channel(bw->ch);
-	spdk_dma_free(bw->buf);
-	free(bw);
-
 	if (!success) {
-		ctx->status = -EIO;
+		tier_sb_band_io_done(bw, false);
+		return;
 	}
-	if (--ctx->remaining == 0) {
-		/* F10: advance the in-memory generation ONLY if every band persisted the new table.
-		 * On any failure t->seq stays put, so the next write retries the same target_seq (no
-		 * spurious generation gap), and the highest-seq on-disk copy remains authoritative. */
-		if (ctx->status == 0) {
-			ctx->t->seq = ctx->target_seq;
-		}
-		if (ctx->cb) {
-			ctx->cb(ctx->cb_arg, ctx->status);
-		}
-		free(ctx);
+	/* F-6: flush before calling this copy durable. */
+	rc = spdk_bdev_flush_blocks(bw->desc, bw->ch, 0, bw->sb_blocks,
+				    tier_sb_flush_band_done, bw);
+	if (rc != 0) {
+		tier_sb_band_io_done(bw, false);
 	}
 }
 
-int
-tier_sb_write_all(struct vbdev_tier *t, void (*cb)(void *cb_arg, int rc), void *cb_arg)
+static void
+tier_sb_write_start(struct vbdev_tier *t)
 {
 	struct tier_sb_write_ctx *ctx;
 	struct tier_band *b;
 	size_t bufsz = (size_t)t->sb_blocks * t->blocklen;
-	int launched = 0;
-
-	if (t->sb_blocks == 0 || bufsz < sizeof(struct tier_superblock)) {
-		return -EINVAL;
-	}
+	uint64_t target_seq;
 
 	ctx = calloc(1, sizeof(*ctx));
 	if (ctx == NULL) {
-		return -ENOMEM;
+		struct tier_sb_pending_cb *p;
+
+		t->sb_write_inflight = false;
+		while ((p = TAILQ_FIRST(&t->sb_pending_cbs)) != NULL) {
+			TAILQ_REMOVE(&t->sb_pending_cbs, p, link);
+			p->cb(p->cb_arg, -ENOMEM);
+			free(p);
+		}
+		return;
 	}
+	t->sb_write_inflight = true;
 	ctx->t = t;
 	ctx->status = 0;
-	ctx->cb = cb;
-	ctx->cb_arg = cb_arg;
+	TAILQ_INIT(&ctx->cbs);
+	/* Take ownership of the queued callbacks (no TAILQ_CONCAT on glibc/SPDK). */
+	{
+		struct tier_sb_pending_cb *p;
+
+		while ((p = TAILQ_FIRST(&t->sb_pending_cbs)) != NULL) {
+			TAILQ_REMOVE(&t->sb_pending_cbs, p, link);
+			TAILQ_INSERT_TAIL(&ctx->cbs, p, link);
+		}
+	}
 	ctx->remaining = 1;	/* hold a ref while we launch, released at the end */
-	ctx->target_seq = t->seq + 1;	/* F10: committed to t->seq on all-band success only */
+
+	/* M5(a): reserve the generation up front (see block comment above). */
+	t->seq++;
+	target_seq = t->seq;
 
 	TAILQ_FOREACH(b, &t->bands, link) {
 		struct tier_sb_band_write *bw;
 		int rc;
 
-		if (b->state == TIER_BAND_RETIRED || b->desc == NULL) {
+		/* M5(b): ACTIVE bands only. */
+		if (b->state != TIER_BAND_ACTIVE || b->desc == NULL) {
 			continue;
 		}
 		bw = calloc(1, sizeof(*bw));
@@ -150,13 +225,15 @@ tier_sb_write_all(struct vbdev_tier *t, void (*cb)(void *cb_arg, int rc), void *
 			continue;
 		}
 		bw->parent = ctx;
+		bw->desc = b->desc;
+		bw->sb_blocks = t->sb_blocks;
 		bw->buf = spdk_dma_zmalloc(bufsz, t->blocklen, NULL);
 		if (bw->buf == NULL) {
 			ctx->status = -ENOMEM;
 			free(bw);
 			continue;
 		}
-		tier_sb_serialize(t, b, ctx->target_seq, (struct tier_superblock *)bw->buf);
+		tier_sb_serialize(t, b, target_seq, (struct tier_superblock *)bw->buf);
 		bw->ch = spdk_bdev_get_io_channel(b->desc);
 		if (bw->ch == NULL) {
 			ctx->status = -ENOMEM;
@@ -175,18 +252,38 @@ tier_sb_write_all(struct vbdev_tier *t, void (*cb)(void *cb_arg, int rc), void *
 			free(bw);
 			continue;
 		}
-		launched++;
 	}
 
 	/* Release the holding ref; if no band write was launched, complete now. */
 	if (--ctx->remaining == 0) {
-		int status = ctx->status;
-		if (ctx->cb) {
-			ctx->cb(ctx->cb_arg, status);
-		}
-		free(ctx);
+		tier_sb_fanout_complete(ctx);
 	}
-	(void)launched;
+}
+
+int
+tier_sb_write_all(struct vbdev_tier *t, void (*cb)(void *cb_arg, int rc), void *cb_arg)
+{
+	size_t bufsz = (size_t)t->sb_blocks * t->blocklen;
+
+	if (t->sb_blocks == 0 || bufsz < sizeof(struct tier_superblock)) {
+		return -EINVAL;
+	}
+	if (cb != NULL) {
+		struct tier_sb_pending_cb *p = calloc(1, sizeof(*p));
+
+		if (p == NULL) {
+			return -ENOMEM;
+		}
+		p->cb = cb;
+		p->cb_arg = cb_arg;
+		TAILQ_INSERT_TAIL(&t->sb_pending_cbs, p, link);
+	}
+	if (t->sb_write_inflight) {
+		/* M5(a): coalesce — one follow-up fan-out will persist the latest state. */
+		t->sb_write_queued = true;
+		return 0;
+	}
+	tier_sb_write_start(t);
 	return 0;
 }
 
