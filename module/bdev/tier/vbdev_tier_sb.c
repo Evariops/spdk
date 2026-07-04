@@ -18,7 +18,8 @@
 /* ---- serialize / validate -------------------------------------------------- */
 
 void
-tier_sb_serialize(struct vbdev_tier *t, struct tier_band *self, uint64_t seq, struct tier_superblock *sb)
+tier_sb_serialize(struct vbdev_tier *t, struct tier_band *self, uint64_t seq,
+		  uint64_t created_epoch_sec, struct tier_superblock *sb)
 {
 	struct tier_band *b;
 	uint32_t i = 0;
@@ -27,6 +28,8 @@ tier_sb_serialize(struct vbdev_tier *t, struct tier_band *self, uint64_t seq, st
 	sb->magic = TIER_SB_MAGIC;
 	sb->version = TIER_SB_VERSION;
 	sb->seq = seq;		/* M5(a): generation RESERVED at write_all entry (t->seq already bumped) */
+	sb->created_epoch_sec = created_epoch_sec;
+	memcpy(sb->generation_uuid, t->gen_uuid, sizeof(sb->generation_uuid));
 	snprintf(sb->composite_name, sizeof(sb->composite_name), "%s", t->bdev.name);
 	sb->md_num_blocks = t->md_num_blocks;
 	sb->md_mirror_a = t->md_mirror_a;
@@ -34,10 +37,7 @@ tier_sb_serialize(struct vbdev_tier *t, struct tier_band *self, uint64_t seq, st
 	sb->num_bands = t->num_bands;
 	sb->this_band_id = self ? self->band_id : UINT32_MAX;
 	sb->blocklen = t->blocklen;
-	/* F-3: the on-disk field is u32 (v1); the RPC refuses cluster_blocks > UINT32_MAX
-	 * at create, so a silent truncation here is impossible — assert the invariant. */
-	assert(t->cluster_blocks <= UINT32_MAX);
-	sb->cluster_blocks = (uint32_t)t->cluster_blocks;	/* F1: boundary alignment grain */
+	sb->cluster_blocks = t->cluster_blocks;	/* F1 grain; u64 on disk since v2 (F-3) */
 
 	TAILQ_FOREACH(b, &t->bands, link) {
 		if (i >= TIER_MAX_BANDS) {
@@ -79,6 +79,32 @@ tier_sb_valid(const struct tier_superblock *sb)
 	return crc == sb->crc;
 }
 
+/* F-5: pick the best (valid, highest-seq) of the two slots in a reserve buffer. */
+const struct tier_superblock *
+tier_sb_select(const void *reserve_buf, size_t reserve_len)
+{
+	const struct tier_superblock *a, *b;
+	bool a_ok, b_ok;
+
+	if (reserve_buf == NULL || reserve_len < TIER_SB_RESERVE_BYTES) {
+		return NULL;
+	}
+	a = (const struct tier_superblock *)reserve_buf;
+	b = (const struct tier_superblock *)((const uint8_t *)reserve_buf + TIER_SB_SLOT_BYTES);
+	a_ok = tier_sb_valid(a);
+	b_ok = tier_sb_valid(b);
+	if (a_ok && b_ok) {
+		return (b->seq > a->seq) ? b : a;
+	}
+	if (a_ok) {
+		return a;
+	}
+	if (b_ok) {
+		return b;
+	}
+	return NULL;
+}
+
 /* ---- async write to all bands ----------------------------------------------
  *
  * M5(a): serialized. One fan-out in flight per composite; requests arriving
@@ -105,7 +131,8 @@ struct tier_sb_band_write {
 	struct spdk_bdev_desc	*desc;
 	struct spdk_io_channel	*ch;
 	void			*buf;
-	uint32_t		sb_blocks;
+	uint64_t		slot_off_blocks;	/* F-5: this generation's slot */
+	uint32_t		slot_blocks;
 };
 
 static void tier_sb_write_start(struct vbdev_tier *t);
@@ -165,7 +192,7 @@ tier_sb_write_band_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg
 		return;
 	}
 	/* F-6: flush before calling this copy durable. */
-	rc = spdk_bdev_flush_blocks(bw->desc, bw->ch, 0, bw->sb_blocks,
+	rc = spdk_bdev_flush_blocks(bw->desc, bw->ch, bw->slot_off_blocks, bw->slot_blocks,
 				    tier_sb_flush_band_done, bw);
 	if (rc != 0) {
 		tier_sb_band_io_done(bw, false);
@@ -177,8 +204,9 @@ tier_sb_write_start(struct vbdev_tier *t)
 {
 	struct tier_sb_write_ctx *ctx;
 	struct tier_band *b;
-	size_t bufsz = (size_t)t->sb_blocks * t->blocklen;
-	uint64_t target_seq;
+	size_t bufsz = TIER_SB_SLOT_BYTES;	/* F-5: one slot per generation */
+	uint32_t slot_blocks = TIER_SB_SLOT_BYTES / t->blocklen;
+	uint64_t target_seq, slot_off_blocks, now_sec;
 
 	ctx = calloc(1, sizeof(*ctx));
 	if (ctx == NULL) {
@@ -210,6 +238,9 @@ tier_sb_write_start(struct vbdev_tier *t)
 	/* M5(a): reserve the generation up front (see block comment above). */
 	t->seq++;
 	target_seq = t->seq;
+	/* F-5: generation N lands in slot N%2 — a torn write only hurts one slot. */
+	slot_off_blocks = (uint64_t)tier_sb_slot_for_seq(target_seq) * slot_blocks;
+	now_sec = (uint64_t)time(NULL);
 
 	TAILQ_FOREACH(b, &t->bands, link) {
 		struct tier_sb_band_write *bw;
@@ -226,14 +257,15 @@ tier_sb_write_start(struct vbdev_tier *t)
 		}
 		bw->parent = ctx;
 		bw->desc = b->desc;
-		bw->sb_blocks = t->sb_blocks;
+		bw->slot_off_blocks = slot_off_blocks;
+		bw->slot_blocks = slot_blocks;
 		bw->buf = spdk_dma_zmalloc(bufsz, t->blocklen, NULL);
 		if (bw->buf == NULL) {
 			ctx->status = -ENOMEM;
 			free(bw);
 			continue;
 		}
-		tier_sb_serialize(t, b, target_seq, (struct tier_superblock *)bw->buf);
+		tier_sb_serialize(t, b, target_seq, now_sec, (struct tier_superblock *)bw->buf);
 		bw->ch = spdk_bdev_get_io_channel(b->desc);
 		if (bw->ch == NULL) {
 			ctx->status = -ENOMEM;
@@ -242,7 +274,7 @@ tier_sb_write_start(struct vbdev_tier *t)
 			continue;
 		}
 		ctx->remaining++;
-		rc = spdk_bdev_write_blocks(b->desc, bw->ch, bw->buf, 0, t->sb_blocks,
+		rc = spdk_bdev_write_blocks(b->desc, bw->ch, bw->buf, slot_off_blocks, slot_blocks,
 					    tier_sb_write_band_done, bw);
 		if (rc != 0) {
 			ctx->remaining--;
@@ -263,9 +295,9 @@ tier_sb_write_start(struct vbdev_tier *t)
 int
 tier_sb_write_all(struct vbdev_tier *t, void (*cb)(void *cb_arg, int rc), void *cb_arg)
 {
-	size_t bufsz = (size_t)t->sb_blocks * t->blocklen;
-
-	if (t->sb_blocks == 0 || bufsz < sizeof(struct tier_superblock)) {
+	if (t->sb_blocks == 0 || t->blocklen == 0 ||
+	    TIER_SB_SLOT_BYTES % t->blocklen != 0 ||
+	    sizeof(struct tier_superblock) > TIER_SB_SLOT_BYTES) {
 		return -EINVAL;
 	}
 	if (cb != NULL) {
@@ -294,6 +326,7 @@ struct tier_sb_read_ctx {
 	struct spdk_io_channel	*ch;
 	void			*buf;
 	uint32_t		sb_blocks;
+	uint32_t		blocklen;
 	void			(*cb)(void *cb_arg, const struct tier_superblock *sb, int rc);
 	void			*cb_arg;
 };
@@ -310,9 +343,9 @@ tier_sb_read_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	if (!success) {
 		rc = -EIO;
 	} else {
-		sb = (const struct tier_superblock *)rc_ctx->buf;
-		if (!tier_sb_valid(sb)) {
-			sb = NULL;
+		/* F-5: both slots were read — take the valid one with the highest seq. */
+		sb = tier_sb_select(rc_ctx->buf, (size_t)rc_ctx->sb_blocks * rc_ctx->blocklen);
+		if (sb == NULL) {
 			rc = -EILSEQ;	/* no / invalid superblock on this disk */
 		}
 	}
@@ -339,6 +372,7 @@ tier_sb_read_desc(struct spdk_bdev_desc *desc, uint32_t blocklen,
 	}
 	ctx->desc = desc;
 	ctx->sb_blocks = sb_blocks;
+	ctx->blocklen = blocklen;
 	ctx->cb = cb;
 	ctx->cb_arg = cb_arg;
 	ctx->buf = spdk_dma_zmalloc(bufsz, blocklen, NULL);

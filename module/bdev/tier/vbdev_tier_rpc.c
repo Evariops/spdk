@@ -15,6 +15,7 @@
 #include "spdk/util.h"
 #include "spdk/string.h"
 #include "spdk/log.h"
+#include "spdk/uuid.h"
 
 /* ---- bdev_tier_create {name, md_num_blocks} ---------------------------------- */
 
@@ -448,11 +449,19 @@ rpc_read_sb_done(void *cb_arg, const struct tier_superblock *sb, int rc)
 	if (rc != 0 || sb == NULL) {
 		spdk_json_write_named_bool(w, "valid", false);
 	} else {
+		char uuid_str[SPDK_UUID_STRING_LEN];
+
 		spdk_json_write_named_bool(w, "valid", true);
 		spdk_json_write_named_string(w, "composite_name", sb->composite_name);
 		spdk_json_write_named_uint64(w, "seq", sb->seq);
+		spdk_json_write_named_uint32(w, "version", sb->version);
+		spdk_json_write_named_uint64(w, "created_epoch_sec", sb->created_epoch_sec);
+		/* F-2: expose the generation uuid so the CSI can fence stale disks. */
+		spdk_uuid_fmt_lower(uuid_str, sizeof(uuid_str),
+				    (const struct spdk_uuid *)sb->generation_uuid);
+		spdk_json_write_named_string(w, "generation_uuid", uuid_str);
 		spdk_json_write_named_uint64(w, "md_num_blocks", sb->md_num_blocks);
-		spdk_json_write_named_uint32(w, "cluster_blocks", sb->cluster_blocks);
+		spdk_json_write_named_uint64(w, "cluster_blocks", sb->cluster_blocks);
 		spdk_json_write_named_uint32(w, "md_mirror_a", sb->md_mirror_a);
 		spdk_json_write_named_uint32(w, "md_mirror_b", sb->md_mirror_b);
 		spdk_json_write_named_uint32(w, "num_bands", sb->num_bands);
@@ -515,3 +524,60 @@ rpc_bdev_tier_read_sb(struct spdk_jsonrpc_request *request, const struct spdk_js
 	}
 }
 SPDK_RPC_REGISTER("bdev_tier_read_sb", rpc_bdev_tier_read_sb, SPDK_RPC_RUNTIME)
+
+/* ---- PR2: evariops_get_capabilities — boot_id + schema versions + methods --- */
+
+extern char g_tier_boot_id[];	/* minted at module init (vbdev_tier.c) */
+
+/* The Evariops-fork RPC surface the control-plane probes for. Presence here is a
+ * capability signal; the CSI checks membership rather than relying on a build tag. */
+static const char *g_evariops_methods[] = {
+	"bdev_tier_create", "bdev_tier_add_band", "bdev_tier_assemble_band",
+	"bdev_tier_register", "bdev_tier_delete", "bdev_tier_retire_band",
+	"bdev_tier_resync_md", "bdev_tier_get_bands", "bdev_tier_read_sb",
+	"bdev_lvol_get_cluster_placement", "bdev_lvol_relocate_cluster",
+	"bdev_lvol_relocate_clusters", "bdev_lvol_remap_cluster",
+	"bdev_lvol_get_allocated_ranges",
+	"bdev_raid_rebuild_ranges", "vbdev_nexus_enable_heat",
+	"vbdev_nexus_disable_heat", "vbdev_nexus_get_heat",
+	"nvmf_subsystem_pause", "nvmf_subsystem_resume",
+	"bdev_cbt_create", "bdev_cbt_delete", "bdev_cbt_epoch_open",
+	"bdev_cbt_epoch_freeze", "bdev_cbt_epoch_close", "bdev_cbt_epoch_invalidate",
+	"bdev_cbt_epoch_get_dirty_ranges", "bdev_cbt_partial_rebuild",
+	"bdev_cbt_start_rebuild", "bdev_cbt_get_rebuild_status",
+	"bdev_cbt_cancel_rebuild", "bdev_cbt_reset",
+	"evariops_get_capabilities",
+};
+
+static void
+rpc_evariops_get_capabilities(struct spdk_jsonrpc_request *request,
+			      const struct spdk_json_val *params)
+{
+	struct spdk_json_write_ctx *w;
+	size_t i;
+
+	/* No params. A spurious body is tolerated (forward-compat with a probe that
+	 * sends options), but an explicit non-object is rejected. */
+	if (params != NULL && params->type != SPDK_JSON_VAL_OBJECT_BEGIN) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "no parameters expected");
+		return;
+	}
+
+	w = spdk_jsonrpc_begin_result(request);
+	spdk_json_write_object_begin(w);
+	/* boot_id: a fresh value across polls means the target restarted — the CSI
+	 * must then treat all volatile state (pauses, relocations, cbt epochs) as lost. */
+	spdk_json_write_named_string(w, "boot_id", g_tier_boot_id);
+	spdk_json_write_named_uint32(w, "tier_sb_version", TIER_SB_VERSION);
+	spdk_json_write_named_uint32(w, "capabilities_schema", 1);
+	spdk_json_write_named_bool(w, "single_reactor_assumed", true);	/* D5 (see RPC-CONTRACT) */
+	spdk_json_write_named_array_begin(w, "methods");
+	for (i = 0; i < SPDK_COUNTOF(g_evariops_methods); i++) {
+		spdk_json_write_string(w, g_evariops_methods[i]);
+	}
+	spdk_json_write_array_end(w);
+	spdk_json_write_object_end(w);
+	spdk_jsonrpc_end_result(request, w);
+}
+SPDK_RPC_REGISTER("evariops_get_capabilities", rpc_evariops_get_capabilities, SPDK_RPC_RUNTIME)

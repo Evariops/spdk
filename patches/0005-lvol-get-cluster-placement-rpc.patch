@@ -1,18 +1,12 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Evariops <dev@evariops.com>
-Date: Sat, 4 Jul 2026 10:58:26 +0200
-Subject: [PATCH 05/10] lvol: get_cluster_placement + relocate_cluster +
- remap_cluster RPCs
+Date: Sat, 4 Jul 2026 15:26:58 +0200
+Subject: [PATCH 05/10] 0005-lvol-get-cluster-placement-rpc.patch
 
-Evariops 0005. C1: relocate runs under a BLOB freeze (not a composite
-quiesce). N-2: the blob is pinned by an own open-ref for the async chain.
-P-2: the lvol must live on the given tier composite. N-7/W6: remap requires
-the source band DEGRADED and the destination band ACTIVE. m9: the placement
-scan (not just the emission) is bounded per call.
 ---
  module/bdev/lvol/Makefile              |   3 +-
- module/bdev/lvol/vbdev_lvol_tier_rpc.c | 643 +++++++++++++++++++++++++
- 2 files changed, 645 insertions(+), 1 deletion(-)
+ module/bdev/lvol/vbdev_lvol_tier_rpc.c | 963 +++++++++++++++++++++++++
+ 2 files changed, 965 insertions(+), 1 deletion(-)
  create mode 100644 module/bdev/lvol/vbdev_lvol_tier_rpc.c
 
 diff --git a/module/bdev/lvol/Makefile b/module/bdev/lvol/Makefile
@@ -31,10 +25,10 @@ index aba6620..a8ed387 100644
  SPDK_MAP_FILE = $(SPDK_ROOT_DIR)/mk/spdk_blank.map
 diff --git a/module/bdev/lvol/vbdev_lvol_tier_rpc.c b/module/bdev/lvol/vbdev_lvol_tier_rpc.c
 new file mode 100644
-index 0000000..65670ba
+index 0000000..79408c2
 --- /dev/null
 +++ b/module/bdev/lvol/vbdev_lvol_tier_rpc.c
-@@ -0,0 +1,643 @@
+@@ -0,0 +1,963 @@
 +/*   SPDX-License-Identifier: BSD-3-Clause
 + *   Copyright (C) 2026 Evariops.
 + *   All rights reserved.
@@ -364,9 +358,10 @@ index 0000000..65670ba
 +	}
 +	c->frozen = true;
 +	/* The copy reads/writes the base bdevs DIRECTLY (below the blob), so it is
-+	 * NOT held by the blob freeze. */
++	 * NOT held by the blob freeze. Single-cluster path always verifies (PF4 opt-out
++	 * is exposed on the batch RPC). */
 +	rc = vbdev_tier_relocate_copy(c->tier, c->old_lba, c->new_lba, c->cluster_blocks,
-+				      relocate_copied, c);
++				      true, relocate_copied, c);
 +	if (rc != 0) {
 +		relocate_finish(c, rc);
 +	}
@@ -490,6 +485,325 @@ index 0000000..65670ba
 +	free(req.tier_name);
 +}
 +SPDK_RPC_REGISTER("bdev_lvol_relocate_cluster", rpc_bdev_lvol_relocate_cluster, SPDK_RPC_RUNTIME)
++
++/* ===================== PF3: batch relocate — ONE freeze over N clusters ========
++ * bdev_lvol_relocate_cluster freezes/unfreezes the blob per cluster (~3× cluster
++ * of stalled blob I/O each). PF3 amortizes that: freeze ONCE, run claim→copy→
++ * commit for every {cluster_num, dst_lba_start, dst_lba_count} sequentially, then
++ * unfreeze ONCE. Correctness is identical (each cluster still swaps its L2P under
++ * the same held freeze); only the freeze/unfreeze count drops from N to 1.
++ * verify (PF4): forwarded to each copy — false skips the C5 read-back on trusted
++ * media. On any per-cluster error the batch STOPS at that cluster (releasing its
++ * un-committed claim) and reports how many committed — the caller retries the
++ * tail. Bounded to RPC_BATCH_MAX clusters per call. */
++
++#define RPC_BATCH_MAX 4096u
++
++struct batch_item {
++	uint64_t cluster_num;
++	uint64_t dst_lba_start;
++	uint64_t dst_lba_count;
++};
++
++struct batch_ctx {
++	struct spdk_jsonrpc_request	*request;
++	struct spdk_blob		*blob;
++	struct vbdev_tier		*tier;
++	uint64_t			cluster_blocks;
++	bool				verify;
++	struct batch_item		*items;
++	uint32_t			num_items;
++	uint32_t			cur;		/* index being processed */
++	uint32_t			done;		/* committed count */
++	uint64_t			cur_old_lba;
++	uint64_t			cur_new_lba;
++	bool				cur_claimed;
++	bool				frozen;
++	bool				ref_held;
++	int				rc;		/* first fatal error */
++};
++
++static void batch_step(struct batch_ctx *c);
++
++static void
++batch_reply(struct batch_ctx *c, int rc)
++{
++	struct spdk_json_write_ctx *w;
++
++	relocate_blob_release(c->blob);
++	/* Partial success is still a success at the RPC layer: the caller reads
++	 * `relocated` and retries the remainder. A hard rc only when NOTHING moved. */
++	if (rc == 0 || c->done > 0) {
++		w = spdk_jsonrpc_begin_result(c->request);
++		spdk_json_write_object_begin(w);
++		spdk_json_write_named_uint32(w, "relocated", c->done);
++		spdk_json_write_named_uint32(w, "requested", c->num_items);
++		spdk_json_write_named_int32(w, "error", rc);
++		spdk_json_write_object_end(w);
++		spdk_jsonrpc_end_result(c->request, w);
++	} else {
++		spdk_jsonrpc_send_error_response_fmt(c->request, rc, "relocate batch failed: %s",
++						     spdk_strerror(rc < 0 ? -rc : rc));
++	}
++	free(c->items);
++	free(c);
++}
++
++static void
++batch_ref_closed(void *cb_arg, int bserrno)
++{
++	struct batch_ctx *c = cb_arg;
++
++	(void)bserrno;
++	batch_reply(c, c->rc);
++}
++
++static void
++batch_unfrozen(void *cb_arg, int status)
++{
++	struct batch_ctx *c = cb_arg;
++
++	(void)status;
++	if (c->ref_held) {
++		c->ref_held = false;
++		spdk_blob_close(c->blob, batch_ref_closed, c);
++		return;
++	}
++	batch_reply(c, c->rc);
++}
++
++/* Terminal: release any un-committed claim, unfreeze ONCE, drop ref, reply. */
++static void
++batch_finish(struct batch_ctx *c, int rc)
++{
++	c->rc = rc;
++	if (c->cur_claimed) {
++		spdk_blob_release_cluster_lba(c->blob, c->cur_new_lba);
++		c->cur_claimed = false;
++	}
++	if (c->frozen) {
++		c->frozen = false;
++		if (spdk_blob_unfreeze_io(c->blob, batch_unfrozen, c) == 0) {
++			return;
++		}
++		SPDK_ERRLOG("relocate batch: UNFREEZE DISPATCH FAILED — blob I/O left frozen!\n");
++	}
++	batch_unfrozen(c, 0);
++}
++
++static void
++batch_committed(void *cb_arg, int bserrno)
++{
++	struct batch_ctx *c = cb_arg;
++
++	if (bserrno != 0) {
++		batch_finish(c, bserrno);
++		return;
++	}
++	c->cur_claimed = false;	/* commit took ownership of new + released old */
++	c->done++;
++	c->cur++;
++	batch_step(c);		/* next cluster, still under the same freeze */
++}
++
++static void
++batch_copied(void *cb_arg, int status)
++{
++	struct batch_ctx *c = cb_arg;
++	int rc;
++
++	if (status != 0) {
++		batch_finish(c, status);
++		return;
++	}
++	rc = spdk_blob_relocate_commit(c->blob, c->items[c->cur].cluster_num, c->cur_new_lba,
++				       batch_committed, c);
++	if (rc != 0) {
++		batch_finish(c, rc);
++	}
++}
++
++/* Process one cluster: resolve+claim+copy. Runs while the blob stays frozen. */
++static void
++batch_step(struct batch_ctx *c)
++{
++	struct batch_item *it;
++	int rc;
++
++	if (c->cur >= c->num_items) {
++		batch_finish(c, 0);	/* all done */
++		return;
++	}
++	it = &c->items[c->cur];
++	c->cur_old_lba = spdk_blob_get_cluster_lba(c->blob, it->cluster_num);
++	if (c->cur_old_lba == 0) {
++		batch_finish(c, -ENOENT);	/* cluster not allocated */
++		return;
++	}
++	rc = spdk_blob_claim_cluster_in_range(c->blob, it->dst_lba_start, it->dst_lba_count,
++					      &c->cur_new_lba);
++	if (rc != 0) {
++		batch_finish(c, rc);
++		return;
++	}
++	c->cur_claimed = true;
++	rc = vbdev_tier_relocate_copy(c->tier, c->cur_old_lba, c->cur_new_lba, c->cluster_blocks,
++				      c->verify, batch_copied, c);
++	if (rc != 0) {
++		batch_finish(c, rc);
++	}
++}
++
++static void
++batch_frozen(void *cb_arg, int status)
++{
++	struct batch_ctx *c = cb_arg;
++
++	if (status != 0) {
++		batch_finish(c, status);
++		return;
++	}
++	c->frozen = true;
++	batch_step(c);
++}
++
++static void
++batch_blob_opened(void *cb_arg, struct spdk_blob *blob, int bserrno)
++{
++	struct batch_ctx *c = cb_arg;
++	int rc;
++
++	if (bserrno != 0) {
++		batch_finish(c, bserrno);
++		return;
++	}
++	assert(blob == c->blob);
++	c->ref_held = true;
++	rc = spdk_blob_freeze_io(c->blob, batch_frozen, c);
++	if (rc != 0) {
++		batch_finish(c, rc);
++	}
++}
++
++struct rpc_lvol_relocate_batch {
++	char			*name;
++	char			*tier_name;
++	bool			verify;
++	struct batch_item	*items;
++	size_t			num_items;
++};
++
++static int
++decode_batch_item(const struct spdk_json_val *val, void *out)
++{
++	struct batch_item *it = out;
++	const struct spdk_json_object_decoder d[] = {
++		{"cluster_num", offsetof(struct batch_item, cluster_num), spdk_json_decode_uint64},
++		{"dst_lba_start", offsetof(struct batch_item, dst_lba_start), spdk_json_decode_uint64},
++		{"dst_lba_count", offsetof(struct batch_item, dst_lba_count), spdk_json_decode_uint64},
++	};
++
++	return spdk_json_decode_object(val, d, SPDK_COUNTOF(d), it) ? -1 : 0;
++}
++
++static int
++decode_batch_items(const struct spdk_json_val *val, void *out)
++{
++	struct rpc_lvol_relocate_batch *req = SPDK_CONTAINEROF(out, struct rpc_lvol_relocate_batch, items);
++
++	req->items = calloc(RPC_BATCH_MAX, sizeof(struct batch_item));
++	if (req->items == NULL) {
++		return -1;
++	}
++	return spdk_json_decode_array(val, decode_batch_item, req->items, RPC_BATCH_MAX,
++				      &req->num_items, sizeof(struct batch_item));
++}
++
++static const struct spdk_json_object_decoder rpc_lvol_relocate_batch_decoders[] = {
++	{"name", offsetof(struct rpc_lvol_relocate_batch, name), spdk_json_decode_string},
++	{"tier_name", offsetof(struct rpc_lvol_relocate_batch, tier_name), spdk_json_decode_string},
++	{"verify", offsetof(struct rpc_lvol_relocate_batch, verify), spdk_json_decode_bool, true},
++	{"clusters", offsetof(struct rpc_lvol_relocate_batch, items), decode_batch_items},
++};
++
++static void
++rpc_bdev_lvol_relocate_clusters(struct spdk_jsonrpc_request *request,
++				const struct spdk_json_val *params)
++{
++	struct rpc_lvol_relocate_batch req = { .verify = true };
++	struct spdk_bdev *bdev;
++	struct spdk_lvol *lvol;
++	struct spdk_blob *blob;
++	struct vbdev_tier *tier;
++	struct batch_ctx *c;
++	uint64_t cluster_size, blocklen;
++
++	if (spdk_json_decode_object(params, rpc_lvol_relocate_batch_decoders,
++				    SPDK_COUNTOF(rpc_lvol_relocate_batch_decoders), &req)) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
++						 "spdk_json_decode_object failed");
++		goto cleanup;
++	}
++	if (req.num_items == 0) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS, "no clusters");
++		goto cleanup;
++	}
++	bdev = spdk_bdev_get_by_name(req.name);
++	if (bdev == NULL || (lvol = vbdev_lvol_get_from_bdev(bdev)) == NULL) {
++		spdk_jsonrpc_send_error_response(request, -ENODEV, "lvol not found");
++		goto cleanup;
++	}
++	tier = vbdev_tier_get_by_name(req.tier_name);
++	if (tier == NULL) {
++		spdk_jsonrpc_send_error_response(request, -ENODEV, "tier not found");
++		goto cleanup;
++	}
++	blob = lvol->blob;
++	if (!lvol_lives_on_tier(lvol, tier)) {		/* P-2 */
++		spdk_jsonrpc_send_error_response(request, -EINVAL,
++						 "lvol does not live on this tier composite (P-2)");
++		goto cleanup;
++	}
++	if (spdk_blob_is_snapshot(blob)) {		/* F2 */
++		spdk_jsonrpc_send_error_response(request, -EBUSY,
++						 "cannot relocate a snapshot blob's clusters (F2)");
++		goto cleanup;
++	}
++	blocklen = spdk_bdev_get_block_size(bdev);
++	if (blocklen == 0) {
++		spdk_jsonrpc_send_error_response(request, -EINVAL, "bad blocklen");
++		goto cleanup;
++	}
++	cluster_size = spdk_bs_get_cluster_size(lvol->lvol_store->blobstore);
++	if (!relocate_blob_acquire(blob)) {		/* F4: one relocate/remap per blob */
++		spdk_jsonrpc_send_error_response(request, -EBUSY,
++						 "another relocate is in flight on this blob (F4)");
++		goto cleanup;
++	}
++	c = calloc(1, sizeof(*c));
++	if (c == NULL) {
++		relocate_blob_release(blob);
++		spdk_jsonrpc_send_error_response(request, -ENOMEM, "oom");
++		goto cleanup;
++	}
++	c->request = request;
++	c->blob = blob;
++	c->tier = tier;
++	c->cluster_blocks = cluster_size / blocklen;
++	c->verify = req.verify;
++	c->items = req.items;		/* ownership transferred to the ctx */
++	req.items = NULL;
++	c->num_items = (uint32_t)req.num_items;
++
++	/* N-2: pin the blob, freeze ONCE, then run the whole batch under that freeze. */
++	spdk_bs_open_blob(lvol->lvol_store->blobstore, spdk_blob_get_id(blob),
++			  batch_blob_opened, c);
++cleanup:
++	free(req.name);
++	free(req.tier_name);
++	free(req.items);
++}
++SPDK_RPC_REGISTER("bdev_lvol_relocate_clusters", rpc_bdev_lvol_relocate_clusters, SPDK_RPC_RUNTIME)
 +
 +/* ===================== F6: remap_cluster (re-home a LOST cluster, no copy) ===== */
 +

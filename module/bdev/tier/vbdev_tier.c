@@ -25,6 +25,7 @@
 #include "spdk/util.h"
 #include "spdk/likely.h"
 #include "spdk/crc32.h"
+#include "spdk/uuid.h"
 
 static int vbdev_tier_init(void);
 static void vbdev_tier_finish(void);
@@ -719,6 +720,16 @@ vbdev_tier_create(const char *name, uint64_t md_num_blocks, uint64_t cluster_blo
 	t->md_mirror_b = UINT32_MAX;
 	t->blocklen = 0;
 	t->total_num_blocks = 0;
+	/* F-2: mint the composite INSTANCE uuid — stored in every SB copy. A
+	 * re-created composite gets a fresh uuid, so disks left over from a
+	 * previous life can never be cross-assembled with the new instance. */
+	{
+		struct spdk_uuid u;
+
+		SPDK_STATIC_ASSERT(sizeof(u) == TIER_SB_GEN_UUID_LEN, "uuid size");
+		spdk_uuid_generate(&u);
+		memcpy(t->gen_uuid, &u, sizeof(t->gen_uuid));
+	}
 
 	t->bdev.name = strdup(name);
 	if (t->bdev.name == NULL) {
@@ -1209,6 +1220,7 @@ struct tier_copy_ctx {
 	uint64_t		num_blocks;
 	uint32_t		blocklen;
 	uint32_t		src_crc;	/* CRC32c of buf, computed after the source read */
+	bool			verify;		/* PF4: run the C5 read-back+CRC (per disk class) */
 	tier_relocate_cb	cb_fn;
 	void			*cb_arg;
 };
@@ -1289,6 +1301,14 @@ tier_copy_write_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 		tier_copy_finish(c, -EIO);
 		return;
 	}
+	/* PF4: the C5 read-back+verify is optional per disk class — on media the
+	 * control-plane trusts, skip the extra flush+read (halves the relocate I/O).
+	 * The blob-freeze (C1) already makes the move correct; verify only detects a
+	 * SILENT media/write corruption at relocate time. */
+	if (!c->verify) {
+		tier_copy_finish(c, 0);
+		return;
+	}
 	/* C5 (F8): FLUSH the destination so the read-back hits media (not the base-bdev write cache),
 	 * otherwise a silent MEDIA corruption would be masked by the cache. Then read back + verify CRC. */
 	rc = spdk_bdev_flush_blocks(c->dst_band->desc, c->dst_ch, c->dst_phys, c->num_blocks,
@@ -1310,7 +1330,9 @@ tier_copy_read_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 		return;
 	}
 	/* C5: snapshot the source CRC now (under quiesce, so the source is stable). */
-	c->src_crc = spdk_crc32c_update(c->buf, c->num_blocks * (uint64_t)c->blocklen, ~0u);
+	if (c->verify) {
+		c->src_crc = spdk_crc32c_update(c->buf, c->num_blocks * (uint64_t)c->blocklen, ~0u);
+	}
 	rc = spdk_bdev_write_blocks(c->dst_band->desc, c->dst_ch, c->buf, c->dst_phys,
 				    c->num_blocks, tier_copy_write_done, c);
 	if (rc != 0) {
@@ -1329,7 +1351,7 @@ tier_copy_read_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
  * it is not itself held by the freeze. */
 int
 vbdev_tier_relocate_copy(struct vbdev_tier *t, uint64_t src_lba, uint64_t dst_lba,
-			 uint64_t num_blocks, tier_relocate_cb cb_fn, void *cb_arg)
+			 uint64_t num_blocks, bool verify, tier_relocate_cb cb_fn, void *cb_arg)
 {
 	struct tier_copy_ctx *c;
 	struct tier_band *sb, *db;
@@ -1358,6 +1380,7 @@ vbdev_tier_relocate_copy(struct vbdev_tier *t, uint64_t src_lba, uint64_t dst_lb
 	c->num_blocks = num_blocks;
 	c->blocklen = t->blocklen;
 	c->dst_phys = db->phys_offset + dst_off;
+	c->verify = verify;
 	c->cb_fn = cb_fn;
 	c->cb_arg = cb_arg;
 	c->buf = spdk_dma_malloc(num_blocks * (uint64_t)t->blocklen, t->blocklen, NULL);
@@ -1630,9 +1653,19 @@ vbdev_tier_resync_md(struct vbdev_tier *t, uint32_t target_band_id,
  * module init / finish
  * -------------------------------------------------------------------------- */
 
+/* PR2: per-process boot id, minted once at module init. The CSI compares it
+ * across polls to detect a target restart — which invalidates ALL volatile
+ * state (standing pauses, in-flight relocations, cbt epochs). Exposed by
+ * evariops_get_capabilities (vbdev_tier_rpc.c). */
+char g_tier_boot_id[SPDK_UUID_STRING_LEN];
+
 static int
 vbdev_tier_init(void)
 {
+	struct spdk_uuid u;
+
+	spdk_uuid_generate(&u);
+	spdk_uuid_fmt_lower(g_tier_boot_id, sizeof(g_tier_boot_id), &u);
 	return 0;
 }
 

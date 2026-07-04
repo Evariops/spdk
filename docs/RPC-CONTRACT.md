@@ -1,0 +1,125 @@
+# Evariops fork — RPC contract (SPEC-73 / SPEC-66)
+
+Contract sheet for the JSON-RPC surface the CSI control-plane drives (PR1). For
+each RPC: preconditions, idempotence, and crash behavior. The invariants P1–P5
+and the decisions D5/CBT-7 that the control-plane must honor are stated at the
+end. This is the fork-side half; the paired control-plane guards live in
+`spdk-csi/docs/reports/2026-07-04_remediations-appariees-fork-spdk.md`.
+
+Probe support with `evariops_get_capabilities` (below) before assuming any of
+these exist — on vanilla SPDK they return JSON-RPC -32601.
+
+## Global assumptions
+
+- **D5 — single reactor (`-m 0x1`).** The standing-pause registry (0003),
+  `g_relocate_inflight` (0005), `band->state`, and the heat counters assume all
+  RPC handlers run on one reactor, lock-free. `nvmf_subsystem_pause` logs an
+  error if it ever sees >1 reactor. Widening the CPU mask requires a concurrency
+  pass first. `evariops_get_capabilities` reports `single_reactor_assumed: true`.
+- **Volatile state dies with the process.** Standing pauses, in-flight
+  relocations, cbt epochs and rebuilds are RAM-only. A target restart loses them
+  all — detect it via `boot_id` (below) and reconcile.
+
+## evariops_get_capabilities
+
+- **Params**: none.
+- **Returns**: `boot_id` (per-process uuid), `tier_sb_version`,
+  `capabilities_schema`, `single_reactor_assumed`, `methods[]`.
+- **Use**: a changed `boot_id` across polls ⇒ the target restarted ⇒ treat all
+  volatile state as lost. `methods[]` membership is the capability probe.
+- Idempotent, read-only.
+
+## Lifecycle — tier
+
+| RPC | Preconditions | Idempotence | Crash behavior |
+|:----|:--------------|:------------|:---------------|
+| `bdev_tier_create` | name free; `md_num_blocks>0` | -EEXIST if name taken | in-RAM only until first SB write |
+| `bdev_tier_add_band` | tier exists, not registered; unique wwn; disk ≥ sb+md | band_id auto-assigned; caller replays deterministically | — |
+| `bdev_tier_assemble_band` | band_id<64; state≤RETIRED; no overlap; fits disk; unique wwn | -EEXIST on duplicate band_id | places at stored geometry |
+| `bdev_tier_register` | ≥1 band, cluster-aligned geometry | **-EEXIST if already registered (W1)** | persists SB on success |
+| `bdev_tier_retire_band` | not an md-mirror band (-EBUSY, T-7) | **idempotent**: re-run re-persists + re-closes | **async: acks only after SB durable (MJ6)**; rc≠0 ⇒ retry |
+| `bdev_tier_resync_md` | target is a DEGRADED md leg; healthy source leg exists | re-runnable (leg stays DEGRADED on failure) | copy under md-range quiesce; acks after activate+persist |
+| `bdev_tier_delete` | — | -ENODEV if absent | unregister → destruct |
+| `bdev_tier_get_bands` / `bdev_tier_read_sb` | — | read-only | read_sb returns highest-seq valid slot + `generation_uuid` |
+
+`bdev_tier_read_sb` exposes `version`, `seq`, `generation_uuid`,
+`created_epoch_sec`. **Assembly (control-plane) must**: read every candidate
+disk's SB, group by `generation_uuid` (fence stale disks from a previous
+instance), take the highest `seq` per band, and if the two md legs disagree on
+`seq`, assemble the higher one ACTIVE and the other DEGRADED then
+`bdev_tier_resync_md` (G-CSI-2). The fork persists DEGRADED but cannot arbitrate
+a split-brain across disks.
+
+## Data-plane — relocate / remap (patch 0005)
+
+- `bdev_lvol_relocate_cluster {name, tier_name, cluster_num, dst_lba_start, dst_lba_count}`
+  - **P-2**: the lvol must live on `tier_name`'s composite (-EINVAL else).
+  - **F2**: refuses snapshot blobs (-EBUSY).
+  - **F4**: one relocate/remap in flight per blob (-EBUSY else).
+  - **C1**: runs under a **blob freeze** for copy+commit; ALL of the blob's I/O
+    stalls ~3× one cluster. **N-2**: the blob is pinned by an own open-ref for
+    the whole chain.
+  - Crash-safe (invariants A/B): a crash mid-op leaves an orphan cluster the
+    native blobstore replay reclaims; never a lost ACKed write.
+- `bdev_lvol_relocate_clusters {…, clusters:[…], verify?}` — **PF3 batch**: one
+  freeze amortized over N clusters (≤4096). Correctness identical to the single
+  form. `verify` (**PF4**, default true) forwards to each copy; false skips the
+  C5 read-back on trusted media. Returns `{relocated, requested, error}` —
+  **partial success is a 200** (caller retries the tail from `relocated`).
+- `bdev_lvol_remap_cluster {…}` — **N-7/W6**: source band must be DEGRADED,
+  destination band ACTIVE. Relaxes invariant A intentionally (the cluster is
+  already lost; the subsequent `bdev_raid_rebuild_ranges` fills the new one). The
+  control-plane MUST journal the remap durably BEFORE calling and re-drive the
+  range rebuild at restart until confirmed (**PR3**, remap-before-rebuild).
+
+## Repair / rebuild
+
+- `bdev_raid_rebuild_ranges {name, ranges:[{start_lba,num_blocks}]}` — **C2**:
+  each chunk repaired under a channel-owned LBA lock (host writes held +
+  replayed). **P-3**: parity raids require **full-stripe-aligned** ranges
+  (-EINVAL else); the caller must align. **N-6**: a REMOVE aborts at the next
+  chunk (-ENODEV) — re-drive.
+- `bdev_raid_add_base_bdev {…, skip_rebuild}` — **CBT-3/P5**: skip_rebuild is a
+  "trust me" primitive; the control-plane MUST prove the residual delta is zero
+  (garde résidu-nul + INV-37) before calling. **CBT-6**: a channel-promotion
+  failure now unwinds fully and returns an error (the member is not left
+  half-wired) — treat as retryable. **CBT-7**: the SB flips to CONFIGURED only
+  after the unquiesce; a crash between the two costs a full rebuild at reboot
+  (conservative, safe).
+
+## CBT epochs / rebuild
+
+- `bdev_cbt_epoch_freeze` / `epoch_close` / `epoch_open` (higher generation):
+  return **-EBUSY** while a rebuild is RUNNING on the epoch (**CBT-1/2/c5**) —
+  the control-plane must `bdev_cbt_cancel_rebuild` first.
+- `bdev_cbt_partial_rebuild` / `bdev_cbt_start_rebuild`: one rebuild per
+  (cbt, epoch); a second returns -EBUSY (interpret as "already running", not a
+  failure). **CBT-4**: the rebuild FLUSHes the target before COMPLETED.
+- `bdev_cbt_reset`: refused while any epoch is active. Bitmap clearing is
+  reset-driven (**D3** — no automatic healthy-clear).
+- After a base-bdev hot-remove the cbt vbdev is NOT silently recreated with a
+  virgin bitmap (**c4**); recreation is an explicit `bdev_cbt_create` and the
+  delta history is considered lost (epoch_invalidate → full rebuild if needed).
+
+## Pause barrier (patch 0003, SPEC-66 H10)
+
+- `nvmf_subsystem_pause {nqn, nsid?, ttl_ms?}` — a **standing, drain-certified**
+  barrier: the 200 OK certifies the drain. Returns an opaque `token`
+  (`<instance>:<epoch>`) and the applied `ttl_ms` (clamped to 60 s, logged if
+  clamped). Idempotent re-pause refreshes the TTL. TTL auto-resumes a leaked
+  pause. **The registry entry is preallocated before the pause dispatch** — a
+  Paused subsystem always gets its entry+TTL (no orphan pause on OOM).
+- `nvmf_subsystem_resume {nqn, token?}` — reports `barrier_intact`: false means
+  the freeze broke (TTL/crash/other) between pause and resume, so the controller
+  must drop any snapshot taken under it. A stale `boot_id` implies the token is
+  dead.
+
+## Invariants the control-plane owns (P1–P5)
+
+- **P1** geometry is SB-authoritative (highest seq); CRD is intent.
+- **P2** relocate/remap target the lvol's own composite (enforced fork-side).
+- **P3** remap journaled before the call; range rebuild re-driven at restart.
+- **P4** skip_rebuild only after a proven-zero residual delta.
+- **P5** the reintegration order is `pause → final freeze → copy delta →
+  add_base_bdev(skip_rebuild) → await callback → resume`; verify by conformance
+  test.
