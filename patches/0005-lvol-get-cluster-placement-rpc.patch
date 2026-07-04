@@ -5,8 +5,8 @@ Subject: [PATCH 05/11] 0005-lvol-get-cluster-placement-rpc.patch
 
 ---
  module/bdev/lvol/Makefile              |    3 +-
- module/bdev/lvol/vbdev_lvol_tier_rpc.c | 1001 ++++++++++++++++++++++++
- 2 files changed, 1003 insertions(+), 1 deletion(-)
+ module/bdev/lvol/vbdev_lvol_tier_rpc.c | 1277 ++++++++++++++++++++++++
+ 2 files changed, 1279 insertions(+), 1 deletion(-)
  create mode 100644 module/bdev/lvol/vbdev_lvol_tier_rpc.c
 
 diff --git a/module/bdev/lvol/Makefile b/module/bdev/lvol/Makefile
@@ -25,10 +25,10 @@ index aba6620..a8ed387 100644
  SPDK_MAP_FILE = $(SPDK_ROOT_DIR)/mk/spdk_blank.map
 diff --git a/module/bdev/lvol/vbdev_lvol_tier_rpc.c b/module/bdev/lvol/vbdev_lvol_tier_rpc.c
 new file mode 100644
-index 0000000..797d6a3
+index 0000000..ac46c8d
 --- /dev/null
 +++ b/module/bdev/lvol/vbdev_lvol_tier_rpc.c
-@@ -0,0 +1,1001 @@
+@@ -0,0 +1,1277 @@
 +/*   SPDX-License-Identifier: BSD-3-Clause
 + *   Copyright (C) 2026 Evariops.
 + *   All rights reserved.
@@ -833,6 +833,55 @@ index 0000000..797d6a3
 +
 +/* ===================== F6: remap_cluster (re-home a LOST cluster, no copy) ===== */
 +
++/* Per-item remap pre-checks, shared by the single and the batch remap RPCs so
++ * both apply IDENTICAL guards (the idempotency contract — re-issuing a partially
++ * committed batch cleanly -EINVALs the already-moved items — depends on this).
++ * On success (0): *old_lba and *new_lba are set and a claim is HELD on *new_lba;
++ * the caller commits it (the commit consumes the claim) or releases it on abort.
++ * On failure (-errno): NO claim is held (released internally if a later check
++ * failed after the claim). Does NOT take the F4 in-flight guard nor the P-2/F2
++ * blob-level checks — those are batch-wide and stay in the callers. Guards, in
++ * order: cluster allocated (ENOENT) -> source band DEGRADED (N-7/W6, EINVAL) ->
++ * claim a dst cluster (ENOSPC/…) -> destination band ACTIVE (EINVAL). */
++static int
++remap_one_precheck(struct vbdev_tier *tier, struct spdk_blob *blob,
++		   const struct batch_item *it, uint64_t *old_lba, uint64_t *new_lba)
++{
++	struct tier_band *src_band, *dst_band;
++	uint64_t band_off, o, n;
++	int rc;
++
++	/* F6: re-home a cluster whose band DIED (unreadable) onto a healthy band WITHOUT copying — the
++	 * data is reconstructed afterwards by bdev_raid_rebuild_ranges writing through the nexus. We swap
++	 * the L2P to a freshly-claimed cluster on the target band and quarantine the old (dead) cluster.
++	 * Invariant A is intentionally relaxed (no data on new yet): the cluster was ALREADY lost, the
++	 * nexus serves reads from k+m redundancy meanwhile, and the subsequent range rebuild fills new. */
++	o = spdk_blob_get_cluster_lba(blob, it->cluster_num);
++	if (o == 0) {
++		return -ENOENT;			/* cluster not allocated */
++	}
++	/* N-7/W6: relaxing invariant A is only legitimate when the data is ALREADY
++	 * lost — the source band must be DEGRADED. Remapping a healthy cluster would
++	 * serve uninitialized garbage to every future read. */
++	src_band = vbdev_tier_band_of_lba(tier, o, &band_off);
++	if (src_band == NULL || src_band->state != TIER_BAND_DEGRADED) {
++		return -EINVAL;			/* source band not DEGRADED */
++	}
++	rc = spdk_blob_claim_cluster_in_range(blob, it->dst_lba_start, it->dst_lba_count, &n);
++	if (rc != 0) {
++		return rc;			/* no free cluster in target band */
++	}
++	/* The destination must be a HEALTHY band (the whole point is to re-home). */
++	dst_band = vbdev_tier_band_of_lba(tier, n, &band_off);
++	if (dst_band == NULL || dst_band->state != TIER_BAND_ACTIVE) {
++		spdk_blob_release_cluster_lba(blob, n);
++		return -EINVAL;			/* destination band not ACTIVE */
++	}
++	*old_lba = o;
++	*new_lba = n;
++	return 0;
++}
++
 +struct remap_ctx {
 +	struct spdk_jsonrpc_request	*request;
 +	struct spdk_blob		*blob;
@@ -927,9 +976,9 @@ index 0000000..797d6a3
 +	struct spdk_lvol *lvol;
 +	struct spdk_blob *blob;
 +	struct vbdev_tier *tier;
-+	struct tier_band *src_band, *dst_band;
++	struct batch_item item;
 +	struct remap_ctx *c;
-+	uint64_t old_lba, new_lba, band_off;
++	uint64_t old_lba, new_lba;
 +	int rc;
 +
 +	if (spdk_json_decode_object(params, rpc_lvol_relocate_decoders,
@@ -968,45 +1017,23 @@ index 0000000..797d6a3
 +		spdk_jsonrpc_send_error_response(request, -EBUSY, "cannot remap a snapshot blob's cluster (F2)");
 +		goto cleanup;
 +	}
-+	/* F6: re-home a cluster whose band DIED (unreadable) onto a healthy band WITHOUT copying — the
-+	 * data is reconstructed afterwards by bdev_raid_rebuild_ranges writing through the nexus. We swap
-+	 * the L2P to a freshly-claimed cluster on the target band and release the old (dead) cluster.
-+	 * Invariant A is intentionally relaxed (no data on new yet): the cluster was ALREADY lost, the
-+	 * nexus serves reads from k+m redundancy meanwhile, and the subsequent range rebuild fills new.
-+	 * NO quiesce/freeze: the source band is dead (no in-flight to drain). */
-+	old_lba = spdk_blob_get_cluster_lba(blob, req.cluster_num);
-+	if (old_lba == 0) {
-+		spdk_jsonrpc_send_error_response(request, -ENOENT, "cluster not allocated");
-+		goto cleanup;
-+	}
-+	/* N-7/W6: relaxing invariant A is only legitimate when the data is ALREADY
-+	 * lost — require the source band to be DEGRADED. Remapping a healthy
-+	 * cluster would serve uninitialized garbage to every future read. */
-+	src_band = vbdev_tier_band_of_lba(tier, old_lba, &band_off);
-+	if (src_band == NULL || src_band->state != TIER_BAND_DEGRADED) {
-+		spdk_jsonrpc_send_error_response(request, -EINVAL,
-+						 "remap source band is not DEGRADED (N-7): remap is only "
-+						 "valid for a lost cluster on a dead band");
-+		goto cleanup;
-+	}
-+	if (!relocate_blob_acquire(blob)) {	/* F4 */
++	/* F4: one relocate/remap in flight per blob. Taken before the per-item
++	 * pre-checks (which claim a dst cluster) and released on any error path. */
++	if (!relocate_blob_acquire(blob)) {
 +		spdk_jsonrpc_send_error_response(request, -EBUSY,
 +						 "another relocate is in flight on this blob (F4)");
 +		goto cleanup;
 +	}
-+	rc = spdk_blob_claim_cluster_in_range(blob, req.dst_lba_start, req.dst_lba_count, &new_lba);
++	/* Shared per-item guards (cluster allocated, source DEGRADED, claim dst,
++	 * dst ACTIVE): on success a claim is held on new_lba; on failure none is. */
++	item = (struct batch_item){ .cluster_num = req.cluster_num,
++				    .dst_lba_start = req.dst_lba_start,
++				    .dst_lba_count = req.dst_lba_count };
++	rc = remap_one_precheck(tier, blob, &item, &old_lba, &new_lba);
 +	if (rc != 0) {
 +		relocate_blob_release(blob);
-+		spdk_jsonrpc_send_error_response_fmt(request, rc, "no free cluster in target band: %s",
++		spdk_jsonrpc_send_error_response_fmt(request, rc, "remap failed: %s",
 +						     spdk_strerror(rc < 0 ? -rc : rc));
-+		goto cleanup;
-+	}
-+	/* The destination must be a HEALTHY band (the whole point is to re-home). */
-+	dst_band = vbdev_tier_band_of_lba(tier, new_lba, &band_off);
-+	if (dst_band == NULL || dst_band->state != TIER_BAND_ACTIVE) {
-+		spdk_blob_release_cluster_lba(blob, new_lba);
-+		relocate_blob_release(blob);
-+		spdk_jsonrpc_send_error_response(request, -EINVAL, "destination band not ACTIVE");
 +		goto cleanup;
 +	}
 +	c = calloc(1, sizeof(*c));
@@ -1030,6 +1057,255 @@ index 0000000..797d6a3
 +	free(req.tier_name);
 +}
 +SPDK_RPC_REGISTER("bdev_lvol_remap_cluster", rpc_bdev_lvol_remap_cluster, SPDK_RPC_RUNTIME)
++
++/* ===================== F6 batch: remap_clusters (re-home N LOST clusters) ======
++ * The no-copy analogue of bdev_lvol_relocate_clusters: collapse N per-cluster
++ * bdev_lvol_remap_cluster round-trips (a full band drain is hundreds–thousands of
++ * clusters) into ONE RPC before a single bdev_raid_rebuild_ranges. Because remap
++ * is no-copy on a DEAD source band, it takes NO freeze (there is no in-flight to
++ * drain) — so unlike the relocate batch there is nothing to amortize and no
++ * foreground I/O stall: this is pure orchestration-overhead elimination.
++ * Per item it runs the SAME remap_one_precheck guards as the single form, then
++ * spdk_blob_relocate_commit(release_old=false) (R11 quarantine). Processed
++ * SEQUENTIALLY; the FIRST per-item error STOPS the batch (releasing that item's
++ * un-committed claim) and replies {remapped, requested, error} — partial success
++ * is a 200 (caller retries the tail from `remapped`). Bounded to RPC_BATCH_MAX.
++ * Crash-safety per item is identical to the single remap (invariant B); the
++ * control-plane journals the remap set and re-drives tail + rebuild at restart. */
++
++struct remap_batch_ctx {
++	struct spdk_jsonrpc_request	*request;
++	struct spdk_blob		*blob;
++	struct vbdev_tier		*tier;
++	struct batch_item		*items;
++	uint32_t			num_items;
++	uint32_t			cur;		/* index being processed */
++	uint32_t			done;		/* committed count */
++	uint64_t			cur_old_lba;
++	uint64_t			cur_new_lba;
++	bool				cur_claimed;
++	bool				ref_held;	/* N-2 */
++	int				rc;		/* first fatal error */
++};
++
++static void remap_batch_step(struct remap_batch_ctx *c);
++
++static void
++remap_batch_reply(struct remap_batch_ctx *c, int rc)
++{
++	struct spdk_json_write_ctx *w;
++
++	relocate_blob_release(c->blob);
++	/* Partial success is still a success at the RPC layer: the caller reads
++	 * `remapped` and retries the remainder. A hard rc only when NOTHING moved. */
++	if (rc == 0 || c->done > 0) {
++		w = spdk_jsonrpc_begin_result(c->request);
++		spdk_json_write_object_begin(w);
++		spdk_json_write_named_uint32(w, "remapped", c->done);
++		spdk_json_write_named_uint32(w, "requested", c->num_items);
++		spdk_json_write_named_int32(w, "error", rc);
++		spdk_json_write_object_end(w);
++		spdk_jsonrpc_end_result(c->request, w);
++	} else {
++		spdk_jsonrpc_send_error_response_fmt(c->request, rc, "remap batch failed: %s",
++						     spdk_strerror(rc < 0 ? -rc : rc));
++	}
++	free(c->items);
++	free(c);
++}
++
++static void
++remap_batch_ref_closed(void *cb_arg, int bserrno)
++{
++	struct remap_batch_ctx *c = cb_arg;
++
++	(void)bserrno;
++	remap_batch_reply(c, c->rc);
++}
++
++/* Terminal: release any un-committed claim, drop the blob ref, reply. There is NO
++ * unfreeze (the batch never freezes — the source band is dead). */
++static void
++remap_batch_finish(struct remap_batch_ctx *c, int rc)
++{
++	c->rc = rc;
++	if (c->cur_claimed) {
++		spdk_blob_release_cluster_lba(c->blob, c->cur_new_lba);
++		c->cur_claimed = false;
++	}
++	if (c->ref_held) {
++		c->ref_held = false;
++		spdk_blob_close(c->blob, remap_batch_ref_closed, c);
++		return;
++	}
++	remap_batch_reply(c, rc);
++}
++
++static void
++remap_batch_committed(void *cb_arg, int bserrno)
++{
++	struct remap_batch_ctx *c = cb_arg;
++
++	if (bserrno != 0) {
++		remap_batch_finish(c, bserrno);
++		return;
++	}
++	c->cur_claimed = false;	/* commit took ownership of new + quarantined old */
++	c->done++;
++	c->cur++;
++	remap_batch_step(c);	/* next cluster */
++}
++
++/* Process one cluster: shared pre-check (claim) + async commit. */
++static void
++remap_batch_step(struct remap_batch_ctx *c)
++{
++	struct batch_item *it;
++	int rc;
++
++	if (c->cur >= c->num_items) {
++		remap_batch_finish(c, 0);	/* all done */
++		return;
++	}
++	it = &c->items[c->cur];
++	rc = remap_one_precheck(c->tier, c->blob, it, &c->cur_old_lba, &c->cur_new_lba);
++	if (rc != 0) {
++		remap_batch_finish(c, rc);	/* stop at first per-item error */
++		return;
++	}
++	c->cur_claimed = true;
++	/* R11: remap → the OLD cluster is on a DEGRADED band → quarantine it
++	 * (release_old=false), never return it to the thin pool. */
++	rc = spdk_blob_relocate_commit(c->blob, it->cluster_num, c->cur_new_lba, false,
++				       remap_batch_committed, c);
++	if (rc != 0) {
++		remap_batch_finish(c, rc);
++	}
++}
++
++static void
++remap_batch_blob_opened(void *cb_arg, struct spdk_blob *blob, int bserrno)
++{
++	struct remap_batch_ctx *c = cb_arg;
++
++	if (bserrno != 0) {
++		remap_batch_finish(c, bserrno);
++		return;
++	}
++	assert(blob == c->blob);
++	c->ref_held = true;
++	remap_batch_step(c);
++}
++
++struct rpc_lvol_remap_batch {
++	char			*name;
++	char			*tier_name;
++	struct batch_item	*items;
++	size_t			num_items;
++};
++
++static int
++decode_remap_batch_items(const struct spdk_json_val *val, void *out)
++{
++	struct rpc_lvol_remap_batch *req = SPDK_CONTAINEROF(out, struct rpc_lvol_remap_batch, items);
++
++	/* R16: a duplicate "clusters" JSON key calls this decoder twice; without the
++	 * guard the second calloc overwrites req->items and leaks the first array.
++	 * Allocate once. (Same shape as decode_batch_items, distinct container type.) */
++	if (req->items == NULL) {
++		req->items = calloc(RPC_BATCH_MAX, sizeof(struct batch_item));
++		if (req->items == NULL) {
++			return -1;
++		}
++	}
++	return spdk_json_decode_array(val, decode_batch_item, req->items, RPC_BATCH_MAX,
++				      &req->num_items, sizeof(struct batch_item));
++}
++
++static const struct spdk_json_object_decoder rpc_lvol_remap_batch_decoders[] = {
++	{"name", offsetof(struct rpc_lvol_remap_batch, name), spdk_json_decode_string},
++	{"tier_name", offsetof(struct rpc_lvol_remap_batch, tier_name), spdk_json_decode_string},
++	{"clusters", offsetof(struct rpc_lvol_remap_batch, items), decode_remap_batch_items},
++};
++
++static void
++rpc_bdev_lvol_remap_clusters(struct spdk_jsonrpc_request *request,
++			     const struct spdk_json_val *params)
++{
++	struct rpc_lvol_remap_batch req = {};
++	struct spdk_bdev *bdev;
++	struct spdk_lvol *lvol;
++	struct spdk_blob *blob;
++	struct vbdev_tier *tier;
++	struct remap_batch_ctx *c;
++
++	if (spdk_json_decode_object(params, rpc_lvol_remap_batch_decoders,
++				    SPDK_COUNTOF(rpc_lvol_remap_batch_decoders), &req)) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
++						 "spdk_json_decode_object failed");
++		goto cleanup;
++	}
++	if (req.num_items == 0) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS, "no clusters");
++		goto cleanup;
++	}
++	/* SEC1: audit this batch L2P remap (re-homes N lost clusters). */
++	{
++		char detail[192];
++
++		snprintf(detail, sizeof(detail), "lvol=%s tier=%s clusters=%zu",
++			 req.name ? req.name : "?", req.tier_name ? req.tier_name : "?",
++			 req.num_items);
++		spdk_jsonrpc_request_audit(request, "bdev_lvol_remap_clusters", detail);
++	}
++	bdev = spdk_bdev_get_by_name(req.name);
++	if (bdev == NULL || (lvol = vbdev_lvol_get_from_bdev(bdev)) == NULL) {
++		spdk_jsonrpc_send_error_response(request, -ENODEV, "lvol not found");
++		goto cleanup;
++	}
++	tier = vbdev_tier_get_by_name(req.tier_name);
++	if (tier == NULL) {
++		spdk_jsonrpc_send_error_response(request, -ENODEV, "tier not found");
++		goto cleanup;
++	}
++	blob = lvol->blob;
++	if (!lvol_lives_on_tier(lvol, tier)) {		/* P-2 */
++		spdk_jsonrpc_send_error_response(request, -EINVAL,
++						 "lvol does not live on this tier composite (P-2)");
++		goto cleanup;
++	}
++	if (spdk_blob_is_snapshot(blob)) {		/* F2 */
++		spdk_jsonrpc_send_error_response(request, -EBUSY,
++						 "cannot remap a snapshot blob's clusters (F2)");
++		goto cleanup;
++	}
++	if (!relocate_blob_acquire(blob)) {		/* F4: one relocate/remap per blob */
++		spdk_jsonrpc_send_error_response(request, -EBUSY,
++						 "another relocate is in flight on this blob (F4)");
++		goto cleanup;
++	}
++	c = calloc(1, sizeof(*c));
++	if (c == NULL) {
++		relocate_blob_release(blob);
++		spdk_jsonrpc_send_error_response(request, -ENOMEM, "oom");
++		goto cleanup;
++	}
++	c->request = request;
++	c->blob = blob;
++	c->tier = tier;
++	c->items = req.items;		/* ownership transferred to the ctx */
++	req.items = NULL;
++	c->num_items = (uint32_t)req.num_items;
++
++	/* N-2: pin the blob for the whole async chain (no freeze — the source is dead). */
++	spdk_bs_open_blob(lvol->lvol_store->blobstore, spdk_blob_get_id(blob),
++			  remap_batch_blob_opened, c);
++cleanup:
++	free(req.name);
++	free(req.tier_name);
++	free(req.items);
++}
++SPDK_RPC_REGISTER("bdev_lvol_remap_clusters", rpc_bdev_lvol_remap_clusters, SPDK_RPC_RUNTIME)
 -- 
 2.50.1 (Apple Git-155)
 

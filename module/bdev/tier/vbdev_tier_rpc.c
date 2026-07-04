@@ -578,6 +578,7 @@ static const char *g_evariops_methods[] = {
 	"bdev_tier_resync_md", "bdev_tier_get_bands", "bdev_tier_read_sb",
 	"bdev_lvol_get_cluster_placement", "bdev_lvol_relocate_cluster",
 	"bdev_lvol_relocate_clusters", "bdev_lvol_remap_cluster",
+	"bdev_lvol_remap_clusters",
 	"bdev_lvol_get_allocated_ranges",
 	"bdev_raid_rebuild_ranges", "vbdev_nexus_enable_heat",
 	"vbdev_nexus_disable_heat", "vbdev_nexus_get_heat",
