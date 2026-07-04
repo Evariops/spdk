@@ -1,8 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Evariops <dev@evariops.com>
+Date: Sat, 4 Jul 2026 10:58:26 +0200
+Subject: [PATCH 04/10] blob: relocate primitives + public blob I/O freeze
+
+Evariops 0004. claim/commit/release relocate primitives (invariants A/B) and
+spdk_blob_freeze_io/spdk_blob_unfreeze_io - the blob-level barrier that
+closes the C1 lost-write (held I/O re-translates through the updated L2P on
+release). m8: assert the bit-pool claim invariant.
+---
+ include/spdk/blob.h    |  48 ++++++++
+ lib/blob/blobstore.c   | 263 +++++++++++++++++++++++++++++++++++++++++
+ lib/blob/spdk_blob.map |   6 +
+ 3 files changed, 317 insertions(+)
+
 diff --git a/include/spdk/blob.h b/include/spdk/blob.h
-index fe982157b..93cba5f5d 100644
+index fe98215..ad6510d 100644
 --- a/include/spdk/blob.h
 +++ b/include/spdk/blob.h
-@@ -544,6 +544,38 @@ uint64_t spdk_blob_get_num_allocated_clusters(struct spdk_blob *blob);
+@@ -544,6 +544,54 @@ uint64_t spdk_blob_get_num_allocated_clusters(struct spdk_blob *blob);
   */
  uint64_t spdk_blob_get_next_allocated_io_unit(struct spdk_blob *blob, uint64_t offset);
  
@@ -38,11 +53,27 @@ index fe982157b..93cba5f5d 100644
 + */
 +void spdk_blob_release_cluster_lba(struct spdk_blob *blob, uint64_t lba);
 +
++/**
++ * SPEC-73 C1: hold (freeze) all I/O submitted to this blob. Queued I/O resumes
++ * on unfreeze and RE-EXECUTES the blob→LBA translation, so a cluster relocated
++ * meanwhile is reached at its NEW physical location (the property a bdev-level
++ * quiesce cannot give — it replays the pre-translation LBA). Refcounted; may be
++ * called from any thread (internally dispatched to the blobstore md thread);
++ * cb_fn fires on the calling thread.
++ * \return 0 if dispatched, -ENOMEM otherwise.
++ */
++int spdk_blob_freeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
++
++/**
++ * SPEC-73 C1: release one freeze reference and replay the held I/O.
++ */
++int spdk_blob_unfreeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
++
  /**
   * Get next unallocated io_unit
   *
 diff --git a/lib/blob/blobstore.c b/lib/blob/blobstore.c
-index 7ae791ca2..5aa024c8b 100644
+index 7ae791c..69ea43e 100644
 --- a/lib/blob/blobstore.c
 +++ b/lib/blob/blobstore.c
 @@ -6246,6 +6246,20 @@ spdk_blob_get_next_unallocated_io_unit(struct spdk_blob *blob, uint64_t offset)
@@ -66,7 +97,7 @@ index 7ae791ca2..5aa024c8b 100644
  /* START spdk_bs_create_blob */
  
  static void
-@@ -9030,6 +9044,171 @@ blob_insert_cluster_on_md_thread(struct spdk_blob *blob, uint32_t cluster_num,
+@@ -9030,6 +9044,255 @@ blob_insert_cluster_on_md_thread(struct spdk_blob *blob, uint32_t cluster_num,
  	spdk_thread_send_msg(blob->bs->md_thread, blob_insert_cluster_msg, ctx);
  }
  
@@ -102,7 +133,12 @@ index 7ae791ca2..5aa024c8b 100644
 +	spdk_spin_lock(&bs->used_lock);
 +	for (c = c_start; c < c_end; c++) {
 +		if (!spdk_bit_pool_is_allocated(bs->used_clusters, c)) {
-+			spdk_bit_pool_set_bit_allocated(bs->used_clusters, c);
++			int claim_rc = spdk_bit_pool_set_bit_allocated(bs->used_clusters, c);
++
++			/* m8: cannot fail — c < capacity and the bit is free, both checked
++			 * under used_lock. Assert the invariant instead of ignoring it. */
++			assert(claim_rc == 0);
++			(void)claim_rc;
 +			bs->num_free_clusters--;
 +			*new_lba = bs_cluster_to_lba(bs, c);
 +			rc = 0;
@@ -235,14 +271,93 @@ index 7ae791ca2..5aa024c8b 100644
 +	return 0;
 +}
 +
++/* ===== SPEC-73 C1: public blob-level I/O freeze ========================
++ * Exposes the internal blob_freeze_io/blob_unfreeze_io (the primitive the
++ * snapshot/resize/delete paths already rely on) so the relocate orchestration
++ * can hold host I/O ABOVE the blob→LBA translation. This is what closes the
++ * C1 lost-write: I/O held by a freeze re-executes the translation on release
++ * (landing on the post-swap cluster), whereas I/O held by a composite-level
++ * quiesce replays a stale pre-swap LBA. Dispatches to the md thread (the
++ * internal primitives assert it); the callback returns on the caller thread. */
++
++struct blob_freeze_pub_ctx {
++	struct spdk_blob	*blob;
++	bool			freeze;
++	struct spdk_thread	*orig_thread;
++	spdk_blob_op_complete	cb_fn;
++	void			*cb_arg;
++	int			rc;
++};
++
++static void
++blob_freeze_pub_done_msg(void *arg)
++{
++	struct blob_freeze_pub_ctx *ctx = arg;
++
++	ctx->cb_fn(ctx->cb_arg, ctx->rc);
++	free(ctx);
++}
++
++static void
++blob_freeze_pub_done(void *cb_arg, int bserrno)
++{
++	struct blob_freeze_pub_ctx *ctx = cb_arg;
++
++	ctx->rc = bserrno;
++	spdk_thread_send_msg(ctx->orig_thread, blob_freeze_pub_done_msg, ctx);
++}
++
++static void
++blob_freeze_pub_msg(void *arg)
++{
++	struct blob_freeze_pub_ctx *ctx = arg;
++
++	if (ctx->freeze) {
++		blob_freeze_io(ctx->blob, blob_freeze_pub_done, ctx);
++	} else {
++		blob_unfreeze_io(ctx->blob, blob_freeze_pub_done, ctx);
++	}
++}
++
++static int
++blob_freeze_pub(struct spdk_blob *blob, bool freeze,
++		spdk_blob_op_complete cb_fn, void *cb_arg)
++{
++	struct blob_freeze_pub_ctx *ctx;
++
++	ctx = calloc(1, sizeof(*ctx));
++	if (ctx == NULL) {
++		return -ENOMEM;
++	}
++	ctx->blob = blob;
++	ctx->freeze = freeze;
++	ctx->orig_thread = spdk_get_thread();
++	ctx->cb_fn = cb_fn;
++	ctx->cb_arg = cb_arg;
++	spdk_thread_send_msg(blob->bs->md_thread, blob_freeze_pub_msg, ctx);
++	return 0;
++}
++
++int
++spdk_blob_freeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
++{
++	return blob_freeze_pub(blob, true, cb_fn, cb_arg);
++}
++
++int
++spdk_blob_unfreeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
++{
++	return blob_freeze_pub(blob, false, cb_fn, cb_arg);
++}
++
  static void
  blob_free_cluster_msg(void *arg)
  {
 diff --git a/lib/blob/spdk_blob.map b/lib/blob/spdk_blob.map
-index d4d85c2b6..44db84f51 100644
+index d4d85c2..071cfe9 100644
 --- a/lib/blob/spdk_blob.map
 +++ b/lib/blob/spdk_blob.map
-@@ -24,6 +24,10 @@
+@@ -24,6 +24,12 @@
  	spdk_blob_get_num_allocated_clusters;
  	spdk_blob_get_next_allocated_io_unit;
  	spdk_blob_get_next_unallocated_io_unit;
@@ -250,6 +365,11 @@ index d4d85c2b6..44db84f51 100644
 +	spdk_blob_claim_cluster_in_range;
 +	spdk_blob_relocate_commit;
 +	spdk_blob_release_cluster_lba;
++	spdk_blob_freeze_io;
++	spdk_blob_unfreeze_io;
  	spdk_blob_opts_init;
  	spdk_bs_create_blob_ext;
  	spdk_bs_create_blob;
+-- 
+2.50.1 (Apple Git-155)
+

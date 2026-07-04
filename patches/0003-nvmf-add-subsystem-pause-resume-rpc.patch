@@ -1,44 +1,17 @@
-From b261bd5574138a0a82ce7c1eeff6cc5be1af48c9 Mon Sep 17 00:00:00 2001
-From: Evariops <noreply@evariops.com>
-Date: Sun, 14 Jun 2026 01:30:31 +0200
-Subject: [PATCH] nvmf: add nvmf_subsystem_pause / nvmf_subsystem_resume RPC
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Evariops <dev@evariops.com>
+Date: Sat, 4 Jul 2026 10:58:26 +0200
+Subject: [PATCH 03/10] nvmf: add nvmf_subsystem_pause / nvmf_subsystem_resume
+ RPC
 
-Adds two SPDK_RPC_RUNTIME JSON-RPCs that turn the public
-spdk_nvmf_subsystem_pause/resume C API into a STANDING, drain-certified
-I/O barrier that holds a subsystem Paused across RPC calls -- the
-primitive spdk-csi needs for cross-volume crash-consistent group
-snapshots (SPEC-66 H10 / fork docs/SPEC-subsystem-pause-resume.md).
-
-Both RPCs respond only from the state-change completion callback, so a
-200 OK certifies the drain (pause) / the resume. A process-RAM registry
-of standing pauses provides:
-
-  - idempotent re-pause (refreshes a mandatory server-side TTL),
-  - TTL auto-resume so a leaked pause self-heals,
-  - a PSTATE_RESUMING guard so overlapping resumes (TTL vs explicit, or
-    explicit vs explicit) can never double-free a registry entry,
-  - a barrier-integrity token: pause returns an opaque "<instance>:<epoch>"
-    token, resume reports barrier_intact so the controller can drop a
-    snapshot whose freeze was broken by a TTL, a target restart, or a
-    third-party resume.
-
-The TTL ceiling is 60 s and must stay below the host I/O timeout
-(nvme_core.io_timeout); a pause that outlasts it makes the host abort
-despite the target queuing without error.
-
-The registry is lock-free and assumes a single reactor (-m 0x1, the
-production SPDK_CPU_MASK); the first pause logs an error if more than one
-reactor is active. Guard g_paused before widening the CPU mask.
-
-New file plus a one-line lib/nvmf/Makefile hunk to minimise upstream
-conflict surface. Additive and consumer-invisible behind a capability
-probe (rpc_get_methods).
-
-Signed-off-by: Evariops <noreply@evariops.com>
+Evariops 0003. Standing, drain-certified, TTL-guarded I/O barrier.
+Includes: registry entry preallocated before the pause dispatch (a Paused
+subsystem can no longer end up without entry+TTL on OOM), UUID-based
+per-process nonce (P-6), loud TTL clamp (S-8 follow-up).
 ---
  lib/nvmf/Makefile         |   2 +-
- lib/nvmf/nvmf_pause_rpc.c | 416 ++++++++++++++++++++++++++++++++++++++
- 2 files changed, 417 insertions(+), 1 deletion(-)
+ lib/nvmf/nvmf_pause_rpc.c | 442 ++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 443 insertions(+), 1 deletion(-)
  create mode 100644 lib/nvmf/nvmf_pause_rpc.c
 
 diff --git a/lib/nvmf/Makefile b/lib/nvmf/Makefile
@@ -56,10 +29,10 @@ index 3136f7a..0af5836 100644
  C_SRCS-$(CONFIG_HAVE_EVP_MAC) += auth.c
 diff --git a/lib/nvmf/nvmf_pause_rpc.c b/lib/nvmf/nvmf_pause_rpc.c
 new file mode 100644
-index 0000000..21e6951
+index 0000000..fbf6996
 --- /dev/null
 +++ b/lib/nvmf/nvmf_pause_rpc.c
-@@ -0,0 +1,416 @@
+@@ -0,0 +1,442 @@
 +/* lib/nvmf/nvmf_pause_rpc.c — SPDX-License-Identifier: BSD-3-Clause
 + * Evariops fork — companion of spdk-csi SPEC-66 (H10).
 + * nvmf_subsystem_pause / nvmf_subsystem_resume: a STANDING, drain-certified,
@@ -73,7 +46,8 @@ index 0000000..21e6951
 +#include "spdk/util.h"
 +#include "spdk/log.h"
 +#include "spdk/queue.h"
-+#include "spdk/env.h"           /* spdk_env_get_core_count, spdk_get_ticks */
++#include "spdk/env.h"           /* spdk_env_get_core_count */
++#include "spdk/uuid.h"          /* P-6: random per-process nonce */
 +
 +#define PAUSE_TTL_DEFAULT_MS  30000u
 +#define PAUSE_TTL_MAX_MS      60000u    /* 60 s ceiling; keep below host io_timeout (R2) */
@@ -110,7 +84,14 @@ index 0000000..21e6951
 +{
 +	static bool warned;
 +	if (g_instance == 0) {
-+		g_instance = (spdk_get_ticks() << 1) | 1;   /* nonzero per-process nonce */
++		/* P-6: random nonce (the old ticks<<1 discarded the high bit and could
++		 * collide across quick restarts). |1 keeps it provably nonzero. */
++		struct spdk_uuid u;
++		uint64_t hi;
++
++		spdk_uuid_generate(&u);
++		memcpy(&hi, &u, sizeof(hi));
++		g_instance = hi | 1;
 +	}
 +	/* RISK R4: the lock-free registry assumes a single reactor (-m 0x1). */
 +	if (!warned && spdk_env_get_core_count() > 1) {
@@ -209,6 +190,11 @@ index 0000000..21e6951
 +	uint32_t  nsid;          /* 0 => resolve to first namespace */
 +	uint32_t  ttl_ms;
 +	struct spdk_nvmf_subsystem *subsystem;
++	/* Registry entry PREALLOCATED before the pause dispatch: a post-drain alloc
++	 * failure used to leave the subsystem Paused with no registry entry and no
++	 * TTL (the exact leaked-pause state the design refuses), undone only by a
++	 * best-effort resume that could itself fail silently. */
++	struct paused_subsystem *prealloc;
 +};
 +
 +static const struct spdk_json_object_decoder rpc_pause_decoders[] = {
@@ -221,6 +207,7 @@ index 0000000..21e6951
 +static void
 +rpc_pause_ctx_free(struct rpc_pause_ctx *ctx)
 +{
++	free(ctx->prealloc);	/* NULL once consumed by pause_done */
 +	free(ctx->nqn); free(ctx->tgt_name); free(ctx);
 +}
 +
@@ -240,15 +227,11 @@ index 0000000..21e6951
 +	/* Drain certified: in-flight I/O complete, new I/O now queued target-side. */
 +	p = paused_find(ss);
 +	if (p == NULL) {
-+		p = calloc(1, sizeof(*p));
-+		if (p == NULL) {
-+			/* cannot arm TTL → refuse to leave a pause we can't auto-heal */
-+			spdk_nvmf_subsystem_resume(ss, NULL, NULL);   /* best-effort undo */
-+			spdk_jsonrpc_send_error_response(ctx->request,
-+				SPDK_JSONRPC_ERROR_INTERNAL_ERROR, "out of memory");
-+			rpc_pause_ctx_free(ctx);
-+			return;
-+		}
++		/* Entry was preallocated before dispatch — no OOM window exists here
++		 * (a Paused subsystem always gets its registry entry + TTL). */
++		p = ctx->prealloc;
++		ctx->prealloc = NULL;
++		assert(p != NULL);
 +		p->subsystem = ss;
 +		p->nsid = ctx->nsid;
 +		p->epoch = ++g_epoch;   /* new barrier → new token */
@@ -304,7 +287,13 @@ index 0000000..21e6951
 +		return;
 +	}
 +	if (ctx->ttl_ms == 0)             { ctx->ttl_ms = PAUSE_TTL_DEFAULT_MS; }
-+	if (ctx->ttl_ms > PAUSE_TTL_MAX_MS) { ctx->ttl_ms = PAUSE_TTL_MAX_MS; }
++	if (ctx->ttl_ms > PAUSE_TTL_MAX_MS) {
++		/* S-8 follow-up: clamp loudly — the caller must know its barrier is
++		 * shorter than requested. */
++		SPDK_WARNLOG("nvmf pause: ttl_ms %u clamped to %u (host io_timeout ceiling)\n",
++			     ctx->ttl_ms, PAUSE_TTL_MAX_MS);
++		ctx->ttl_ms = PAUSE_TTL_MAX_MS;
++	}
 +
 +	tgt = spdk_nvmf_get_tgt(ctx->tgt_name);   /* NULL name => the single default tgt */
 +	if (!tgt) { spdk_jsonrpc_send_error_response(request, -ENODEV, "target not found");
@@ -323,6 +312,16 @@ index 0000000..21e6951
 +		/* admin-only pause is not a drain barrier → refuse rather than ack a no-op */
 +		spdk_jsonrpc_send_error_response(request, -EINVAL,
 +			"subsystem has no namespace to drain");
++		rpc_pause_ctx_free(ctx);
++		return;
++	}
++
++	/* Preallocate the registry entry (see struct comment): fail BEFORE pausing,
++	 * never after — a drained subsystem must always get its entry + TTL. */
++	ctx->prealloc = calloc(1, sizeof(*ctx->prealloc));
++	if (ctx->prealloc == NULL) {
++		spdk_jsonrpc_send_error_response(request,
++			SPDK_JSONRPC_ERROR_INTERNAL_ERROR, "out of memory");
 +		rpc_pause_ctx_free(ctx);
 +		return;
 +	}

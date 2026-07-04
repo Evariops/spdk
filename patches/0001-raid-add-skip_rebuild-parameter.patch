@@ -1,31 +1,24 @@
-From c004e1653bd1fe24a4f585bc416b80f350223f35 Mon Sep 17 00:00:00 2001
-From: Evariops <noreply@evariops.com>
-Date: Sat, 23 May 2026 12:57:10 +0200
-Subject: [PATCH] raid: add skip_rebuild parameter to bdev_raid_add_base_bdev
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Evariops <dev@evariops.com>
+Date: Sat, 4 Jul 2026 10:58:25 +0200
+Subject: [PATCH 01/10] raid: add skip_rebuild parameter to
+ bdev_raid_add_base_bdev
 
-When a base bdev is re-added after a CBT-driven partial rebuild,
-the full surface rebuild is unnecessary. This adds an optional
-skip_rebuild boolean to the bdev_raid_add_base_bdev RPC.
-
-When true, the RAID module:
-1. Marks the base bdev ONLINE immediately (no full rebuild)
-2. Quiesces the RAID bdev to safely update IO channels
-3. Opens base_channel[slot] in all existing IO channels
-4. Unquiesces to resume IO
-5. Writes superblock if enabled (persists across reboot)
-
-Signed-off-by: Evariops <noreply@evariops.com>
+Evariops 0001. Promotes a CBT-resynced member without a full rebuild.
+Includes: CBT-6 channel-promotion error propagation + unwind (never ONLINE
+with a NULL channel on a reactor), P-5 runtime slot check (was an
+NDEBUG-erased assert), membership rollback on quiesce failure.
 ---
- module/bdev/raid/bdev_raid.c     | 139 ++++++++++++++++++++++++++++++-
+ module/bdev/raid/bdev_raid.c     | 217 ++++++++++++++++++++++++++++++-
  module/bdev/raid/bdev_raid.h     |   4 +
  module/bdev/raid/bdev_raid_rpc.c |   9 +-
- 3 files changed, 149 insertions(+), 3 deletions(-)
+ 3 files changed, 227 insertions(+), 3 deletions(-)
 
 diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
-index 7ab1607..94ada40 100644
+index 7ab1607..cc515bc 100644
 --- a/module/bdev/raid/bdev_raid.c
 +++ b/module/bdev/raid/bdev_raid.c
-@@ -3201,10 +3201,121 @@ raid_bdev_ch_sync(struct spdk_io_channel_iter *i)
+@@ -3201,10 +3201,199 @@ raid_bdev_ch_sync(struct spdk_io_channel_iter *i)
  	spdk_for_each_channel_continue(i, 0);
  }
  
@@ -35,6 +28,7 @@ index 7ab1607..94ada40 100644
 +	struct raid_base_bdev_info	*base_info;
 +	raid_base_bdev_cb		 cb_fn;
 +	void				*cb_ctx;
++	int				 err;	/* first failure; drives the unwind path */
 +};
 +
 +static void
@@ -63,6 +57,9 @@ index 7ab1607..94ada40 100644
 +		struct raid_bdev_sb_base_bdev *sb_base_bdev;
 +		uint8_t i;
 +
++		/* CBT-7 (documented): the SB flips to CONFIGURED only after the
++		 * unquiesce. A crash between the two costs a full rebuild at reboot —
++		 * conservative and safe (never CONFIGURED without live channels). */
 +		for (i = 0; i < sb->base_bdevs_size; i++) {
 +			sb_base_bdev = &sb->base_bdevs[i];
 +			if (sb_base_bdev->slot == raid_bdev_base_bdev_slot(base_info)) {
@@ -82,12 +79,73 @@ index 7ab1607..94ada40 100644
 +	free(sr_ctx);
 +}
 +
++/* ── CBT-6 unwind: a reactor failed to open the member's channel. Close every
++ * channel we opened, unquiesce, revert the membership (the online remove path
++ * also rolls back num_base_bdevs_operational) and report the error — the
++ * member must NOT come up ONLINE with a NULL channel on any reactor (silent
++ * divergence: writes skip it while the SB says CONFIGURED). ── */
++
++static void
++raid_bdev_skip_rebuild_fail_unquiesced(void *ctx, int status)
++{
++	struct skip_rebuild_ctx *sr_ctx = ctx;
++	struct raid_base_bdev_info *base_info = sr_ctx->base_info;
++
++	(void)status;
++	_raid_bdev_remove_base_bdev(base_info, NULL, NULL);
++	if (sr_ctx->cb_fn) {
++		sr_ctx->cb_fn(sr_ctx->cb_ctx, sr_ctx->err);
++	}
++	free(sr_ctx);
++}
++
++static void
++raid_bdev_skip_rebuild_unwind_ch_iter(struct spdk_io_channel_iter *i)
++{
++	struct skip_rebuild_ctx *sr_ctx = spdk_io_channel_iter_get_ctx(i);
++	struct spdk_io_channel *ch = spdk_io_channel_iter_get_channel(i);
++	struct raid_bdev_io_channel *raid_ch = spdk_io_channel_get_ctx(ch);
++	uint8_t slot = raid_bdev_base_bdev_slot(sr_ctx->base_info);
++
++	if (raid_ch->base_channel[slot] != NULL) {
++		spdk_put_io_channel(raid_ch->base_channel[slot]);
++		raid_ch->base_channel[slot] = NULL;
++	}
++	spdk_for_each_channel_continue(i, 0);
++}
++
++static void
++raid_bdev_skip_rebuild_unwind_ch_done(struct spdk_io_channel_iter *i, int status)
++{
++	struct skip_rebuild_ctx *sr_ctx = spdk_io_channel_iter_get_ctx(i);
++	struct raid_bdev *raid_bdev = sr_ctx->base_info->raid_bdev;
++	int rc;
++
++	(void)status;
++	rc = spdk_bdev_unquiesce(&raid_bdev->bdev, &g_raid_if,
++				 raid_bdev_skip_rebuild_fail_unquiesced, sr_ctx);
++	if (rc != 0) {
++		raid_bdev_skip_rebuild_fail_unquiesced(sr_ctx, rc);
++	}
++}
++
 +static void
 +raid_bdev_skip_rebuild_ch_done(struct spdk_io_channel_iter *i, int status)
 +{
 +	struct skip_rebuild_ctx *sr_ctx = spdk_io_channel_iter_get_ctx(i);
 +	struct raid_bdev *raid_bdev = sr_ctx->base_info->raid_bdev;
 +	int rc;
++
++	if (status != 0) {
++		/* CBT-6: at least one reactor could not open the channel — unwind
++		 * instead of bringing the member up half-wired. */
++		SPDK_ERRLOG("skip_rebuild: channel promotion failed (%s) — unwinding\n",
++			    spdk_strerror(-status));
++		sr_ctx->err = status;
++		spdk_for_each_channel(raid_bdev, raid_bdev_skip_rebuild_unwind_ch_iter,
++				      sr_ctx, raid_bdev_skip_rebuild_unwind_ch_done);
++		return;
++	}
 +
 +	rc = spdk_bdev_unquiesce(&raid_bdev->bdev, &g_raid_if,
 +				 raid_bdev_skip_rebuild_unquiesced, sr_ctx);
@@ -105,10 +163,20 @@ index 7ab1607..94ada40 100644
 +	struct raid_base_bdev_info *base_info = sr_ctx->base_info;
 +	uint8_t slot = raid_bdev_base_bdev_slot(base_info);
 +
-+	assert(raid_ch->base_channel[slot] == NULL);
++	if (raid_ch->base_channel[slot] != NULL) {
++		/* P-5: was an assert — NDEBUG builds dropped it and silently overwrote
++		 * a live channel (leak + double channel). A populated slot is already
++		 * what promotion wants: reuse it. */
++		spdk_for_each_channel_continue(i, 0);
++		return;
++	}
 +	raid_ch->base_channel[slot] = spdk_bdev_get_io_channel(base_info->desc);
 +	if (raid_ch->base_channel[slot] == NULL) {
 +		SPDK_ERRLOG("skip_rebuild: failed to get io channel for slot %u\n", slot);
++		/* CBT-6: propagate — hardcoding 0 here brought the member ONLINE with a
++		 * NULL channel on this reactor. */
++		spdk_for_each_channel_continue(i, -ENOMEM);
++		return;
 +	}
 +
 +	spdk_for_each_channel_continue(i, 0);
@@ -124,6 +192,9 @@ index 7ab1607..94ada40 100644
 +	if (status != 0) {
 +		SPDK_ERRLOG("Failed to quiesce for skip_rebuild: %s\n",
 +			    spdk_strerror(-status));
++		/* Revert the membership taken in configure_base_bdev_cont —
++		 * num_base_bdevs_operational rolls back via the online remove path. */
++		_raid_bdev_remove_base_bdev(base_info, NULL, NULL);
 +		if (sr_ctx->cb_fn) {
 +			sr_ctx->cb_fn(sr_ctx->cb_ctx, status);
 +		}
@@ -147,7 +218,7 @@ index 7ab1607..94ada40 100644
  	raid_base_bdev_cb configure_cb;
  	int rc;
  
-@@ -3243,7 +3354,30 @@ raid_bdev_configure_base_bdev_cont(struct raid_base_bdev_info *base_info)
+@@ -3243,7 +3432,30 @@ raid_bdev_configure_base_bdev_cont(struct raid_base_bdev_info *base_info)
  		}
  	} else if (base_info->is_process_target) {
  		raid_bdev->num_base_bdevs_operational++;
@@ -179,7 +250,7 @@ index 7ab1607..94ada40 100644
  		if (rc != 0) {
  			SPDK_ERRLOG("Failed to start rebuild: %s\n", spdk_strerror(-rc));
  			_raid_bdev_remove_base_bdev(base_info, NULL, NULL);
-@@ -3488,6 +3622,7 @@ out:
+@@ -3488,6 +3700,7 @@ out:
  
  int
  raid_bdev_add_base_bdev(struct raid_bdev *raid_bdev, const char *name,
@@ -187,7 +258,7 @@ index 7ab1607..94ada40 100644
  			raid_base_bdev_cb cb_fn, void *cb_ctx)
  {
  	struct raid_base_bdev_info *base_info = NULL, *iter;
-@@ -3543,6 +3678,8 @@ raid_bdev_add_base_bdev(struct raid_bdev *raid_bdev, const char *name,
+@@ -3543,6 +3756,8 @@ raid_bdev_add_base_bdev(struct raid_bdev *raid_bdev, const char *name,
  		return -ENOMEM;
  	}
  

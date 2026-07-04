@@ -1,7 +1,22 @@
-Subject: [PATCH] m5: nexus logical heat instrumentation + free-at-destruct (SPEC-73)
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Evariops <dev@evariops.com>
+Date: Sat, 4 Jul 2026 10:58:26 +0200
+Subject: [PATCH 07/10] raid: nexus logical heat instrumentation
+
+Evariops 0007. M7: release-publish / acquire-load of the heat pointer
+(arm64-safe), per-region TSC recency instead of a shared tick counter.
+N-8/P-4: disable_heat reclaims the sketch after a for_each_channel grace
+period (the old "reclaimed at teardown" claim was false - it leaked).
+---
+ module/bdev/raid/Makefile         |   2 +-
+ module/bdev/raid/bdev_raid.c      |  17 ++
+ module/bdev/raid/bdev_raid.h      |   9 +
+ module/bdev/raid/bdev_raid_heat.c | 312 ++++++++++++++++++++++++++++++
+ 4 files changed, 339 insertions(+), 1 deletion(-)
+ create mode 100644 module/bdev/raid/bdev_raid_heat.c
 
 diff --git a/module/bdev/raid/Makefile b/module/bdev/raid/Makefile
-index 3dff369dd..cb46945e7 100644
+index 3dff369..cb46945 100644
 --- a/module/bdev/raid/Makefile
 +++ b/module/bdev/raid/Makefile
 @@ -10,7 +10,7 @@ SO_VER := 7
@@ -14,7 +29,7 @@ index 3dff369dd..cb46945e7 100644
  ifeq ($(CONFIG_RAID5F),y)
  C_SRCS += raid5f.c
 diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
-index 94ada40ec..676a9306c 100644
+index cc515bc..636eda1 100644
 --- a/module/bdev/raid/bdev_raid.c
 +++ b/module/bdev/raid/bdev_raid.c
 @@ -393,6 +393,9 @@ raid_bdev_cleanup(struct raid_bdev *raid_bdev)
@@ -27,23 +42,29 @@ index 94ada40ec..676a9306c 100644
  	raid_bdev_free_superblock(raid_bdev);
  	free(raid_bdev->base_bdev_info);
  	free(raid_bdev->bdev.name);
-@@ -968,6 +971,14 @@ static void
+@@ -968,6 +971,20 @@ static void
  raid_bdev_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
  {
  	struct raid_bdev_io *raid_io = (struct raid_bdev_io *)bdev_io->driver_ctx;
 +	struct raid_bdev *raid_bdev = (struct raid_bdev *)bdev_io->bdev->ctxt;
++	void *heat;
 +
-+	/* SPEC-73 M5: record logical heat on the hot path (lossy by design). */
-+	if (spdk_unlikely(raid_bdev->tier_heat != NULL) &&
++	/* SPEC-73 M5: record logical heat on the hot path (lossy by design).
++	 * M7: ACQUIRE pairs with the RELEASE publish in enable_heat — on arm64 the
++	 * regions array must be visible before the pointer. No branch hint: heat is
++	 * always-on in the nominal SPEC-73 deployment (the old spdk_unlikely was
++	 * inverted for that state). */
++	heat = __atomic_load_n(&raid_bdev->tier_heat, __ATOMIC_ACQUIRE);
++	if (heat != NULL &&
 +	    (bdev_io->type == SPDK_BDEV_IO_TYPE_READ || bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE)) {
-+		raid_tier_heat_record(raid_bdev->tier_heat, bdev_io->u.bdev.offset_blocks,
++		raid_tier_heat_record(heat, bdev_io->u.bdev.offset_blocks,
 +				      bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE);
 +	}
  
  	raid_bdev_io_init(raid_io, spdk_io_channel_get_ctx(ch), bdev_io->type,
  			  bdev_io->u.bdev.offset_blocks, bdev_io->u.bdev.num_blocks,
 diff --git a/module/bdev/raid/bdev_raid.h b/module/bdev/raid/bdev_raid.h
-index d0484ca5d..e7d7ac5fc 100644
+index d0484ca..e7d7ac5 100644
 --- a/module/bdev/raid/bdev_raid.h
 +++ b/module/bdev/raid/bdev_raid.h
 @@ -237,6 +237,9 @@ struct raid_bdev {
@@ -69,10 +90,10 @@ index d0484ca5d..e7d7ac5fc 100644
  #endif /* SPDK_BDEV_RAID_INTERNAL_H */
 diff --git a/module/bdev/raid/bdev_raid_heat.c b/module/bdev/raid/bdev_raid_heat.c
 new file mode 100644
-index 000000000..0749163a0
+index 0000000..4e456e3
 --- /dev/null
 +++ b/module/bdev/raid/bdev_raid_heat.c
-@@ -0,0 +1,254 @@
+@@ -0,0 +1,312 @@
 +/*   SPDX-License-Identifier: BSD-3-Clause
 + *   Copyright (C) 2026 Evariops.
 + *   All rights reserved.
@@ -101,7 +122,6 @@ index 000000000..0749163a0
 +struct raid_tier_heat {
 +	uint64_t			region_blocks;
 +	uint64_t			num_regions;
-+	uint64_t			tick;		/* monotone logical clock */
 +	struct raid_region_heat		*regions;
 +};
 +
@@ -139,7 +159,11 @@ index 000000000..0749163a0
 +	free(h);
 +}
 +
-+/* Hot path: cheap, racy increment (approximate counts tolerated). */
++/* Hot path: cheap, racy increment (approximate counts tolerated — INV-52; the
++ * counters are per-region so concurrent reactors only contend when hitting the
++ * SAME 64 MiB region). M7: recency uses the per-CPU TSC — the old shared
++ * `++h->tick` was a guaranteed cacheline ping-pong across every reactor on
++ * every I/O and a torn read/write on 32-bit stores. */
 +void
 +raid_tier_heat_record(void *heat, uint64_t offset_blocks, bool is_write)
 +{
@@ -158,7 +182,7 @@ index 000000000..0749163a0
 +	} else {
 +		h->regions[region].reads++;
 +	}
-+	h->regions[region].last_tick = ++h->tick;
++	h->regions[region].last_tick = spdk_get_ticks();
 +}
 +
 +/* ---- lookup ---------------------------------------------------------------- */
@@ -208,16 +232,21 @@ index 000000000..0749163a0
 +		spdk_jsonrpc_send_error_response(request, -ENODEV, "nexus not found");
 +		goto cleanup;
 +	}
-+	if (raid_bdev->tier_heat == NULL) {
++	if (__atomic_load_n(&raid_bdev->tier_heat, __ATOMIC_RELAXED) == NULL) {
++		void *h;
++
 +		region_blocks = ((uint64_t)req.region_mib << 20) / raid_bdev->bdev.blocklen;
 +		if (region_blocks == 0) {
 +			region_blocks = 1;
 +		}
-+		raid_bdev->tier_heat = raid_tier_heat_create(raid_bdev->bdev.blockcnt, region_blocks);
-+		if (raid_bdev->tier_heat == NULL) {
++		h = raid_tier_heat_create(raid_bdev->bdev.blockcnt, region_blocks);
++		if (h == NULL) {
 +			spdk_jsonrpc_send_error_response(request, -ENOMEM, "heat alloc failed");
 +			goto cleanup;
 +		}
++		/* M7: RELEASE publish — pairs with the ACQUIRE load in the submit hot
++		 * path so the regions array is visible before the pointer (arm64). */
++		__atomic_store_n(&raid_bdev->tier_heat, h, __ATOMIC_RELEASE);
 +	}
 +	spdk_jsonrpc_send_bool_response(request, true);
 +cleanup:
@@ -232,11 +261,39 @@ index 000000000..0749163a0
 +	{"name", offsetof(struct rpc_heat_name, name), spdk_json_decode_string},
 +};
 +
++/* N-8/P-4: disable must actually reclaim the sketch — "reclaimed at teardown"
++ * was false (no reference was kept), so enable/disable/enable leaked the first
++ * array forever. Reclaim happens after a for_each_channel GRACE PERIOD: SPDK
++ * reactors are run-to-completion, so once every reactor has processed one
++ * message, any record() that loaded the old pointer has finished. */
++struct heat_disable_ctx {
++	struct spdk_jsonrpc_request	*request;
++	void				*old;
++};
++
++static void
++heat_disable_grace_iter(struct spdk_io_channel_iter *i)
++{
++	spdk_for_each_channel_continue(i, 0);
++}
++
++static void
++heat_disable_grace_done(struct spdk_io_channel_iter *i, int status)
++{
++	struct heat_disable_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
++
++	(void)status;
++	raid_tier_heat_destroy(ctx->old);
++	spdk_jsonrpc_send_bool_response(ctx->request, true);
++	free(ctx);
++}
++
 +static void
 +rpc_vbdev_nexus_disable_heat(struct spdk_jsonrpc_request *request, const struct spdk_json_val *params)
 +{
 +	struct rpc_heat_name req = {};
 +	struct raid_bdev *raid_bdev;
++	void *old = NULL;
 +
 +	if (spdk_json_decode_object(params, rpc_heat_name_decoders,
 +				    SPDK_COUNTOF(rpc_heat_name_decoders), &req)) {
@@ -245,12 +302,32 @@ index 000000000..0749163a0
 +	}
 +	raid_bdev = raid_heat_find(req.name);
 +	if (raid_bdev != NULL) {
-+		/* Stop the hot path by clearing the pointer. We intentionally do NOT free
-+		 * here: an in-flight record() may still hold the old array. The array is
-+		 * reclaimed at nexus teardown (no I/O in flight). Disable is a rare admin
-+		 * op, so the transient orphan is acceptable (avoids a use-after-free). */
-+		raid_bdev->tier_heat = NULL;
++		old = __atomic_exchange_n(&raid_bdev->tier_heat, NULL, __ATOMIC_ACQ_REL);
 +	}
++	if (old == NULL) {
++		spdk_jsonrpc_send_bool_response(request, true);
++		goto cleanup;
++	}
++	if (raid_bdev->state == RAID_BDEV_STATE_ONLINE) {
++		struct heat_disable_ctx *ctx = calloc(1, sizeof(*ctx));
++
++		if (ctx == NULL) {
++			/* Cannot run the grace sweep: leave the array orphaned (leak,
++			 * never a use-after-free) — teardown still reclaims it if the
++			 * nexus is later freed. */
++			SPDK_ERRLOG("disable_heat: oom — heat array orphaned until teardown\n");
++			spdk_jsonrpc_send_bool_response(request, true);
++			goto cleanup;
++		}
++		ctx->request = request;
++		ctx->old = old;
++		spdk_for_each_channel(raid_bdev, heat_disable_grace_iter, ctx,
++				      heat_disable_grace_done);
++		free(req.name);
++		return;
++	}
++	/* Not ONLINE: no channels exist, no reactor can be inside record(). */
++	raid_tier_heat_destroy(old);
 +	spdk_jsonrpc_send_bool_response(request, true);
 +cleanup:
 +	free(req.name);
@@ -291,17 +368,19 @@ index 000000000..0749163a0
 +		req.max_regions = HEAT_GET_DEFAULT_MAX;
 +	}
 +	raid_bdev = raid_heat_find(req.name);
-+	if (raid_bdev == NULL || raid_bdev->tier_heat == NULL) {
++	h = raid_bdev != NULL ?
++	    __atomic_load_n(&raid_bdev->tier_heat, __ATOMIC_ACQUIRE) : NULL;
++	if (h == NULL) {
 +		spdk_jsonrpc_send_error_response(request, -ENODEV, "nexus/heat not found");
 +		goto cleanup;
 +	}
-+	h = raid_bdev->tier_heat;
 +
 +	w = spdk_jsonrpc_begin_result(request);
 +	spdk_json_write_object_begin(w);
 +	spdk_json_write_named_uint64(w, "region_blocks", h->region_blocks);
 +	spdk_json_write_named_uint64(w, "num_regions", h->num_regions);
-+	spdk_json_write_named_uint64(w, "tick", h->tick);
++	/* M7: recency reference is the TSC now (last_tick is per-region TSC). */
++	spdk_json_write_named_uint64(w, "tick", spdk_get_ticks());
 +	spdk_json_write_named_array_begin(w, "regions");
 +	for (r = req.start_region; r < h->num_regions; r++) {
 +		if (h->regions[r].reads == 0 && h->regions[r].writes == 0) {
@@ -327,3 +406,6 @@ index 000000000..0749163a0
 +	free(req.name);
 +}
 +SPDK_RPC_REGISTER("vbdev_nexus_get_heat", rpc_vbdev_nexus_get_heat, SPDK_RPC_RUNTIME)
+-- 
+2.50.1 (Apple Git-155)
+
