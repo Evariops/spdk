@@ -10,6 +10,12 @@
  * write/unmap/write_zeroes that flows through it.  The bitmap is used to
  * drive incremental (partial) RAID rebuilds after backend outages.
  *
+ * Bitmap lifecycle is RESET-DRIVEN (D3): the bitmap only shrinks when the
+ * orchestrator explicitly calls bdev_cbt_reset after certifying all backends
+ * are healthy and in-sync. There is NO automatic healthy-clear poller — an
+ * in-target timer cannot know distributed backend health, and a wrong clear
+ * silently destroys the delta needed for partial rebuild.
+ *
  * Design reference: SPEC-52 §2.
  */
 
@@ -206,39 +212,16 @@ cbt_mark_dirty(struct vbdev_cbt *cbt, uint64_t offset_blocks, uint64_t num_block
 	__atomic_fetch_add(&cbt->total_writes_tracked, 1, __ATOMIC_RELAXED);
 }
 
-/* ================================================================== */
-/* Healthy-clear poller                                               */
-/* ================================================================== */
+/* D3: the healthy-clear poller was removed — it required an explicit
+ * bdev_cbt_set_backends_healthy() signal that no caller ever sent (dead code),
+ * so the bitmap only tended towards 100% dirty. Clearing is reset-driven:
+ * the orchestrator calls bdev_cbt_reset (refused while any epoch is active). */
 
-static int
-cbt_healthy_clear_poller_fn(void *ctx)
-{
-	struct vbdev_cbt *cbt = ctx;
-
-	/* If any epoch is open/frozen/rebuilding, do NOT clear. */
-	if (cbt->healthy_clear_suspended || cbt_any_epoch_open(cbt)) {
-		return SPDK_POLLER_IDLE;
-	}
-
-	/* Only clear if the orchestrator has explicitly confirmed all
-	 * backends are healthy and in-sync.
-	 */
-	if (!cbt->backends_healthy) {
-		return SPDK_POLLER_IDLE;
-	}
-
-	/* Clear the bitmap — all backends are confirmed healthy.
-	 * This runs on the owner thread (same as epoch ops). IO threads
-	 * may concurrently set bits via atomic OR; a few bits set between
-	 * our check and the memset are acceptable (they will be re-set on
-	 * the next write and caught by the next clear cycle).
-	 */
-	if (cbt_popcount_bitmap(cbt) > 0) {
-		memset(cbt->bitmap, 0, cbt->bitmap_size_bytes);
-	}
-
-	return SPDK_POLLER_IDLE;
-}
+/* Forward declaration (rebuild registry, defined below) — used by the epoch
+ * state guards CBT-1/CBT-2/c5. */
+struct cbt_rebuild_ctx;
+static struct cbt_rebuild_ctx *cbt_rebuild_find_active_for_epoch(const struct vbdev_cbt *cbt,
+								 const char *epoch_id);
 
 /* ================================================================== */
 /* IO forwarding (passthrough + tracking)                             */
@@ -519,10 +502,6 @@ vbdev_cbt_destruct(void *ctx)
 
 	TAILQ_REMOVE(&g_cbt_nodes, cbt_node, link);
 
-	if (cbt_node->healthy_poller) {
-		spdk_poller_unregister(&cbt_node->healthy_poller);
-	}
-
 	spdk_bdev_module_release_bdev(cbt_node->base_bdev);
 
 	if (cbt_node->thread && cbt_node->thread != spdk_get_thread()) {
@@ -582,9 +561,24 @@ vbdev_cbt_base_bdev_event_cb(enum spdk_bdev_event_type type,
 {
 	if (type == SPDK_BDEV_EVENT_REMOVE) {
 		struct vbdev_cbt *node, *tmp;
+		struct cbt_bdev_name *name, *ntmp;
 
 		TAILQ_FOREACH_SAFE(node, &g_cbt_nodes, link, tmp) {
 			if (bdev == node->base_bdev) {
+				/* c4: drop the deferred-create entry too — otherwise a
+				 * reappearing base bdev silently recreates the cbt vbdev
+				 * with a VIRGIN bitmap that masquerades as continuous
+				 * tracking history. Recreation must be an explicit
+				 * bdev_cbt_create from the orchestrator. */
+				TAILQ_FOREACH_SAFE(name, &g_bdev_names, link, ntmp) {
+					if (strcmp(name->vbdev_name,
+						   spdk_bdev_get_name(&node->cbt_bdev)) == 0) {
+						TAILQ_REMOVE(&g_bdev_names, name, link);
+						free(name->bdev_name);
+						free(name->vbdev_name);
+						free(name);
+					}
+				}
 				spdk_bdev_unregister(&node->cbt_bdev, NULL, NULL);
 			}
 		}
@@ -736,11 +730,6 @@ vbdev_cbt_register(const char *bdev_name)
 			return rc;
 		}
 
-		/* ── Register healthy-clear poller (always-on) ── */
-		cbt_node->healthy_poller = SPDK_POLLER_REGISTER(
-			cbt_healthy_clear_poller_fn, cbt_node,
-			CBT_HEALTHY_CLEAR_INTERVAL_US);
-
 		SPDK_NOTICELOG("CBT: created vbdev '%s' over '%s' "
 			       "(chunk=%u KB, bitmap=%lu bytes, %lu chunks)\n",
 			       name->vbdev_name, bdev_name,
@@ -889,6 +878,15 @@ bdev_cbt_epoch_open(const char *cbt_name, const char *epoch_id,
 	ep = cbt_find_epoch(cbt, epoch_id);
 	if (ep) {
 		if (generation > ep->generation) {
+			/* c5 (requalified): a higher-generation takeover must NOT rip the
+			 * epoch away from a rebuild that is scanning/writing its frozen
+			 * bitmap — that corrupts the state machine and opens the CBT-1 UAF. */
+			if (ep->state == CBT_EPOCH_REBUILDING ||
+			    cbt_rebuild_find_active_for_epoch(cbt, epoch_id) != NULL) {
+				SPDK_ERRLOG("CBT: epoch_open gen=%lu refused: epoch '%s' has an "
+					    "active rebuild\n", (unsigned long)generation, epoch_id);
+				return -EBUSY;
+			}
 			/* Replace with higher generation. */
 			ep->generation = generation;
 			snprintf(ep->stale_backend_id, sizeof(ep->stale_backend_id),
@@ -936,9 +934,6 @@ bdev_cbt_epoch_open(const char *cbt_name, const char *epoch_id,
 	TAILQ_INSERT_TAIL(&cbt->epochs, ep, link);
 	cbt->epoch_count++;
 
-	/* Suspend healthy-clear while any epoch is open. */
-	cbt->healthy_clear_suspended = true;
-
 	SPDK_NOTICELOG("CBT: epoch_open '%s' for stale backend '%s' gen=%lu\n",
 		       epoch_id, stale_backend_id, (unsigned long)generation);
 	return 0;
@@ -964,6 +959,13 @@ bdev_cbt_epoch_freeze(const char *cbt_name, const char *epoch_id)
 	if (ep->state != CBT_EPOCH_OPEN && ep->state != CBT_EPOCH_FROZEN &&
 	    ep->state != CBT_EPOCH_REBUILDING) {
 		return -EINVAL;
+	}
+	/* CBT-1: a RUNNING rebuild holds ctx->bitmap = ep->bitmap_frozen and scans it
+	 * asynchronously — freeing/reallocating it here is a use-after-free read.
+	 * Same guard start_rebuild already applies, made symmetric. */
+	if (cbt_rebuild_find_active_for_epoch(cbt, epoch_id) != NULL) {
+		SPDK_ERRLOG("CBT: epoch_freeze '%s' refused: rebuild in progress\n", epoch_id);
+		return -EBUSY;
 	}
 
 	/* Free previous frozen bitmap if re-freezing. */
@@ -1020,17 +1022,19 @@ bdev_cbt_epoch_close(const char *cbt_name, const char *epoch_id)
 	if (ep->state == CBT_EPOCH_OPEN) {
 		return -EINVAL;
 	}
+	/* CBT-2: a RUNNING rebuild writes ctx->epoch->bitmap_frozen and
+	 * ctx->epoch->state at completion — freeing the epoch under it is a
+	 * use-after-free WRITE. Cancel the rebuild first. */
+	if (cbt_rebuild_find_active_for_epoch(cbt, epoch_id) != NULL) {
+		SPDK_ERRLOG("CBT: epoch_close '%s' refused: rebuild in progress\n", epoch_id);
+		return -EBUSY;
+	}
 
 	ep->state = CBT_EPOCH_COMPLETED;
 	TAILQ_REMOVE(&cbt->epochs, ep, link);
 	cbt->epoch_count--;
 	free(ep->bitmap_frozen);
 	free(ep);
-
-	/* Resume healthy-clear if no more active epochs. */
-	if (!cbt_any_epoch_open(cbt)) {
-		cbt->healthy_clear_suspended = false;
-	}
 
 	SPDK_NOTICELOG("CBT: epoch_close '%s'\n", epoch_id);
 	return 0;
@@ -1276,12 +1280,14 @@ cbt_rebuild_find_by_id(const char *rebuild_id)
 	return NULL;
 }
 
+/* New: discriminate by cbt node too — two cbt vbdevs may legitimately use the
+ * same epoch_id (the old name-only match made them block each other). */
 static struct cbt_rebuild_ctx *
-cbt_rebuild_find_active_for_epoch(const char *epoch_id)
+cbt_rebuild_find_active_for_epoch(const struct vbdev_cbt *cbt, const char *epoch_id)
 {
 	struct cbt_rebuild_ctx *ctx;
 	TAILQ_FOREACH(ctx, &g_rebuild_registry, registry_link) {
-		if (ctx->state == CBT_REBUILD_RUNNING &&
+		if (ctx->state == CBT_REBUILD_RUNNING && ctx->cbt == cbt &&
 		    strcmp(ctx->epoch->epoch_id, epoch_id) == 0) {
 			return ctx;
 		}
@@ -1661,8 +1667,50 @@ done_scanning:
 	}
 }
 
+static void cbt_rebuild_finalize(struct cbt_rebuild_ctx *ctx);
+
+static void
+cbt_rebuild_flush_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct cbt_rebuild_ctx *ctx = cb_arg;
+
+	spdk_bdev_free_io(bdev_io);
+	if (!success) {
+		SPDK_ERRLOG("CBT rebuild: target flush failed — member NOT durably synced\n");
+		ctx->error = -EIO;
+		ctx->aborted = true;
+	}
+	cbt_rebuild_finalize(ctx);
+}
+
+/* CBT-4: all chunk writes landed — FLUSH the target before declaring the rebuild
+ * COMPLETED. Without it the copied chunks may sit in a volatile write cache; a
+ * power cut then leaves a lacunary member that the control-plane believes synced. */
 static void
 cbt_rebuild_finish(struct cbt_rebuild_ctx *ctx)
+{
+	if (ctx->error == 0 && !ctx->cancelled && ctx->chunks_copied > 0 &&
+	    ctx->dst_desc != NULL && ctx->dst_ch != NULL) {
+		struct spdk_bdev *dst = spdk_bdev_desc_get_bdev(ctx->dst_desc);
+
+		if (spdk_bdev_io_type_supported(dst, SPDK_BDEV_IO_TYPE_FLUSH)) {
+			int rc = spdk_bdev_flush_blocks(ctx->dst_desc, ctx->dst_ch, 0,
+							spdk_bdev_get_num_blocks(dst),
+							cbt_rebuild_flush_cb, ctx);
+			if (rc == 0) {
+				return;	/* finalize from the flush callback */
+			}
+			SPDK_ERRLOG("CBT rebuild: target flush submit failed rc=%d\n", rc);
+			ctx->error = rc;
+			ctx->aborted = true;
+		}
+		/* No FLUSH support ⇒ no volatile cache to drain — fall through. */
+	}
+	cbt_rebuild_finalize(ctx);
+}
+
+static void
+cbt_rebuild_finalize(struct cbt_rebuild_ctx *ctx)
 {
 	struct cbt_rebuild_result result = {0};
 	uint64_t elapsed_tsc = spdk_get_ticks() - ctx->start_tsc;
@@ -1751,14 +1799,19 @@ cbt_rebuild_finish(struct cbt_rebuild_ctx *ctx)
 	 */
 }
 
-int
-bdev_cbt_partial_rebuild(const char *cbt_name, const char *epoch_id,
-			 const char *target_bdev_name,
-			 const char *source_bdev_name,
-			 uint64_t max_bw_mb_sec, uint32_t queue_depth,
-			 const struct cbt_rebuild_range *override_ranges,
-			 uint32_t num_ranges,
-			 cbt_rebuild_done_cb cb_fn, void *cb_arg)
+/* Shared engine start for both the legacy (deferred-response) and async
+ * (rebuild_id) paths. rebuild_id, when non-NULL, is stamped on the context
+ * BEFORE the first I/O can complete — a zero-dirty bitmap finishes
+ * SYNCHRONOUSLY, and the old tag-after-return dance freed the context before
+ * the id was set (get_rebuild_status then returned -ENOENT forever). */
+static int
+cbt_rebuild_start(const char *cbt_name, const char *epoch_id,
+		  const char *target_bdev_name,
+		  const char *source_bdev_name,
+		  uint64_t max_bw_mb_sec, uint32_t queue_depth,
+		  const struct cbt_rebuild_range *override_ranges,
+		  uint32_t num_ranges, const char *rebuild_id,
+		  cbt_rebuild_done_cb cb_fn, void *cb_arg)
 {
 	struct vbdev_cbt *cbt;
 	struct cbt_epoch *ep;
@@ -1783,6 +1836,11 @@ bdev_cbt_partial_rebuild(const char *cbt_name, const char *epoch_id,
 	}
 	if (!ep->bitmap_frozen) {
 		return -EINVAL;
+	}
+	/* New: the legacy RPC path had NO anti-double-rebuild guard — two concurrent
+	 * rebuilds would share ep->bitmap_frozen. One rebuild per (cbt, epoch). */
+	if (cbt_rebuild_find_active_for_epoch(cbt, epoch_id) != NULL) {
+		return -EBUSY;
 	}
 
 	/* Validate queue_depth. */
@@ -1809,6 +1867,11 @@ bdev_cbt_partial_rebuild(const char *cbt_name, const char *epoch_id,
 	ctx->start_tsc = spdk_get_ticks();
 	ctx->window_start_tsc = ctx->start_tsc;
 	ctx->bitmap = ep->bitmap_frozen;
+	if (rebuild_id != NULL) {
+		/* Stamp the id NOW (see function comment): a synchronous finish must
+		 * already see it so the ctx survives in the registry for get_status. */
+		snprintf(ctx->rebuild_id, sizeof(ctx->rebuild_id), "%s", rebuild_id);
+	}
 
 	/* Copy override ranges if provided. */
 	if (override_ranges && num_ranges > 0) {
@@ -1913,9 +1976,10 @@ bdev_cbt_partial_rebuild(const char *cbt_name, const char *epoch_id,
 			cbt_rebuild_gc_poller_fn, NULL, 10000000); /* 10s */
 	}
 
-	SPDK_NOTICELOG("CBT: partial_rebuild started for '%s' epoch '%s' → '%s' "
-		       "(qd=%d, bw_limit=%lu MB/s, coalesce=%d chunks/io)\n",
+	SPDK_NOTICELOG("CBT: rebuild started for '%s' epoch '%s' → '%s' "
+		       "(id=%s, qd=%d, bw_limit=%lu MB/s, coalesce=%d chunks/io)\n",
 		       cbt_name, epoch_id, target_bdev_name,
+		       rebuild_id != NULL ? rebuild_id : "-",
 		       ctx->max_outstanding,
 		       (unsigned long)max_bw_mb_sec,
 		       CBT_REBUILD_MAX_COALESCE_CHUNKS);
@@ -1923,6 +1987,20 @@ bdev_cbt_partial_rebuild(const char *cbt_name, const char *epoch_id,
 	/* Kick off the first batch. */
 	cbt_rebuild_submit_next(ctx);
 	return 0;
+}
+
+int
+bdev_cbt_partial_rebuild(const char *cbt_name, const char *epoch_id,
+			 const char *target_bdev_name,
+			 const char *source_bdev_name,
+			 uint64_t max_bw_mb_sec, uint32_t queue_depth,
+			 const struct cbt_rebuild_range *override_ranges,
+			 uint32_t num_ranges,
+			 cbt_rebuild_done_cb cb_fn, void *cb_arg)
+{
+	return cbt_rebuild_start(cbt_name, epoch_id, target_bdev_name, source_bdev_name,
+				 max_bw_mb_sec, queue_depth, override_ranges, num_ranges,
+				 NULL, cb_fn, cb_arg);
 }
 
 /* ================================================================== */
@@ -1936,54 +2014,23 @@ bdev_cbt_start_rebuild(const char *cbt_name, const char *epoch_id,
 		       uint64_t max_bw_mb_sec, uint32_t queue_depth,
 		       char *out_rebuild_id)
 {
-	struct vbdev_cbt *cbt;
-	struct cbt_epoch *ep;
-	struct cbt_rebuild_ctx *ctx;
 	uint64_t id;
 	int rc;
 
 	assert(spdk_get_thread() == spdk_thread_get_app_thread());
 
-	/* Validate early — same checks as bdev_cbt_partial_rebuild. */
-	cbt = cbt_find_by_name(cbt_name);
-	if (!cbt) {
-		return -ENODEV;
-	}
-	ep = cbt_find_epoch(cbt, epoch_id);
-	if (!ep) {
-		return -ENOENT;
-	}
-	if (ep->state != CBT_EPOCH_FROZEN && ep->state != CBT_EPOCH_REBUILDING) {
-		return -EINVAL;
-	}
-	if (cbt_rebuild_find_active_for_epoch(epoch_id)) {
-		return -EBUSY;
-	}
-
-	/* Generate a unique rebuild_id. */
+	/* Generate the rebuild_id FIRST: cbt_rebuild_start stamps it on the context
+	 * before any I/O, so even a synchronous finish (zero dirty chunks) leaves a
+	 * queryable registry entry (the old post-hoc tagging raced exactly that). */
 	id = ++g_rebuild_id_counter;
 	snprintf(out_rebuild_id, CBT_REBUILD_ID_MAX, "rebuild-%lu", (unsigned long)id);
 
-	/* Start the rebuild using the existing engine (no callback — async model). */
-	rc = bdev_cbt_partial_rebuild(cbt_name, epoch_id, target_bdev_name,
-				      source_bdev_name, max_bw_mb_sec,
-				      queue_depth, NULL, 0, NULL, NULL);
+	rc = cbt_rebuild_start(cbt_name, epoch_id, target_bdev_name,
+			       source_bdev_name, max_bw_mb_sec,
+			       queue_depth, NULL, 0, out_rebuild_id, NULL, NULL);
 	if (rc != 0) {
 		return rc;
 	}
-
-	/* Tag the just-created context with its rebuild_id.
-	 * It's the last entry in the registry (we just inserted it).
-	 */
-	TAILQ_FOREACH_REVERSE(ctx, &g_rebuild_registry, cbt_rebuild_registry_head,
-			      registry_link) {
-		if (ctx->state == CBT_REBUILD_RUNNING && ctx->rebuild_id[0] == '\0') {
-			snprintf(ctx->rebuild_id, sizeof(ctx->rebuild_id),
-				 "%s", out_rebuild_id);
-			break;
-		}
-	}
-
 	return 0;
 }
 
@@ -2139,19 +2186,6 @@ bdev_cbt_reset(const char *cbt_name)
 	__atomic_thread_fence(__ATOMIC_ACQUIRE);
 	memset(cbt->bitmap, 0, cbt->bitmap_size_bytes);
 	return 0;
-}
-
-void
-bdev_cbt_set_backends_healthy(const char *cbt_name, bool healthy)
-{
-	struct vbdev_cbt *cbt = cbt_find_by_name(cbt_name);
-
-	if (!cbt) {
-		return;
-	}
-
-	cbt->backends_healthy = healthy;
-	SPDK_NOTICELOG("CBT: '%s' backends_healthy=%d\n", cbt_name, (int)healthy);
 }
 
 /* ================================================================== */
