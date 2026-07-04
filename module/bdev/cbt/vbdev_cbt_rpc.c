@@ -465,8 +465,8 @@ rpc_bdev_cbt_epoch_list(struct spdk_jsonrpc_request *request,
 	spdk_json_write_named_uint64(w, "total_chunks", cbt->bitmap_size_bits);
 	spdk_json_write_named_double(w, "dirty_ratio", dirty_ratio);
 	spdk_json_write_named_uint64(w, "total_writes_tracked", writes_tracked);
-	spdk_json_write_named_bool(w, "healthy_clear_suspended", cbt->healthy_clear_suspended);
-	spdk_json_write_named_bool(w, "backends_healthy", cbt->backends_healthy);
+	/* D3: healthy_clear_suspended / backends_healthy removed with the dead
+	 * healthy-clear poller (bitmap clearing is reset-driven). */
 
 	spdk_json_write_named_array_begin(w, "epochs");
 	TAILQ_FOREACH(ep, &cbt->epochs, link) {
@@ -679,8 +679,6 @@ struct rpc_cbt_partial_rebuild {
 	char     *source_bdev_name;
 	uint64_t  max_bandwidth_mb_sec;
 	uint32_t  queue_depth;
-	struct cbt_rebuild_range *override_ranges;
-	uint32_t  num_override_ranges;
 };
 
 static void
@@ -690,77 +688,11 @@ free_rpc_cbt_partial_rebuild(struct rpc_cbt_partial_rebuild *r)
 	free(r->epoch_id);
 	free(r->target_bdev_name);
 	free(r->source_bdev_name);
-	free(r->override_ranges);
 }
 
-static int
-decode_override_ranges(const struct spdk_json_val *val, void *out)
-{
-	struct rpc_cbt_partial_rebuild *req = out;
-	struct spdk_json_val *array_val = (struct spdk_json_val *)val;
-	uint32_t count, i;
-	struct cbt_rebuild_range *ranges;
-
-	if (val->type != SPDK_JSON_VAL_ARRAY_BEGIN) {
-		return -EINVAL;
-	}
-
-	count = val->len;
-	if (count == 0) {
-		req->override_ranges = NULL;
-		req->num_override_ranges = 0;
-		return 0;
-	}
-
-	ranges = calloc(count, sizeof(*ranges));
-	if (!ranges) {
-		return -ENOMEM;
-	}
-
-	/* Step into array items. */
-	array_val++;
-	for (i = 0; i < count; i++) {
-		/* Each element is an object with offset_blocks and length_blocks. */
-		struct spdk_json_val *obj = array_val;
-		if (obj->type != SPDK_JSON_VAL_OBJECT_BEGIN) {
-			free(ranges);
-			return -EINVAL;
-		}
-
-		uint32_t obj_size = obj->len;
-		struct spdk_json_val *key = obj + 1;
-		uint32_t j;
-
-		for (j = 0; j < obj_size; j++) {
-			if (key->type != SPDK_JSON_VAL_NAME) {
-				break;
-			}
-			struct spdk_json_val *value = key + 1;
-
-			if (spdk_json_strequal(key, "offset_blocks")) {
-				if (spdk_json_number_to_uint64(value, &ranges[i].offset_blocks)) {
-					free(ranges);
-					return -EINVAL;
-				}
-			} else if (spdk_json_strequal(key, "length_blocks")) {
-				if (spdk_json_number_to_uint64(value, &ranges[i].length_blocks)) {
-					free(ranges);
-					return -EINVAL;
-				}
-			}
-			key = value + spdk_json_val_len(value);
-		}
-
-		/* Advance past this object. */
-		array_val = obj + 1 + spdk_json_val_len(obj) - 1;
-		/* Actually skip entire object. */
-		array_val = (struct spdk_json_val *)obj + spdk_json_val_len(obj);
-	}
-
-	req->override_ranges = ranges;
-	req->num_override_ranges = count;
-	return 0;
-}
+/* Note: the C engine supports override_ranges, but this RPC exposes only the
+ * bitmap-driven mode (the former decode_override_ranges was ~70 lines of dead,
+ * never-wired parsing — removed; re-add via a proper decoder if ever needed). */
 
 static const struct spdk_json_object_decoder rpc_cbt_partial_rebuild_decoders[] = {
 	{"name",                 offsetof(struct rpc_cbt_partial_rebuild, name),                 spdk_json_decode_string},
@@ -815,12 +747,6 @@ rpc_bdev_cbt_partial_rebuild(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	/* Manually decode optional override_ranges array if present. */
-	/* For simplicity, override_ranges are not decoded here — we only
-	 * support bitmap-driven rebuild via this RPC. Override ranges can
-	 * be added later if needed by extending the decoder.
-	 */
-
 	cb_arg = calloc(1, sizeof(*cb_arg));
 	if (!cb_arg) {
 		spdk_jsonrpc_send_error_response(request, -ENOMEM,
@@ -834,8 +760,7 @@ rpc_bdev_cbt_partial_rebuild(struct spdk_jsonrpc_request *request,
 				      req.source_bdev_name,
 				      req.max_bandwidth_mb_sec,
 				      req.queue_depth,
-				      req.override_ranges,
-				      req.num_override_ranges,
+				      NULL, 0,
 				      rpc_rebuild_done_cb, cb_arg);
 	if (rc != 0) {
 		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));

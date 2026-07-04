@@ -29,11 +29,10 @@ struct vbdev_cbt {
 	uint32_t                     chunk_shift;    /* log2(chunk_size_blocks) for fast path */
 	uint64_t                     total_blocks;
 
-	/* ── Healthy-clear poller ── */
-	struct spdk_poller          *healthy_poller;
-	bool                         healthy_clear_suspended;
-	bool                         backends_healthy;     /* explicit health signal from orchestrator */
-	bool                         dirty_history_valid;  /* false after restart until first epoch completes */
+	/* D3: bitmap clearing is RESET-DRIVEN (bdev_cbt_reset, refused while an
+	 * epoch is active). The automatic healthy-clear poller and its
+	 * backends_healthy / dirty_history_valid signals were dead code (no
+	 * caller ever set them) and were removed. */
 
 	/* ── Epoch management ── */
 	TAILQ_HEAD(, cbt_epoch)      epochs;

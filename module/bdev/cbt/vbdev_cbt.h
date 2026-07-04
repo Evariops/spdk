@@ -21,7 +21,6 @@ extern "C" {
 #define CBT_CHUNK_SIZE_MAX_KB           65536    /* 64 MB */
 #define CBT_MAX_EPOCHS                  4
 #define CBT_MAX_RANGES_LIMIT            65536
-#define CBT_HEALTHY_CLEAR_INTERVAL_US   5000000  /* 5 s */
 #define CBT_EPOCH_ID_MAX                64
 #define CBT_BACKEND_ID_MAX              128
 #define CBT_REBUILD_DEFAULT_QD          16
@@ -222,12 +221,6 @@ int bdev_cbt_get_dirty_ranges(const char *cbt_name, uint32_t max_ranges,
 			      uint32_t *out_chunk_size_kb,
 			      bool *out_truncated);
 int bdev_cbt_reset(const char *cbt_name);
-
-/**
- * Notify CBT that all backends are confirmed healthy and in-sync.
- * Only after this call will the healthy-clear poller clear the bitmap.
- */
-void bdev_cbt_set_backends_healthy(const char *cbt_name, bool healthy);
 
 #ifdef __cplusplus
 }
