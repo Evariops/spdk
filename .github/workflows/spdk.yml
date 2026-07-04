@@ -22,7 +22,9 @@ on:
       - "patches/**"
       - ".github/workflows/spdk.yml"
   pull_request:
-    types: [labeled, synchronize]
+    # TS3: `opened` so lint + unit tests run on EVERY PR from the first push;
+    # image builds stay gated by the authorize job (label + allowlist).
+    types: [opened, labeled, synchronize]
     paths:
       - "images/spdk/**"
       - "module/bdev/cbt/**"
@@ -75,6 +77,13 @@ jobs:
         with:
           dockerfile: images/spdk/Dockerfile
           config: images/spdk/.hadolint.yaml
+
+      # TS2: host-compiled unit tests of the PRODUCTION tier code (mock SPDK
+      # headers — no SPDK/Docker build involved, runs in seconds). Kept in this
+      # job to avoid spinning an extra runner; a failure blocks the image build
+      # via the compute-tag dependency below.
+      - name: Tier module unit tests (T1, ASAN+UBSAN)
+        run: make -C module/bdev/tier/test
 
   # ────────────────────────────────────────────────────────────────
   # 2. Compute image tag (single source of truth)
