@@ -105,6 +105,20 @@ a split-brain across disks.
     blob extents (now pointing at the new cluster) and the control-plane reassembles
     the dead band DEGRADED/RETIRED so its range is not re-served. Relocate (copy,
     healthy source) still frees the old cluster normally (`release_old=true`).
+- `bdev_lvol_remap_clusters {name, tier_name, clusters:[{cluster_num, dst_lba_start, dst_lba_count}]}`
+  — **batch no-copy remap**: the no-copy analogue of `bdev_lvol_relocate_clusters`.
+  Re-homes N lost clusters (DEGRADED source → ACTIVE dst) under the **same per-item
+  guards** as the single `bdev_lvol_remap_cluster` (shared `remap_one_precheck`);
+  **no freeze, no copy, no `verify`** (the source is dead — nothing to drain or
+  read back). Sequential; **stops at the first per-item error** releasing that
+  item's un-committed claim, and returns `{remapped, requested, error}` —
+  **partial success is a 200** (caller retries the tail from `remapped`). Bounded
+  to 4096 items. Old clusters are QUARANTINED per item (`release_old=false`, R11).
+  Crash-safety per item is identical to the single remap (invariant B); the
+  control-plane journals the remap set and re-drives the tail + range rebuild at
+  restart (**PR3**). Re-issuing a partially-committed batch is safe: already-moved
+  clusters no longer sit on a DEGRADED band, so their per-item guard cleanly
+  `-EINVAL`s rather than double-moving.
 
 ## Capacity / ENOSPC (patch 0009)
 
