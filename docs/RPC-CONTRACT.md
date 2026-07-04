@@ -119,6 +119,16 @@ a split-brain across disks.
   restart (**PR3**). Re-issuing a partially-committed batch is safe: already-moved
   clusters no longer sit on a DEGRADED band, so their per-item guard cleanly
   `-EINVAL`s rather than double-moving.
+- **Cluster claim performance (deferred #4, patch 0004).** The claim under both
+  batch RPCs (`spdk_blob_claim_cluster_in_range`) is **word-wise** (skips
+  fully-allocated 64-bit words of the `used_clusters` bit-pool in one step) with an
+  optional **resume cursor** (`spdk_blob_claim_cluster_in_range_from`): a batch that
+  fills one band claims in **O(bandsize + N)** rather than O(N²), so a long
+  demotion/evac campaign shows flat per-cluster claim cost. Semantics are
+  **unchanged** (first free cluster in the window, `-ENOSPC` when full); the cursor
+  is a hint only — never a correctness input — so a stale/over-shot cursor is always
+  safe (the live windowed scan bounds every result). The batch threads one cursor
+  per dst band window and resets it when the window changes.
 
 ## Capacity / ENOSPC (patch 0009)
 
