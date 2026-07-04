@@ -1,34 +1,40 @@
-From 906c5213cfc58b0158ea2b6c559760a6e717cf68 Mon Sep 17 00:00:00 2001
-From: =?UTF-8?q?Rapha=C3=ABl=20DUCOM?= <raphael.ducom@gmail.com>
-Date: Sun, 21 Jun 2026 14:36:21 +0200
-Subject: [PATCH] m2: get_cluster_placement + relocate_cluster + remap_cluster RPCs
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Evariops <dev@evariops.com>
+Date: Sat, 4 Jul 2026 10:58:26 +0200
+Subject: [PATCH 05/10] lvol: get_cluster_placement + relocate_cluster +
+ remap_cluster RPCs
 
+Evariops 0005. C1: relocate runs under a BLOB freeze (not a composite
+quiesce). N-2: the blob is pinned by an own open-ref for the async chain.
+P-2: the lvol must live on the given tier composite. N-7/W6: remap requires
+the source band DEGRADED and the destination band ACTIVE. m9: the placement
+scan (not just the emission) is bounded per call.
 ---
  module/bdev/lvol/Makefile              |   3 +-
- module/bdev/lvol/vbdev_lvol_tier_rpc.c | 500 +++++++++++++++++++++++++
- 2 files changed, 502 insertions(+), 1 deletion(-)
+ module/bdev/lvol/vbdev_lvol_tier_rpc.c | 643 +++++++++++++++++++++++++
+ 2 files changed, 645 insertions(+), 1 deletion(-)
  create mode 100644 module/bdev/lvol/vbdev_lvol_tier_rpc.c
 
 diff --git a/module/bdev/lvol/Makefile b/module/bdev/lvol/Makefile
-index aba6620dc..a8ed3873d 100644
+index aba6620..a8ed387 100644
 --- a/module/bdev/lvol/Makefile
 +++ b/module/bdev/lvol/Makefile
 @@ -9,7 +9,8 @@ include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
  SO_VER := 7
  SO_MINOR := 0
-
+ 
 -C_SRCS = vbdev_lvol.c vbdev_lvol_rpc.c vbdev_lvol_ranges_rpc.c
 +CFLAGS += -I$(SPDK_ROOT_DIR)/module/bdev/tier
 +C_SRCS = vbdev_lvol.c vbdev_lvol_rpc.c vbdev_lvol_ranges_rpc.c vbdev_lvol_tier_rpc.c
  LIBNAME = bdev_lvol
-
+ 
  SPDK_MAP_FILE = $(SPDK_ROOT_DIR)/mk/spdk_blank.map
 diff --git a/module/bdev/lvol/vbdev_lvol_tier_rpc.c b/module/bdev/lvol/vbdev_lvol_tier_rpc.c
 new file mode 100644
-index 000000000..3caf17bc6
+index 0000000..65670ba
 --- /dev/null
 +++ b/module/bdev/lvol/vbdev_lvol_tier_rpc.c
-@@ -0,0 +1,500 @@
+@@ -0,0 +1,643 @@
 +/*   SPDX-License-Identifier: BSD-3-Clause
 + *   Copyright (C) 2026 Evariops.
 + *   All rights reserved.
@@ -38,19 +44,30 @@ index 000000000..3caf17bc6
 + *
 + *   Placement (M2a): per allocated cluster -> physical LBA on the bs_dev (the
 + *   bdev_tier composite); the control-plane maps LBA->band/tier from its band
-+ *   table. Read-only.
++ *   table. Read-only. Both the emission AND the scan are bounded per call (m9).
 + *
 + *   Relocate (M2b): move one cluster to a destination band, fully in the
-+ *   data-plane (INV-T2). Coherence (D6): the copy reads the SOURCE band's base
-+ *   bdev DIRECTLY (bypasses the composite), so a quiesce on the composite's old
-+ *   range holds upper-layer I/O without dead-locking the copy. Order:
-+ *     claim dst -> quiesce old (composite) -> copy (base-direct) ->
-+ *     commit (md-thread swap+persist+release old) -> unquiesce.
++ *   data-plane (INV-T2). C1: the barrier is a BLOB-level freeze
++ *   (spdk_blob_freeze_io) held for copy+commit — NOT a composite-level quiesce.
++ *   A composite quiesce holds writes BELOW the blob→LBA translation and replays
++ *   them to the OLD lba after the L2P swap (ACKed write lands on a freed
++ *   cluster = lost write). The blob freeze holds writes ABOVE the translation;
++ *   on unfreeze they re-translate through the updated L2P. Order:
++ *     open blob ref -> claim dst -> freeze blob -> copy (base-direct, not held
++ *     by the freeze) -> commit (md-thread swap+persist+release old) ->
++ *     unfreeze -> close ref.
 + *   Crash-safety: invariants A/B inside spdk_blob_relocate_commit.
 + *
 + *   F2: a SNAPSHOT blob's clusters may be shared (clones read through back_bs_dev),
 + *   so relocate/remap REFUSE snapshot blobs (owned-only, the v3 invariant).
 + *   F4: at most one relocate/remap in flight per blob (self-safe primitive).
++ *   N-2: the blob is pinned with its own open-ref for the whole async chain, so
++ *   a concurrent lvol close/delete cannot free it under the callbacks.
++ *   P-2: the lvol must live on the SAME composite as tier_name (a mismatched
++ *   pair would freeze/copy on the wrong device).
++ *   N-7/W6 (remap): the source band must be DEGRADED — remap intentionally
++ *   swaps the L2P to an UNWRITTEN cluster (the data is rebuilt afterwards by
++ *   bdev_raid_rebuild_ranges); doing that to a HEALTHY band serves garbage.
 + */
 +
 +#include "spdk/rpc.h"
@@ -65,6 +82,9 @@ index 000000000..3caf17bc6
 +
 +#define RPC_PLACEMENT_DEFAULT_MAX 4096u
 +#define RPC_PLACEMENT_HARD_MAX    1048576u
++/* m9: max cluster-table entries EXAMINED per call — bounds the synchronous scan
++ * on the reactor even for sparse multi-million-cluster blobs. */
++#define RPC_PLACEMENT_SCAN_BUDGET 262144u
 +
 +/* ===================== F4: per-blob relocate serialization ===================== */
 +/* Two in-flight relocate/remap ops on the SAME blob can issue two concurrent extent-page device
@@ -111,6 +131,15 @@ index 000000000..3caf17bc6
 +	}
 +}
 +
++/* P-2: true when the lvol's blobstore sits on THIS composite bdev. */
++static bool
++lvol_lives_on_tier(struct spdk_lvol *lvol, struct vbdev_tier *tier)
++{
++	struct lvol_store_bdev *lvs_bdev = vbdev_get_lvs_bdev_by_lvs(lvol->lvol_store);
++
++	return lvs_bdev != NULL && lvs_bdev->bdev == &tier->bdev;
++}
++
 +/* ===================== M2a: get_cluster_placement ===================== */
 +
 +struct rpc_lvol_placement {
@@ -134,7 +163,7 @@ index 000000000..3caf17bc6
 +	struct spdk_bdev *bdev;
 +	struct spdk_lvol *lvol;
 +	struct spdk_blob *blob;
-+	uint64_t cluster_size, num_clusters, c, emitted = 0, next_cursor = 0, lba;
++	uint64_t cluster_size, num_clusters, c, emitted = 0, scanned = 0, next_cursor = 0, lba;
 +
 +	if (spdk_json_decode_object(params, rpc_lvol_placement_decoders,
 +				    SPDK_COUNTOF(rpc_lvol_placement_decoders), &req)) {
@@ -164,13 +193,15 @@ index 000000000..3caf17bc6
 +	spdk_json_write_named_array_begin(w, "clusters");
 +
 +	for (c = req.start_cluster; c < num_clusters; c++) {
++		/* m9: bound the SCAN, not only the emission — a sparse blob used to
++		 * walk millions of unallocated entries on the reactor in one call. */
++		if (scanned++ >= RPC_PLACEMENT_SCAN_BUDGET || emitted >= req.max_clusters) {
++			next_cursor = c;
++			break;
++		}
 +		lba = spdk_blob_get_cluster_lba(blob, c);
 +		if (lba == 0) {
 +			continue;	/* unallocated */
-+		}
-+		if (emitted >= req.max_clusters) {
-+			next_cursor = c;
-+			break;
 +		}
 +		spdk_json_write_object_begin(w);
 +		spdk_json_write_named_uint64(w, "index", c);
@@ -215,7 +246,8 @@ index 000000000..3caf17bc6
 +	uint64_t			old_lba;
 +	uint64_t			new_lba;
 +	uint64_t			cluster_blocks;
-+	bool				quiesced;
++	bool				frozen;		/* C1: blob freeze held */
++	bool				ref_held;	/* N-2: our own blob open-ref */
 +	bool				claimed;
 +	bool				committed;
 +	int				rc;
@@ -242,28 +274,54 @@ index 000000000..3caf17bc6
 +}
 +
 +static void
-+relocate_unquiesced(void *cb_arg, int status)
++relocate_ref_closed(void *cb_arg, int bserrno)
 +{
 +	struct relocate_ctx *c = cb_arg;
 +
-+	(void)status;	/* best-effort unquiesce; the relocate outcome is c->rc */
++	(void)bserrno;	/* the relocate outcome is c->rc */
 +	relocate_reply(c, c->rc);
 +}
 +
-+/* Final stage once we are (or were) quiesced: release the dst on failure, then
-+ * unquiesce and reply. */
 +static void
-+relocate_finish_quiesced(struct relocate_ctx *c, int rc)
++relocate_close_ref(struct relocate_ctx *c)
++{
++	if (c->ref_held) {
++		c->ref_held = false;
++		spdk_blob_close(c->blob, relocate_ref_closed, c);
++		return;
++	}
++	relocate_reply(c, c->rc);
++}
++
++static void
++relocate_unfrozen(void *cb_arg, int status)
++{
++	struct relocate_ctx *c = cb_arg;
++
++	(void)status;	/* best-effort unfreeze completion; outcome is c->rc */
++	relocate_close_ref(c);
++}
++
++/* Final stage: release the dst claim on failure, lift the freeze, drop the blob
++ * ref, then reply. */
++static void
++relocate_finish(struct relocate_ctx *c, int rc)
 +{
 +	c->rc = rc;
 +	if (rc != 0 && c->claimed && !c->committed) {
 +		spdk_blob_release_cluster_lba(c->blob, c->new_lba);
 +		c->claimed = false;
 +	}
-+	if (vbdev_tier_relocate_unquiesce(c->tier, c->old_lba, c->cluster_blocks,
-+					  relocate_unquiesced, c) != 0) {
-+		relocate_reply(c, rc);
++	if (c->frozen) {
++		c->frozen = false;
++		if (spdk_blob_unfreeze_io(c->blob, relocate_unfrozen, c) == 0) {
++			return;
++		}
++		/* Unfreeze dispatch can only fail on OOM. A leaked freeze stalls this
++		 * blob's I/O FOREVER — scream; operator remediation: restart target. */
++		SPDK_ERRLOG("relocate: UNFREEZE DISPATCH FAILED — blob I/O left frozen!\n");
 +	}
++	relocate_close_ref(c);
 +}
 +
 +static void
@@ -274,7 +332,7 @@ index 000000000..3caf17bc6
 +	if (bserrno == 0) {
 +		c->committed = true;	/* commit took ownership of new + released old */
 +	}
-+	relocate_finish_quiesced(c, bserrno);
++	relocate_finish(c, bserrno);
 +}
 +
 +static void
@@ -284,33 +342,52 @@ index 000000000..3caf17bc6
 +	int rc;
 +
 +	if (status != 0) {
-+		relocate_finish_quiesced(c, status);
++		relocate_finish(c, status);
 +		return;
 +	}
 +	/* Data is on new (invariant A). Swap the map + persist + release old. */
 +	rc = spdk_blob_relocate_commit(c->blob, c->cluster_num, c->new_lba, relocate_committed, c);
 +	if (rc != 0) {
-+		relocate_finish_quiesced(c, rc);
++		relocate_finish(c, rc);
 +	}
 +}
 +
 +static void
-+relocate_quiesced(void *cb_arg, int status)
++relocate_frozen(void *cb_arg, int status)
 +{
 +	struct relocate_ctx *c = cb_arg;
 +	int rc;
 +
 +	if (status != 0) {
-+		relocate_finish_quiesced(c, status);
++		relocate_finish(c, status);
 +		return;
 +	}
-+	c->quiesced = true;
-+	/* Copy reads the source band's base bdev directly (bypasses the composite,
-+	 * so it is NOT held by the quiesce on the composite old range). */
++	c->frozen = true;
++	/* The copy reads/writes the base bdevs DIRECTLY (below the blob), so it is
++	 * NOT held by the blob freeze. */
 +	rc = vbdev_tier_relocate_copy(c->tier, c->old_lba, c->new_lba, c->cluster_blocks,
 +				      relocate_copied, c);
 +	if (rc != 0) {
-+		relocate_finish_quiesced(c, rc);
++		relocate_finish(c, rc);
++	}
++}
++
++/* N-2: our pin on the blob is established — start the frozen section. */
++static void
++relocate_blob_opened(void *cb_arg, struct spdk_blob *blob, int bserrno)
++{
++	struct relocate_ctx *c = cb_arg;
++	int rc;
++
++	if (bserrno != 0) {
++		relocate_finish(c, bserrno);
++		return;
++	}
++	assert(blob == c->blob);
++	c->ref_held = true;
++	rc = spdk_blob_freeze_io(c->blob, relocate_frozen, c);
++	if (rc != 0) {
++		relocate_finish(c, rc);
 +	}
 +}
 +
@@ -345,6 +422,13 @@ index 000000000..3caf17bc6
 +		goto cleanup;
 +	}
 +	blob = lvol->blob;
++	/* P-2: name and tier_name are independent parameters — verify the lvol's
++	 * blobstore actually sits on THIS composite before freezing/copying on it. */
++	if (!lvol_lives_on_tier(lvol, tier)) {
++		spdk_jsonrpc_send_error_response(request, -EINVAL,
++						 "lvol does not live on this tier composite (P-2)");
++		goto cleanup;
++	}
 +	/* F2 (reinstates the v3 "owned-only" invariant; reverses C6): a SNAPSHOT blob's clusters may be
 +	 * shared with clones reading THROUGH back_bs_dev (and delete_snapshot has a transient sharing
 +	 * window). Relocating one would free `old` under a clone -> corruption. The S-D-snap spike (safe
@@ -398,15 +482,9 @@ index 000000000..3caf17bc6
 +	c->cluster_blocks = cluster_size / blocklen;
 +	c->claimed = true;
 +
-+	/* Quiesce the composite's old range, then copy + commit + unquiesce. */
-+	rc = vbdev_tier_relocate_quiesce(tier, old_lba, c->cluster_blocks, relocate_quiesced, c);
-+	if (rc != 0) {
-+		spdk_blob_release_cluster_lba(blob, new_lba);
-+		relocate_blob_release(blob);
-+		spdk_jsonrpc_send_error_response_fmt(request, rc, "quiesce failed: %s",
-+						     spdk_strerror(rc < 0 ? -rc : rc));
-+		free(c);
-+	}
++	/* N-2: pin the blob for the whole async chain, then freeze + copy + commit. */
++	spdk_bs_open_blob(lvol->lvol_store->blobstore, spdk_blob_get_id(blob),
++			  relocate_blob_opened, c);
 +cleanup:
 +	free(req.name);
 +	free(req.tier_name);
@@ -418,9 +496,12 @@ index 000000000..3caf17bc6
 +struct remap_ctx {
 +	struct spdk_jsonrpc_request	*request;
 +	struct spdk_blob		*blob;
++	uint64_t			cluster_num;
 +	uint64_t			old_lba;
 +	uint64_t			new_lba;
 +	bool				claimed;
++	bool				ref_held;	/* N-2 */
++	int				rc;
 +};
 +
 +static void
@@ -447,6 +528,27 @@ index 000000000..3caf17bc6
 +}
 +
 +static void
++remap_ref_closed(void *cb_arg, int bserrno)
++{
++	struct remap_ctx *c = cb_arg;
++
++	(void)bserrno;
++	remap_reply(c, c->rc);
++}
++
++static void
++remap_finish(struct remap_ctx *c, int rc)
++{
++	c->rc = rc;
++	if (c->ref_held) {
++		c->ref_held = false;
++		spdk_blob_close(c->blob, remap_ref_closed, c);
++		return;
++	}
++	remap_reply(c, rc);
++}
++
++static void
 +remap_committed(void *cb_arg, int bserrno)
 +{
 +	struct remap_ctx *c = cb_arg;
@@ -454,7 +556,25 @@ index 000000000..3caf17bc6
 +	if (bserrno == 0) {
 +		c->claimed = false;	/* commit took ownership of new + released old */
 +	}
-+	remap_reply(c, bserrno);
++	remap_finish(c, bserrno);
++}
++
++static void
++remap_blob_opened(void *cb_arg, struct spdk_blob *blob, int bserrno)
++{
++	struct remap_ctx *c = cb_arg;
++	int rc;
++
++	if (bserrno != 0) {
++		remap_finish(c, bserrno);
++		return;
++	}
++	assert(blob == c->blob);
++	c->ref_held = true;
++	rc = spdk_blob_relocate_commit(c->blob, c->cluster_num, c->new_lba, remap_committed, c);
++	if (rc != 0) {
++		remap_finish(c, rc);
++	}
 +}
 +
 +static void
@@ -464,8 +584,10 @@ index 000000000..3caf17bc6
 +	struct spdk_bdev *bdev;
 +	struct spdk_lvol *lvol;
 +	struct spdk_blob *blob;
++	struct vbdev_tier *tier;
++	struct tier_band *src_band, *dst_band;
 +	struct remap_ctx *c;
-+	uint64_t old_lba, new_lba;
++	uint64_t old_lba, new_lba, band_off;
 +	int rc;
 +
 +	if (spdk_json_decode_object(params, rpc_lvol_relocate_decoders,
@@ -479,7 +601,17 @@ index 000000000..3caf17bc6
 +		spdk_jsonrpc_send_error_response(request, -ENODEV, "lvol not found");
 +		goto cleanup;
 +	}
++	tier = vbdev_tier_get_by_name(req.tier_name);
++	if (tier == NULL) {
++		spdk_jsonrpc_send_error_response(request, -ENODEV, "tier not found");
++		goto cleanup;
++	}
 +	blob = lvol->blob;
++	if (!lvol_lives_on_tier(lvol, tier)) {	/* P-2 */
++		spdk_jsonrpc_send_error_response(request, -EINVAL,
++						 "lvol does not live on this tier composite (P-2)");
++		goto cleanup;
++	}
 +	if (spdk_blob_is_snapshot(blob)) {	/* F2 */
 +		spdk_jsonrpc_send_error_response(request, -EBUSY, "cannot remap a snapshot blob's cluster (F2)");
 +		goto cleanup;
@@ -489,11 +621,20 @@ index 000000000..3caf17bc6
 +	 * the L2P to a freshly-claimed cluster on the target band and release the old (dead) cluster.
 +	 * Invariant A is intentionally relaxed (no data on new yet): the cluster was ALREADY lost, the
 +	 * nexus serves reads from k+m redundancy meanwhile, and the subsequent range rebuild fills new.
-+	 * A crash before the rebuild leaves cn->new(uninitialised) = same "local-lost, redundancy-has-it"
-+	 * state as before, re-driven next cycle. NO quiesce: the source band is dead (no in-flight to drain). */
++	 * NO quiesce/freeze: the source band is dead (no in-flight to drain). */
 +	old_lba = spdk_blob_get_cluster_lba(blob, req.cluster_num);
 +	if (old_lba == 0) {
 +		spdk_jsonrpc_send_error_response(request, -ENOENT, "cluster not allocated");
++		goto cleanup;
++	}
++	/* N-7/W6: relaxing invariant A is only legitimate when the data is ALREADY
++	 * lost — require the source band to be DEGRADED. Remapping a healthy
++	 * cluster would serve uninitialized garbage to every future read. */
++	src_band = vbdev_tier_band_of_lba(tier, old_lba, &band_off);
++	if (src_band == NULL || src_band->state != TIER_BAND_DEGRADED) {
++		spdk_jsonrpc_send_error_response(request, -EINVAL,
++						 "remap source band is not DEGRADED (N-7): remap is only "
++						 "valid for a lost cluster on a dead band");
 +		goto cleanup;
 +	}
 +	if (!relocate_blob_acquire(blob)) {	/* F4 */
@@ -508,6 +649,14 @@ index 000000000..3caf17bc6
 +						     spdk_strerror(rc < 0 ? -rc : rc));
 +		goto cleanup;
 +	}
++	/* The destination must be a HEALTHY band (the whole point is to re-home). */
++	dst_band = vbdev_tier_band_of_lba(tier, new_lba, &band_off);
++	if (dst_band == NULL || dst_band->state != TIER_BAND_ACTIVE) {
++		spdk_blob_release_cluster_lba(blob, new_lba);
++		relocate_blob_release(blob);
++		spdk_jsonrpc_send_error_response(request, -EINVAL, "destination band not ACTIVE");
++		goto cleanup;
++	}
 +	c = calloc(1, sizeof(*c));
 +	if (c == NULL) {
 +		spdk_blob_release_cluster_lba(blob, new_lba);
@@ -517,17 +666,18 @@ index 000000000..3caf17bc6
 +	}
 +	c->request = request;
 +	c->blob = blob;
++	c->cluster_num = req.cluster_num;
 +	c->old_lba = old_lba;
 +	c->new_lba = new_lba;
 +	c->claimed = true;
-+	rc = spdk_blob_relocate_commit(blob, req.cluster_num, new_lba, remap_committed, c);
-+	if (rc != 0) {
-+		remap_reply(c, rc);
-+	}
++	/* N-2: pin the blob across the async commit. */
++	spdk_bs_open_blob(lvol->lvol_store->blobstore, spdk_blob_get_id(blob),
++			  remap_blob_opened, c);
 +cleanup:
 +	free(req.name);
 +	free(req.tier_name);
 +}
 +SPDK_RPC_REGISTER("bdev_lvol_remap_cluster", rpc_bdev_lvol_remap_cluster, SPDK_RPC_RUNTIME)
---
+-- 
 2.50.1 (Apple Git-155)
+

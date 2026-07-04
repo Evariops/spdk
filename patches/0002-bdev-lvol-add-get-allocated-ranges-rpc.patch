@@ -1,20 +1,9 @@
-From af7a521923ec587b18151e12c393b9c24f8ff675 Mon Sep 17 00:00:00 2001
-From: Evariops <noreply@evariops.com>
-Date: Tue, 9 Jun 2026 22:05:00 +0200
-Subject: [PATCH] bdev/lvol: add bdev_lvol_get_allocated_ranges RPC
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Evariops <dev@evariops.com>
+Date: Sat, 4 Jul 2026 10:32:48 +0200
+Subject: [PATCH 02/10] lvol: add bdev_lvol_get_allocated_ranges RPC (Evariops
+ 0002)
 
-Adds a read-only JSON-RPC that reports the allocated cluster extents of
-a single lvol blob layer, walking the in-memory cluster map via the
-exported spdk_blob_get_next_allocated_io_unit /
-spdk_blob_get_next_unallocated_io_unit APIs. Emits merged, ascending,
-cluster-aligned extents with max_ranges-based pagination.
-
-This is the native changed-block-tracking surface for thin snapshots,
-consumed by spdk-csi for CSI SnapshotMetadata (KEP-3314) incremental
-backups. New file plus a one-line Makefile hunk to minimise upstream
-conflict surface.
-
-Signed-off-by: Evariops <noreply@evariops.com>
 ---
  module/bdev/lvol/Makefile                |   2 +-
  module/bdev/lvol/vbdev_lvol_ranges_rpc.c | 102 +++++++++++++++++++++++

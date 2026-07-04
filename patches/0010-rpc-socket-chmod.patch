@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Evariops <dev@evariops.com>
+Date: Sat, 4 Jul 2026 10:56:39 +0200
+Subject: [PATCH 10/10] rpc: chmod 0600 the unix socket after bind (Evariops
+ 0010, S-2)
+
+---
+ lib/rpc/rpc.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/lib/rpc/rpc.c b/lib/rpc/rpc.c
+index ead7c66..9e3a88f 100644
+--- a/lib/rpc/rpc.c
++++ b/lib/rpc/rpc.c
+@@ -205,6 +205,19 @@ spdk_rpc_server_listen(const char *listen_addr)
+ 		goto ret;
+ 	}
+ 
++	/* Evariops S-2: this socket is FULL data-plane control (create/delete/relocate
++	 * of volumes). Its mode was whatever umask produced — often 0755/0775 in a
++	 * shared /var/tmp. Owner-only, explicitly. */
++	if (chmod(server->listen_addr_unix.sun_path, 0600) != 0) {
++		SPDK_ERRLOG("Cannot chmod 0600 RPC socket %s: %s\n",
++			    server->listen_addr_unix.sun_path, spdk_strerror(errno));
++		spdk_jsonrpc_server_shutdown(server->jsonrpc_server);
++		close(server->lock_fd);
++		unlink(server->lock_path);
++		unlink(server->listen_addr_unix.sun_path);
++		goto ret;
++	}
++
+ 	return server;
+ 
+ ret:
+-- 
+2.50.1 (Apple Git-155)
+

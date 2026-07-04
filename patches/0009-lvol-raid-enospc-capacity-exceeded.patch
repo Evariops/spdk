@@ -1,0 +1,142 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Evariops <dev@evariops.com>
+Date: Sat, 4 Jul 2026 10:55:35 +0200
+Subject: [PATCH 09/10] lvol/raid: surface thin-pool ENOSPC as NVMe
+ CAPACITY_EXCEEDED (Evariops 0009, C-1)
+
+lvol maps blob -ENOSPC to NVMe CAPACITY_EXCEEDED (survives the NVMe-oF hop);
+raid1 does NOT fail a member on CAPACITY_EXCEEDED (thin exhaustion is not a
+device fault) and the raid_io completes CAPACITY_EXCEEDED to the consumer
+even if another leg succeeded - no more silently-diverged, silently-degraded
+mirror on asymmetric ENOSPC.
+---
+ module/bdev/lvol/vbdev_lvol.c |  9 +++++++++
+ module/bdev/raid/bdev_raid.c  | 10 ++++++++++
+ module/bdev/raid/bdev_raid.h  |  6 ++++++
+ module/bdev/raid/raid1.c      | 23 +++++++++++++++++++----
+ 4 files changed, 44 insertions(+), 4 deletions(-)
+
+diff --git a/module/bdev/lvol/vbdev_lvol.c b/module/bdev/lvol/vbdev_lvol.c
+index 4c74027..713f905 100644
+--- a/module/bdev/lvol/vbdev_lvol.c
++++ b/module/bdev/lvol/vbdev_lvol.c
+@@ -6,6 +6,7 @@
+ 
+ #include "spdk/rpc.h"
+ #include "spdk/bdev_module.h"
++#include "spdk/nvme_spec.h"	/* Evariops C-1 */
+ #include "spdk/log.h"
+ #include "spdk/string.h"
+ #include "spdk/uuid.h"
+@@ -868,6 +869,14 @@ lvol_op_comp(void *cb_arg, int bserrno)
+ 	if (bserrno != 0) {
+ 		if (bserrno == -ENOMEM) {
+ 			status = SPDK_BDEV_IO_STATUS_NOMEM;
++		} else if (bserrno == -ENOSPC) {
++			/* Evariops C-1: surface thin-pool exhaustion as NVMe
++			 * CAPACITY_EXCEEDED so it survives the NVMe-oF hop and upper
++			 * layers (raid1) can distinguish it from a media fault (the
++			 * generic FAILED mapping erased that information). */
++			spdk_bdev_io_complete_nvme_status(bdev_io, 0, SPDK_NVME_SCT_GENERIC,
++							  SPDK_NVME_SC_CAPACITY_EXCEEDED);
++			return;
+ 		} else {
+ 			status = SPDK_BDEV_IO_STATUS_FAILED;
+ 		}
+diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
+index 636eda1..c67f91c 100644
+--- a/module/bdev/raid/bdev_raid.c
++++ b/module/bdev/raid/bdev_raid.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include "bdev_raid.h"
++#include "spdk/nvme_spec.h"	/* Evariops C-1 */
+ #include "spdk/env.h"
+ #include "spdk/thread.h"
+ #include "spdk/log.h"
+@@ -681,6 +682,14 @@ raid_bdev_io_complete(struct raid_bdev_io *raid_io, enum spdk_bdev_io_status sta
+ 				status = SPDK_BDEV_IO_STATUS_FAILED;
+ 			}
+ 		}
++		/* Evariops C-1: a thin-exhausted member surfaces to the consumer as
++		 * CAPACITY_EXCEEDED (the FS sees ENOSPC), overriding the any-leg-SUCCESS
++		 * outcome — one replica silently missed this write. */
++		if (spdk_unlikely(raid_io->enospc)) {
++			spdk_bdev_io_complete_nvme_status(bdev_io, 0, SPDK_NVME_SCT_GENERIC,
++							  SPDK_NVME_SC_CAPACITY_EXCEEDED);
++			return;
++		}
+ 		spdk_bdev_io_complete(bdev_io, status);
+ 	}
+ }
+@@ -951,6 +960,7 @@ raid_bdev_io_init(struct raid_bdev_io *raid_io, struct raid_bdev_io_channel *rai
+ 	raid_io->base_bdev_io_remaining = 0;
+ 	raid_io->base_bdev_io_submitted = 0;
+ 	raid_io->completion_cb = NULL;
++	raid_io->enospc = false;	/* Evariops C-1 */
+ 	raid_io->split.offset = RAID_OFFSET_BLOCKS_INVALID;
+ 
+ 	raid_bdev_io_set_default_status(raid_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+diff --git a/module/bdev/raid/bdev_raid.h b/module/bdev/raid/bdev_raid.h
+index e7d7ac5..7ee701a 100644
+--- a/module/bdev/raid/bdev_raid.h
++++ b/module/bdev/raid/bdev_raid.h
+@@ -150,6 +150,12 @@ struct raid_bdev_io {
+ 	/* This will be the raid_io completion status unless any base io's status is different. */
+ 	enum spdk_bdev_io_status	base_bdev_io_status_default;
+ 
++	/* Evariops C-1: a member completed a write with NVMe CAPACITY_EXCEEDED
++	 * (thin-pool exhaustion). Sticky: the raid_io completes CAPACITY_EXCEEDED
++	 * to the consumer even if another leg succeeded (the any-leg-SUCCESS rule
++	 * of complete_part must not ACK a write one replica silently missed). */
++	bool				enospc;
++
+ 	/* Private data for the raid module */
+ 	void				*module_private;
+ 
+diff --git a/module/bdev/raid/raid1.c b/module/bdev/raid/raid1.c
+index 4b24829..af633de 100644
+--- a/module/bdev/raid/raid1.c
++++ b/module/bdev/raid/raid1.c
+@@ -7,6 +7,7 @@
+ 
+ #include "spdk/likely.h"
+ #include "spdk/log.h"
++#include "spdk/nvme_spec.h"	/* Evariops C-1: CAPACITY_EXCEEDED discrimination */
+ 
+ struct raid1_info {
+ 	/* The parent raid bdev */
+@@ -54,11 +55,25 @@ raid1_write_bdev_io_completion(struct spdk_bdev_io *bdev_io, bool success, void
+ 	struct raid_bdev_io *raid_io = cb_arg;
+ 
+ 	if (!success) {
+-		struct raid_base_bdev_info *base_info;
++		uint32_t cdw0;
++		int sct, sc;
++
++		spdk_bdev_io_get_nvme_status(bdev_io, &cdw0, &sct, &sc);
++		if (sct == SPDK_NVME_SCT_GENERIC && sc == SPDK_NVME_SC_CAPACITY_EXCEEDED) {
++			/* Evariops C-1: thin-pool exhaustion is NOT a device fault. The old
++			 * behavior failed the member (silent redundancy loss) while
++			 * complete_part still ACKed the write off the surviving leg
++			 * (silent divergence). Instead: keep the member, mark the raid_io
++			 * so it completes CAPACITY_EXCEEDED to the consumer (the FS sees
++			 * ENOSPC; a later successful rewrite reconverges both legs). */
++			raid_io->enospc = true;
++		} else {
++			struct raid_base_bdev_info *base_info;
+ 
+-		base_info = raid_bdev_channel_get_base_info(raid_io->raid_ch, bdev_io->bdev);
+-		if (base_info) {
+-			raid_bdev_fail_base_bdev(base_info);
++			base_info = raid_bdev_channel_get_base_info(raid_io->raid_ch, bdev_io->bdev);
++			if (base_info) {
++				raid_bdev_fail_base_bdev(base_info);
++			}
+ 		}
+ 	}
+ 
+-- 
+2.50.1 (Apple Git-155)
+
