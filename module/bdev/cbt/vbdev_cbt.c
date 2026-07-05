@@ -41,6 +41,7 @@ static void vbdev_cbt_finish(void);
 static int  vbdev_cbt_get_ctx_size(void);
 static void vbdev_cbt_examine(struct spdk_bdev *bdev);
 static int  vbdev_cbt_config_json(struct spdk_json_write_ctx *w);
+static uint64_t cbt_count_dirty_bits(const uint8_t *bitmap, uint64_t size_bytes);
 
 /* ================================================================== */
 /* Module registration                                                */
@@ -142,6 +143,25 @@ cbt_any_epoch_open(struct vbdev_cbt *cbt)
 	struct cbt_epoch *ep;
 
 	TAILQ_FOREACH(ep, &cbt->epochs, link) {
+		if (ep->state == CBT_EPOCH_OPEN || ep->state == CBT_EPOCH_FROZEN ||
+		    ep->state == CBT_EPOCH_REBUILDING) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/* Epochs share the single live bitmap: snapshot-and-clear at freeze is only
+ * safe when no OTHER epoch still needs the accumulated view. */
+static bool
+cbt_has_other_active_epoch(struct vbdev_cbt *cbt, struct cbt_epoch *self)
+{
+	struct cbt_epoch *ep;
+
+	TAILQ_FOREACH(ep, &cbt->epochs, link) {
+		if (ep == self) {
+			continue;
+		}
 		if (ep->state == CBT_EPOCH_OPEN || ep->state == CBT_EPOCH_FROZEN ||
 		    ep->state == CBT_EPOCH_REBUILDING) {
 			return true;
@@ -985,22 +1005,45 @@ bdev_cbt_epoch_freeze(const char *cbt_name, const char *epoch_id)
 	 * in-flight may or may not be captured. This is acceptable because
 	 * the orchestrator must ensure all writes are drained before calling
 	 * freeze if it needs a precise point-in-time snapshot.
-	 *
-	 * An atomic fence ensures visibility of all relaxed stores before
-	 * we read.
 	 */
 	ep->bitmap_frozen = malloc(cbt->bitmap_size_bytes);
 	if (!ep->bitmap_frozen) {
 		return -ENOMEM;
 	}
 	__atomic_thread_fence(__ATOMIC_ACQUIRE);
-	memcpy(ep->bitmap_frozen, cbt->bitmap, cbt->bitmap_size_bytes);
+
+	if (!cbt_has_other_active_epoch(cbt, ep)) {
+		/* Snapshot-AND-CLEAR (atomic per-byte exchange): each freeze captures the
+		 * DELTA since the previous freeze, so iterative partial rebuilds converge
+		 * geometrically once copy_rate > dirty_rate. The previous accumulate-only
+		 * semantics recopied the union of everything dirtied since epoch open on
+		 * every iteration — residual was monotonically non-decreasing and the
+		 * convergence loop could not terminate by design.
+		 *
+		 * Exchange (not memcpy+memset): a bit OR'd by an IO thread between the
+		 * copy and the clear would be LOST — a missed chunk under skip_rebuild
+		 * is silent data divergence. The exchange makes each concurrent OR land
+		 * either before (captured in this snapshot) or after (tracked for the
+		 * next delta). */
+		for (uint64_t i = 0; i < cbt->bitmap_size_bytes; i++) {
+			ep->bitmap_frozen[i] =
+				__atomic_exchange_n(&cbt->bitmap[i], 0, __ATOMIC_ACQ_REL);
+		}
+	} else {
+		/* Another epoch still consumes the accumulated live view — snapshot only.
+		 * Convergence is degraded (residual includes prior deltas) but correct. */
+		memcpy(ep->bitmap_frozen, cbt->bitmap, cbt->bitmap_size_bytes);
+		SPDK_NOTICELOG("CBT: epoch_freeze '%s' without clear (other active epochs)\n",
+			       epoch_id);
+	}
 	ep->state = CBT_EPOCH_FROZEN;
 
-	SPDK_NOTICELOG("CBT: epoch_freeze '%s' (dirty=%lu/%lu)\n",
+	SPDK_NOTICELOG("CBT: epoch_freeze '%s' (dirty=%lu/%lu, live_after=%lu)\n",
 		       epoch_id,
-		       (unsigned long)cbt_popcount_bitmap(cbt),
-		       (unsigned long)cbt->bitmap_size_bits);
+		       (unsigned long)cbt_count_dirty_bits(ep->bitmap_frozen,
+				       cbt->bitmap_size_bytes),
+		       (unsigned long)cbt->bitmap_size_bits,
+		       (unsigned long)cbt_popcount_bitmap(cbt));
 	return 0;
 }
 
