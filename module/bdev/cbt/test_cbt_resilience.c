@@ -283,6 +283,21 @@ cbt_epoch_open(struct cbt_device *dev, const char *epoch_id,
 	return 0;
 }
 
+/* Mirrors vbdev_cbt.c cbt_has_other_active_epoch: epochs share the live bitmap,
+ * so snapshot-and-clear is only safe when no OTHER epoch needs the accumulated view. */
+static bool
+cbt_has_other_active_epoch(struct cbt_device *dev, struct cbt_epoch *self)
+{
+	for (struct cbt_epoch *ep = dev->epochs_head; ep; ep = ep->next) {
+		if (ep == self) continue;
+		if (ep->state == CBT_EPOCH_OPEN || ep->state == CBT_EPOCH_FROZEN ||
+		    ep->state == CBT_EPOCH_REBUILDING) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static int
 cbt_epoch_freeze(struct cbt_device *dev, const char *epoch_id)
 {
@@ -300,7 +315,18 @@ cbt_epoch_freeze(struct cbt_device *dev, const char *epoch_id)
 	ep->bitmap_frozen = fi_malloc(dev->bitmap_size_bytes);
 	if (!ep->bitmap_frozen) return -ENOMEM;
 
-	memcpy(ep->bitmap_frozen, dev->bitmap, dev->bitmap_size_bytes);
+	if (!cbt_has_other_active_epoch(dev, ep)) {
+		/* Snapshot-AND-CLEAR (atomic per-byte exchange): each freeze captures
+		 * the DELTA since the previous freeze — iterative rebuilds converge.
+		 * Exchange, not memcpy+memset: a concurrent OR between copy and clear
+		 * would be lost (missed chunk under skip_rebuild = silent divergence). */
+		for (uint64_t i = 0; i < dev->bitmap_size_bytes; i++) {
+			ep->bitmap_frozen[i] = __atomic_exchange_n(&dev->bitmap[i], 0,
+								   __ATOMIC_ACQ_REL);
+		}
+	} else {
+		memcpy(ep->bitmap_frozen, dev->bitmap, dev->bitmap_size_bytes);
+	}
 	ep->state = CBT_EPOCH_FROZEN;
 	return 0;
 }
@@ -848,15 +874,17 @@ static void test_double_freeze(void)
 	cbt_mark_dirty(dev, 0, 128);
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
 
-	/* Mark more, re-freeze → should succeed, updating snapshot. */
+	/* Mark more, re-freeze → succeeds. Delta semantics (snapshot-and-clear):
+	 * the first freeze CONSUMED the first range; the re-frozen snapshot holds
+	 * ONLY what was marked since — that delta is what convergence copies. */
 	cbt_mark_dirty(dev, 256, 128);
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
 
-	/* Verify new snapshot has both ranges. */
 	struct dirty_range *ranges = NULL;
 	uint32_t count = 0;
 	ASSERT_RC(cbt_epoch_get_dirty_ranges(dev, "ep1", 0, &ranges, &count), 0);
-	ASSERT_EQ(count, 2);
+	ASSERT_EQ(count, 1);
+	ASSERT_EQ(ranges[0].offset_blocks, 256);
 	free(ranges);
 
 	cbt_destroy(dev);
@@ -1523,6 +1551,151 @@ static void test_rebuild_convergence_refreeze(void)
 }
 
 /* ================================================================== */
+/* SECTION 12: Freeze delta semantics (snapshot-and-clear)            */
+/* ================================================================== */
+
+static uint64_t
+count_bits(const uint8_t *bm, uint64_t bytes)
+{
+	uint64_t n = 0;
+	for (uint64_t i = 0; i < bytes; i++) {
+		n += (uint64_t)__builtin_popcount(bm[i]);
+	}
+	return n;
+}
+
+static void test_freeze_clears_live_when_sole_epoch(void)
+{
+	TEST(test_freeze_clears_live_when_sole_epoch);
+	fi_reset();
+	struct cbt_device *dev = cbt_create(2048, 64, 512);
+	ASSERT(dev != NULL);
+
+	ASSERT_RC(cbt_epoch_open(dev, "ep1", "b", 1), 0);
+	cbt_mark_dirty(dev, 0, 512);
+
+	/* Freeze #1: captures the marks AND clears the live bitmap. */
+	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
+	struct cbt_epoch *ep = cbt_find_epoch(dev, "ep1");
+	ASSERT(ep != NULL);
+	ASSERT(count_bits(ep->bitmap_frozen, dev->bitmap_size_bytes) > 0);
+	ASSERT_EQ(count_bits(dev->bitmap, dev->bitmap_size_bytes), 0);
+
+	/* New writes land AFTER the freeze. */
+	cbt_mark_dirty(dev, 1024, 128);
+	uint64_t delta_chunks = count_bits(dev->bitmap, dev->bitmap_size_bytes);
+	ASSERT(delta_chunks > 0);
+
+	/* Freeze #2 (re-freeze): frozen must contain ONLY the new delta —
+	 * geometric convergence depends on this. */
+	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
+	ASSERT_EQ(count_bits(ep->bitmap_frozen, dev->bitmap_size_bytes), delta_chunks);
+	ASSERT_EQ(count_bits(dev->bitmap, dev->bitmap_size_bytes), 0);
+
+	/* Freeze #3 with no new writes: empty delta → converged. */
+	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
+	ASSERT_EQ(count_bits(ep->bitmap_frozen, dev->bitmap_size_bytes), 0);
+
+	cbt_destroy(dev);
+	PASS();
+}
+
+static void test_freeze_preserves_live_with_other_active_epoch(void)
+{
+	TEST(test_freeze_preserves_live_with_other_active_epoch);
+	fi_reset();
+	struct cbt_device *dev = cbt_create(2048, 64, 512);
+	ASSERT(dev != NULL);
+
+	ASSERT_RC(cbt_epoch_open(dev, "ep1", "b1", 1), 0);
+	ASSERT_RC(cbt_epoch_open(dev, "ep2", "b2", 2), 0);
+	cbt_mark_dirty(dev, 0, 512);
+
+	uint64_t before = count_bits(dev->bitmap, dev->bitmap_size_bytes);
+	ASSERT(before > 0);
+
+	/* ep2 is still OPEN and needs the accumulated view → freeze must NOT clear. */
+	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
+	ASSERT_EQ(count_bits(dev->bitmap, dev->bitmap_size_bytes), before);
+
+	cbt_destroy(dev);
+	PASS();
+}
+
+/* Property: under a concurrent writer, the union of all frozen snapshots plus
+ * the live bitmap must equal exactly the set of chunks the writer marked —
+ * the per-byte atomic exchange must never lose (or invent) a bit. */
+struct delta_race_ctx {
+	struct cbt_device *dev;
+	uint8_t           *shadow;      /* same layout as dev->bitmap */
+	_Atomic bool       stop;
+	_Atomic uint64_t   marks;
+};
+
+static void *
+delta_marker_thread(void *arg)
+{
+	struct delta_race_ctx *ctx = arg;
+	uint64_t seed = 0x9e3779b97f4a7c15ull;
+	while (!atomic_load(&ctx->stop)) {
+		seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+		uint64_t block = seed % ctx->dev->total_blocks;
+		cbt_mark_dirty(ctx->dev, block, 1);
+		uint64_t chunk = block >> ctx->dev->chunk_shift;
+		__atomic_fetch_or(&ctx->shadow[chunk >> 3], (uint8_t)(1u << (chunk & 7)),
+				  __ATOMIC_RELAXED);
+		atomic_fetch_add(&ctx->marks, 1);
+	}
+	return NULL;
+}
+
+static void test_concurrent_refreeze_never_loses_bits(void)
+{
+	TEST(test_concurrent_refreeze_never_loses_bits);
+	fi_reset();
+	struct cbt_device *dev = cbt_create(65536, 64, 512);
+	ASSERT(dev != NULL);
+
+	uint8_t *shadow = calloc(1, dev->bitmap_size_bytes);
+	uint8_t *acc    = calloc(1, dev->bitmap_size_bytes);
+	ASSERT(shadow != NULL && acc != NULL);
+
+	ASSERT_RC(cbt_epoch_open(dev, "ep1", "b", 1), 0);
+	struct cbt_epoch *ep = cbt_find_epoch(dev, "ep1");
+	ASSERT(ep != NULL);
+
+	struct delta_race_ctx ctx = { .dev = dev, .shadow = shadow, .stop = false, .marks = 0 };
+	pthread_t t;
+	pthread_create(&t, NULL, delta_marker_thread, &ctx);
+
+	/* Re-freeze repeatedly under fire, accumulating every captured delta. */
+	for (int pass = 0; pass < 200; pass++) {
+		ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
+		for (uint64_t i = 0; i < dev->bitmap_size_bytes; i++) {
+			acc[i] |= ep->bitmap_frozen[i];
+		}
+	}
+
+	atomic_store(&ctx.stop, true);
+	pthread_join(t, NULL);
+	ASSERT(atomic_load(&ctx.marks) > 0);
+
+	/* Tail: whatever the writer marked after the last freeze is still live. */
+	for (uint64_t i = 0; i < dev->bitmap_size_bytes; i++) {
+		acc[i] |= dev->bitmap[i];
+	}
+
+	/* Exact equality: no lost bits (missed chunk = silent divergence under
+	 * skip_rebuild) and no phantom bits. */
+	ASSERT_EQ(memcmp(acc, shadow, dev->bitmap_size_bytes), 0);
+
+	free(shadow);
+	free(acc);
+	cbt_destroy(dev);
+	PASS();
+}
+
+/* ================================================================== */
 /* Main                                                               */
 /* ================================================================== */
 
@@ -1607,6 +1780,11 @@ main(void)
 	test_rebuild_invalidate_during_rebuild();
 	test_rebuild_get_ranges_during_rebuild();
 	test_rebuild_convergence_refreeze();
+
+	printf("\n── Freeze delta semantics (snapshot-and-clear) ──\n");
+	test_freeze_clears_live_when_sole_epoch();
+	test_freeze_preserves_live_with_other_active_epoch();
+	test_concurrent_refreeze_never_loses_bits();
 
 	printf("\n========================================================\n");
 	printf("Results: %d passed, %d failed\n", g_passed, g_failed);

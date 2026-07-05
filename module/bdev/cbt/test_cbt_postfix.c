@@ -341,6 +341,21 @@ cbt_epoch_open(struct cbt_device *dev, const char *epoch_id,
 	return 0;
 }
 
+/* Mirrors vbdev_cbt.c: snapshot-and-clear is only safe when no OTHER epoch
+ * still needs the shared accumulated live view. */
+static bool
+cbt_has_other_active_epoch(struct cbt_device *dev, struct cbt_epoch *self)
+{
+	for (struct cbt_epoch *ep = dev->epochs_head; ep; ep = ep->next) {
+		if (ep == self) continue;
+		if (ep->state == CBT_EPOCH_OPEN || ep->state == CBT_EPOCH_FROZEN ||
+		    ep->state == CBT_EPOCH_REBUILDING) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static int
 cbt_epoch_freeze(struct cbt_device *dev, const char *epoch_id)
 {
@@ -353,7 +368,15 @@ cbt_epoch_freeze(struct cbt_device *dev, const char *epoch_id)
 	if (!ep->bitmap_frozen) return -ENOMEM;
 
 	__atomic_thread_fence(__ATOMIC_ACQUIRE);
-	memcpy(ep->bitmap_frozen, dev->bitmap, dev->bitmap_size_bytes);
+	if (!cbt_has_other_active_epoch(dev, ep)) {
+		/* Delta semantics: atomic per-byte exchange (no lost concurrent ORs). */
+		for (uint64_t i = 0; i < dev->bitmap_size_bytes; i++) {
+			ep->bitmap_frozen[i] = __atomic_exchange_n(&dev->bitmap[i], 0,
+								   __ATOMIC_ACQ_REL);
+		}
+	} else {
+		memcpy(ep->bitmap_frozen, dev->bitmap, dev->bitmap_size_bytes);
+	}
 	ep->state = CBT_EPOCH_FROZEN;
 	return 0;
 }
