@@ -41,4 +41,15 @@ void spdk_bdev_free_io(struct spdk_bdev_io *bdev_io);
 struct spdk_io_channel *spdk_bdev_get_io_channel(struct spdk_bdev_desc *desc);
 void spdk_put_io_channel(struct spdk_io_channel *ch);
 
+enum spdk_bdev_io_type {
+	SPDK_BDEV_IO_TYPE_INVALID = 0,
+	SPDK_BDEV_IO_TYPE_READ,
+	SPDK_BDEV_IO_TYPE_WRITE,
+	SPDK_BDEV_IO_TYPE_UNMAP,
+	SPDK_BDEV_IO_TYPE_FLUSH,
+};
+
+struct spdk_bdev *spdk_bdev_desc_get_bdev(struct spdk_bdev_desc *desc);
+bool spdk_bdev_io_type_supported(struct spdk_bdev *bdev, enum spdk_bdev_io_type io_type);
+
 #endif

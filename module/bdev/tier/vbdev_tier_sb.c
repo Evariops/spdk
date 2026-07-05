@@ -201,7 +201,16 @@ tier_sb_write_band_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg
 		tier_sb_band_io_done(bw, false);
 		return;
 	}
-	/* F-6: flush before calling this copy durable. */
+	/* F-6: flush before calling this copy durable. Same contract as the CBT
+	 * rebuild path: a base bdev without FLUSH support (bdev_uring) has no
+	 * volatile cache to drain — treat the completed write as durable instead
+	 * of failing the persist. This EIO'd EVERY superblock persist on uring
+	 * bases, so no tier SB was ever written on such nodes. */
+	if (!spdk_bdev_io_type_supported(spdk_bdev_desc_get_bdev(bw->desc),
+					 SPDK_BDEV_IO_TYPE_FLUSH)) {
+		tier_sb_band_io_done(bw, true);
+		return;
+	}
 	rc = spdk_bdev_flush_blocks(bw->desc, bw->ch, bw->slot_off_blocks, bw->slot_blocks,
 				    tier_sb_flush_band_done, bw);
 	if (rc != 0) {
