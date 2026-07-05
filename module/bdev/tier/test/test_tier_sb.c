@@ -41,6 +41,19 @@ spdk_bdev_write_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 	return -ENOTSUP;
 }
 
+struct spdk_bdev *
+spdk_bdev_desc_get_bdev(struct spdk_bdev_desc *desc)
+{
+	return (struct spdk_bdev *)desc;	/* opaque round-trip for the mock */
+}
+
+bool
+spdk_bdev_io_type_supported(struct spdk_bdev *bdev, enum spdk_bdev_io_type io_type)
+{
+	(void)bdev; (void)io_type;
+	return false;	/* mirrors the -ENOTSUP flush stub: no-FLUSH base (bdev_uring) */
+}
+
 int
 spdk_bdev_read_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 		      void *buf, uint64_t offset_blocks, uint64_t num_blocks,
