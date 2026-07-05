@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Evariops <dev@evariops.com>
+Date: Sat, 5 Jul 2026 18:20:00 +0200
+Subject: [PATCH 12/12] lvol: NOTICE-level shutdown unload observability
+ (Evariops 0012)
+
+A lvolstore whose shutdown unload fails (or never runs because lvols
+were still open at fini_start and the unregister-path unload never
+fired) leaves the blobstore superblock dirty: the next load performs a
+full metadata recovery - tens of seconds on SATA, which inflates every
+rollout's node-ready time and the CBT dirty window with it. Observed on
+turing: ~70-95s boots on rolled nodes vs ~6s on clean loads, with the
+existing INFOLOG outcome invisible in production logs.
+
+Log all three outcomes (clean unload via fini_start, clean unload via
+unregister path, FAILED unload with errno) and the fini_start skip at
+NOTICE so field logs pinpoint which path ran.
+---
+ module/bdev/lvol/vbdev_lvol.c | 30 ++++++++++++++++++++++++------
+ 1 file changed, 24 insertions(+), 6 deletions(-)
+
+diff --git a/module/bdev/lvol/vbdev_lvol.c b/module/bdev/lvol/vbdev_lvol.c
+--- a/module/bdev/lvol/vbdev_lvol.c
++++ b/module/bdev/lvol/vbdev_lvol.c
+@@ -585,8 +585,14 @@
+ 	struct lvol_bdev *lvol_bdev = cb_arg;
+ 	struct lvol_store_bdev *lvs_bdev = lvol_bdev->lvs_bdev;
+ 
++	/* Evariops 0012: a failed shutdown unload leaves the blobstore superblock
++	 * dirty — the next load replays md for tens of seconds on SATA. Surface the
++	 * outcome at NOTICE so field logs pinpoint the errno and the path taken. */
+ 	if (lvserrno != 0) {
+-		SPDK_INFOLOG(vbdev_lvol, "Lvol store removed with error: %d.\n", lvserrno);
++		SPDK_NOTICELOG("shutdown: lvolstore unload FAILED err=%d "
++			       "(superblock left dirty; next load will recover)\n", lvserrno);
++	} else if (g_shutdown_started) {
++		SPDK_NOTICELOG("shutdown: lvolstore unloaded clean (unregister path)\n");
+ 	}
+ 
+ 	TAILQ_REMOVE(&g_spdk_lvol_pairs, lvs_bdev, lvol_stores);
+@@ -1495,8 +1501,12 @@
+ 	struct lvol_store_bdev *lvs_bdev = cb_arg;
+ 	struct lvol_store_bdev *next_lvs_bdev = vbdev_lvol_store_next(lvs_bdev);
+ 
++	/* Evariops 0012: see _vbdev_lvol_unregister_unload_lvs — NOTICE both outcomes. */
+ 	if (lvserrno != 0) {
+-		SPDK_INFOLOG(vbdev_lvol, "Lvol store removed with error: %d.\n", lvserrno);
++		SPDK_NOTICELOG("shutdown: lvolstore unload FAILED err=%d "
++			       "(superblock left dirty; next load will recover)\n", lvserrno);
++	} else {
++		SPDK_NOTICELOG("shutdown: lvolstore unloaded clean (fini_start path)\n");
+ 	}
+ 
+ 	TAILQ_REMOVE(&g_spdk_lvol_pairs, lvs_bdev, lvol_stores);
+@@ -1517,6 +1527,11 @@
+ 			spdk_lvs_unload(lvs, vbdev_lvs_fini_start_unload_cb, lvs_bdev);
+ 			return;
+ 		}
++		/* Evariops 0012: an lvstore skipped here relies on the unregister path
++		 * to unload later; if THAT never fires, the superblock stays dirty and
++		 * the next boot pays a full md recovery. Make the skip visible. */
++		SPDK_NOTICELOG("shutdown: lvolstore NOT unloaded at fini_start "
++			       "(lvols still open) — deferring to unregister path\n");
+ 		lvs_bdev = vbdev_lvol_store_next(lvs_bdev);
+ 	}
+ 
+-- 
+2.39.0
