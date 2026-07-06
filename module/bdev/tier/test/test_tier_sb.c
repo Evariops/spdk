@@ -18,6 +18,25 @@
  *   I/O routing, fan-out, hot-remove, resync, write_all channel plumbing.
  */
 
+/* M2 framing: countdown-armed calloc fault injection for the production code
+ * compiled below (-1 = pass-through). test_calloc's own call binds to the real
+ * libc calloc (resolved before the macro exists). */
+#include <stdlib.h>
+static int g_calloc_fail_countdown = -1;
+static void *
+test_calloc(size_t n, size_t sz)
+{
+	if (g_calloc_fail_countdown == 0) {
+		g_calloc_fail_countdown = -1;
+		return NULL;
+	}
+	if (g_calloc_fail_countdown > 0) {
+		g_calloc_fail_countdown--;
+	}
+	return calloc(n, sz);
+}
+#define calloc(n, sz) test_calloc((n), (sz))
+
 #include "vbdev_tier_sb.c"	/* PRODUCTION code under test */
 
 static int g_failures;
@@ -86,13 +105,15 @@ spdk_bdev_get_io_channel(struct spdk_bdev_desc *desc)
 	return NULL;
 }
 
-/* T-4b: lives in vbdev_tier.c (not host-compilable). The SB serialize/valid/select
- * tests never drive a fan-out to completion, so a no-op that reports "nothing
- * deferred" (false) is sufficient to satisfy the link. */
+/* T-4b: lives in vbdev_tier.c (not host-compilable). A no-op that reports
+ * "nothing deferred" (false) satisfies the link; the M2 framing test counts
+ * invocations to pin "every fan-out termination resolves deferred teardown". */
+static int g_fanout_idle_calls;
 bool
 vbdev_tier_sb_fanout_idle(struct vbdev_tier *t)
 {
 	(void)t;
+	g_fanout_idle_calls++;
 	return false;
 }
 
@@ -367,6 +388,60 @@ test_golden_header(void)
 	free_composite(&t);
 }
 
+/* ---- audit findings framing (M2/M3) ----------------------------------------- */
+
+static void
+persist_rc_cb(void *cb_arg, int rc)
+{
+	*(int *)cb_arg = rc;
+}
+
+/* M3: a fan-out where EVERY band is skipped (DEGRADED / RETIRED / desc-less)
+ * writes zero superblock copies and must NOT complete rc == 0 — the callers'
+ * MJ6 contract reads rc == 0 as "durably persisted", and a retire acked on a
+ * zero-copy persist resurrects after reboot from the old highest-seq SBs. */
+static void
+test_m3_zero_copy_persist_not_durable(void)
+{
+	struct vbdev_tier t;
+	struct tier_band *b;
+	int rc = 12345;
+
+	make_composite(&t);
+	/* All bands non-ACTIVE (fixture descs are NULL anyway — both skip legs). */
+	TAILQ_FOREACH(b, &t.bands, link) {
+		b->state = TIER_BAND_DEGRADED;
+	}
+	CHECK(tier_sb_write_all(&t, persist_rc_cb, &rc) == 0);
+	/* Zero writes launch → the fan-out completes synchronously. */
+	CHECK(rc == -ENODEV);
+	CHECK(t.sb_write_inflight == false);
+	free_composite(&t);
+}
+
+/* M2: the ctx-calloc ENOMEM path is a fan-out TERMINATION — it must resolve
+ * teardown deferred behind the fan-out (vbdev_tier_sb_fanout_idle), or a
+ * delete_pending composite whose drained callbacks hold no async_inflight
+ * reference leaks forever (bands, claims, -EEXIST on re-create). */
+static void
+test_m2_enomem_termination_resolves_deferred_teardown(void)
+{
+	struct vbdev_tier t;
+	int rc = 12345;
+
+	make_composite(&t);
+	t.delete_pending = true;
+	g_fanout_idle_calls = 0;
+	/* calloc #1 = the pending-cb wrapper (pass), #2 = the write ctx (fail). */
+	g_calloc_fail_countdown = 1;
+	CHECK(tier_sb_write_all(&t, persist_rc_cb, &rc) == 0);
+	g_calloc_fail_countdown = -1;
+	CHECK(rc == -ENOMEM);			/* queued cb drained with the error */
+	CHECK(t.sb_write_inflight == false);
+	CHECK(g_fanout_idle_calls == 1);	/* the fix: termination → idle hook */
+	free_composite(&t);
+}
+
 int
 main(void)
 {
@@ -376,6 +451,8 @@ main(void)
 	test_slot_select();
 	test_geometry_inlines();
 	test_golden_header();
+	test_m3_zero_copy_persist_not_durable();
+	test_m2_enomem_termination_resolves_deferred_teardown();
 
 	if (g_failures != 0) {
 		fprintf(stderr, "test_tier_sb: %d FAILURE(S)\n", g_failures);

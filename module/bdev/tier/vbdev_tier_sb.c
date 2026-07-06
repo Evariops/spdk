@@ -237,6 +237,13 @@ tier_sb_write_start(struct vbdev_tier *t)
 			p->cb(p->cb_arg, -ENOMEM);
 			free(p);
 		}
+		/* M2: this IS a fan-out termination. A bdev_tier_delete deferred
+		 * behind the queued follow-up (delete_pending), or a hot-removed
+		 * band's close_pending, was waiting on vbdev_tier_sb_fanout_idle —
+		 * returning without it stranded the composite (and its claimed base
+		 * descs) forever when the drained callbacks held no async_inflight
+		 * reference. Do not touch `t` if the teardown consumed it. */
+		vbdev_tier_sb_fanout_idle(t);
 		return;
 	}
 	t->sb_write_inflight = true;
@@ -260,6 +267,8 @@ tier_sb_write_start(struct vbdev_tier *t)
 	/* F-5: generation N lands in slot N%2 — a torn write only hurts one slot. */
 	slot_off_blocks = (uint64_t)tier_sb_slot_for_seq(target_seq) * slot_blocks;
 	now_sec = (uint64_t)time(NULL);
+
+	int launched = 0;
 
 	TAILQ_FOREACH(b, &t->bands, link) {
 		struct tier_sb_band_write *bw;
@@ -303,6 +312,19 @@ tier_sb_write_start(struct vbdev_tier *t)
 			free(bw);
 			continue;
 		}
+		launched++;
+	}
+
+	/* M3: zero copies written must NOT complete rc == 0 — the callers'
+	 * contract (rc != 0 ⇒ NOT durable, MJ6) treats 0 as "the state is on
+	 * disk". With every band skipped (all DEGRADED/RETIRED/desc-less), a
+	 * retire acked "durable" would silently resurrect after reboot from the
+	 * old highest-seq superblocks. */
+	if (launched == 0 && ctx->status == 0) {
+		SPDK_ERRLOG("tier '%s': superblock persist wrote ZERO copies (no "
+			    "ACTIVE band with an open desc) — reporting not durable\n",
+			    t->bdev.name);
+		ctx->status = -ENODEV;
 	}
 
 	/* Release the holding ref; if no band write was launched, complete now. */
