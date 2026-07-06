@@ -60,6 +60,13 @@ struct cbt_epoch {
 	/* Per-epoch frozen bitmap (allocated on freeze, freed on close). */
 	uint8_t                *bitmap_frozen;
 
+	/* H1: true while bitmap_frozen holds bits that were exchanged OUT of the
+	 * live bitmap (snapshot-and-clear freeze) and not yet proven copied by a
+	 * COMPLETED rebuild. Discarding such a buffer (re-freeze, close, evict)
+	 * must first OR it back into the live bitmap — those chunks exist nowhere
+	 * else and dropping them is silent divergence under skip_rebuild. */
+	bool                    frozen_live_consumed;
+
 	TAILQ_ENTRY(cbt_epoch)  link;
 };
 
