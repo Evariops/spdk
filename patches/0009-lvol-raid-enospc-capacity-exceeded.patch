@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Evariops <dev@evariops.com>
 Date: Sat, 4 Jul 2026 10:55:35 +0200
-Subject: [PATCH 09/11] lvol/raid: surface thin-pool ENOSPC as NVMe
+Subject: [PATCH 09/12] lvol/raid: surface thin-pool ENOSPC as NVMe
  CAPACITY_EXCEEDED (Evariops 0009, C-1)
 
 lvol maps blob -ENOSPC to NVMe CAPACITY_EXCEEDED (survives the NVMe-oF hop);

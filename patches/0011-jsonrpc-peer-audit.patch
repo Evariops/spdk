@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Evariops <dev@evariops.com>
 Date: Sat, 4 Jul 2026 19:16:48 +0200
-Subject: [PATCH 11/11] jsonrpc: SO_PEERCRED peer-credential audit hook
+Subject: [PATCH 11/12] jsonrpc: SO_PEERCRED peer-credential audit hook
  (Evariops 0011, SEC1)
 
 Capture the RPC client's Unix-socket credentials (SO_PEERCRED) at accept and
