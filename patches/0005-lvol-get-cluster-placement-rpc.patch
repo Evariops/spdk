@@ -1,12 +1,12 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Evariops <dev@evariops.com>
 Date: Sat, 4 Jul 2026 15:26:58 +0200
-Subject: [PATCH 05/11] 0005-lvol-get-cluster-placement-rpc.patch
+Subject: [PATCH 05/12] 0005-lvol-get-cluster-placement-rpc.patch
 
 ---
  module/bdev/lvol/Makefile              |    3 +-
- module/bdev/lvol/vbdev_lvol_tier_rpc.c | 1309 ++++++++++++++++++++++++
- 2 files changed, 1311 insertions(+), 1 deletion(-)
+ module/bdev/lvol/vbdev_lvol_tier_rpc.c | 1441 ++++++++++++++++++++++++
+ 2 files changed, 1443 insertions(+), 1 deletion(-)
  create mode 100644 module/bdev/lvol/vbdev_lvol_tier_rpc.c
 
 diff --git a/module/bdev/lvol/Makefile b/module/bdev/lvol/Makefile
@@ -25,10 +25,10 @@ index aba6620..a8ed387 100644
  SPDK_MAP_FILE = $(SPDK_ROOT_DIR)/mk/spdk_blank.map
 diff --git a/module/bdev/lvol/vbdev_lvol_tier_rpc.c b/module/bdev/lvol/vbdev_lvol_tier_rpc.c
 new file mode 100644
-index 0000000..6142d29
+index 0000000..6bf3ca1
 --- /dev/null
 +++ b/module/bdev/lvol/vbdev_lvol_tier_rpc.c
-@@ -0,0 +1,1309 @@
+@@ -0,0 +1,1441 @@
 +/*   SPDX-License-Identifier: BSD-3-Clause
 + *   Copyright (C) 2026 Evariops.
 + *   All rights reserved.
@@ -41,14 +41,20 @@ index 0000000..6142d29
 + *   table. Read-only. Both the emission AND the scan are bounded per call (m9).
 + *
 + *   Relocate (M2b): move one cluster to a destination band, fully in the
-+ *   data-plane (INV-T2). C1: the barrier is a BLOB-level freeze
-+ *   (spdk_blob_freeze_io) held for copy+commit — NOT a composite-level quiesce.
-+ *   A composite quiesce holds writes BELOW the blob→LBA translation and replays
-+ *   them to the OLD lba after the L2P swap (ACKed write lands on a freed
-+ *   cluster = lost write). The blob freeze holds writes ABOVE the translation;
-+ *   on unfreeze they re-translate through the updated L2P. Order:
-+ *     open blob ref -> claim dst -> freeze blob -> copy (base-direct, not held
-+ *     by the freeze) -> commit (md-thread swap+persist+release old) ->
++ *   data-plane (INV-T2). C1: the barrier is an LVOL-BDEV quiesce
++ *   (spdk_bdev_quiesce — DRAINS outstanding host I/O, then holds new I/O
++ *   ABOVE the blob→LBA translation) plus an inner blob-level freeze
++ *   (spdk_blob_freeze_io) — NOT a composite-level quiesce. A composite
++ *   quiesce holds writes BELOW the translation and replays them to the OLD
++ *   lba after the L2P swap (ACKed write lands on a freed cluster = lost
++ *   write). The blob freeze alone gated only NEW submissions: a write already
++ *   submitted to the bs_dev before the freeze round could land on old_lba
++ *   AFTER the copy read it — the C1-DRAIN hole; the bdev quiesce closes it by
++ *   waiting for outstanding I/O (LBA-range lock semantics) before the copy.
++ *   Held I/O re-translates through the updated L2P on release. Order:
++ *     open blob ref -> claim dst -> quiesce lvol bdev (drain+hold) -> freeze
++ *     blob -> copy (base-direct, not held) ->
++ *     commit (md-thread swap+persist+release old) ->
 + *     unfreeze -> close ref.
 + *   Crash-safety: invariants A/B inside spdk_blob_relocate_commit.
 + *
@@ -70,6 +76,7 @@ index 0000000..6142d29
 +#include "spdk/string.h"
 +#include "spdk/blob.h"
 +#include "spdk/bdev.h"
++#include "spdk/bdev_module.h"	/* C1-DRAIN: spdk_bdev_quiesce/unquiesce */
 +#include "spdk/log.h"
 +#include "vbdev_lvol.h"
 +#include "vbdev_tier.h"
@@ -236,14 +243,17 @@ index 0000000..6142d29
 +	struct spdk_jsonrpc_request	*request;
 +	struct spdk_blob		*blob;
 +	struct vbdev_tier		*tier;
++	struct spdk_bdev		*lvol_bdev;	/* C1-DRAIN: quiesce target */
 +	uint64_t			cluster_num;
 +	uint64_t			old_lba;
 +	uint64_t			new_lba;
 +	uint64_t			cluster_blocks;
++	bool				quiesced;	/* C1-DRAIN: lvol bdev quiesce held */
 +	bool				frozen;		/* C1: blob freeze held */
 +	bool				ref_held;	/* N-2: our own blob open-ref */
 +	bool				claimed;
 +	bool				committed;
++	bool				commit_ambiguous; /* H4: commit failed AFTER dispatch */
 +	int				rc;
 +};
 +
@@ -288,11 +298,28 @@ index 0000000..6142d29
 +}
 +
 +static void
++relocate_unquiesced(void *cb_arg, int status)
++{
++	struct relocate_ctx *c = cb_arg;
++
++	(void)status;	/* best-effort unquiesce completion; outcome is c->rc */
++	relocate_close_ref(c);
++}
++
++static void
 +relocate_unfrozen(void *cb_arg, int status)
 +{
 +	struct relocate_ctx *c = cb_arg;
 +
 +	(void)status;	/* best-effort unfreeze completion; outcome is c->rc */
++	if (c->quiesced) {
++		c->quiesced = false;
++		if (spdk_bdev_unquiesce(c->lvol_bdev, c->lvol_bdev->module,
++					relocate_unquiesced, c) == 0) {
++			return;
++		}
++		SPDK_ERRLOG("relocate: UNQUIESCE DISPATCH FAILED — lvol I/O left held!\n");
++	}
 +	relocate_close_ref(c);
 +}
 +
@@ -303,8 +330,24 @@ index 0000000..6142d29
 +{
 +	c->rc = rc;
 +	if (rc != 0 && c->claimed && !c->committed) {
-+		spdk_blob_release_cluster_lba(c->blob, c->new_lba);
-+		c->claimed = false;
++		if (c->commit_ambiguous) {
++			/* H4: the commit failed AFTER dispatch — the extent-page write may
++			 * still have reached media (timeout/abort/reset completions are
++			 * ambiguous). If the durable extent points at new_lba, releasing it
++			 * lets a later thin allocation durably commit the same cluster in
++			 * another blob → two owners after restart. QUARANTINE instead: the
++			 * in-RAM claim stays, so nothing reuses new_lba this boot; at the
++			 * next restart replay either reclaims it as an orphan (extent never
++			 * landed) or the extent legitimately owns it (its content was fully
++			 * copied and verified BEFORE the commit). */
++			SPDK_ERRLOG("relocate: ambiguous commit failure — quarantining "
++				    "cluster lba %" PRIu64 " until restart (no release)\n",
++				    c->new_lba);
++			c->claimed = false;
++		} else {
++			spdk_blob_release_cluster_lba(c->blob, c->new_lba);
++			c->claimed = false;
++		}
 +	}
 +	if (c->frozen) {
 +		c->frozen = false;
@@ -315,7 +358,7 @@ index 0000000..6142d29
 +		 * blob's I/O FOREVER — scream; operator remediation: restart target. */
 +		SPDK_ERRLOG("relocate: UNFREEZE DISPATCH FAILED — blob I/O left frozen!\n");
 +	}
-+	relocate_close_ref(c);
++	relocate_unfrozen(c, 0);
 +}
 +
 +static void
@@ -325,6 +368,8 @@ index 0000000..6142d29
 +
 +	if (bserrno == 0) {
 +		c->committed = true;	/* commit took ownership of new + released old */
++	} else {
++		c->commit_ambiguous = true;	/* H4: dispatched — media state unknown */
 +	}
 +	relocate_finish(c, bserrno);
 +}
@@ -368,7 +413,33 @@ index 0000000..6142d29
 +	}
 +}
 +
-+/* N-2: our pin on the blob is established — start the frozen section. */
++/* C1-DRAIN: the lvol bdev is quiesced — every host I/O submitted BEFORE the
++ * quiesce has now COMPLETED (the LBA-range lock waits for outstanding I/O),
++ * and new I/O is held ABOVE the blob→LBA translation (re-translates through
++ * the updated L2P on release). Only now is the copy's source stable: the blob
++ * freeze alone gated new submissions but never drained writes already in
++ * flight to the bs_dev, so a pre-freeze ACKed write could land on old_lba
++ * AFTER the copy read it — lost on commit, cross-blob overwrite once old_lba
++ * was reallocated (the C1 hole the audit confirmed). The blob freeze is kept
++ * as an inner belt (blob-level consumers, no bdev detour). */
++static void
++relocate_quiesced(void *cb_arg, int status)
++{
++	struct relocate_ctx *c = cb_arg;
++	int rc;
++
++	if (status != 0) {
++		relocate_finish(c, status);
++		return;
++	}
++	c->quiesced = true;
++	rc = spdk_blob_freeze_io(c->blob, relocate_frozen, c);
++	if (rc != 0) {
++		relocate_finish(c, rc);
++	}
++}
++
++/* N-2: our pin on the blob is established — start the drained+frozen section. */
 +static void
 +relocate_blob_opened(void *cb_arg, struct spdk_blob *blob, int bserrno)
 +{
@@ -381,7 +452,7 @@ index 0000000..6142d29
 +	}
 +	assert(blob == c->blob);
 +	c->ref_held = true;
-+	rc = spdk_blob_freeze_io(c->blob, relocate_frozen, c);
++	rc = spdk_bdev_quiesce(c->lvol_bdev, c->lvol_bdev->module, relocate_quiesced, c);
 +	if (rc != 0) {
 +		relocate_finish(c, rc);
 +	}
@@ -483,13 +554,15 @@ index 0000000..6142d29
 +	c->request = request;
 +	c->blob = blob;
 +	c->tier = tier;
++	c->lvol_bdev = bdev;	/* C1-DRAIN */
 +	c->cluster_num = req.cluster_num;
 +	c->old_lba = old_lba;
 +	c->new_lba = new_lba;
 +	c->cluster_blocks = cluster_size / blocklen;
 +	c->claimed = true;
 +
-+	/* N-2: pin the blob for the whole async chain, then freeze + copy + commit. */
++	/* N-2: pin the blob for the whole async chain, then quiesce (drain) +
++	 * freeze + copy + commit. */
 +	spdk_bs_open_blob(lvol->lvol_store->blobstore, spdk_blob_get_id(blob),
 +			  relocate_blob_opened, c);
 +cleanup:
@@ -544,6 +617,7 @@ index 0000000..6142d29
 +	struct spdk_jsonrpc_request	*request;
 +	struct spdk_blob		*blob;
 +	struct vbdev_tier		*tier;
++	struct spdk_bdev		*lvol_bdev;	/* C1-DRAIN: quiesce target */
 +	uint64_t			cluster_blocks;
 +	bool				verify;
 +	struct batch_item		*items;
@@ -553,8 +627,10 @@ index 0000000..6142d29
 +	uint64_t			cur_old_lba;
 +	uint64_t			cur_new_lba;
 +	bool				cur_claimed;
++	bool				quiesced;	/* C1-DRAIN */
 +	bool				frozen;
 +	bool				ref_held;
++	bool				commit_ambiguous; /* H4 */
 +	struct claim_cursor		cc;		/* deferred #4: resume hint */
 +	int				rc;		/* first fatal error */
 +};
@@ -595,11 +671,8 @@ index 0000000..6142d29
 +}
 +
 +static void
-+batch_unfrozen(void *cb_arg, int status)
++batch_ref_close_or_reply(struct batch_ctx *c)
 +{
-+	struct batch_ctx *c = cb_arg;
-+
-+	(void)status;
 +	if (c->ref_held) {
 +		c->ref_held = false;
 +		spdk_blob_close(c->blob, batch_ref_closed, c);
@@ -608,14 +681,51 @@ index 0000000..6142d29
 +	batch_reply(c, c->rc);
 +}
 +
-+/* Terminal: release any un-committed claim, unfreeze ONCE, drop ref, reply. */
++static void
++batch_unquiesced(void *cb_arg, int status)
++{
++	struct batch_ctx *c = cb_arg;
++
++	(void)status;
++	batch_ref_close_or_reply(c);
++}
++
++static void
++batch_unfrozen(void *cb_arg, int status)
++{
++	struct batch_ctx *c = cb_arg;
++
++	(void)status;
++	if (c->quiesced) {
++		c->quiesced = false;
++		if (spdk_bdev_unquiesce(c->lvol_bdev, c->lvol_bdev->module,
++					batch_unquiesced, c) == 0) {
++			return;
++		}
++		SPDK_ERRLOG("relocate batch: UNQUIESCE DISPATCH FAILED — lvol I/O left held!\n");
++	}
++	batch_ref_close_or_reply(c);
++}
++
++/* Terminal: release any un-committed claim, unfreeze + unquiesce ONCE, drop
++ * ref, reply. */
 +static void
 +batch_finish(struct batch_ctx *c, int rc)
 +{
 +	c->rc = rc;
 +	if (c->cur_claimed) {
-+		spdk_blob_release_cluster_lba(c->blob, c->cur_new_lba);
-+		c->cur_claimed = false;
++		if (c->commit_ambiguous) {
++			/* H4: same quarantine contract as the single-cluster path — an
++			 * ambiguous commit failure must NOT return cur_new_lba to the
++			 * pool while the durable extent may reference it. */
++			SPDK_ERRLOG("relocate batch: ambiguous commit failure — quarantining "
++				    "cluster lba %" PRIu64 " until restart (no release)\n",
++				    c->cur_new_lba);
++			c->cur_claimed = false;
++		} else {
++			spdk_blob_release_cluster_lba(c->blob, c->cur_new_lba);
++			c->cur_claimed = false;
++		}
 +	}
 +	if (c->frozen) {
 +		c->frozen = false;
@@ -633,6 +743,7 @@ index 0000000..6142d29
 +	struct batch_ctx *c = cb_arg;
 +
 +	if (bserrno != 0) {
++		c->commit_ambiguous = true;	/* H4: dispatched — media state unknown */
 +		batch_finish(c, bserrno);
 +		return;
 +	}
@@ -704,6 +815,25 @@ index 0000000..6142d29
 +	batch_step(c);
 +}
 +
++/* C1-DRAIN: see relocate_quiesced — outstanding host I/O has drained, new I/O
++ * is held above the L2P translation for the whole batch. */
++static void
++batch_quiesced(void *cb_arg, int status)
++{
++	struct batch_ctx *c = cb_arg;
++	int rc;
++
++	if (status != 0) {
++		batch_finish(c, status);
++		return;
++	}
++	c->quiesced = true;
++	rc = spdk_blob_freeze_io(c->blob, batch_frozen, c);
++	if (rc != 0) {
++		batch_finish(c, rc);
++	}
++}
++
 +static void
 +batch_blob_opened(void *cb_arg, struct spdk_blob *blob, int bserrno)
 +{
@@ -716,7 +846,7 @@ index 0000000..6142d29
 +	}
 +	assert(blob == c->blob);
 +	c->ref_held = true;
-+	rc = spdk_blob_freeze_io(c->blob, batch_frozen, c);
++	rc = spdk_bdev_quiesce(c->lvol_bdev, c->lvol_bdev->module, batch_quiesced, c);
 +	if (rc != 0) {
 +		batch_finish(c, rc);
 +	}
@@ -840,13 +970,15 @@ index 0000000..6142d29
 +	c->request = request;
 +	c->blob = blob;
 +	c->tier = tier;
++	c->lvol_bdev = bdev;	/* C1-DRAIN */
 +	c->cluster_blocks = cluster_size / blocklen;
 +	c->verify = req.verify;
 +	c->items = req.items;		/* ownership transferred to the ctx */
 +	req.items = NULL;
 +	c->num_items = (uint32_t)req.num_items;
 +
-+	/* N-2: pin the blob, freeze ONCE, then run the whole batch under that freeze. */
++	/* N-2: pin the blob, quiesce (drain) + freeze ONCE, then run the whole
++	 * batch under that held window. */
 +	spdk_bs_open_blob(lvol->lvol_store->blobstore, spdk_blob_get_id(blob),
 +			  batch_blob_opened, c);
 +cleanup:

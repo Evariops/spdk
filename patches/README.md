@@ -8,7 +8,7 @@ upstream paths. The two out-of-tree bdev **modules** (`module/bdev/cbt`,
 
 ## Application order (U-5/U-6)
 
-Patches are applied in **lexicographic order of filename** (`0001` … `0011`) —
+Patches are applied in **lexicographic order of filename** (`0001` … `0012`) —
 the Dockerfile globs `patches/*.patch` and `git apply`s each. The numeric prefix
 IS the contract; do not rely on any other ordering. Order matters:
 
@@ -25,9 +25,11 @@ IS the contract; do not rely on any other ordering. Order matters:
 | 0009 | ENOSPC → CAPACITY_EXCEEDED | bdev_lvol, bdev_raid | — |
 | 0010 | rpc socket chmod 0600 | lib/rpc | — |
 | 0011 | jsonrpc SO_PEERCRED audit hook (SEC1) | lib/jsonrpc | — |
+| 0012 | lvol shutdown-unload observability | bdev_lvol | — |
 
-0005 `#include`s `vbdev_tier.h`; the Dockerfile adds `-I module/bdev/tier` to the
-lvol module CFLAGS and injects the module dirs before applying patches.
+0005 `#include`s `vbdev_tier.h` and adds `-I module/bdev/tier` to the lvol module
+CFLAGS via its own Makefile hunk; the Dockerfile injects the module dirs before
+applying patches (copy-before-apply ordering matters).
 
 **0011 is a shared substrate, not a leaf.** It adds `spdk_jsonrpc_request_audit()`
 + `spdk_jsonrpc_request_get_peer_ucred()` to `lib/jsonrpc`, which the destructive
