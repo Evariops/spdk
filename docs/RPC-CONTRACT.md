@@ -81,16 +81,23 @@ a split-brain across disks.
   - **P-2**: the lvol must live on `tier_name`'s composite (-EINVAL else).
   - **F2**: refuses snapshot blobs (-EBUSY).
   - **F4**: one relocate/remap in flight per blob (-EBUSY else).
-  - **C1**: runs under a **blob freeze** for copy+commit; ALL of the blob's I/O
-    stalls ~3× one cluster. **N-2**: the blob is pinned by an own open-ref for
-    the whole chain.
+  - **C1 + C1-DRAIN**: runs under an **lvol-bdev quiesce** (drains outstanding
+    host I/O, then holds new I/O above the L2P translation) plus an inner
+    **blob freeze**, for copy+commit; ALL of the lvol's I/O stalls
+    ~drain + 3× one cluster. The drain is what makes the copy's source stable —
+    the freeze alone never covered writes already in flight. **N-2**: the blob
+    is pinned by an own open-ref for the whole chain.
   - Crash-safe (invariants A/B): a crash mid-op leaves an orphan cluster the
     native blobstore replay reclaims; never a lost ACKed write.
+  - **H4**: an ambiguous commit failure (extent write dispatched, error
+    completion) QUARANTINES the destination cluster until restart instead of
+    releasing it — the durable extent may reference it; replay reconciles.
 - `bdev_lvol_relocate_clusters {…, clusters:[…], verify?}` — **PF3 batch**: one
-  freeze amortized over N clusters (≤4096). Correctness identical to the single
-  form. `verify` (**PF4**, default true) forwards to each copy; false skips the
-  C5 read-back on trusted media. Returns `{relocated, requested, error}` —
-  **partial success is a 200** (caller retries the tail from `relocated`).
+  quiesce+freeze amortized over N clusters (≤4096). Correctness identical to the
+  single form (same C1-DRAIN and H4 contracts). `verify` (**PF4**, default true)
+  forwards to each copy; false skips the C5 read-back on trusted media. Returns
+  `{relocated, requested, error}` — **partial success is a 200** (caller retries
+  the tail from `relocated`).
 - `bdev_lvol_remap_cluster {…}` — **N-7/W6**: source band must be DEGRADED,
   destination band ACTIVE. Relaxes invariant A intentionally (the cluster is
   already lost; the subsequent `bdev_raid_rebuild_ranges` fills the new one). The
@@ -195,6 +202,19 @@ a split-brain across disks.
     I/O reported `completed` → silent under-replication.)
 - `bdev_cbt_reset`: refused while any epoch is active. Bitmap clearing is
   reset-driven (**D3** — no automatic healthy-clear).
+- **Breaking (D3)**: `bdev_cbt_epoch_list` no longer emits
+  `healthy_clear_suspended` nor `backends_healthy` — both fields' backing state
+  was removed with the dead healthy-clear poller (`backends_healthy` was
+  constant `false`: `bdev_cbt_set_backends_healthy` never had a caller). Strict
+  parsers must drop these keys.
+- `bdev_cbt_epoch_invalidate`: refused with `-EBUSY` while a rebuild is RUNNING
+  on the epoch (**C3** — an INVALID epoch is evictable; evicting it under the
+  rebuild would free the frozen bitmap the rebuild is scanning). Cancel first.
+- **H1 (delta preservation)**: a frozen delta that was exchanged out of the
+  live bitmap and never proven copied (rebuild aborted/failed/never run) is
+  merged back into the live bitmap before its buffer is discarded (re-freeze,
+  close, evict). A freeze retry therefore captures (unconsumed delta ∪ new
+  writes) — a failed iteration never loses chunks under `skip_rebuild`.
 - After a base-bdev hot-remove the cbt vbdev is NOT silently recreated with a
   virgin bitmap (**c4**); recreation is an explicit `bdev_cbt_create` and the
   delta history is considered lost (epoch_invalidate → full rebuild if needed).
