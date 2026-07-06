@@ -26,9 +26,13 @@ The module exposes its functionality through JSON-RPC. The orchestrator drives t
 
 An *epoch* represents a single backend outage and its associated recovery. The orchestrator opens an epoch when it detects that a backend is stale, identifying which backend and at which generation. Up to four epochs may coexist simultaneously — allowing independent tracking when multiple backends fail at different times.
 
-**Opening** (`bdev_cbt_epoch_open`) records the stale backend identity and suspends the healthy-clear poller. The bitmap continues accumulating all writes as before — the epoch is purely an administrative marker.
+**Opening** (`bdev_cbt_epoch_open`) records the stale backend identity. The bitmap continues accumulating all writes as before — the epoch is purely an administrative marker.
 
-**Freezing** (`bdev_cbt_epoch_freeze`) takes a point-in-time snapshot of the live bitmap into the epoch. An atomic fence ensures visibility of all prior relaxed stores from IO threads. After freeze, the live bitmap continues accumulating new writes independently of the frozen copy. Re-freezing the same epoch replaces the previous snapshot — useful for iterative convergence. Freeze is accepted from OPEN, FROZEN, or REBUILDING states (the latter enables the convergence loop: freeze → partial_rebuild → re-freeze → partial_rebuild → ...).
+**Freezing** (`bdev_cbt_epoch_freeze`) captures the DELTA since the previous freeze: when no other epoch is active, the live bitmap is atomically exchanged (snapshot-AND-clear) into the epoch's frozen bitmap, so iterative partial rebuilds converge geometrically. An atomic fence ensures visibility of all prior relaxed stores from IO threads. After freeze, the live bitmap accumulates only NEW writes. Freeze is accepted from OPEN, FROZEN, or REBUILDING states (the latter enables the convergence loop: freeze → partial_rebuild → re-freeze → partial_rebuild → ...), and is refused with `-EBUSY` while a rebuild is RUNNING on the epoch (CBT-1).
+
+Delta-preservation invariant (H1): bits exchanged out of the live bitmap exist only in the frozen buffer until a rebuild COMPLETES. Any path that discards that buffer without a completed rebuild — re-freeze after an aborted/failed rebuild, close, eviction — first ORs it back into the live bitmap, so a retry snapshot is exactly (unconsumed delta ∪ new writes). A failed iteration loses nothing; already-copied chunks are pessimistically re-copied.
+
+In-flight writes (H2): a write's dirty bit is set at submission AND re-set at completion (before the host ack). A freeze that consumes the submit-time bit of a still-in-flight write is therefore harmless — the chunk lands in the next delta. No host-I/O drain is required around freeze.
 
 **Reading ranges** (`bdev_cbt_epoch_get_dirty_ranges`) walks the frozen bitmap and coalesces contiguous dirty chunks into offset+length pairs. The result is capped to avoid unbounded allocations, and a `truncated` flag signals when the caller must paginate.
 
@@ -80,13 +84,13 @@ On completion, the response includes:
 - `duration_ms`: wall-clock time for the operation
 - `residual_dirty_ratio`: fraction of the bitmap that is now dirty (writes that arrived during the copy). This ratio drives the orchestrator's convergence loop — when it drops below a threshold, a final quiesce+freeze+copy achieves zero delta.
 
-**Closing** (`bdev_cbt_epoch_close`) discards the epoch and its frozen bitmap. If no epochs remain active, the healthy-clear poller is re-enabled.
+**Closing** (`bdev_cbt_epoch_close`) discards the epoch and its frozen bitmap — after merging an unconsumed delta back into the live bitmap (H1), so abandoning an epoch never loses dirty history. Refused with `-EBUSY` while a rebuild is RUNNING (CBT-2).
 
-**Invalidation** (`bdev_cbt_epoch_invalidate`) marks an epoch as unrecoverable. The orchestrator knows it must fall back to a full rebuild for that backend.
+**Invalidation** (`bdev_cbt_epoch_invalidate`) marks an epoch as unrecoverable. The orchestrator knows it must fall back to a full rebuild for that backend. Refused with `-EBUSY` while a rebuild is RUNNING (C3 — an INVALID epoch is evictable, and evicting it under a running rebuild would free the bitmap the rebuild is scanning).
 
-### Health signaling
+### Bitmap clearing is reset-driven
 
-The orchestrator must explicitly call `bdev_cbt_set_backends_healthy(true)` to confirm that all backends are synchronized. Only then will the poller clear the bitmap. This double-guard prevents premature clearing — even if all epochs are closed, the bitmap persists until health is confirmed.
+There is no automatic clearing (the former healthy-clear poller and its `bdev_cbt_set_backends_healthy()` signal were dead code and have been REMOVED — D3). Once the orchestrator has confirmed all backends are synchronized (after `skip_rebuild` promotion), it MUST call `bdev_cbt_reset` explicitly; otherwise the bitmap grows monotonically and "partial" rebuilds degrade toward full-surface copies.
 
 ### Reset
 
@@ -108,7 +112,8 @@ A typical orchestrator sequence for partial rebuild under sustained write load:
 8. ANA drain (2s quiesce at the NVMe-oF target level). No more writes arrive.
 9. Final freeze. Delta is zero by construction.
 10. Final `bdev_cbt_partial_rebuild` (nothing or near-nothing). Close epoch.
-11. Re-add the backend with `skip_rebuild=true`. Signal healthy.
+11. Re-add the backend with `skip_rebuild=true`. Then `bdev_cbt_reset` (explicit —
+    there is no automatic clear; see "Bitmap clearing is reset-driven").
 
 The state machine for a single epoch through the convergence loop:
 
@@ -132,9 +137,9 @@ This is modeled on SPDK's own `raid_bdev_process_finish` sequence (the normal re
 
 ## Concurrency model
 
-All epoch operations and the healthy-clear poller run on the SPDK app thread. They are not thread-safe against each other — SPDK guarantees single-threaded execution on that thread. The `assert(spdk_get_thread() == spdk_thread_get_app_thread())` guards enforce this.
+All epoch operations run on the SPDK app thread. They are not thread-safe against each other — SPDK guarantees single-threaded execution on that thread. The `assert(spdk_get_thread() == spdk_thread_get_app_thread())` guards enforce this.
 
-IO submission (`cbt_mark_dirty`) runs on any reactor thread. It uses `__atomic_fetch_or` with relaxed ordering for individual bitmap bytes, and `memset(0xFF)` for full bytes in large ranges. The combination is safe because setting a bit to 1 is idempotent — concurrent ORs cannot lose information.
+IO submission (`cbt_mark_dirty`) runs on any reactor thread. It uses `__atomic_fetch_or` with relaxed ordering for individual bitmap bytes, and `memset(0xFF)` for full bytes in large ranges. The combination is safe because setting a bit to 1 is idempotent — concurrent ORs cannot lose information. Completions RE-mark the written range before acking the host (H2), so a snapshot-and-clear freeze racing an in-flight write never loses the chunk.
 
 The `total_writes_tracked` counter uses relaxed atomics. It is a statistical counter with no correctness semantics.
 

@@ -170,6 +170,38 @@ cbt_has_other_active_epoch(struct vbdev_cbt *cbt, struct cbt_epoch *self)
 	return false;
 }
 
+/* H1: OR an unconsumed frozen delta back into the live bitmap before its
+ * buffer is discarded (re-freeze, close, evict). Bits exchanged out of the
+ * live bitmap at freeze exist ONLY in bitmap_frozen until a rebuild COMPLETES;
+ * freeing that buffer without this merge-back permanently loses the chunks —
+ * a later "successful" delta rebuild then promotes a silently divergent
+ * member under skip_rebuild.
+ *
+ * Pessimistic by design: chunks the aborted rebuild DID copy are re-marked
+ * too and get re-copied on the next iteration — wasted bandwidth, never lost
+ * data. Lock-free: per-byte atomic OR, same discipline as the IO-thread
+ * markers; caller is the app thread and all call sites are guarded against a
+ * concurrently RUNNING rebuild, so bitmap_frozen has no concurrent reader. */
+static void
+cbt_epoch_restore_unconsumed_delta(struct vbdev_cbt *cbt, struct cbt_epoch *ep)
+{
+	uint64_t restored = 0;
+
+	if (!ep->frozen_live_consumed || ep->bitmap_frozen == NULL) {
+		return;
+	}
+	for (uint64_t i = 0; i < cbt->bitmap_size_bytes; i++) {
+		uint8_t b = ep->bitmap_frozen[i];
+		if (b != 0) {
+			__atomic_fetch_or(&cbt->bitmap[i], b, __ATOMIC_RELAXED);
+			restored += (uint64_t)__builtin_popcount(b);
+		}
+	}
+	ep->frozen_live_consumed = false;
+	SPDK_NOTICELOG("CBT: epoch '%s' unconsumed delta merged back into live bitmap "
+		       "(%lu chunks)\n", ep->epoch_id, (unsigned long)restored);
+}
+
 /* ================================================================== */
 /* Bitmap operations (hot path — may run on any reactor thread)       */
 /* Uses atomic OR so concurrent IO threads cannot lose bits.          */
@@ -181,8 +213,10 @@ cbt_has_other_active_epoch(struct vbdev_cbt *cbt, struct cbt_epoch *self)
 /*   - total_writes_tracked uses relaxed add (stats only)            */
 /* ================================================================== */
 
+/* Core bit-setter, shared by the submit-time mark and the completion-time
+ * re-mark (H2). No statistics side effect. */
 static inline void
-cbt_mark_dirty(struct vbdev_cbt *cbt, uint64_t offset_blocks, uint64_t num_blocks)
+cbt_mark_dirty_bits(struct vbdev_cbt *cbt, uint64_t offset_blocks, uint64_t num_blocks)
 {
 	uint64_t chunk_start, chunk_end;
 
@@ -228,7 +262,12 @@ cbt_mark_dirty(struct vbdev_cbt *cbt, uint64_t offset_blocks, uint64_t num_block
 		uint8_t last_mask = (uint8_t)(0xFF >> (7 - (chunk_end & 7)));
 		__atomic_fetch_or(&cbt->bitmap[byte_end], last_mask, __ATOMIC_RELAXED);
 	}
+}
 
+static inline void
+cbt_mark_dirty(struct vbdev_cbt *cbt, uint64_t offset_blocks, uint64_t num_blocks)
+{
+	cbt_mark_dirty_bits(cbt, offset_blocks, num_blocks);
 	__atomic_fetch_add(&cbt->total_writes_tracked, 1, __ATOMIC_RELAXED);
 }
 
@@ -265,6 +304,35 @@ static void
 _cbt_complete_io(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
 	struct spdk_bdev_io *orig_io = cb_arg;
+
+	/* H2: RE-mark the dirty bit at completion, BEFORE acking the host.
+	 *
+	 * The submit-time mark alone is not enough under snapshot-and-clear
+	 * freeze: a freeze can exchange-and-consume the bit while this write is
+	 * still in flight to the base. The rebuild may then read the chunk
+	 * before the write lands, and the bit exists in no bitmap afterwards —
+	 * the chunk silently diverges forever. Re-marking here closes that
+	 * window without any drain or freeze of host I/O:
+	 *   - write landed before the rebuild read  → the consumed bit is fine,
+	 *     the rebuild copies the new data;
+	 *   - write lands after                     → this re-mark puts the bit
+	 *     in the (new) live bitmap → captured by the next delta.
+	 * Re-mark also on FAILURE: a failed write may have partially reached
+	 * media. The submit-time mark stays for crash conservatism.
+	 * Cost: one relaxed atomic OR on a byte whose cacheline the submit-time
+	 * mark touched moments ago. */
+	switch (orig_io->type) {
+	case SPDK_BDEV_IO_TYPE_WRITE:
+	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
+	case SPDK_BDEV_IO_TYPE_UNMAP:
+	case SPDK_BDEV_IO_TYPE_COPY:
+		cbt_mark_dirty_bits(SPDK_CONTAINEROF(orig_io->bdev, struct vbdev_cbt, cbt_bdev),
+				    orig_io->u.bdev.offset_blocks,
+				    orig_io->u.bdev.num_blocks);
+		break;
+	default:
+		break;
+	}
 
 	spdk_bdev_io_complete_base_io_status(orig_io, bdev_io);
 	spdk_bdev_free_io(bdev_io);
@@ -935,9 +1003,20 @@ bdev_cbt_epoch_open(const char *cbt_name, const char *epoch_id,
 				    oldest ? (int)oldest->state : -1);
 			return -ENOSPC;
 		}
+		/* C3 (defense-in-depth): with the epoch_invalidate rebuild guard an
+		 * INVALID epoch cannot have a RUNNING rebuild (rebuild_start requires
+		 * FROZEN/REBUILDING), but never free an epoch a rebuild ctx still
+		 * points at — that is a UAF read (ctx->bitmap) AND write (finalize). */
+		if (cbt_rebuild_find_active_for_epoch(cbt, oldest->epoch_id) != NULL) {
+			SPDK_ERRLOG("CBT: max epochs reached, epoch '%s' has an active "
+				    "rebuild — refusing eviction\n", oldest->epoch_id);
+			return -ENOSPC;
+		}
 		/* Safe to evict: COMPLETED or INVALID. */
 		SPDK_WARNLOG("CBT: max epochs reached, evicting '%s'\n",
 			     oldest->epoch_id);
+		/* H1: an INVALID epoch may still hold an unconsumed exchanged delta. */
+		cbt_epoch_restore_unconsumed_delta(cbt, oldest);
 		TAILQ_REMOVE(&cbt->epochs, oldest, link);
 		cbt->epoch_count--;
 		free(oldest->bitmap_frozen);
@@ -992,24 +1071,38 @@ bdev_cbt_epoch_freeze(const char *cbt_name, const char *epoch_id)
 		return -EBUSY;
 	}
 
-	/* Free previous frozen bitmap if re-freezing. */
-	free(ep->bitmap_frozen);
+	/* H1: allocate the new snapshot BEFORE touching the old one — an ENOMEM
+	 * must leave the epoch exactly as it was (the old code freed the only
+	 * copy of the previous delta first, so a failed malloc bricked the epoch
+	 * AND lost the un-copied chunks). */
+	uint8_t *new_frozen = malloc(cbt->bitmap_size_bytes);
+	if (!new_frozen) {
+		return -ENOMEM;
+	}
 
-	/* Allocate and snapshot the current bitmap into this epoch.
+	/* H1: re-freeze after a FAILED/ABORTED rebuild — the previous delta was
+	 * exchanged out of the live bitmap and its un-copied chunks exist only in
+	 * the old bitmap_frozen. Merge it back first: the exchange below then
+	 * re-captures (old unconsumed delta ∪ writes since last freeze), which is
+	 * exactly the correct retry set. */
+	if (ep->bitmap_frozen != NULL) {
+		cbt_epoch_restore_unconsumed_delta(cbt, ep);
+		free(ep->bitmap_frozen);
+	}
+	ep->bitmap_frozen = new_frozen;
+
+	/* Snapshot the current bitmap into this epoch.
 	 *
 	 * Thread safety: IO threads write individual bits with atomic OR.
 	 * We read the bitmap here on the app thread. On x86/arm64, each byte
-	 * read is atomic, so we never see a torn byte. The semantic guarantee
-	 * is: any write that completed its IO callback before this function
-	 * was called is guaranteed to be in the snapshot. Writes that are
-	 * in-flight may or may not be captured. This is acceptable because
-	 * the orchestrator must ensure all writes are drained before calling
-	 * freeze if it needs a precise point-in-time snapshot.
-	 */
-	ep->bitmap_frozen = malloc(cbt->bitmap_size_bytes);
-	if (!ep->bitmap_frozen) {
-		return -ENOMEM;
-	}
+	 * read is atomic, so we never see a torn byte. Any write that completed
+	 * its IO callback before this function was called is guaranteed to be
+	 * in the snapshot. A write still in flight may have its submit-time bit
+	 * consumed by the exchange below, but that is harmless (H2): the
+	 * completion path RE-marks the bit before acking the host, so the chunk
+	 * either was copied with the new data (write landed before the rebuild
+	 * read) or lands in the next delta (bit re-set in the live bitmap). No
+	 * host-I/O drain is required around freeze. */
 	__atomic_thread_fence(__ATOMIC_ACQUIRE);
 
 	if (!cbt_has_other_active_epoch(cbt, ep)) {
@@ -1029,10 +1122,13 @@ bdev_cbt_epoch_freeze(const char *cbt_name, const char *epoch_id)
 			ep->bitmap_frozen[i] =
 				__atomic_exchange_n(&cbt->bitmap[i], 0, __ATOMIC_ACQ_REL);
 		}
+		/* H1: these bits now exist ONLY here until a rebuild COMPLETES. */
+		ep->frozen_live_consumed = true;
 	} else {
 		/* Another epoch still consumes the accumulated live view — snapshot only.
 		 * Convergence is degraded (residual includes prior deltas) but correct. */
 		memcpy(ep->bitmap_frozen, cbt->bitmap, cbt->bitmap_size_bytes);
+		ep->frozen_live_consumed = false;	/* live bitmap untouched */
 		SPDK_NOTICELOG("CBT: epoch_freeze '%s' without clear (other active epochs)\n",
 			       epoch_id);
 	}
@@ -1077,6 +1173,11 @@ bdev_cbt_epoch_close(const char *cbt_name, const char *epoch_id)
 		return -EBUSY;
 	}
 
+	/* H1: closing an epoch must not lose dirty history. If the frozen delta
+	 * was exchanged out of the live bitmap and never proven copied (rebuild
+	 * aborted/failed/never run), merge it back before discarding. */
+	cbt_epoch_restore_unconsumed_delta(cbt, ep);
+
 	ep->state = CBT_EPOCH_COMPLETED;
 	TAILQ_REMOVE(&cbt->epochs, ep, link);
 	cbt->epoch_count--;
@@ -1103,6 +1204,16 @@ bdev_cbt_epoch_invalidate(const char *cbt_name, const char *epoch_id)
 	ep = cbt_find_epoch(cbt, epoch_id);
 	if (!ep) {
 		return -ENOENT;
+	}
+
+	/* C3: same guard as freeze (CBT-1) and close (CBT-2). Invalidating a
+	 * REBUILDING epoch makes it evictable by epoch_open's max-epochs path,
+	 * which would free ep->bitmap_frozen and ep under the RUNNING rebuild —
+	 * UAF read in the chunk scanner, UAF write in finalize. */
+	if (cbt_rebuild_find_active_for_epoch(cbt, epoch_id) != NULL) {
+		SPDK_ERRLOG("CBT: epoch_invalidate '%s' refused: rebuild in progress "
+			    "(cancel it first)\n", epoch_id);
+		return -EBUSY;
 	}
 
 	ep->state = CBT_EPOCH_INVALID;
@@ -1769,7 +1880,13 @@ cbt_rebuild_flush_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 static void
 cbt_rebuild_finish(struct cbt_rebuild_ctx *ctx)
 {
-	if (ctx->error == 0 && !ctx->cancelled && ctx->chunks_copied > 0 &&
+	/* M1: !aborted — a hot-remove abort must reach finalize with error == 0
+	 * so R1 classifies it ABORTED (resumable), not FAILED. Flushing the
+	 * (possibly removed) target here would fail, overwrite the
+	 * classification, and durability of a partial copy is moot anyway: the
+	 * resume re-copies from the merged-back delta (H1). */
+	if (ctx->error == 0 && !ctx->cancelled && !ctx->aborted &&
+	    ctx->chunks_copied > 0 &&
 	    ctx->dst_desc != NULL && ctx->dst_ch != NULL) {
 		struct spdk_bdev *dst = spdk_bdev_desc_get_bdev(ctx->dst_desc);
 
@@ -1837,6 +1954,11 @@ cbt_rebuild_finalize(struct cbt_rebuild_ctx *ctx)
 
 	/* Compute residual dirty ratio on successful completion. */
 	if (result.completed && ctx->cbt->bitmap_size_bits > 0) {
+		/* H1: every chunk of the exchanged delta is now proven copied — the
+		 * frozen buffer no longer holds the only copy of anything, and the
+		 * memcpy below repurposes it as a residual snapshot of the live
+		 * bitmap. It must NOT be merged back on a later discard. */
+		ctx->epoch->frozen_live_consumed = false;
 		__atomic_thread_fence(__ATOMIC_ACQUIRE);
 		memcpy(ctx->epoch->bitmap_frozen, ctx->cbt->bitmap,
 		       ctx->cbt->bitmap_size_bytes);
