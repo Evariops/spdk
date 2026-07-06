@@ -163,6 +163,23 @@ struct tier_band {
 	 * vbdev_tier_sb_fanout_idle() once the fan-out drains. */
 	bool			close_pending;
 
+	/* C2: drain state. A band drain must not put a reactor's base channel while
+	 * host legs are in flight on it (bdev_channel_destroy asserts
+	 * io_outstanding == 0 — abort in debug, channel UAF in release), and must
+	 * not close the desc while a relocate/resync engine still submits on it.
+	 * drain_refs counts the drain fan-out itself (+1) plus every reactor that
+	 * deferred its channel put to its last leg completion; the final release
+	 * closes the desc on the app thread. desc_pins (app-thread only, engines
+	 * run entirely on the app thread) counts engines using this band's desc; a
+	 * close requested while pinned is deferred to the engine's terminal
+	 * (close_deferred). */
+	bool			draining;
+	uint32_t		drain_refs;	/* atomic (released from reactor threads) */
+	bool			close_deferred;
+	uint32_t		desc_pins;	/* app-thread only */
+	void			(*drain_cb)(void *cb_arg, int rc);
+	void			*drain_cb_arg;
+
 	/* Back-pointer to the composite (needed by the hot-remove event callback,
 	 * which only receives the band as event_ctx). */
 	struct vbdev_tier	*t;
@@ -201,6 +218,13 @@ struct vbdev_tier {
 	uint64_t		total_num_blocks;	/* md region + Σ data bands (excludes per-disk sb reserve) */
 	bool			registered;
 
+	/* H3: the module thread (captured at create — the app/RPC thread). ALL
+	 * composite-global SB-persist state (seq, sb_write_inflight/queued,
+	 * sb_pending_cbs, delete/close_pending) is owned by this thread; reactor-
+	 * side events (md-leg degrade in _tier_leg_complete) funnel their persist
+	 * through spdk_thread_send_msg instead of mutating it in place. */
+	struct spdk_thread	*thread;
+
 	/* M5(a): serialize tier_sb_write_all — one fan-out in flight at a time;
 	 * concurrent requests queue their callbacks and are coalesced into ONE
 	 * follow-up fan-out that persists the latest state. */
@@ -237,6 +261,13 @@ struct tier_sb_pending_cb {
  */
 struct tier_io_channel {
 	struct spdk_io_channel	*base_ch[TIER_MAX_BANDS];	/* indexed by band slot */
+
+	/* C2: legs in flight per band on THIS reactor (single-thread access: legs
+	 * complete on their submitting thread — no atomics needed). A band drain
+	 * finding inflight > 0 defers the channel put to the last completion via
+	 * drain_deferred. */
+	uint32_t		inflight[TIER_MAX_BANDS];
+	bool			drain_deferred[TIER_MAX_BANDS];
 };
 
 /* ---- Internal API (consumed by vbdev_tier.c, vbdev_tier_rpc.c, and the
