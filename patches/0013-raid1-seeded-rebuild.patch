@@ -1,0 +1,645 @@
+diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
+index ad5143d..e89a0cc 100644
+--- a/module/bdev/raid/bdev_raid.c
++++ b/module/bdev/raid/bdev_raid.c
+@@ -81,6 +81,16 @@ struct raid_bdev_process {
+ 	int				status;
+ 	TAILQ_HEAD(, raid_process_finish_action) finish_actions;
+ 	struct raid_process_qos		qos;
++	/* SPEC-74 M6 seeded rebuild (docs/SEEDED-REBUILD-DESIGN.md): sorted,
++	 * non-overlapping dirty ranges (owned by the process, freed with it).
++	 * Windows intersecting no range complete without copying — the target
++	 * was attached write_only, so unlisted blocks are already current. */
++	bool				seeded;
++	struct raid_bdev_seed_range	*seed_ranges;
++	uint32_t			num_seed_ranges;
++	/* Cursor into seed_ranges — windows only ever advance, so passed
++	 * ranges never need re-scanning. */
++	uint32_t			seed_range_idx;
+ };
+ 
+ struct raid_process_finish_action {
+@@ -420,6 +430,14 @@ raid_bdev_deconfigure_base_bdev(struct raid_base_bdev_info *base_info)
+ 	raid_bdev->num_base_bdevs_discovered--;
+ 	base_info->is_configured = false;
+ 	base_info->is_process_target = false;
++	/* SPEC-74 M6: per-add request flags and seeded-rebuild state die with the
++	 * membership — a reused slot (or an SB re-examine of a returning disk)
++	 * must not inherit a stale skip_rebuild/write_only request or a stale
++	 * read exclusion. */
++	base_info->skip_rebuild = false;
++	base_info->write_only = false;
++	base_info->read_excluded = false;
++	base_info->write_only_pending = false;
+ }
+ 
+ /*
+@@ -2554,7 +2572,12 @@ raid_bdev_process_finish_write_sb(void *ctx)
+ 		if (sb_base_bdev->state != RAID_SB_BASE_BDEV_CONFIGURED &&
+ 		    sb_base_bdev->slot < raid_bdev->num_base_bdevs) {
+ 			base_info = &raid_bdev->base_bdev_info[sb_base_bdev->slot];
+-			if (base_info->is_configured) {
++			/* SPEC-74 M6: a write_only member whose seeded rebuild has not
++			 * completed must NOT be promoted by another process's completion —
++			 * its data region may still be stale (SEEDED-REBUILD-DESIGN.md:
++			 * the SB flip is deferred to seeded-rebuild completion, which
++			 * clears write_only_pending first). */
++			if (base_info->is_configured && !base_info->write_only_pending) {
+ 				sb_base_bdev->state = RAID_SB_BASE_BDEV_CONFIGURED;
+ 				sb_base_bdev->data_offset = base_info->data_offset;
+ 				spdk_uuid_copy(&sb_base_bdev->uuid, &base_info->uuid);
+@@ -2682,8 +2705,17 @@ raid_bdev_channel_process_finish(struct spdk_io_channel_iter *i)
+ 	if (process->status == 0) {
+ 		uint8_t slot = raid_bdev_base_bdev_slot(process->target);
+ 
+-		raid_ch->base_channel[slot] = raid_ch->process.target_ch;
+-		raid_ch->process.target_ch = NULL;
++		if (process->seeded) {
++			/* SPEC-74 M6: the target was wired into base_channel[slot] at
++			 * write_only attach — there is nothing to promote. The process's
++			 * duplicate target_ch reference is dropped by
++			 * raid_bdev_ch_process_cleanup below (assigning it here would
++			 * leak the attach-time reference). */
++			assert(raid_ch->base_channel[slot] != NULL);
++		} else {
++			raid_ch->base_channel[slot] = raid_ch->process.target_ch;
++			raid_ch->process.target_ch = NULL;
++		}
+ 	}
+ 
+ 	raid_bdev_ch_process_cleanup(raid_ch);
+@@ -2704,6 +2736,16 @@ raid_bdev_process_finish_quiesced(void *ctx, int status)
+ 
+ 	raid_bdev->process = NULL;
+ 	process->target->is_process_target = false;
++	if (process->seeded && process->status == 0) {
++		/* SEEDED-REBUILD-DESIGN.md completion: promote read-eligibility under
++		 * the whole-raid quiesce (no I/O in flight during the transition).
++		 * With write_only_pending cleared, raid_bdev_process_finish_write_sb
++		 * flips the SB slot to CONFIGURED (0001 CBT-7 discipline: the wiring
++		 * has been live since attach). On failure the flags die with the
++		 * member on the vanilla removal path. */
++		process->target->read_excluded = false;
++		process->target->write_only_pending = false;
++	}
+ 
+ 	spdk_for_each_channel(process->raid_bdev, raid_bdev_channel_process_finish, process,
+ 			      __raid_bdev_process_finish);
+@@ -2868,6 +2910,38 @@ raid_bdev_submit_process_request(struct raid_bdev_process *process, uint64_t off
+ 	return ret;
+ }
+ 
++/* SPEC-74 M6: true when the CURRENT window of a seeded process intersects no
++ * seed range, i.e. every block in it was either untouched since the epoch
++ * opened or write-replicated to the target at host-write time (the target is
++ * attached write_only) — so the window needs no copy. Ranges are sorted and
++ * non-overlapping (validated at the RPC) and windows only advance, making the
++ * cursor scan O(1) amortized and the predicate idempotent for repeated calls
++ * on the same window. Process thread only. */
++static bool
++raid_bdev_process_window_seeded_clean(struct raid_bdev_process *process)
++{
++	uint64_t offset = process->window_offset;
++	uint64_t offset_end = spdk_min(offset + process->max_window_size,
++				       process->raid_bdev->bdev.blockcnt);
++
++	if (!process->seeded) {
++		return false;
++	}
++
++	while (process->seed_range_idx < process->num_seed_ranges) {
++		const struct raid_bdev_seed_range *range =
++			&process->seed_ranges[process->seed_range_idx];
++
++		if (range->offset_blocks + range->num_blocks <= offset) {
++			process->seed_range_idx++;
++			continue;
++		}
++		return range->offset_blocks >= offset_end;
++	}
++
++	return true;
++}
++
+ static void
+ _raid_bdev_process_thread_run(struct raid_bdev_process *process)
+ {
+@@ -2876,6 +2950,19 @@ _raid_bdev_process_thread_run(struct raid_bdev_process *process)
+ 	const uint64_t offset_end = spdk_min(offset + process->max_window_size, raid_bdev->bdev.blockcnt);
+ 	int ret;
+ 
++	if (spdk_unlikely(process->seeded) && raid_bdev_process_window_seeded_clean(process)) {
++		/* SEEDED-REBUILD-DESIGN.md: clean window — complete it WITHOUT
++		 * submitting copy requests, with the same bookkeeping as a copied
++		 * window: window_size drives the per-channel process.offset update
++		 * and the unlock advances window_offset. The per-window
++		 * quiesce/unquiesce cycle is kept in V1 (safe; the SPEC-74 C4 bench
++		 * may motivate a lock-free jump to the next dirty range later). */
++		process->window_size = offset_end - offset;
++		spdk_for_each_channel(raid_bdev, raid_bdev_process_channel_update, process,
++				      raid_bdev_process_channels_update_done);
++		return;
++	}
++
+ 	while (offset < offset_end) {
+ 		ret = raid_bdev_submit_process_request(process, offset, offset_end - offset);
+ 		if (ret <= 0) {
+@@ -2940,7 +3027,13 @@ raid_bdev_process_lock_window_range(struct raid_bdev_process *process)
+ 	assert(process->window_range_locked == false);
+ 
+ 	if (process->qos.enable_qos) {
+-		if (raid_bdev_process_consume_token(process)) {
++		if (spdk_unlikely(process->seeded) &&
++		    raid_bdev_process_window_seeded_clean(process)) {
++			/* SPEC-74 M6: a clean window does no copy I/O — exempt it from
++			 * the QoS token so the fast-skip is not paced at copy bandwidth
++			 * (SEEDED-REBUILD-DESIGN.md "fast-advance"). */
++			spdk_poller_pause(process->qos.process_continue_poller);
++		} else if (raid_bdev_process_consume_token(process)) {
+ 			spdk_poller_pause(process->qos.process_continue_poller);
+ 		} else {
+ 			spdk_poller_resume(process->qos.process_continue_poller);
+@@ -3159,6 +3252,9 @@ raid_bdev_process_free(struct raid_bdev_process *process)
+ 		raid_bdev_process_request_free(process_req);
+ 	}
+ 
++	/* SPEC-74 M6: the seeded process owns its ranges — every teardown path
++	 * (finish or aborted start) goes through here. */
++	free(process->seed_ranges);
+ 	free(process);
+ }
+ 
+@@ -3223,6 +3319,38 @@ raid_bdev_start_rebuild(struct raid_base_bdev_info *target)
+ 	return 0;
+ }
+ 
++/* SPEC-74 M6 (docs/SEEDED-REBUILD-DESIGN.md): start the in-raid rebuild seeded
++ * with dirty ranges on a write_only-attached member. The target is NOT marked
++ * is_process_target: it is already wired into every channel (writes reach it;
++ * reads are blocked by read_excluded) and channels created mid-backfill must
++ * keep including it (raid_bdev_create_cb excludes process targets). Takes
++ * ownership of \c ranges on success (freed with the process). */
++int
++raid_bdev_start_seeded_rebuild(struct raid_base_bdev_info *target,
++			       struct raid_bdev_seed_range *ranges, uint32_t num_ranges)
++{
++	struct raid_bdev_process *process;
++
++	assert(spdk_get_thread() == spdk_thread_get_app_thread());
++
++	if (!target->write_only_pending) {
++		return -EINVAL;
++	}
++
++	process = raid_bdev_process_alloc(target->raid_bdev, RAID_PROCESS_REBUILD, target);
++	if (process == NULL) {
++		return -ENOMEM;
++	}
++
++	process->seeded = true;
++	process->seed_ranges = ranges;
++	process->num_seed_ranges = num_ranges;
++
++	raid_bdev_process_start(process);
++
++	return 0;
++}
++
+ static void raid_bdev_configure_base_bdev_cont(struct raid_base_bdev_info *base_info);
+ 
+ static void
+@@ -3269,7 +3397,10 @@ raid_bdev_skip_rebuild_unquiesced(void *ctx, int status)
+ 			    spdk_strerror(-status));
+ 	}
+ 
+-	if (raid_bdev->superblock_enabled) {
++	/* SPEC-74 M6: for a write_only attach the SB flip is deferred to
++	 * seeded-rebuild completion (the data region is still stale) — the slot
++	 * stays un-promoted exactly like an ordinary rebuild target's. */
++	if (raid_bdev->superblock_enabled && !base_info->write_only_pending) {
+ 		struct raid_bdev_superblock *sb = raid_bdev->sb;
+ 		struct raid_bdev_sb_base_bdev *sb_base_bdev;
+ 		uint8_t i;
+@@ -3419,6 +3550,15 @@ raid_bdev_skip_rebuild_quiesced(void *ctx, int status)
+ 		return;
+ 	}
+ 
++	if (base_info->write_only) {
++		/* SEEDED-REBUILD-DESIGN.md: reads must never select the joiner before
++		 * the seeded backfill completes. Set under the whole-raid quiesce, so
++		 * no read is in flight when the channels get wired below. On failure
++		 * the flags die with the member (raid_bdev_deconfigure_base_bdev). */
++		base_info->read_excluded = true;
++		base_info->write_only_pending = true;
++	}
++
+ 	base_info->is_process_target = false;
+ 
+ 	spdk_for_each_channel(raid_bdev, raid_bdev_skip_rebuild_ch_iter, sr_ctx,
+@@ -3432,6 +3572,7 @@ raid_bdev_configure_base_bdev_cont(struct raid_base_bdev_info *base_info)
+ {
+ 	struct raid_bdev *raid_bdev = base_info->raid_bdev;
+ 	bool skip_rebuild = base_info->skip_rebuild;
++	bool write_only = base_info->write_only;
+ 	raid_base_bdev_cb configure_cb;
+ 	int rc;
+ 
+@@ -3470,16 +3611,27 @@ raid_bdev_configure_base_bdev_cont(struct raid_base_bdev_info *base_info)
+ 		}
+ 	} else if (base_info->is_process_target) {
+ 		raid_bdev->num_base_bdevs_operational++;
+-		if (skip_rebuild) {
++		/* SPEC-74 M6: a write_only attach wires the member into every channel
++		 * like skip_rebuild does (same quiesce + CBT-6 unwind discipline), but
++		 * leaves it read_excluded with the SB flip deferred — the seeded
++		 * rebuild (bdev_raid_start_seeded_rebuild) promotes it later. */
++		if (skip_rebuild || write_only) {
+ 			struct skip_rebuild_ctx *sr_ctx = calloc(1, sizeof(*sr_ctx));
+ 			if (!sr_ctx) {
+-				SPDK_ERRLOG("skip_rebuild: context allocation failed\n");
++				SPDK_ERRLOG("%s: context allocation failed\n",
++					    write_only ? "write_only attach" : "skip_rebuild");
+ 				_raid_bdev_remove_base_bdev(base_info, NULL, NULL);
+ 				rc = -ENOMEM;
+ 			} else {
+-				SPDK_NOTICELOG("Skipping rebuild for base bdev '%s' "
+-					       "(skip_rebuild=true, quiescing)\n",
+-					       base_info->name);
++				if (write_only) {
++					SPDK_NOTICELOG("Attaching base bdev '%s' write-only "
++						       "(seeded rebuild pending, quiescing)\n",
++						       base_info->name);
++				} else {
++					SPDK_NOTICELOG("Skipping rebuild for base bdev '%s' "
++						       "(skip_rebuild=true, quiescing)\n",
++						       base_info->name);
++				}
+ 				sr_ctx->base_info = base_info;
+ 				sr_ctx->cb_fn = configure_cb;
+ 				sr_ctx->cb_ctx = base_info->configure_cb_ctx;
+@@ -3738,7 +3890,7 @@ out:
+ 
+ int
+ raid_bdev_add_base_bdev(struct raid_bdev *raid_bdev, const char *name,
+-			bool skip_rebuild,
++			bool skip_rebuild, bool write_only,
+ 			raid_base_bdev_cb cb_fn, void *cb_ctx)
+ {
+ 	struct raid_base_bdev_info *base_info = NULL, *iter;
+@@ -3795,6 +3947,7 @@ raid_bdev_add_base_bdev(struct raid_bdev *raid_bdev, const char *name,
+ 	}
+ 
+ 	base_info->skip_rebuild = skip_rebuild;
++	base_info->write_only = write_only;
+ 
+ 	rc = raid_bdev_configure_base_bdev(base_info, false, cb_fn, cb_ctx);
+ 	if (rc != 0 && (rc != -ENODEV || raid_bdev->state != RAID_BDEV_STATE_CONFIGURING)) {
+diff --git a/module/bdev/raid/bdev_raid.h b/module/bdev/raid/bdev_raid.h
+index 7ee701a..ef387aa 100644
+--- a/module/bdev/raid/bdev_raid.h
++++ b/module/bdev/raid/bdev_raid.h
+@@ -114,6 +114,22 @@ struct raid_base_bdev_info {
+ 
+ 	/* When true, skip the full rebuild on re-add (CBT partial sync done) */
+ 	bool			skip_rebuild;
++
++	/* SPEC-74 M6 seeded rebuild (docs/SEEDED-REBUILD-DESIGN.md): attach this
++	 * member write-only — wired into every channel for WRITES at configure
++	 * time, excluded from reads, superblock flip deferred to seeded-rebuild
++	 * completion. Per-add request flag, like skip_rebuild. */
++	bool			write_only;
++
++	/* SPEC-74 M6: the member receives writes but serves no reads (raid1 read
++	 * selection skips the slot). Set for the whole write_only-attach +
++	 * seeded-rebuild window; cleared at completion or with the membership. */
++	bool			read_excluded;
++
++	/* SPEC-74 M6: write_only attach done, seeded rebuild not yet completed —
++	 * the SB slot must stay un-promoted (never CONFIGURED while the data
++	 * region may still be stale). */
++	bool			write_only_pending;
+ };
+ 
+ struct raid_bdev_io;
+@@ -279,8 +295,18 @@ int raid_bdev_create(const char *name, uint32_t strip_size, uint8_t num_base_bde
+ 		     struct raid_bdev **raid_bdev_out);
+ void raid_bdev_delete(struct raid_bdev *raid_bdev, raid_bdev_destruct_cb cb_fn, void *cb_ctx);
+ int raid_bdev_add_base_bdev(struct raid_bdev *raid_bdev, const char *name,
+-			    bool skip_rebuild,
++			    bool skip_rebuild, bool write_only,
+ 			    raid_base_bdev_cb cb_fn, void *cb_ctx);
++
++/* SPEC-74 M6 seeded rebuild: a dirty range (block units) seeding a partial
++ * rebuild. Sorted and non-overlapping (validated at the RPC). */
++struct raid_bdev_seed_range {
++	uint64_t		offset_blocks;
++	uint64_t		num_blocks;
++};
++
++int raid_bdev_start_seeded_rebuild(struct raid_base_bdev_info *target,
++				   struct raid_bdev_seed_range *ranges, uint32_t num_ranges);
+ struct raid_bdev *raid_bdev_find_by_name(const char *name);
+ enum raid_level raid_bdev_str_to_level(const char *str);
+ const char *raid_bdev_level_to_str(enum raid_level level);
+diff --git a/module/bdev/raid/bdev_raid_rpc.c b/module/bdev/raid/bdev_raid_rpc.c
+index b1f3d92..a30a613 100644
+--- a/module/bdev/raid/bdev_raid_rpc.c
++++ b/module/bdev/raid/bdev_raid_rpc.c
+@@ -305,7 +305,7 @@ rpc_bdev_raid_create(struct spdk_jsonrpc_request *request,
+ 	for (i = 0; i < num_base_bdevs; i++) {
+ 		const char *base_bdev_name = req->base_bdevs.base_bdevs[i];
+ 
+-		rc = raid_bdev_add_base_bdev(raid_bdev, base_bdev_name, false,
++		rc = raid_bdev_add_base_bdev(raid_bdev, base_bdev_name, false, false,
+ 					     rpc_bdev_raid_create_add_base_bdev_cb, ctx);
+ 		if (rc == -ENODEV) {
+ 			SPDK_DEBUGLOG(bdev_raid, "base bdev %s doesn't exist now\n", base_bdev_name);
+@@ -451,6 +451,10 @@ struct rpc_bdev_raid_add_base_bdev {
+ 
+ 	/* Skip the full rebuild (base bdev already synced by CBT) */
+ 	bool			skip_rebuild;
++
++	/* SPEC-74 M6: attach write-only — receives writes immediately, serves no
++	 * reads, SB flip deferred to seeded-rebuild completion */
++	bool			write_only;
+ };
+ 
+ /*
+@@ -476,6 +480,7 @@ static const struct spdk_json_object_decoder rpc_bdev_raid_add_base_bdev_decoder
+ 	{"base_bdev", offsetof(struct rpc_bdev_raid_add_base_bdev, base_bdev), spdk_json_decode_string},
+ 	{"raid_bdev", offsetof(struct rpc_bdev_raid_add_base_bdev, raid_bdev), spdk_json_decode_string},
+ 	{"skip_rebuild", offsetof(struct rpc_bdev_raid_add_base_bdev, skip_rebuild), spdk_json_decode_bool, true},
++	{"write_only", offsetof(struct rpc_bdev_raid_add_base_bdev, write_only), spdk_json_decode_bool, true},
+ };
+ 
+ static void
+@@ -523,6 +528,12 @@ rpc_bdev_raid_add_base_bdev(struct spdk_jsonrpc_request *request,
+ 		goto cleanup;
+ 	}
+ 
++	if (req.skip_rebuild && req.write_only) {
++		spdk_jsonrpc_send_error_response(request, -EINVAL,
++						 "skip_rebuild and write_only are mutually exclusive");
++		goto cleanup;
++	}
++
+ 	raid_bdev = raid_bdev_find_by_name(req.raid_bdev);
+ 	if (raid_bdev == NULL) {
+ 		spdk_jsonrpc_send_error_response_fmt(request, -ENODEV, "raid bdev %s is not found in config",
+@@ -530,7 +541,15 @@ rpc_bdev_raid_add_base_bdev(struct spdk_jsonrpc_request *request,
+ 		goto cleanup;
+ 	}
+ 
+-	rc = raid_bdev_add_base_bdev(raid_bdev, req.base_bdev, req.skip_rebuild,
++	/* SPEC-74 M6: read exclusion is implemented by the raid1 read selection
++	 * only — a write_only attach on any other level would serve stale reads. */
++	if (req.write_only && raid_bdev->level != RAID1) {
++		spdk_jsonrpc_send_error_response(request, -EINVAL,
++						 "write_only attach requires a raid1 bdev");
++		goto cleanup;
++	}
++
++	rc = raid_bdev_add_base_bdev(raid_bdev, req.base_bdev, req.skip_rebuild, req.write_only,
+ 				     rpc_bdev_raid_add_base_bdev_done, request);
+ 	if (rc != 0) {
+ 		spdk_jsonrpc_send_error_response_fmt(request, rc,
+@@ -545,6 +564,209 @@ cleanup:
+ }
+ SPDK_RPC_REGISTER("bdev_raid_add_base_bdev", rpc_bdev_raid_add_base_bdev, SPDK_RPC_RUNTIME)
+ 
++/* ---- SPEC-74 M6 (docs/SEEDED-REBUILD-DESIGN.md, RPC-CONTRACT P5b):
++ * bdev_raid_start_seeded_rebuild {name, base_bdev, ranges:[{offset_blocks,
++ * length_blocks}]} — start the in-raid rebuild seeded with CBT dirty ranges on
++ * a write_only-attached member. Immediate {rebuild_id} reply; progress via the
++ * existing bdev_raid_get_bdevs process info; completion promotes
++ * read-eligibility and flips the SB slot to CONFIGURED. ---- */
++
++/* CBT emits coalesced dirty ranges; the 1 MiB process window makes finer
++ * granularity worthless, so the orchestrator folds any excess (same cap as
++ * bdev_raid_rebuild_ranges). */
++#define RAID_SEEDED_REBUILD_MAX_RANGES 4096u
++
++struct rpc_bdev_raid_start_seeded_rebuild {
++	/* Raid bdev name */
++	char				*name;
++
++	/* Base bdev name (the write_only-attached member) */
++	char				*base_bdev;
++
++	/* Number of seed ranges */
++	size_t				num_ranges;
++
++	/* Heap-allocated in the array decoder (0008 house pattern) */
++	struct raid_bdev_seed_range	*ranges;
++};
++
++static void
++free_rpc_bdev_raid_start_seeded_rebuild(struct rpc_bdev_raid_start_seeded_rebuild *req)
++{
++	free(req->name);
++	free(req->base_bdev);
++	free(req->ranges);
++}
++
++static int
++decode_seed_range(const struct spdk_json_val *val, void *out)
++{
++	const struct spdk_json_object_decoder decoders[] = {
++		{"offset_blocks", offsetof(struct raid_bdev_seed_range, offset_blocks), spdk_json_decode_uint64},
++		{"length_blocks", offsetof(struct raid_bdev_seed_range, num_blocks), spdk_json_decode_uint64},
++	};
++
++	return spdk_json_decode_object(val, decoders, SPDK_COUNTOF(decoders),
++				       (struct raid_bdev_seed_range *)out) ? -1 : 0;
++}
++
++static int
++decode_seed_ranges(const struct spdk_json_val *val, void *out)
++{
++	struct rpc_bdev_raid_start_seeded_rebuild *req =
++		SPDK_CONTAINEROF(out, struct rpc_bdev_raid_start_seeded_rebuild, ranges);
++
++	if (req->ranges == NULL) {
++		req->ranges = calloc(RAID_SEEDED_REBUILD_MAX_RANGES, sizeof(struct raid_bdev_seed_range));
++		if (req->ranges == NULL) {
++			return -ENOMEM;
++		}
++	}
++	return spdk_json_decode_array(val, decode_seed_range, req->ranges,
++				      RAID_SEEDED_REBUILD_MAX_RANGES, &req->num_ranges,
++				      sizeof(struct raid_bdev_seed_range));
++}
++
++static const struct spdk_json_object_decoder rpc_bdev_raid_start_seeded_rebuild_decoders[] = {
++	{"name", offsetof(struct rpc_bdev_raid_start_seeded_rebuild, name), spdk_json_decode_string},
++	{"base_bdev", offsetof(struct rpc_bdev_raid_start_seeded_rebuild, base_bdev), spdk_json_decode_string},
++	{"ranges", offsetof(struct rpc_bdev_raid_start_seeded_rebuild, ranges), decode_seed_ranges},
++};
++
++static int
++seed_range_cmp(const void *a, const void *b)
++{
++	const struct raid_bdev_seed_range *ra = a;
++	const struct raid_bdev_seed_range *rb = b;
++
++	if (ra->offset_blocks < rb->offset_blocks) {
++		return -1;
++	}
++	if (ra->offset_blocks > rb->offset_blocks) {
++		return 1;
++	}
++	return 0;
++}
++
++static void
++rpc_bdev_raid_start_seeded_rebuild(struct spdk_jsonrpc_request *request,
++				   const struct spdk_json_val *params)
++{
++	struct rpc_bdev_raid_start_seeded_rebuild req = {};
++	struct raid_bdev *raid_bdev;
++	struct raid_base_bdev_info *base_info = NULL, *iter;
++	struct raid_bdev_seed_range *ranges;
++	struct spdk_json_write_ctx *w;
++	uint64_t blockcnt;
++	char detail[192];
++	uint32_t i;
++	int rc;
++
++	if (spdk_json_decode_object(params, rpc_bdev_raid_start_seeded_rebuild_decoders,
++				    SPDK_COUNTOF(rpc_bdev_raid_start_seeded_rebuild_decoders),
++				    &req)) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_PARSE_ERROR,
++						 "spdk_json_decode_object failed");
++		goto cleanup;
++	}
++
++	raid_bdev = raid_bdev_find_by_name(req.name);
++	if (raid_bdev == NULL) {
++		spdk_jsonrpc_send_error_response_fmt(request, -ENODEV, "raid bdev %s is not found in config",
++						     req.name);
++		goto cleanup;
++	}
++
++	if (raid_bdev->process != NULL) {
++		spdk_jsonrpc_send_error_response_fmt(request, -EBUSY,
++						     "raid bdev %s already has a background process",
++						     req.name);
++		goto cleanup;
++	}
++
++	RAID_FOR_EACH_BASE_BDEV(raid_bdev, iter) {
++		if (iter->name != NULL && strcmp(iter->name, req.base_bdev) == 0) {
++			base_info = iter;
++			break;
++		}
++	}
++	if (base_info == NULL) {
++		spdk_jsonrpc_send_error_response_fmt(request, -ENODEV,
++						     "base bdev %s is not a member of raid bdev %s",
++						     req.base_bdev, req.name);
++		goto cleanup;
++	}
++
++	if (!base_info->write_only_pending) {
++		spdk_jsonrpc_send_error_response_fmt(request, -EINVAL,
++						     "base bdev %s is not write_only-attached",
++						     req.base_bdev);
++		goto cleanup;
++	}
++
++	/* Sort, then validate bounds and non-overlap (the engine's fast-skip
++	 * cursor depends on both). Touching ranges are fine. */
++	qsort(req.ranges, req.num_ranges, sizeof(*req.ranges), seed_range_cmp);
++
++	blockcnt = raid_bdev->bdev.blockcnt;
++	for (i = 0; i < req.num_ranges; i++) {
++		const struct raid_bdev_seed_range *range = &req.ranges[i];
++
++		if (range->num_blocks == 0 || range->offset_blocks >= blockcnt ||
++		    range->num_blocks > blockcnt - range->offset_blocks) {
++			spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
++							     "range %u [%" PRIu64 ", +%" PRIu64 ") is empty or "
++							     "exceeds the raid size (%" PRIu64 " blocks)",
++							     i, range->offset_blocks, range->num_blocks,
++							     blockcnt);
++			goto cleanup;
++		}
++		if (i > 0 && req.ranges[i - 1].offset_blocks + req.ranges[i - 1].num_blocks >
++		    range->offset_blocks) {
++			spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
++							     "ranges %u and %u overlap", i - 1, i);
++			goto cleanup;
++		}
++	}
++
++	/* SEC1: audit — this arms a background writer on the array (patch 0011
++	 * discipline for destructive RPCs). */
++	snprintf(detail, sizeof(detail), "raid=%s base=%s ranges=%zu",
++		 req.name, req.base_bdev, req.num_ranges);
++	spdk_jsonrpc_request_audit(request, "bdev_raid_start_seeded_rebuild", detail);
++
++	/* Hand the ranges over to the process (freed with it). An empty set is
++	 * legal — nothing was dirty — the backfill fast-skips the whole range
++	 * and the completion still promotes the member. */
++	if (req.num_ranges == 0) {
++		free(req.ranges);
++		ranges = NULL;
++	} else {
++		ranges = req.ranges;
++	}
++	req.ranges = NULL;
++
++	rc = raid_bdev_start_seeded_rebuild(base_info, ranges, (uint32_t)req.num_ranges);
++	if (rc != 0) {
++		free(ranges);
++		spdk_jsonrpc_send_error_response_fmt(request, rc,
++						     "Failed to start seeded rebuild on %s/%s: %s",
++						     req.name, req.base_bdev, spdk_strerror(-rc));
++		goto cleanup;
++	}
++
++	w = spdk_jsonrpc_begin_result(request);
++	spdk_json_write_object_begin(w);
++	spdk_json_write_named_string_fmt(w, "rebuild_id", "%s:%s", req.name, req.base_bdev);
++	spdk_json_write_object_end(w);
++	spdk_jsonrpc_end_result(request, w);
++
++cleanup:
++	free_rpc_bdev_raid_start_seeded_rebuild(&req);
++}
++SPDK_RPC_REGISTER("bdev_raid_start_seeded_rebuild", rpc_bdev_raid_start_seeded_rebuild,
++		  SPDK_RPC_RUNTIME)
++
+ /*
+  * Decoder object for RPC bdev_raid_remove_base_bdev
+  */
+diff --git a/module/bdev/raid/raid1.c b/module/bdev/raid/raid1.c
+index af633de..ae832f9 100644
+--- a/module/bdev/raid/raid1.c
++++ b/module/bdev/raid/raid1.c
+@@ -176,7 +176,11 @@ raid1_read_other_base_bdev(void *_raid_io)
+ 		base_info = &raid_bdev->base_bdev_info[i];
+ 		base_ch = raid_bdev_channel_get_base_channel(raid_io->raid_ch, i);
+ 
+-		if (base_ch == NULL || i == raid_io->base_bdev_io_submitted) {
++		/* SPEC-74 M6: never fall back to a read_excluded member — its data
++		 * region may still be stale, and raid1_correct_read_error would then
++		 * "repair" the healthy leg with stale blocks. */
++		if (base_ch == NULL || i == raid_io->base_bdev_io_submitted ||
++		    base_info->read_excluded) {
+ 			raid_io->base_bdev_io_remaining--;
+ 			continue;
+ 		}
+@@ -240,7 +244,12 @@ raid1_channel_next_read_base_bdev(struct raid_bdev *raid_bdev, struct raid_bdev_
+ 	uint8_t i;
+ 
+ 	for (i = 0; i < raid_bdev->num_base_bdevs; i++) {
++		/* SPEC-74 M6 (docs/SEEDED-REBUILD-DESIGN.md): a write_only-attached
++		 * member receives writes (channel present) but serves no reads until
++		 * its seeded rebuild completes — this also keeps the rebuild's own
++		 * healthy-leg reads off the joiner. */
+ 		if (raid_bdev_channel_get_base_channel(raid_ch, i) != NULL &&
++		    !raid_bdev->base_bdev_info[i].read_excluded &&
+ 		    raid1_ch->read_blocks_outstanding[i] < read_blocks_min) {
+ 			read_blocks_min = raid1_ch->read_blocks_outstanding[i];
+ 			idx = i;
