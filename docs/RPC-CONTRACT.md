@@ -232,7 +232,7 @@ a split-brain across disks.
   must drop any snapshot taken under it. A stale `boot_id` implies the token is
   dead.
 
-## Invariants the control-plane owns (P1–P5)
+## Invariants the control-plane owns (P1–P5b)
 
 - **P1** geometry is SB-authoritative (highest seq); CRD is intent.
 - **P2** relocate/remap target the lvol's own composite (enforced fork-side).
@@ -241,3 +241,25 @@ a split-brain across disks.
 - **P5** the reintegration order is `pause → final freeze → copy delta →
   add_base_bdev(skip_rebuild) → await callback → resume`; verify by conformance
   test.
+- **P5b (seeded rebuild — SPEC-74 M6, see docs/SEEDED-REBUILD-DESIGN.md)** the
+  monotonic reintegration order is `add_base_bdev(write_only) →
+  cbt epoch_freeze → epoch_get_dirty_ranges → start_seeded_rebuild(ranges) →
+  completion → control-plane set-after`. No pause anywhere on this path.
+  Correctness rests on the write-only attach preceding the freeze: from the
+  attach instant every host write is replicated to the joiner, so the frozen
+  delta is FIXED and clean gaps may be skipped. The member stays read-excluded
+  until the seeded rebuild completes. P5 remains valid while both paths coexist;
+  deleting it is gated on the SPEC-74 C4 bench (p99-under-roll within policy).
+
+### Planned RPC surface for P5b (this branch)
+
+- `bdev_raid_add_base_bdev` gains optional `"write_only": bool` — attach the
+  member write-replicated/read-excluded; no rebuild process, no SB CONFIGURED
+  flip. Idempotent re-attach of the same bdev in the same mode is a no-op.
+- `bdev_raid_start_seeded_rebuild {name, base_bdev, ranges:[{offset_blocks,
+  length_blocks}]}` — starts the in-raid rebuild seeded with the given dirty
+  ranges (fast-advance across clean gaps; per-window quiesce_range region lock
+  unchanged). Async: immediate `{rebuild_id}`; completion promotes
+  read-eligibility + SB CONFIGURED. Refused `-EINVAL` if the member is not
+  write_only-attached; SEC1-audited. A failed seeded rebuild removes the member
+  (vanilla process-failure path) and leaves the epoch FROZEN (H1) for retry.
