@@ -235,8 +235,18 @@ a split-brain across disks.
     and **no process write is emitted after the RPC returns** (the delete reply
     is gated behind the process fully stopping). The CP deliberately has no
     `Cancel` action — cleanliness is guaranteed here.
-  - `verified` stays `false` until 0014.8 (integrated verify) — so
-    `bdev_cbt_epoch_close(mode=consumed)` is deliberately unusable until then.
+  - `verified` is set by the integrated verify phase (0014.8, patch 0018):
+    after the copy completes and BEFORE the process concludes (the SB
+    CONFIGURED flip is gated on it), 64 uniform-stride windows across the
+    copied extent (seed ranges for seeded rebuilds, whole raid otherwise) are
+    compared two-legs under `quiesce_range`, arbiter = the source leg. A
+    mismatch is re-copied from the arbiter and re-verified once; a second
+    mismatch under the same lock seals the outcome **DIVERGENT** (-EILSEQ).
+    Success seals `verified=true` — unlocking `epoch_close(consumed)` for the
+    token. Honest scope (T-C12): a probabilistic process-bug detector
+    (~64 MiB sampled); the exhaustive one is `bdev_raid_verify_ranges` (§10b).
+    Raid1 plain-data only; anything else completes unverified. The registry
+    shows `verifying` while the phase runs; re-copied windows count in `bytes`.
 
 ## CBT epochs / rebuild
 
@@ -256,9 +266,9 @@ a split-brain across disks.
   to the live bitmap (H1 discipline); `consumed` deliberately DISCARDS it under
   caller certification and **requires a rebuild_token naming a LOCAL
   succeeded+verified outcome-registry entry (-EPERM otherwise)** — validated
-  against the 0014.5 registry (effective since patch 0015; unusable-by-design
-  until 0014.8 makes entries `verified`). An unknown `mode` is -EINVAL, never a
-  silent preserve.
+  against the 0014.5 registry; `verified` is produced by the integrated verify
+  phase (0014.8, patch 0018). An unknown `mode` is -EINVAL, never a silent
+  preserve.
 - **0014.6 (cbt part)** — `get_bdevs` exposes `driver_specific.cbt.epochs[]`:
   `{epoch_id, nonce, state: open|frozen|rebuilding|completed|invalid,
   generation, truncated}` — the control-plane's `EpochObservation` source (no
