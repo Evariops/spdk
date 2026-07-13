@@ -186,6 +186,28 @@ a split-brain across disks.
   after the unquiesce; a crash between the two costs a full rebuild at reboot
   (conservative, safe).
 
+## Member observation & extended superblock (GCCP 0014.6/0014.7, patches 0016/0017)
+
+- **0014.7 — extended superblock (V-2).** SB minor 0→1 (carved from reserved
+  bytes: a minor-0 SB reads back as generation 0 / epoch 0). Per member:
+  `content_generation` — survivors increment it in the SAME SB transaction
+  that records a member's ejection (RecordDivergence); a member completing a
+  rebuild (or skip_rebuild promotion) ADOPTS the survivors' max generation in
+  the same transaction as its CONFIGURED flip. A lagging generation is the
+  durable proof of staleness the cold-recovery pass reads. `view_epoch` is
+  persisted/reassembled here; the view protocol mutates it (W3, 0014b).
+  Reassembly restores both for ALL slots (a FAILED slot keeps its stale
+  generation — that lag is the point).
+- **0014.6 — per-member observation.** `get_bdevs` → `driver_specific.raid.
+  base_bdevs_list[]` gains: `state` (derived, precedence:
+  `failed > write_only > configured > configuring > absent`), `since` (unix
+  seconds of the last observable state flip — the CP's anti-flap input),
+  `content_generation`, `view_epoch`, and — when the member is a cbt bdev
+  tracking a live epoch — `epoch_nonce`/`epoch_state`/`truncated` (the
+  Decider's EpochObservation source; fields absent otherwise). The raid reads
+  the cbt facts via `vbdev_cbt_query_latest_epoch()` (most recently opened
+  live epoch; closed epochs leave the list).
+
 ## Incarnation & rebuild outcomes (GCCP 0014.4/0014.5, patches 0014/0015)
 
 - **0014.4 — identity.** `bdev_raid_create {…, incarnation}` (required, ≤63
