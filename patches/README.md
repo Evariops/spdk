@@ -26,6 +26,9 @@ IS the contract; do not rely on any other ordering. Order matters:
 | 0010 | rpc socket chmod 0600 | lib/rpc | — |
 | 0011 | jsonrpc SO_PEERCRED audit hook (SEC1) | lib/jsonrpc | — |
 | 0012 | lvol shutdown-unload observability | bdev_lvol | — |
+| 0013 | raid1 seeded rebuild (write_only attach + range-seeded backfill) | bdev_raid | 0001, 0008, 0011 |
+| 0014 | raid incarnation identity + `expected_incarnation` ⇒ -ESTALE (GCCP 0014.4) | bdev_raid | 0013 |
+| 0015 | raid rebuild-outcome registry + CANCELED contract + `bdev_raid_get_rebuild_outcomes` (GCCP 0014.5) | bdev_raid (adds `bdev_raid_outcomes.{c,h}`); `module/bdev/cbt` consults it for `epoch_close(consumed)` | 0013, 0014 |
 
 0005 `#include`s `vbdev_tier.h` and adds `-I module/bdev/tier` to the lvol module
 CFLAGS via its own Makefile hunk; the Dockerfile injects the module dirs before

@@ -9,11 +9,11 @@
 
 | # | Item | Contrat | Véhicule |
 |---|---|---|---|
-| 0014.1 | Epochs noncés : `bdev_cbt_epoch_open(nonce, generation)` ; nonce dans get_bdevs | §5 | module/bdev/cbt (arbre) |
-| 0014.2 | `truncated=true` au resize sous epoch ouvert (phase OPEN incluse) | §5/T-D6 | module/bdev/cbt |
-| 0014.3 | `bdev_cbt_epoch_close(epoch_id, mode: consumed\|preserve)` — consumed exige un token SUCCEEDED-verified local (-EPERM sinon) | §4 | module/bdev/cbt |
-| 0014.4 | Incarnation : `bdev_raid_create(..., incarnation)` ; `expected_incarnation` sur tous les RPC engageants ⇒ `-ESTALE` | §1 | patch raid |
-| 0014.5 | Registre d'outcomes process-wide (TTL 15 min) : `{token, state RUNNING\|VERIFYING\|SUCCEEDED\|FAILED\|DIVERGENT\|CANCELED, bytes, verified, finished_at}` + `bdev_raid_get_rebuild_outcomes(token?)` ; contrat CANCELED (destroy pendant rebuild ⇒ zéro écriture après retour) | §2 | patch raid |
+| 0014.1 ✅ | Epochs noncés : `bdev_cbt_epoch_open(nonce, generation)` ; nonce dans get_bdevs | §5 | module/bdev/cbt (arbre) |
+| 0014.2 ✅ | `truncated=true` au resize sous epoch ouvert (phase OPEN incluse) | §5/T-D6 | module/bdev/cbt |
+| 0014.3 ✅ | `bdev_cbt_epoch_close(epoch_id, mode: consumed\|preserve)` — consumed exige un token SUCCEEDED-verified local (-EPERM sinon ; consultation registre effective depuis patch 0015) | §4 | module/bdev/cbt |
+| 0014.4 ✅ (patch 0014) | Incarnation : `bdev_raid_create(..., incarnation)` ; `expected_incarnation` sur tous les RPC engageants ⇒ `-ESTALE` | §1 | patch raid |
+| 0014.5 ✅ (patch 0015) | Registre d'outcomes process-wide (TTL 15 min) : `{token, state RUNNING\|VERIFYING\|SUCCEEDED\|FAILED\|DIVERGENT\|CANCELED, bytes, verified, finished_at}` + `bdev_raid_get_rebuild_outcomes(token?)` ; contrat CANCELED (destroy pendant rebuild ⇒ zéro écriture après retour) ; `epoch_close(consumed)` consulte le registre | §2 | patch raid |
 | 0014.6 | get_bdevs enrichi par membre : `{state, since, content_generation, view_epoch, epoch_nonce, epoch_state, truncated}` | §3 | patch raid+cbt |
 | 0014.7 | SB étendu : `content_generation` + `view_epoch` par membre, MÊME transaction que l'état ; reassembly étendue | §8/V-2 | patch raid (0001 discipline) |
 | 0014.8 | Verify intégrée au rebuild : K=64 fenêtres échantillonnées sous quiesce_range, re-copie+re-verify avant DIVERGENT ; alimente le registre (VERIFYING) | §10a | patch raid |
