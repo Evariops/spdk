@@ -32,4 +32,19 @@ struct vbdev_cbt_epoch_facts {
  */
 int vbdev_cbt_query_latest_epoch(const char *bdev_name, struct vbdev_cbt_epoch_facts *out);
 
+/**
+ * Evariops 0014.10 (spdk-csi RPC-CONTRACT §12): open a delta epoch the moment
+ * the raid ejects a member — the unplanned loss is the dominant production
+ * event, and without this bound the debt path degrades to a FULL rebuild
+ * (D14). Called by the raid module on each surviving member's cbt when a
+ * member leaves; the auto-generated epoch id/nonce are REPORTED through
+ * get_bdevs (0014.6), which is how the control-plane adopts the round.
+ *
+ * \return 0 on success; -EEXIST if an OPEN epoch already tracks the round
+ *         (never take over implicitly); -ENODEV if \c bdev_name is not a cbt
+ *         bdev; other negative errno from the underlying epoch machinery.
+ *         App thread only.
+ */
+int vbdev_cbt_auto_epoch_open(const char *bdev_name, const char *stale_backend_id);
+
 #endif /* SPDK_VBDEV_CBT_QUERY_H */

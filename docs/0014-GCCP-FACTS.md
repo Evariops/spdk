@@ -17,10 +17,10 @@
 | 0014.6 ✅ (patch 0017) | get_bdevs enrichi par membre : `{state, since, content_generation, view_epoch, epoch_nonce, epoch_state, truncated}` (pont `vbdev_cbt_query_latest_epoch`) | §3 | patch raid+cbt |
 | 0014.7 ✅ (patch 0016) | SB étendu : `content_generation` + `view_epoch` par membre, MÊME transaction que l'état (éjection = gen++ survivants ; complétion/skip = adoption du max) ; reassembly étendue ; SB minor 0→1 | §8/V-2 | patch raid (0001 discipline) |
 | 0014.8 ✅ (patch 0018) | Verify intégrée au rebuild : K=64 fenêtres stride-uniforme sous quiesce_range (étendue = seed ranges ou raid entier), arbitre = jambe source, re-copie+re-verify avant DIVERGENT (-EILSEQ) ; registre VERIFYING → verified=true (débloque consumed) ; flip CONFIGURED gated | §10a | patch raid |
-| 0014.9 | Enveloppes : caps rebuild/verify/relocate ×(nominal, maintenance) + bornes de concurrence par node ; pose par RPC ; défaut 0=illimité ⇒ l'échec de pose est un incident CP | §6 | patch raid/rpc |
-| 0014.10 | Epoch automatique à l'éjection d'un membre (nonce fourni au create ou généré+rapporté) | §12 (échéance W3) | patch raid+cbt |
-| 0014.11 | Contrat pause H10 × rebuild : la pause ne fait JAMAIS échouer un rebuild en vol ; + force-resume au chemin de fence (DÉC-11) | §13 | patch nvmf (0003) |
-| 0014.12 | `bdev_raid_verify_ranges(name, ranges\|allocated, rate_class=verify)` | §10b (W6) | patch raid |
+| 0014.9 ✅ (patch 0021) | Enveloppes : caps rebuild/verify/relocate ×(nominal, maintenance) + borne de concurrence ; `bdev_raid_set/get_envelopes` ; rebuild cap figé à l'alloc du process ; seeded → -EAGAIN au-delà de la borne, auto-attach admis bruyamment | §6 | patch raid/rpc |
+| 0014.10 ✅ (patch 0019) | Epoch automatique à l'éjection : le raid ouvre un epoch auto (nonce généré, rapporté via get_bdevs) sur le cbt de CHAQUE survivant ; -EEXIST si un OPEN couvre déjà (jamais de takeover implicite) | §12 | patch raid+cbt |
+| 0014.11 ✅ (patch 0020) | Pause H10 × rebuild : jamais d'échec du fait de la pause (structurel : aucun timeout dans le path process, writes parqués côté target) ; force-resume EXPLICITE et audité (`force:true`) au chemin de fence — la barrière percée échoue proprement à SON resume | §13 | patch nvmf (0003) |
+| 0014.12 ✅ (patch 0022) | `bdev_raid_verify_ranges {name, ranges?, token?, expected_incarnation?}` : détecteur exhaustif, chunks 1 MiB sous LBA-lock, cadence = enveloppe verify (figée au dispatch), rapporte {verified/divergent_blocks, divergent_ranges ≤128 + flag truncated} et ne répare JAMAIS (arbitrage = CP R≥3) ; registre alimenté (verifying → succeeded-verified/divergent) ; -EBUSY si process | §10b | patch raid |
 
 Hors périmètre de cette PR : 0014b (enforcement PR) = wrapper C# côté spdk-csi (T-A5 —
 vanilla `bdev_nvme_send_cmd` suffit), livré W3.

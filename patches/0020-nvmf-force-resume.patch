@@ -1,0 +1,46 @@
+diff --git a/lib/nvmf/nvmf_pause_rpc.c b/lib/nvmf/nvmf_pause_rpc.c
+index a162553..1e731c1 100644
+--- a/lib/nvmf/nvmf_pause_rpc.c
++++ b/lib/nvmf/nvmf_pause_rpc.c
+@@ -346,6 +346,13 @@ struct rpc_resume_ctx {
+ 	char *nqn;
+ 	char *tgt_name;
+ 	char *token;                    /* optional: pins the barrier to verify continuity */
++	/* Evariops 0014.11 (RPC-CONTRACT §13, DÉC-11): the fence path resumes the
++	 * subsystem BEFORE preempt-and-abort, whatever barrier is standing —
++	 * failover availability is substance, the snapshot barrier is comfort.
++	 * force=true overrides any pinned token and is audited; the barrier's
++	 * own (tokened) resume later reports resumed:false / barrier_intact:
++	 * false, so the group-snapshot saga fails CLEANLY and replays. */
++	bool  force;
+ 	bool  barrier_intact;           /* computed at dispatch, reported in resume_done */
+ 	struct paused_subsystem *entry;
+ };
+@@ -354,6 +361,7 @@ static const struct spdk_json_object_decoder rpc_resume_decoders[] = {
+ 	{"nqn",      offsetof(struct rpc_resume_ctx, nqn),      spdk_json_decode_string},
+ 	{"tgt_name", offsetof(struct rpc_resume_ctx, tgt_name), spdk_json_decode_string, true},
+ 	{"token",    offsetof(struct rpc_resume_ctx, token),    spdk_json_decode_string, true},
++	{"force",    offsetof(struct rpc_resume_ctx, force),    spdk_json_decode_bool, true},
+ };
+ 
+ static void
+@@ -445,6 +453,19 @@ rpc_nvmf_subsystem_resume(struct spdk_jsonrpc_request *request,
+ 		rpc_resume_ctx_free(ctx);
+ 		return;
+ 	}
++
++	/* Evariops 0014.11 (DÉC-11): the fence path force-resumes whatever
++	 * barrier is standing. Loud + audited — this deliberately breaks a live
++	 * group-snapshot barrier, whose own tokened resume will then report it. */
++	if (ctx->force) {
++		SPDK_WARNLOG("nvmf pause: FORCED resume of %s (fence path) — standing "
++			     "barrier epoch %" PRIu64 " is broken by design\n",
++			     ctx->nqn, p->epoch);
++		spdk_jsonrpc_request_audit(request, "nvmf_subsystem_resume",
++					   "forced (fence path)");
++		have_token = false;
++	}
++
+ 	/* With a pinned token, only resume the *matching* standing pause: a mismatch means
+ 	 * our barrier already ended (TTL/crash/other) and a different one may now be live —
+ 	 * report it broken and leave that one untouched (RISK R1/R3). */

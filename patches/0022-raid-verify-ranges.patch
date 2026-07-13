@@ -1,0 +1,651 @@
+diff --git a/module/bdev/raid/Makefile b/module/bdev/raid/Makefile
+index c90b4a2..d381b3b 100644
+--- a/module/bdev/raid/Makefile
++++ b/module/bdev/raid/Makefile
+@@ -10,7 +10,7 @@ SO_VER := 7
+ SO_MINOR := 0
+ 
+ CFLAGS += -I$(SPDK_ROOT_DIR)/lib/bdev/
+-C_SRCS = bdev_raid.c bdev_raid_rpc.c bdev_raid_sb.c bdev_raid_heat.c bdev_raid_repair.c bdev_raid_outcomes.c bdev_raid_envelopes.c raid0.c raid1.c concat.c
++C_SRCS = bdev_raid.c bdev_raid_rpc.c bdev_raid_sb.c bdev_raid_heat.c bdev_raid_repair.c bdev_raid_outcomes.c bdev_raid_envelopes.c bdev_raid_verify_ranges.c raid0.c raid1.c concat.c
+ 
+ ifeq ($(CONFIG_RAID5F),y)
+ C_SRCS += raid5f.c
+diff --git a/module/bdev/raid/bdev_raid_verify_ranges.c b/module/bdev/raid/bdev_raid_verify_ranges.c
+new file mode 100644
+index 0000000..6ae24bf
+--- /dev/null
++++ b/module/bdev/raid/bdev_raid_verify_ranges.c
+@@ -0,0 +1,632 @@
++/*   SPDX-License-Identifier: BSD-3-Clause
++ *   Copyright (C) 2026 Evariops.
++ *   All rights reserved.
++ */
++
++/* Evariops 0014.12 (spdk-csi RPC-CONTRACT §10b): bdev_raid_verify_ranges —
++ * the EXHAUSTIVE divergence detector (the integrated verify phase, §10a, is
++ * the probabilistic one). Compares the first configured leg (implicit
++ * arbiter) against every other configured leg of a raid1, chunk by chunk,
++ * each chunk under a channel-owned LBA lock (host writes overlapping the
++ * chunk are held and replayed — patch 0008 discipline). It REPORTS divergent
++ * ranges and never repairs: arbitration is the control plane's (R >= 3 vote,
++ * or DivergenceUnarbitrated at R == 2 — T-D2).
++ *
++ * Pacing: the `verify` envelope class (0014.9), frozen at dispatch. The
++ * caller drives bounded batches and re-drives the tail, exactly like
++ * bdev_raid_rebuild_ranges. Progress and the terminal state are mirrored in
++ * the rebuild-outcome registry under the request token (observability; a
++ * zero-divergence completion seals succeeded+verified). */
++
++#include "bdev_raid.h"
++#include "bdev_raid_outcomes.h"
++#include "bdev_raid_envelopes.h"
++
++#include "spdk/env.h"
++#include "spdk/json.h"
++#include "spdk/log.h"
++#include "spdk/rpc.h"
++#include "spdk/string.h"
++#include "spdk/thread.h"
++#include "spdk/util.h"
++/* spdk_bdev_lock_lba_range comes from spdk/bdev_module.h (patch 0008), which
++ * bdev_raid.h already includes. */
++
++#define RAID_VERIFY_CHUNK_BLOCKS	2048u	/* 1 MiB @ 512B, like repair */
++#define RAID_VERIFY_MAX_RANGES		4096u
++#define RAID_VERIFY_MAX_REPORTED	128u
++
++struct raid_verify_range {
++	uint64_t start_lba;
++	uint64_t num_blocks;
++};
++
++struct raid_verify_ctx {
++	struct spdk_jsonrpc_request	*request;
++	struct raid_bdev		*raid_bdev;
++	struct spdk_bdev_desc		*desc;		/* on the raid bdev (lock owner) */
++	struct spdk_io_channel		*ch;		/* raid channel for the LBA lock */
++	struct raid_base_bdev_info	*arbiter;
++	struct raid_verify_range	*ranges;
++	uint32_t			num_ranges;
++	uint32_t			cur;
++	uint64_t			cur_off;
++	uint64_t			io_lba;
++	uint64_t			io_blocks;
++	bool				locked;
++	bool				removed;
++	int				rc;
++	void				*buf_arb;
++	void				*buf_leg;
++	struct iovec			iov_arb;
++	struct iovec			iov_leg;
++	/* Leg currently being compared for the in-flight chunk (slot walk). */
++	uint8_t				leg_slot;
++	int				ios_remaining;
++	int				io_status;
++	/* Pacing (verify envelope, frozen at dispatch; 0 = unlimited). */
++	double				bytes_per_tsc;
++	double				bytes_available;
++	double				bytes_max;
++	uint64_t			last_tsc;
++	struct spdk_poller		*pace_poller;
++	/* Results. */
++	uint64_t			verified_blocks;
++	uint64_t			divergent_blocks;
++	struct raid_verify_range	divergent[RAID_VERIFY_MAX_REPORTED];
++	uint32_t			num_divergent;
++	struct raid_rebuild_outcome	*outcome;
++};
++
++static void raid_verify_next(struct raid_verify_ctx *c);
++
++static void
++raid_verify_complete(struct raid_verify_ctx *c, int rc)
++{
++	struct spdk_json_write_ctx *w;
++	uint32_t i;
++
++	spdk_poller_unregister(&c->pace_poller);
++	if (c->ch != NULL) {
++		spdk_put_io_channel(c->ch);
++	}
++	if (c->desc != NULL) {
++		spdk_bdev_close(c->desc);
++	}
++	spdk_dma_free(c->buf_arb);
++	spdk_dma_free(c->buf_leg);
++
++	if (c->outcome != NULL) {
++		enum raid_rebuild_outcome_state terminal;
++		bool verified = false;
++
++		if (rc != 0) {
++			terminal = RAID_REBUILD_OUTCOME_FAILED;
++		} else if (c->divergent_blocks > 0) {
++			terminal = RAID_REBUILD_OUTCOME_DIVERGENT;
++		} else {
++			terminal = RAID_REBUILD_OUTCOME_SUCCEEDED;
++			verified = true;
++		}
++		raid_rebuild_outcome_finish(c->outcome, terminal, verified);
++	}
++
++	if (rc == 0) {
++		w = spdk_jsonrpc_begin_result(c->request);
++		spdk_json_write_object_begin(w);
++		spdk_json_write_named_uint64(w, "verified_blocks", c->verified_blocks);
++		spdk_json_write_named_uint64(w, "divergent_blocks", c->divergent_blocks);
++		spdk_json_write_named_array_begin(w, "divergent_ranges");
++		for (i = 0; i < c->num_divergent; i++) {
++			spdk_json_write_object_begin(w);
++			spdk_json_write_named_uint64(w, "start_lba", c->divergent[i].start_lba);
++			spdk_json_write_named_uint64(w, "num_blocks", c->divergent[i].num_blocks);
++			spdk_json_write_object_end(w);
++		}
++		spdk_json_write_array_end(w);
++		/* Silent-cap honesty: the caller must know when the report is
++		 * truncated (the count is still exact). */
++		spdk_json_write_named_bool(w, "divergent_ranges_truncated",
++					   c->divergent_blocks > 0 &&
++					   c->num_divergent == RAID_VERIFY_MAX_REPORTED);
++		spdk_json_write_object_end(w);
++		spdk_jsonrpc_end_result(c->request, w);
++	} else {
++		spdk_jsonrpc_send_error_response_fmt(c->request, rc, "verify_ranges failed: %s",
++						     spdk_strerror(rc < 0 ? -rc : rc));
++	}
++	free(c->ranges);
++	free(c);
++}
++
++static void
++raid_verify_finish_unlocked(struct lba_range *range, void *cb_arg, int status)
++{
++	struct raid_verify_ctx *c = cb_arg;
++
++	(void)range;
++	(void)status;
++	raid_verify_complete(c, c->rc);
++}
++
++/* Terminal path: release a held chunk lock first (host I/O queued behind it
++ * would hang forever otherwise), then reply. */
++static void
++raid_verify_finish(struct raid_verify_ctx *c, int rc)
++{
++	c->rc = rc;
++	if (c->locked) {
++		c->locked = false;
++		if (spdk_bdev_unlock_lba_range(c->desc, c->ch, c->io_lba, c->io_blocks,
++					       raid_verify_finish_unlocked, c) == 0) {
++			return;
++		}
++		SPDK_ERRLOG("raid verify: terminal unlock dispatch failed — host I/O on "
++			    "[%" PRIu64 ", +%" PRIu64 ") left held!\n", c->io_lba, c->io_blocks);
++	}
++	raid_verify_complete(c, rc);
++}
++
++static struct raid_base_bdev_info *
++raid_verify_next_leg(struct raid_verify_ctx *c)
++{
++	struct raid_bdev *raid_bdev = c->raid_bdev;
++
++	while (c->leg_slot < raid_bdev->num_base_bdevs) {
++		struct raid_base_bdev_info *base_info =
++			&raid_bdev->base_bdev_info[c->leg_slot];
++
++		if (base_info != c->arbiter && base_info->is_configured &&
++		    !base_info->read_excluded && base_info->desc != NULL) {
++			return base_info;
++		}
++		c->leg_slot++;
++	}
++
++	return NULL;
++}
++
++static void raid_verify_compare_leg(struct raid_verify_ctx *c);
++
++static void
++raid_verify_chunk_unlocked(struct lba_range *range, void *cb_arg, int status)
++{
++	struct raid_verify_ctx *c = cb_arg;
++
++	(void)range;
++	(void)status;
++	c->cur_off += c->io_blocks;
++	raid_verify_next(c);
++}
++
++static void
++raid_verify_chunk_done(struct raid_verify_ctx *c)
++{
++	assert(c->locked);
++	c->locked = false;
++	c->verified_blocks += c->io_blocks;
++	/* Registry telemetry: bytes = volume verified so far. */
++	raid_rebuild_outcome_add_bytes(c->outcome,
++				       c->io_blocks * c->raid_bdev->bdev.blocklen);
++	if (spdk_bdev_unlock_lba_range(c->desc, c->ch, c->io_lba, c->io_blocks,
++				       raid_verify_chunk_unlocked, c) != 0) {
++		SPDK_ERRLOG("raid verify: chunk unlock dispatch failed\n");
++		c->locked = true;	/* still held — go through the terminal path */
++		raid_verify_finish(c, -EIO);
++	}
++}
++
++static void
++raid_verify_record_divergence(struct raid_verify_ctx *c)
++{
++	SPDK_ERRLOG("raid verify: '%s' legs '%s' vs '%s' DIVERGE on [%" PRIu64
++		    ", +%" PRIu64 ")\n", c->raid_bdev->bdev.name, c->arbiter->name,
++		    c->raid_bdev->base_bdev_info[c->leg_slot].name,
++		    c->io_lba, c->io_blocks);
++	c->divergent_blocks += c->io_blocks;
++	if (c->num_divergent < RAID_VERIFY_MAX_REPORTED) {
++		c->divergent[c->num_divergent].start_lba = c->io_lba;
++		c->divergent[c->num_divergent].num_blocks = c->io_blocks;
++		c->num_divergent++;
++	}
++}
++
++static void
++raid_verify_io_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
++{
++	struct raid_verify_ctx *c = cb_arg;
++
++	spdk_bdev_free_io(bdev_io);
++	if (!success && c->io_status == 0) {
++		c->io_status = -EIO;
++	}
++	assert(c->ios_remaining > 0);
++	if (--c->ios_remaining > 0) {
++		return;
++	}
++
++	if (c->io_status != 0) {
++		raid_verify_finish(c, c->io_status);
++		return;
++	}
++
++	if (memcmp(c->buf_arb, c->buf_leg,
++		   c->io_blocks * c->raid_bdev->bdev.blocklen) != 0) {
++		raid_verify_record_divergence(c);
++	}
++
++	c->leg_slot++;
++	raid_verify_compare_leg(c);
++}
++
++/* Compare the locked chunk on the next remaining leg, or finish the chunk. */
++static void
++raid_verify_compare_leg(struct raid_verify_ctx *c)
++{
++	struct raid_base_bdev_info *leg;
++	int rc;
++
++	if (c->removed) {
++		raid_verify_finish(c, -ENODEV);
++		return;
++	}
++	/* A background process appeared (rebuild) — its writes would show up
++	 * as phantom divergences. Abort cleanly; the caller re-drives. */
++	if (c->raid_bdev->process != NULL) {
++		raid_verify_finish(c, -EBUSY);
++		return;
++	}
++
++	leg = raid_verify_next_leg(c);
++	if (leg == NULL) {
++		raid_verify_chunk_done(c);
++		return;
++	}
++
++	c->iov_arb.iov_len = c->io_blocks * c->raid_bdev->bdev.blocklen;
++	c->iov_leg.iov_len = c->iov_arb.iov_len;
++	c->ios_remaining = 2;
++	c->io_status = 0;
++
++	rc = raid_bdev_readv_blocks_ext(c->arbiter, c->arbiter->app_thread_ch,
++					&c->iov_arb, 1, c->io_lba, c->io_blocks,
++					raid_verify_io_cb, c, NULL);
++	if (rc != 0) {
++		raid_verify_finish(c, rc);
++		return;
++	}
++	rc = raid_bdev_readv_blocks_ext(leg, leg->app_thread_ch,
++					&c->iov_leg, 1, c->io_lba, c->io_blocks,
++					raid_verify_io_cb, c, NULL);
++	if (rc != 0) {
++		/* The arbiter read is in flight; let its completion route the
++		 * failure through io_cb. */
++		c->io_status = rc;
++		c->ios_remaining = 1;
++	}
++}
++
++static void
++raid_verify_chunk_locked(struct lba_range *range, void *cb_arg, int status)
++{
++	struct raid_verify_ctx *c = cb_arg;
++
++	(void)range;
++	if (status != 0) {
++		raid_verify_finish(c, status);
++		return;
++	}
++	c->locked = true;
++	c->leg_slot = 0;
++	raid_verify_compare_leg(c);
++}
++
++static int
++raid_verify_pace_poll(void *arg)
++{
++	struct raid_verify_ctx *c = arg;
++
++	spdk_poller_unregister(&c->pace_poller);
++	raid_verify_next(c);
++	return SPDK_POLLER_BUSY;
++}
++
++/* Token bucket on the verify envelope. Returns true when the next chunk may
++ * run now; otherwise arms a poller and returns false. */
++static bool
++raid_verify_pace_admit(struct raid_verify_ctx *c, uint64_t chunk_bytes)
++{
++	uint64_t now;
++
++	if (c->bytes_per_tsc == 0.0) {
++		return true;
++	}
++
++	now = spdk_get_ticks();
++	c->bytes_available = spdk_min(c->bytes_max,
++				      c->bytes_available +
++				      (now - c->last_tsc) * c->bytes_per_tsc);
++	c->last_tsc = now;
++	if (c->bytes_available > 0.0) {
++		c->bytes_available -= chunk_bytes;
++		return true;
++	}
++
++	c->pace_poller = SPDK_POLLER_REGISTER(raid_verify_pace_poll, c, 10000);
++	return false;
++}
++
++static void
++raid_verify_next(struct raid_verify_ctx *c)
++{
++	struct raid_verify_range *range;
++	uint64_t remaining;
++	int rc;
++
++	if (c->removed) {
++		raid_verify_finish(c, -ENODEV);
++		return;
++	}
++
++	while (c->cur < c->num_ranges) {
++		range = &c->ranges[c->cur];
++		remaining = range->num_blocks - c->cur_off;
++		if (remaining == 0) {
++			c->cur++;
++			c->cur_off = 0;
++			continue;
++		}
++
++		c->io_lba = range->start_lba + c->cur_off;
++		c->io_blocks = spdk_min(remaining, (uint64_t)RAID_VERIFY_CHUNK_BLOCKS);
++
++		if (!raid_verify_pace_admit(c, c->io_blocks * c->raid_bdev->bdev.blocklen)) {
++			return;	/* poller re-enters raid_verify_next */
++		}
++
++		rc = spdk_bdev_lock_lba_range(c->desc, c->ch, c->io_lba, c->io_blocks,
++					      raid_verify_chunk_locked, c);
++		if (rc != 0) {
++			raid_verify_finish(c, rc);
++		}
++		return;
++	}
++
++	raid_verify_finish(c, 0);
++}
++
++static void
++raid_verify_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev, void *event_ctx)
++{
++	struct raid_verify_ctx *c = event_ctx;
++
++	(void)bdev;
++	if (type == SPDK_BDEV_EVENT_REMOVE) {
++		c->removed = true;	/* abort at the next chunk boundary */
++	}
++}
++
++/* ── RPC ─────────────────────────────────────────────────────────────── */
++
++struct rpc_bdev_raid_verify_ranges {
++	char				*name;
++	size_t				num_ranges;
++	struct raid_verify_range	*ranges;
++	char				*expected_incarnation;
++	char				*token;
++};
++
++static int
++decode_verify_range(const struct spdk_json_val *val, void *out)
++{
++	const struct spdk_json_object_decoder decoders[] = {
++		{"start_lba", offsetof(struct raid_verify_range, start_lba), spdk_json_decode_uint64},
++		{"num_blocks", offsetof(struct raid_verify_range, num_blocks), spdk_json_decode_uint64},
++	};
++
++	return spdk_json_decode_object(val, decoders, SPDK_COUNTOF(decoders),
++				       (struct raid_verify_range *)out) ? -1 : 0;
++}
++
++static int
++decode_verify_ranges(const struct spdk_json_val *val, void *out)
++{
++	struct rpc_bdev_raid_verify_ranges *req =
++		SPDK_CONTAINEROF(out, struct rpc_bdev_raid_verify_ranges, ranges);
++
++	if (req->ranges == NULL) {
++		req->ranges = calloc(RAID_VERIFY_MAX_RANGES, sizeof(struct raid_verify_range));
++		if (req->ranges == NULL) {
++			return -ENOMEM;
++		}
++	}
++	return spdk_json_decode_array(val, decode_verify_range, req->ranges,
++				      RAID_VERIFY_MAX_RANGES, &req->num_ranges,
++				      sizeof(struct raid_verify_range));
++}
++
++static const struct spdk_json_object_decoder rpc_bdev_raid_verify_ranges_decoders[] = {
++	{"name", offsetof(struct rpc_bdev_raid_verify_ranges, name), spdk_json_decode_string},
++	{"ranges", offsetof(struct rpc_bdev_raid_verify_ranges, ranges), decode_verify_ranges, true},
++	{"expected_incarnation", offsetof(struct rpc_bdev_raid_verify_ranges, expected_incarnation), spdk_json_decode_string, true},
++	{"token", offsetof(struct rpc_bdev_raid_verify_ranges, token), spdk_json_decode_string, true},
++};
++
++static void
++free_rpc_bdev_raid_verify_ranges(struct rpc_bdev_raid_verify_ranges *req)
++{
++	free(req->name);
++	free(req->ranges);
++	free(req->expected_incarnation);
++	free(req->token);
++}
++
++static void
++rpc_bdev_raid_verify_ranges(struct spdk_jsonrpc_request *request,
++			    const struct spdk_json_val *params)
++{
++	struct rpc_bdev_raid_verify_ranges req = {};
++	struct raid_verify_ctx *c = NULL;
++	struct raid_bdev *raid_bdev;
++	struct raid_base_bdev_info *base_info, *arbiter = NULL;
++	uint32_t configured = 0, verify_mb_sec, i;
++	uint64_t buf_len;
++	char detail[192];
++	char auto_token[RAID_REBUILD_TOKEN_MAX];
++	const char *token;
++	int rc;
++
++	if (spdk_json_decode_object(params, rpc_bdev_raid_verify_ranges_decoders,
++				    SPDK_COUNTOF(rpc_bdev_raid_verify_ranges_decoders), &req)) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_PARSE_ERROR,
++						 "spdk_json_decode_object failed");
++		goto cleanup;
++	}
++
++	raid_bdev = raid_bdev_find_by_name(req.name);
++	if (raid_bdev == NULL) {
++		spdk_jsonrpc_send_error_response_fmt(request, -ENODEV,
++						     "raid bdev %s not found", req.name);
++		goto cleanup;
++	}
++
++	if (raid_bdev_check_incarnation(raid_bdev, req.expected_incarnation) != 0) {
++		spdk_jsonrpc_send_error_response_fmt(request, -ESTALE,
++						     "stale incarnation for raid bdev %s",
++						     req.name);
++		goto cleanup;
++	}
++
++	if (raid_bdev->level != RAID1 || raid_bdev->state != RAID_BDEV_STATE_ONLINE) {
++		spdk_jsonrpc_send_error_response(request, -EINVAL,
++						 "verify_ranges requires an ONLINE raid1 bdev");
++		goto cleanup;
++	}
++	if (raid_bdev->process != NULL) {
++		spdk_jsonrpc_send_error_response(request, -EBUSY,
++						 "raid bdev has a background process");
++		goto cleanup;
++	}
++
++	RAID_FOR_EACH_BASE_BDEV(raid_bdev, base_info) {
++		if (base_info->is_configured && !base_info->read_excluded &&
++		    base_info->desc != NULL) {
++			if (arbiter == NULL) {
++				arbiter = base_info;
++			}
++			configured++;
++		}
++	}
++	if (configured < 2) {
++		spdk_jsonrpc_send_error_response(request, -EINVAL,
++						 "verify_ranges needs at least 2 readable legs");
++		goto cleanup;
++	}
++
++	if (req.token != NULL &&
++	    strnlen(req.token, RAID_REBUILD_TOKEN_MAX) == RAID_REBUILD_TOKEN_MAX) {
++		spdk_jsonrpc_send_error_response_fmt(request, -ENAMETOOLONG,
++						     "token exceeds %d characters",
++						     RAID_REBUILD_TOKEN_MAX - 1);
++		goto cleanup;
++	}
++
++	/* Default: verify every allocated block — the whole raid (the caller
++	 * bounds batches with explicit ranges when it wants increments). */
++	if (req.num_ranges == 0) {
++		free(req.ranges);
++		req.ranges = calloc(1, sizeof(struct raid_verify_range));
++		if (req.ranges == NULL) {
++			spdk_jsonrpc_send_error_response(request, -ENOMEM, spdk_strerror(ENOMEM));
++			goto cleanup;
++		}
++		req.ranges[0].start_lba = 0;
++		req.ranges[0].num_blocks = raid_bdev->bdev.blockcnt;
++		req.num_ranges = 1;
++	}
++
++	for (i = 0; i < req.num_ranges; i++) {
++		const struct raid_verify_range *range = &req.ranges[i];
++
++		if (range->num_blocks == 0 || range->start_lba >= raid_bdev->bdev.blockcnt ||
++		    range->num_blocks > raid_bdev->bdev.blockcnt - range->start_lba) {
++			spdk_jsonrpc_send_error_response_fmt(request,
++							     SPDK_JSONRPC_ERROR_INVALID_PARAMS,
++							     "range %u is empty or exceeds the raid size", i);
++			goto cleanup;
++		}
++	}
++
++	c = calloc(1, sizeof(*c));
++	if (c == NULL) {
++		spdk_jsonrpc_send_error_response(request, -ENOMEM, spdk_strerror(ENOMEM));
++		goto cleanup;
++	}
++
++	buf_len = (uint64_t)RAID_VERIFY_CHUNK_BLOCKS * raid_bdev->bdev.blocklen;
++	c->buf_arb = spdk_dma_malloc(buf_len, 4096, NULL);
++	c->buf_leg = spdk_dma_malloc(buf_len, 4096, NULL);
++	if (c->buf_arb == NULL || c->buf_leg == NULL) {
++		spdk_dma_free(c->buf_arb);
++		spdk_dma_free(c->buf_leg);
++		free(c);
++		spdk_jsonrpc_send_error_response(request, -ENOMEM, spdk_strerror(ENOMEM));
++		goto cleanup;
++	}
++	c->iov_arb.iov_base = c->buf_arb;
++	c->iov_leg.iov_base = c->buf_leg;
++
++	rc = spdk_bdev_open_ext(req.name, false, raid_verify_event_cb, c, &c->desc);
++	if (rc != 0) {
++		spdk_dma_free(c->buf_arb);
++		spdk_dma_free(c->buf_leg);
++		free(c);
++		spdk_jsonrpc_send_error_response_fmt(request, rc, "open failed: %s",
++						     spdk_strerror(-rc));
++		goto cleanup;
++	}
++	c->ch = spdk_bdev_get_io_channel(c->desc);
++	if (c->ch == NULL) {
++		spdk_bdev_close(c->desc);
++		spdk_dma_free(c->buf_arb);
++		spdk_dma_free(c->buf_leg);
++		free(c);
++		spdk_jsonrpc_send_error_response(request, -ENOMEM, "io channel");
++		goto cleanup;
++	}
++
++	/* Pacing under the verify envelope, frozen now (0014.9 discipline). */
++	verify_mb_sec = raid_envelope_active_mb_sec(RAID_ENVELOPE_VERIFY);
++	if (verify_mb_sec != 0) {
++		c->bytes_per_tsc = verify_mb_sec * 1024 * 1024.0 / spdk_get_ticks_hz();
++		c->bytes_max = verify_mb_sec * 1024 * 1024.0 / SPDK_SEC_TO_MSEC;
++		c->last_tsc = spdk_get_ticks();
++	}
++
++	if (req.token == NULL || req.token[0] == '\0') {
++		snprintf(auto_token, sizeof(auto_token), "auto:verify:%s:%" PRIu64,
++			 req.name, spdk_get_ticks());
++		token = auto_token;
++	} else {
++		token = req.token;
++	}
++	c->outcome = raid_rebuild_outcome_open(token, req.name, "(verify_ranges)");
++	raid_rebuild_outcome_set_verifying(c->outcome);
++
++	/* SEC1 audit (0011 discipline): long-lived reader holding LBA locks. */
++	snprintf(detail, sizeof(detail), "raid=%s ranges=%zu", req.name, req.num_ranges);
++	spdk_jsonrpc_request_audit(request, "bdev_raid_verify_ranges", detail);
++
++	c->request = request;
++	c->raid_bdev = raid_bdev;
++	c->arbiter = arbiter;
++	c->ranges = (struct raid_verify_range *)req.ranges;
++	c->num_ranges = (uint32_t)req.num_ranges;
++	req.ranges = NULL;	/* ownership moved */
++
++	raid_verify_next(c);
++
++cleanup:
++	free_rpc_bdev_raid_verify_ranges(&req);
++}
++SPDK_RPC_REGISTER("bdev_raid_verify_ranges", rpc_bdev_raid_verify_ranges, SPDK_RPC_RUNTIME)

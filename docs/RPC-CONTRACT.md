@@ -208,6 +208,44 @@ a split-brain across disks.
   the cbt facts via `vbdev_cbt_query_latest_epoch()` (most recently opened
   live epoch; closed epochs leave the list).
 
+## Envelopes, ejection epochs, fence-resume, verify_ranges (GCCP 0014.9-.12)
+
+- **0014.9 — envelopes (patch 0021).** `bdev_raid_set_envelopes {rebuild|verify|
+  relocate}_{nominal|maintenance}_mb_sec, max_concurrent_rebuilds, regime?` +
+  `bdev_raid_get_envelopes`. CAPS, never shares; data-plane default 0 =
+  UNLIMITED (a failed set is a control-plane INCIDENT, never a silent
+  fallback); unknown regime = -EINVAL. The rebuild cap (under the current
+  regime) is FROZEN at process allocation and takes precedence over the legacy
+  `bdev_raid_set_options` bandwidth. Concurrency: an RPC-driven seeded rebuild
+  beyond the bound is refused -EAGAIN (retryable); the attach-triggered auto
+  rebuild is admitted LOUDLY (refusing would strand an attached member). The
+  relocate cap is stored for the tier module (wiring deferred, documented).
+- **0014.10 — epoch at ejection (patch 0019).** The raid opens an auto epoch
+  (`auto-<ticks>` / nonce `auto<hex>`) on EVERY surviving member's cbt in the
+  ejection path, stale_backend_id = the ejected member. -EEXIST when an OPEN
+  epoch already bounds the round (never an implicit takeover), -ENODEV when
+  the member is not cbt-wrapped — both fine. The auto nonce reaches the CP
+  through get_bdevs (0014.6): that is how the round is adopted.
+- **0014.11 — pause × rebuild (patch 0020).** Structural contract: a paused
+  subsystem QUEUES the rebuild's writes target-side; nothing in the process
+  path times out, so the outcome is never FAILED because of a pause.
+  Force-resume (DÉC-11): `nvmf_subsystem_resume {…, force: true}` breaks any
+  standing barrier — loud (WARNLOG) and audited; the barrier's own tokened
+  resume then reports `resumed:false/barrier_intact:false`, so the
+  group-snapshot saga fails cleanly and replays.
+- **0014.12 — verify_ranges (patch 0022).** `bdev_raid_verify_ranges {name,
+  ranges?:[{start_lba,num_blocks}], token?, expected_incarnation?}` — the
+  EXHAUSTIVE detector (§10a's integrated phase is the probabilistic one).
+  First configured leg = implicit arbiter, compared to every other readable
+  leg, 1 MiB chunks each under a channel-owned LBA lock (host writes held +
+  replayed); paced by the verify envelope (frozen at dispatch). REPORTS
+  `{verified_blocks, divergent_blocks, divergent_ranges (≤128, exact count +
+  truncated flag)}` and never repairs — arbitration is the CP's (R ≥ 3, T-D2).
+  No ranges = the whole raid; callers drive bounded batches and re-drive, like
+  rebuild_ranges. -EBUSY with a live background process (and aborts cleanly if
+  one appears mid-run); registry mirrors progress under the token
+  (verifying → succeeded+verified on zero divergence / divergent otherwise).
+
 ## Incarnation & rebuild outcomes (GCCP 0014.4/0014.5, patches 0014/0015)
 
 - **0014.4 — identity.** `bdev_raid_create {…, incarnation}` (required, ≤63
