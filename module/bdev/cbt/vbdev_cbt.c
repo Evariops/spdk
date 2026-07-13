@@ -22,6 +22,7 @@
 #include "spdk/stdinc.h"
 
 #include "vbdev_cbt_internal.h"
+#include "vbdev_cbt_query.h"	/* Evariops 0014.6: raid-facing epoch facts */
 /* Evariops 0014.5: the rebuild outcome registry lives in the raid module (the
  * nexus process hosts both); patch 0015 materializes this header at image
  * build. Linked via --whole-archive, so the cross-module symbol resolves. */
@@ -540,6 +541,37 @@ cbt_epoch_state_name(enum cbt_epoch_state state)
 	case CBT_EPOCH_INVALID:     return "invalid";
 	default:                    return "unknown";
 	}
+}
+
+/* 0014.6 (RPC-CONTRACT §3): cross-module query — the raid module publishes
+ * these facts per member in ITS get_bdevs output (see vbdev_cbt_query.h).
+ * Epochs are appended at open, so the last list entry is the most recently
+ * opened one; closed epochs leave the list, so everything here is live. */
+int
+vbdev_cbt_query_latest_epoch(const char *bdev_name, struct vbdev_cbt_epoch_facts *out)
+{
+	struct vbdev_cbt *cbt;
+	struct cbt_epoch *ep, *latest = NULL;
+
+	assert(spdk_get_thread() == spdk_thread_get_app_thread());
+
+	cbt = cbt_find_by_name(bdev_name);
+	if (cbt == NULL) {
+		return -ENODEV;
+	}
+
+	TAILQ_FOREACH(ep, &cbt->epochs, link) {
+		latest = ep;
+	}
+	if (latest == NULL) {
+		return -ENOENT;
+	}
+
+	snprintf(out->nonce, sizeof(out->nonce), "%s", latest->nonce);
+	out->state = cbt_epoch_state_name(latest->state);
+	out->truncated = latest->truncated;
+
+	return 0;
 }
 
 static int
