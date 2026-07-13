@@ -22,6 +22,10 @@
 #include "spdk/stdinc.h"
 
 #include "vbdev_cbt_internal.h"
+/* Evariops 0014.5: the rebuild outcome registry lives in the raid module (the
+ * nexus process hosts both); patch 0015 materializes this header at image
+ * build. Linked via --whole-archive, so the cross-module symbol resolves. */
+#include "../raid/bdev_raid_outcomes.h"
 #include "spdk/rpc.h"
 #include "spdk/env.h"
 #include "spdk/endian.h"
@@ -1242,13 +1246,21 @@ bdev_cbt_epoch_close(const char *cbt_name, const char *epoch_id,
 
 	/* 0014.3 (RPC-CONTRACT §4): CONSUMED deliberately discards the frozen delta —
 	 * the caller certifies it was copied by a verified-successful rebuild. The
-	 * certification is the outcome-registry token: demanded non-empty here, checked
-	 * against the registry as of 0014.5 (the raid-side registry increment). Without
-	 * a token: -EPERM, never a silent downgrade to PRESERVE. */
+	 * certification is the outcome-registry token (0014.5): it must name a LOCAL
+	 * registry entry in state succeeded+verified. Without that proof: -EPERM,
+	 * never a silent downgrade to PRESERVE. Note: until 0014.8 delivers the
+	 * integrated verify phase no entry is ever `verified`, so consumed is
+	 * deliberately unusable — honest increments over premature certification. */
 	if (mode == CBT_EPOCH_CLOSE_CONSUMED) {
 		if (rebuild_token == NULL || rebuild_token[0] == '\0') {
 			SPDK_ERRLOG("CBT: epoch_close '%s' mode=consumed refused: no "
 				    "rebuild token (-EPERM)\n", epoch_id);
+			return -EPERM;
+		}
+		if (!raid_rebuild_outcome_is_succeeded_verified(rebuild_token)) {
+			SPDK_ERRLOG("CBT: epoch_close '%s' mode=consumed refused: token "
+				    "'%s' is not a succeeded+verified rebuild outcome "
+				    "(-EPERM)\n", epoch_id, rebuild_token);
 			return -EPERM;
 		}
 		SPDK_NOTICELOG("CBT: epoch_close '%s' CONSUMED under token '%s' — "

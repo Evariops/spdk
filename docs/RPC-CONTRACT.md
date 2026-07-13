@@ -186,6 +186,36 @@ a split-brain across disks.
   after the unquiesce; a crash between the two costs a full rebuild at reboot
   (conservative, safe).
 
+## Incarnation & rebuild outcomes (GCCP 0014.4/0014.5, patches 0014/0015)
+
+- **0014.4 — identity.** `bdev_raid_create {…, incarnation}` (required, ≤63
+  chars): no creation without the creating control-plane incarnation's
+  identity. Engaging RPCs — `bdev_raid_delete`, `bdev_raid_add_base_bdev`,
+  `bdev_raid_remove_base_bdev`, `bdev_raid_start_seeded_rebuild` — accept
+  `expected_incarnation?` and refuse with **-ESTALE** on mismatch (never
+  best-effort execution). Omission is reserved for manual rescue tooling: the
+  control-plane client ALWAYS sends it. Superblock-reassembled raids are
+  *unclaimed* (`incarnation` absent from `get_bdevs`); any engaging RPC that
+  carries `expected_incarnation` against an unclaimed raid is -ESTALE.
+  `get_bdevs` → `driver_specific.raid.incarnation` exposes ownership.
+- **0014.5 — rebuild outcome registry.** Process-wide, survives the raid bdev,
+  terminal entries purged 15 min after finishing (lazy TTL).
+  `bdev_raid_start_seeded_rebuild {…, rebuild_token?}` records the attempt
+  under the CP token (deterministic per attempt — a retry re-opens the same
+  entry); full rebuilds feed the SAME registry under `auto:<raid>:<member>:<ticks>`
+  tokens. `bdev_raid_get_rebuild_outcomes {token?}` returns
+  `[{token, raid_bdev, base_bdev, state, bytes, verified, finished_at}]` with
+  `state ∈ running|verifying|succeeded|failed|divergent|canceled` (lowercase on
+  the wire), `bytes` = bytes actually copied (seeded fast-skip windows do not
+  count), `finished_at` = unix seconds (0 while non-terminal).
+  - **CANCELED contract (T-D5)**: `bdev_raid_delete` (or member removal) with a
+    rebuild in flight ⇒ the process is cancelled, the outcome is `canceled`,
+    and **no process write is emitted after the RPC returns** (the delete reply
+    is gated behind the process fully stopping). The CP deliberately has no
+    `Cancel` action — cleanliness is guaranteed here.
+  - `verified` stays `false` until 0014.8 (integrated verify) — so
+    `bdev_cbt_epoch_close(mode=consumed)` is deliberately unusable until then.
+
 ## CBT epochs / rebuild
 
 - `bdev_cbt_epoch_freeze` / `epoch_close` / `epoch_open` (higher generation):
@@ -202,9 +232,10 @@ a split-brain across disks.
 - **0014.3** — `bdev_cbt_epoch_close {…, mode?: "preserve"|"consumed",
   rebuild_token?}`: `preserve` (default) restores any unconsumed frozen delta
   to the live bitmap (H1 discipline); `consumed` deliberately DISCARDS it under
-  caller certification and **requires a non-empty rebuild_token (-EPERM
-  otherwise)** — the SUCCEEDED-verified outcome-registry token (validated
-  against the registry as of 0014.5). An unknown `mode` is -EINVAL, never a
+  caller certification and **requires a rebuild_token naming a LOCAL
+  succeeded+verified outcome-registry entry (-EPERM otherwise)** — validated
+  against the 0014.5 registry (effective since patch 0015; unusable-by-design
+  until 0014.8 makes entries `verified`). An unknown `mode` is -EINVAL, never a
   silent preserve.
 - **0014.6 (cbt part)** — `get_bdevs` exposes `driver_specific.cbt.epochs[]`:
   `{epoch_id, nonce, state: open|frozen|rebuilding|completed|invalid,
