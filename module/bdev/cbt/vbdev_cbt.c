@@ -1279,10 +1279,9 @@ bdev_cbt_epoch_close(const char *cbt_name, const char *epoch_id,
 	/* 0014.3 (RPC-CONTRACT §4): CONSUMED deliberately discards the frozen delta —
 	 * the caller certifies it was copied by a verified-successful rebuild. The
 	 * certification is the outcome-registry token (0014.5): it must name a LOCAL
-	 * registry entry in state succeeded+verified. Without that proof: -EPERM,
-	 * never a silent downgrade to PRESERVE. Note: until 0014.8 delivers the
-	 * integrated verify phase no entry is ever `verified`, so consumed is
-	 * deliberately unusable — honest increments over premature certification. */
+	 * registry entry in state succeeded+verified — `verified` is set by the
+	 * integrated verify phase (0014.8, K sampled windows against the arbiter
+	 * leg). Without that proof: -EPERM, never a silent downgrade to PRESERVE. */
 	if (mode == CBT_EPOCH_CLOSE_CONSUMED) {
 		if (rebuild_token == NULL || rebuild_token[0] == '\0') {
 			SPDK_ERRLOG("CBT: epoch_close '%s' mode=consumed refused: no "

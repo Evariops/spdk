@@ -31,6 +31,7 @@ IS the contract; do not rely on any other ordering. Order matters:
 | 0015 | raid rebuild-outcome registry + CANCELED contract + `bdev_raid_get_rebuild_outcomes` (GCCP 0014.5) | bdev_raid (adds `bdev_raid_outcomes.{c,h}`); `module/bdev/cbt` consults it for `epoch_close(consumed)` | 0013, 0014 |
 | 0016 | raid extended superblock — per-member `content_generation`/`view_epoch`, same-transaction (GCCP 0014.7, V-2) | bdev_raid (SB minor 0→1, carved from reserved bytes) | 0013 |
 | 0017 | raid per-member observation — `state`/`since`/generations + cbt live-epoch facts in get_bdevs (GCCP 0014.6) | bdev_raid; `#include`s `../cbt/vbdev_cbt_query.h` (requires the cbt module, like 0005 requires tier) | 0013, 0016, cbt module |
+| 0018 | raid integrated verify — K=64 sampled windows post-copy under quiesce_range, re-copy before DIVERGENT, `verified` registry seal gating `epoch_close(consumed)` (GCCP 0014.8) | bdev_raid | 0013, 0015, 0016 |
 
 0005 `#include`s `vbdev_tier.h` and adds `-I module/bdev/tier` to the lvol module
 CFLAGS via its own Makefile hunk; the Dockerfile injects the module dirs before
