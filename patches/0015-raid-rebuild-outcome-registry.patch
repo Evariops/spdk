@@ -1,0 +1,586 @@
+diff --git a/module/bdev/raid/Makefile b/module/bdev/raid/Makefile
+index e118002..120700c 100644
+--- a/module/bdev/raid/Makefile
++++ b/module/bdev/raid/Makefile
+@@ -10,7 +10,7 @@ SO_VER := 7
+ SO_MINOR := 0
+ 
+ CFLAGS += -I$(SPDK_ROOT_DIR)/lib/bdev/
+-C_SRCS = bdev_raid.c bdev_raid_rpc.c bdev_raid_sb.c bdev_raid_heat.c bdev_raid_repair.c raid0.c raid1.c concat.c
++C_SRCS = bdev_raid.c bdev_raid_rpc.c bdev_raid_sb.c bdev_raid_heat.c bdev_raid_repair.c bdev_raid_outcomes.c raid0.c raid1.c concat.c
+ 
+ ifeq ($(CONFIG_RAID5F),y)
+ C_SRCS += raid5f.c
+diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
+index 9e9ed50..a88a237 100644
+--- a/module/bdev/raid/bdev_raid.c
++++ b/module/bdev/raid/bdev_raid.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include "bdev_raid.h"
++#include "bdev_raid_outcomes.h"	/* Evariops 0014.5 */
+ #include "spdk/nvme_spec.h"	/* Evariops C-1 */
+ #include "spdk/env.h"
+ #include "spdk/thread.h"
+@@ -91,6 +92,10 @@ struct raid_bdev_process {
+ 	/* Cursor into seed_ranges — windows only ever advance, so passed
+ 	 * ranges never need re-scanning. */
+ 	uint32_t			seed_range_idx;
++	/* Evariops 0014.5 (RPC-CONTRACT §2): registry entry for this attempt.
++	 * NULL when the registry could not allocate — the rebuild still runs,
++	 * it is just unobservable there. Sealed exactly once at finish. */
++	struct raid_rebuild_outcome	*outcome;
+ };
+ 
+ struct raid_process_finish_action {
+@@ -2726,6 +2731,27 @@ raid_bdev_process_finish_done(void *ctx)
+ 
+ 	process->state = RAID_PROCESS_STATE_STOPPED;
+ 
++	/* Evariops 0014.5 (RPC-CONTRACT §2): seal the registry entry. The two
++	 * cancellation causes — raid destroy (-ECANCELED) and member removal
++	 * (-ENODEV) — are CANCELED, not FAILED: the copy process itself never
++	 * broke, its subject went away. All process writes have ceased at this
++	 * point, so a bdev_raid_delete reply (which is gated behind this
++	 * process stopping) honors "no writes after the RPC returns" (T-D5).
++	 * verified stays false until 0014.8 delivers the integrated verify. */
++	if (process->outcome != NULL) {
++		enum raid_rebuild_outcome_state terminal;
++
++		if (process->status == 0) {
++			terminal = RAID_REBUILD_OUTCOME_SUCCEEDED;
++		} else if (process->status == -ECANCELED || process->status == -ENODEV) {
++			terminal = RAID_REBUILD_OUTCOME_CANCELED;
++		} else {
++			terminal = RAID_REBUILD_OUTCOME_FAILED;
++		}
++		raid_rebuild_outcome_finish(process->outcome, terminal, false);
++		process->outcome = NULL;
++	}
++
+ 	if (process->status == 0) {
+ 		SPDK_NOTICELOG("Finished %s on raid bdev %s\n",
+ 			       raid_bdev_process_to_str(process->type),
+@@ -2919,6 +2945,12 @@ raid_bdev_process_request_complete(struct raid_bdev_process_request *process_req
+ 
+ 	if (status != 0) {
+ 		process->window_status = status;
++	} else {
++		/* Evariops 0014.5: bytes actually copied (seeded fast-skip
++		 * windows never reach here — the count stays honest). */
++		raid_rebuild_outcome_add_bytes(process->outcome,
++					       (uint64_t)process_req->num_blocks *
++					       process->raid_bdev->bdev.blocklen);
+ 	}
+ 
+ 	process->window_remaining -= process_req->num_blocks;
+@@ -3314,6 +3346,13 @@ raid_bdev_process_free(struct raid_bdev_process *process)
+ 	/* SPEC-74 M6: the seeded process owns its ranges — every teardown path
+ 	 * (finish or aborted start) goes through here. */
+ 	free(process->seed_ranges);
++	/* Evariops 0014.5: safety net for teardown paths that bypass
++	 * raid_bdev_process_finish_done (aborted channel start) — a RUNNING
++	 * entry with no owner would otherwise never seal nor expire. */
++	if (process->outcome != NULL) {
++		raid_rebuild_outcome_finish(process->outcome, RAID_REBUILD_OUTCOME_FAILED, false);
++		process->outcome = NULL;
++	}
+ 	free(process);
+ }
+ 
+@@ -3365,6 +3404,7 @@ static int
+ raid_bdev_start_rebuild(struct raid_base_bdev_info *target)
+ {
+ 	struct raid_bdev_process *process;
++	char token[RAID_REBUILD_TOKEN_MAX];
+ 
+ 	assert(spdk_get_thread() == spdk_thread_get_app_thread());
+ 
+@@ -3373,6 +3413,15 @@ raid_bdev_start_rebuild(struct raid_base_bdev_info *target)
+ 		return -ENOMEM;
+ 	}
+ 
++	/* Evariops 0014.5 (RPC-CONTRACT §2): the full rebuild feeds the SAME
++	 * registry as seeded attempts, under an auto-generated token (there is
++	 * no control-plane-provided one on this path). */
++	snprintf(token, sizeof(token), "auto:%s:%s:%" PRIu64,
++		 target->raid_bdev->bdev.name, target->name != NULL ? target->name : "?",
++		 spdk_get_ticks());
++	process->outcome = raid_rebuild_outcome_open(token, target->raid_bdev->bdev.name,
++			   target->name);
++
+ 	raid_bdev_process_start(process);
+ 
+ 	return 0;
+@@ -3386,9 +3435,11 @@ raid_bdev_start_rebuild(struct raid_base_bdev_info *target)
+  * ownership of \c ranges on success (freed with the process). */
+ int
+ raid_bdev_start_seeded_rebuild(struct raid_base_bdev_info *target,
+-			       struct raid_bdev_seed_range *ranges, uint32_t num_ranges)
++			       struct raid_bdev_seed_range *ranges, uint32_t num_ranges,
++			       const char *rebuild_token)
+ {
+ 	struct raid_bdev_process *process;
++	char auto_token[RAID_REBUILD_TOKEN_MAX];
+ 
+ 	assert(spdk_get_thread() == spdk_thread_get_app_thread());
+ 
+@@ -3405,6 +3456,18 @@ raid_bdev_start_seeded_rebuild(struct raid_base_bdev_info *target,
+ 	process->seed_ranges = ranges;
+ 	process->num_seed_ranges = num_ranges;
+ 
++	/* Evariops 0014.5 (RPC-CONTRACT §2): record the attempt under the
++	 * control-plane token (deterministic per attempt — retries re-open the
++	 * same entry) or an auto one when driven by rescue tooling. */
++	if (rebuild_token == NULL || rebuild_token[0] == '\0') {
++		snprintf(auto_token, sizeof(auto_token), "auto:%s:%s:%" PRIu64,
++			 target->raid_bdev->bdev.name, target->name != NULL ? target->name : "?",
++			 spdk_get_ticks());
++		rebuild_token = auto_token;
++	}
++	process->outcome = raid_rebuild_outcome_open(rebuild_token,
++			   target->raid_bdev->bdev.name, target->name);
++
+ 	raid_bdev_process_start(process);
+ 
+ 	return 0;
+diff --git a/module/bdev/raid/bdev_raid.h b/module/bdev/raid/bdev_raid.h
+index 08471e4..43d76da 100644
+--- a/module/bdev/raid/bdev_raid.h
++++ b/module/bdev/raid/bdev_raid.h
+@@ -322,7 +322,8 @@ struct raid_bdev_seed_range {
+ };
+ 
+ int raid_bdev_start_seeded_rebuild(struct raid_base_bdev_info *target,
+-				   struct raid_bdev_seed_range *ranges, uint32_t num_ranges);
++				   struct raid_bdev_seed_range *ranges, uint32_t num_ranges,
++				   const char *rebuild_token);
+ struct raid_bdev *raid_bdev_find_by_name(const char *name);
+ enum raid_level raid_bdev_str_to_level(const char *str);
+ const char *raid_bdev_level_to_str(enum raid_level level);
+diff --git a/module/bdev/raid/bdev_raid_outcomes.c b/module/bdev/raid/bdev_raid_outcomes.c
+new file mode 100644
+index 0000000..bfbcbb0
+--- /dev/null
++++ b/module/bdev/raid/bdev_raid_outcomes.c
+@@ -0,0 +1,236 @@
++/*   SPDX-License-Identifier: BSD-3-Clause
++ *   Copyright (C) 2026 Evariops.
++ *   All rights reserved.
++ */
++
++/* Evariops 0014.5 (spdk-csi RPC-CONTRACT §2): see bdev_raid_outcomes.h. */
++
++#include "bdev_raid_outcomes.h"
++
++#include "spdk/env.h"
++#include "spdk/log.h"
++#include "spdk/queue.h"
++#include "spdk/thread.h"
++
++struct raid_rebuild_outcome {
++	char					token[RAID_REBUILD_TOKEN_MAX];
++	char					*raid_name;
++	char					*base_bdev_name;
++	enum raid_rebuild_outcome_state		state;
++	uint64_t				bytes;
++	bool					verified;
++	/* Wall clock, reported to the control plane. 0 while non-terminal. */
++	int64_t					finished_at;
++	/* Monotonic deadline (ticks) for the lazy TTL purge. 0 while non-terminal. */
++	uint64_t				expire_ticks;
++	TAILQ_ENTRY(raid_rebuild_outcome)	link;
++};
++
++static TAILQ_HEAD(, raid_rebuild_outcome) g_raid_rebuild_outcomes =
++	TAILQ_HEAD_INITIALIZER(g_raid_rebuild_outcomes);
++
++/* Entries are opened on the app thread but mutated from process threads and
++ * read from RPC (app) and CBT contexts — a spinlock keeps the registry
++ * consistent without cross-thread messaging. */
++static struct spdk_spinlock g_raid_rebuild_outcomes_lock;
++
++__attribute__((constructor)) static void
++raid_rebuild_outcomes_init(void)
++{
++	spdk_spin_init(&g_raid_rebuild_outcomes_lock);
++}
++
++static void
++raid_rebuild_outcome_free(struct raid_rebuild_outcome *outcome)
++{
++	free(outcome->raid_name);
++	free(outcome->base_bdev_name);
++	free(outcome);
++}
++
++/* Lazy TTL purge — must be called with the lock held. */
++static void
++raid_rebuild_outcomes_purge_expired(void)
++{
++	struct raid_rebuild_outcome *outcome, *tmp;
++	uint64_t now = spdk_get_ticks();
++
++	TAILQ_FOREACH_SAFE(outcome, &g_raid_rebuild_outcomes, link, tmp) {
++		if (outcome->expire_ticks != 0 && now > outcome->expire_ticks) {
++			TAILQ_REMOVE(&g_raid_rebuild_outcomes, outcome, link);
++			raid_rebuild_outcome_free(outcome);
++		}
++	}
++}
++
++static struct raid_rebuild_outcome *
++raid_rebuild_outcome_find(const char *token)
++{
++	struct raid_rebuild_outcome *outcome;
++
++	TAILQ_FOREACH(outcome, &g_raid_rebuild_outcomes, link) {
++		if (strcmp(outcome->token, token) == 0) {
++			return outcome;
++		}
++	}
++
++	return NULL;
++}
++
++struct raid_rebuild_outcome *
++raid_rebuild_outcome_open(const char *token, const char *raid_name, const char *base_bdev_name)
++{
++	struct raid_rebuild_outcome *outcome;
++
++	assert(token != NULL);
++	assert(strnlen(token, RAID_REBUILD_TOKEN_MAX) < RAID_REBUILD_TOKEN_MAX);
++
++	spdk_spin_lock(&g_raid_rebuild_outcomes_lock);
++
++	raid_rebuild_outcomes_purge_expired();
++
++	/* Control-plane retries reuse deterministic tokens: a re-open of the
++	 * same attempt resets the entry rather than duplicating it. */
++	outcome = raid_rebuild_outcome_find(token);
++	if (outcome == NULL) {
++		outcome = calloc(1, sizeof(*outcome));
++		if (outcome == NULL) {
++			spdk_spin_unlock(&g_raid_rebuild_outcomes_lock);
++			SPDK_ERRLOG("Failed to allocate rebuild outcome for token '%s' — "
++				    "the attempt will be unobservable in the registry\n", token);
++			return NULL;
++		}
++		snprintf(outcome->token, sizeof(outcome->token), "%s", token);
++		TAILQ_INSERT_TAIL(&g_raid_rebuild_outcomes, outcome, link);
++	} else {
++		free(outcome->raid_name);
++		free(outcome->base_bdev_name);
++	}
++
++	outcome->raid_name = strdup(raid_name != NULL ? raid_name : "");
++	outcome->base_bdev_name = strdup(base_bdev_name != NULL ? base_bdev_name : "");
++	outcome->state = RAID_REBUILD_OUTCOME_RUNNING;
++	outcome->bytes = 0;
++	outcome->verified = false;
++	outcome->finished_at = 0;
++	outcome->expire_ticks = 0;
++
++	spdk_spin_unlock(&g_raid_rebuild_outcomes_lock);
++
++	return outcome;
++}
++
++void
++raid_rebuild_outcome_add_bytes(struct raid_rebuild_outcome *outcome, uint64_t bytes)
++{
++	if (outcome == NULL) {
++		return;
++	}
++
++	spdk_spin_lock(&g_raid_rebuild_outcomes_lock);
++	outcome->bytes += bytes;
++	spdk_spin_unlock(&g_raid_rebuild_outcomes_lock);
++}
++
++void
++raid_rebuild_outcome_set_verifying(struct raid_rebuild_outcome *outcome)
++{
++	if (outcome == NULL) {
++		return;
++	}
++
++	spdk_spin_lock(&g_raid_rebuild_outcomes_lock);
++	outcome->state = RAID_REBUILD_OUTCOME_VERIFYING;
++	spdk_spin_unlock(&g_raid_rebuild_outcomes_lock);
++}
++
++void
++raid_rebuild_outcome_finish(struct raid_rebuild_outcome *outcome,
++			    enum raid_rebuild_outcome_state terminal, bool verified)
++{
++	if (outcome == NULL) {
++		return;
++	}
++
++	assert(terminal != RAID_REBUILD_OUTCOME_RUNNING &&
++	       terminal != RAID_REBUILD_OUTCOME_VERIFYING);
++
++	spdk_spin_lock(&g_raid_rebuild_outcomes_lock);
++	outcome->state = terminal;
++	outcome->verified = verified;
++	outcome->finished_at = (int64_t)time(NULL);
++	outcome->expire_ticks = spdk_get_ticks() +
++				RAID_REBUILD_OUTCOME_TTL_SEC * spdk_get_ticks_hz();
++	spdk_spin_unlock(&g_raid_rebuild_outcomes_lock);
++}
++
++bool
++raid_rebuild_outcome_is_succeeded_verified(const char *token)
++{
++	struct raid_rebuild_outcome *outcome;
++	bool ok = false;
++
++	if (token == NULL || token[0] == '\0') {
++		return false;
++	}
++
++	spdk_spin_lock(&g_raid_rebuild_outcomes_lock);
++	raid_rebuild_outcomes_purge_expired();
++	outcome = raid_rebuild_outcome_find(token);
++	if (outcome != NULL) {
++		ok = outcome->state == RAID_REBUILD_OUTCOME_SUCCEEDED && outcome->verified;
++	}
++	spdk_spin_unlock(&g_raid_rebuild_outcomes_lock);
++
++	return ok;
++}
++
++static const char *
++raid_rebuild_outcome_state_name(enum raid_rebuild_outcome_state state)
++{
++	switch (state) {
++	case RAID_REBUILD_OUTCOME_RUNNING:
++		return "running";
++	case RAID_REBUILD_OUTCOME_VERIFYING:
++		return "verifying";
++	case RAID_REBUILD_OUTCOME_SUCCEEDED:
++		return "succeeded";
++	case RAID_REBUILD_OUTCOME_FAILED:
++		return "failed";
++	case RAID_REBUILD_OUTCOME_DIVERGENT:
++		return "divergent";
++	case RAID_REBUILD_OUTCOME_CANCELED:
++		return "canceled";
++	default:
++		return "unknown";
++	}
++}
++
++void
++raid_rebuild_outcomes_write_json(struct spdk_json_write_ctx *w, const char *token_filter)
++{
++	struct raid_rebuild_outcome *outcome;
++
++	spdk_json_write_array_begin(w);
++
++	spdk_spin_lock(&g_raid_rebuild_outcomes_lock);
++	raid_rebuild_outcomes_purge_expired();
++	TAILQ_FOREACH(outcome, &g_raid_rebuild_outcomes, link) {
++		if (token_filter != NULL && strcmp(outcome->token, token_filter) != 0) {
++			continue;
++		}
++		spdk_json_write_object_begin(w);
++		spdk_json_write_named_string(w, "token", outcome->token);
++		spdk_json_write_named_string(w, "raid_bdev", outcome->raid_name);
++		spdk_json_write_named_string(w, "base_bdev", outcome->base_bdev_name);
++		spdk_json_write_named_string(w, "state",
++					     raid_rebuild_outcome_state_name(outcome->state));
++		spdk_json_write_named_uint64(w, "bytes", outcome->bytes);
++		spdk_json_write_named_bool(w, "verified", outcome->verified);
++		spdk_json_write_named_int64(w, "finished_at", outcome->finished_at);
++		spdk_json_write_object_end(w);
++	}
++	spdk_spin_unlock(&g_raid_rebuild_outcomes_lock);
++
++	spdk_json_write_array_end(w);
++}
+diff --git a/module/bdev/raid/bdev_raid_outcomes.h b/module/bdev/raid/bdev_raid_outcomes.h
+new file mode 100644
+index 0000000..a8660cc
+--- /dev/null
++++ b/module/bdev/raid/bdev_raid_outcomes.h
+@@ -0,0 +1,65 @@
++/*   SPDX-License-Identifier: BSD-3-Clause
++ *   Copyright (C) 2026 Evariops.
++ *   All rights reserved.
++ */
++
++/* Evariops 0014.5 (spdk-csi RPC-CONTRACT §2): process-wide rebuild outcome
++ * registry. Records the fate of every rebuild attempt — seeded or full — under
++ * an opaque token, and survives the raid bdev itself (a destroyed nexus must
++ * still be able to answer "what happened to attempt <token>?" for 15 minutes).
++ * The registry is the fast-path proof; the durable proof stays the superblock.
++ *
++ * This header is the only coupling surface for other modules: the CBT module
++ * consults raid_rebuild_outcome_is_succeeded_verified() before allowing
++ * bdev_cbt_epoch_close(mode=consumed) to discard a frozen delta (§4).
++ */
++
++#ifndef SPDK_BDEV_RAID_OUTCOMES_H
++#define SPDK_BDEV_RAID_OUTCOMES_H
++
++#include "spdk/stdinc.h"
++#include "spdk/json.h"
++
++/* Max token length including the NUL terminator (contract: tokens are
++ * control-plane-generated, deterministic per attempt). */
++#define RAID_REBUILD_TOKEN_MAX		192
++
++/* Terminal entries are purged this long after finishing (contract §2). */
++#define RAID_REBUILD_OUTCOME_TTL_SEC	900
++
++enum raid_rebuild_outcome_state {
++	RAID_REBUILD_OUTCOME_RUNNING = 0,
++	RAID_REBUILD_OUTCOME_VERIFYING,
++	RAID_REBUILD_OUTCOME_SUCCEEDED,
++	RAID_REBUILD_OUTCOME_FAILED,
++	RAID_REBUILD_OUTCOME_DIVERGENT,
++	RAID_REBUILD_OUTCOME_CANCELED,
++};
++
++struct raid_rebuild_outcome;
++
++/* Open (or reset — control-plane retries reuse deterministic tokens) the
++ * registry entry for a new rebuild attempt. Returns NULL on allocation
++ * failure; every other function below is NULL-safe so a rebuild without an
++ * entry degrades to "unobservable", never to a crash. */
++struct raid_rebuild_outcome *raid_rebuild_outcome_open(const char *token,
++		const char *raid_name, const char *base_bdev_name);
++
++void raid_rebuild_outcome_add_bytes(struct raid_rebuild_outcome *outcome, uint64_t bytes);
++
++/* 0014.8 wires this: the integrated verify phase reports through the registry. */
++void raid_rebuild_outcome_set_verifying(struct raid_rebuild_outcome *outcome);
++
++/* Seal the entry. Must be called exactly once per opened entry; the pointer
++ * must not be used afterwards (the registry owns the entry's lifetime). */
++void raid_rebuild_outcome_finish(struct raid_rebuild_outcome *outcome,
++		enum raid_rebuild_outcome_state terminal, bool verified);
++
++/* RPC-CONTRACT §4: bdev_cbt_epoch_close(mode=consumed) gate. */
++bool raid_rebuild_outcome_is_succeeded_verified(const char *token);
++
++/* Write the registry (optionally filtered by token) as a JSON array of
++ * {token, state, bytes, verified, finished_at}. */
++void raid_rebuild_outcomes_write_json(struct spdk_json_write_ctx *w, const char *token_filter);
++
++#endif /* SPDK_BDEV_RAID_OUTCOMES_H */
+diff --git a/module/bdev/raid/bdev_raid_rpc.c b/module/bdev/raid/bdev_raid_rpc.c
+index 8a14573..f65ea35 100644
+--- a/module/bdev/raid/bdev_raid_rpc.c
++++ b/module/bdev/raid/bdev_raid_rpc.c
+@@ -6,6 +6,7 @@
+ #include "spdk/rpc.h"
+ #include "spdk/bdev.h"
+ #include "bdev_raid.h"
++#include "bdev_raid_outcomes.h"	/* Evariops 0014.5 */
+ #include "spdk/util.h"
+ #include "spdk/string.h"
+ #include "spdk/log.h"
+@@ -625,6 +626,10 @@ struct rpc_bdev_raid_start_seeded_rebuild {
+ 
+ 	/* Evariops 0014.4: -ESTALE on mismatch (see bdev_raid_delete) */
+ 	char				*expected_incarnation;
++
++	/* Evariops 0014.5 (RPC-CONTRACT §2): control-plane token identifying
++	 * this attempt in the rebuild outcome registry */
++	char				*rebuild_token;
+ };
+ 
+ static void
+@@ -634,6 +639,7 @@ free_rpc_bdev_raid_start_seeded_rebuild(struct rpc_bdev_raid_start_seeded_rebuil
+ 	free(req->base_bdev);
+ 	free(req->ranges);
+ 	free(req->expected_incarnation);
++	free(req->rebuild_token);
+ }
+ 
+ static int
+@@ -670,6 +676,7 @@ static const struct spdk_json_object_decoder rpc_bdev_raid_start_seeded_rebuild_
+ 	{"base_bdev", offsetof(struct rpc_bdev_raid_start_seeded_rebuild, base_bdev), spdk_json_decode_string},
+ 	{"ranges", offsetof(struct rpc_bdev_raid_start_seeded_rebuild, ranges), decode_seed_ranges},
+ 	{"expected_incarnation", offsetof(struct rpc_bdev_raid_start_seeded_rebuild, expected_incarnation), spdk_json_decode_string, true},
++	{"rebuild_token", offsetof(struct rpc_bdev_raid_start_seeded_rebuild, rebuild_token), spdk_json_decode_string, true},
+ };
+ 
+ static int
+@@ -776,6 +783,15 @@ rpc_bdev_raid_start_seeded_rebuild(struct spdk_jsonrpc_request *request,
+ 		}
+ 	}
+ 
++	/* Evariops 0014.5: the registry token is bounded (contract §2). */
++	if (req.rebuild_token != NULL &&
++	    strnlen(req.rebuild_token, RAID_REBUILD_TOKEN_MAX) == RAID_REBUILD_TOKEN_MAX) {
++		spdk_jsonrpc_send_error_response_fmt(request, -ENAMETOOLONG,
++						     "rebuild_token exceeds %d characters",
++						     RAID_REBUILD_TOKEN_MAX - 1);
++		goto cleanup;
++	}
++
+ 	/* SEC1: audit — this arms a background writer on the array (patch 0011
+ 	 * discipline for destructive RPCs). */
+ 	snprintf(detail, sizeof(detail), "raid=%s base=%s ranges=%zu",
+@@ -793,7 +809,8 @@ rpc_bdev_raid_start_seeded_rebuild(struct spdk_jsonrpc_request *request,
+ 	}
+ 	req.ranges = NULL;
+ 
+-	rc = raid_bdev_start_seeded_rebuild(base_info, ranges, (uint32_t)req.num_ranges);
++	rc = raid_bdev_start_seeded_rebuild(base_info, ranges, (uint32_t)req.num_ranges,
++					    req.rebuild_token);
+ 	if (rc != 0) {
+ 		free(ranges);
+ 		spdk_jsonrpc_send_error_response_fmt(request, rc,
+@@ -892,6 +909,46 @@ err:
+ }
+ SPDK_RPC_REGISTER("bdev_raid_remove_base_bdev", rpc_bdev_raid_remove_base_bdev, SPDK_RPC_RUNTIME)
+ 
++/* ---- Evariops 0014.5 (RPC-CONTRACT §2): bdev_raid_get_rebuild_outcomes
++ * {token?} — read the process-wide rebuild outcome registry. Entries survive
++ * the raid bdev (15 min TTL after finishing); the control plane matches by
++ * token (D12 extinguishes debt only against a succeeded+verified entry, D13
++ * reacts to failed/divergent/canceled ones). ---- */
++
++struct rpc_bdev_raid_get_rebuild_outcomes {
++	/* Optional token filter */
++	char *token;
++};
++
++static const struct spdk_json_object_decoder rpc_bdev_raid_get_rebuild_outcomes_decoders[] = {
++	{"token", offsetof(struct rpc_bdev_raid_get_rebuild_outcomes, token), spdk_json_decode_string, true},
++};
++
++static void
++rpc_bdev_raid_get_rebuild_outcomes(struct spdk_jsonrpc_request *request,
++				   const struct spdk_json_val *params)
++{
++	struct rpc_bdev_raid_get_rebuild_outcomes req = {};
++	struct spdk_json_write_ctx *w;
++
++	if (params != NULL &&
++	    spdk_json_decode_object(params, rpc_bdev_raid_get_rebuild_outcomes_decoders,
++				    SPDK_COUNTOF(rpc_bdev_raid_get_rebuild_outcomes_decoders),
++				    &req)) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_PARSE_ERROR,
++						 "spdk_json_decode_object failed");
++		return;
++	}
++
++	w = spdk_jsonrpc_begin_result(request);
++	raid_rebuild_outcomes_write_json(w, req.token);
++	spdk_jsonrpc_end_result(request, w);
++
++	free(req.token);
++}
++SPDK_RPC_REGISTER("bdev_raid_get_rebuild_outcomes", rpc_bdev_raid_get_rebuild_outcomes,
++		  SPDK_RPC_RUNTIME)
++
+ static const struct spdk_json_object_decoder rpc_bdev_raid_set_options_decoders[] = {
+ 	{"process_window_size_kb", offsetof(struct spdk_raid_bdev_opts, process_window_size_kb), spdk_json_decode_uint32, true},
+ 	{"process_max_bandwidth_mb_sec", offsetof(struct spdk_raid_bdev_opts, process_max_bandwidth_mb_sec), spdk_json_decode_uint32, true},
