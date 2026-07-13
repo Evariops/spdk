@@ -524,10 +524,25 @@ vbdev_cbt_get_io_channel(void *ctx)
 	return spdk_get_io_channel(cbt_node);
 }
 
+/* 0014.6 (cbt part): stable state names for get_bdevs consumers. */
+static const char *
+cbt_epoch_state_name(enum cbt_epoch_state state)
+{
+	switch (state) {
+	case CBT_EPOCH_OPEN:        return "open";
+	case CBT_EPOCH_FROZEN:      return "frozen";
+	case CBT_EPOCH_REBUILDING:  return "rebuilding";
+	case CBT_EPOCH_COMPLETED:   return "completed";
+	case CBT_EPOCH_INVALID:     return "invalid";
+	default:                    return "unknown";
+	}
+}
+
 static int
 vbdev_cbt_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 {
 	struct vbdev_cbt *cbt_node = ctx;
+	struct cbt_epoch *ep;
 
 	spdk_json_write_name(w, "cbt");
 	spdk_json_write_object_begin(w);
@@ -538,6 +553,22 @@ vbdev_cbt_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 	spdk_json_write_named_uint32(w, "chunk_size_kb", cbt_node->chunk_size_kb);
 	spdk_json_write_named_uint64(w, "dirty_chunks", cbt_popcount_bitmap(cbt_node));
 	spdk_json_write_named_uint64(w, "total_chunks", cbt_node->bitmap_size_bits);
+
+	/* 0014.1/0014.2/0014.6 (RPC-CONTRACT §3/§5): the observation source — the
+	 * control-plane's EpochObservation is built from get_bdevs, never from a
+	 * dedicated poll. Per epoch: {epoch_id, nonce, state, generation, truncated}. */
+	spdk_json_write_named_array_begin(w, "epochs");
+	TAILQ_FOREACH(ep, &cbt_node->epochs, link) {
+		spdk_json_write_object_begin(w);
+		spdk_json_write_named_string(w, "epoch_id", ep->epoch_id);
+		spdk_json_write_named_string(w, "nonce", ep->nonce);
+		spdk_json_write_named_string(w, "state", cbt_epoch_state_name(ep->state));
+		spdk_json_write_named_uint64(w, "generation", ep->generation);
+		spdk_json_write_named_bool(w, "truncated", ep->truncated);
+		spdk_json_write_object_end(w);
+	}
+	spdk_json_write_array_end(w);
+
 	spdk_json_write_object_end(w);
 
 	return 0;
@@ -647,6 +678,31 @@ static void
 vbdev_cbt_base_bdev_event_cb(enum spdk_bdev_event_type type,
 			     struct spdk_bdev *bdev, void *event_ctx)
 {
+	if (type == SPDK_BDEV_EVENT_RESIZE) {
+		/* 0014.2 (RPC-CONTRACT §5, T-D6): the live bitmap was sized at create —
+		 * a grown base leaves the growth zone tracked by NOTHING. Every live
+		 * epoch becomes a lie: mark it truncated so the control-plane routes to
+		 * a FULL rebuild (D14) instead of trusting a partial delta. */
+		struct vbdev_cbt *rnode;
+		struct cbt_epoch *rep;
+
+		TAILQ_FOREACH(rnode, &g_cbt_nodes, link) {
+			if (bdev != rnode->base_bdev) {
+				continue;
+			}
+			TAILQ_FOREACH(rep, &rnode->epochs, link) {
+				if (!rep->truncated) {
+					rep->truncated = true;
+					SPDK_WARNLOG("CBT: base bdev '%s' resized — epoch "
+						     "'%s' marked truncated (delta no longer "
+						     "covers the device)\n",
+						     spdk_bdev_get_name(bdev), rep->epoch_id);
+				}
+			}
+		}
+		return;
+	}
+
 	if (type == SPDK_BDEV_EVENT_REMOVE) {
 		struct vbdev_cbt *node, *tmp;
 		struct cbt_bdev_name *name, *ntmp;
@@ -942,7 +998,8 @@ bdev_cbt_delete_disk(const char *cbt_name,
 
 int
 bdev_cbt_epoch_open(const char *cbt_name, const char *epoch_id,
-		    const char *stale_backend_id, uint64_t generation)
+		    const char *stale_backend_id, uint64_t generation,
+		    const char *nonce)
 {
 	struct vbdev_cbt *cbt;
 	struct cbt_epoch *ep;
@@ -959,6 +1016,10 @@ bdev_cbt_epoch_open(const char *cbt_name, const char *epoch_id,
 		return -ENAMETOOLONG;
 	}
 	if (strlen(stale_backend_id) >= CBT_BACKEND_ID_MAX) {
+		return -ENAMETOOLONG;
+	}
+	/* 0014.1: the nonce is opaque and optional (pre-0014 callers pass NULL). */
+	if (nonce != NULL && strlen(nonce) >= CBT_NONCE_MAX) {
 		return -ENAMETOOLONG;
 	}
 
@@ -979,10 +1040,13 @@ bdev_cbt_epoch_open(const char *cbt_name, const char *epoch_id,
 					    "active rebuild\n", (unsigned long)generation, epoch_id);
 				return -EBUSY;
 			}
-			/* Replace with higher generation. */
+			/* Replace with higher generation. 0014.1: the takeover carries the
+			 * NEW round's nonce; 0014.2: `truncated` deliberately survives —
+			 * the bitmap still does not cover a growth zone from a resize. */
 			ep->generation = generation;
 			snprintf(ep->stale_backend_id, sizeof(ep->stale_backend_id),
 				 "%s", stale_backend_id);
+			snprintf(ep->nonce, sizeof(ep->nonce), "%s", nonce ? nonce : "");
 			ep->state = CBT_EPOCH_OPEN;
 			return 0;
 		}
@@ -1031,14 +1095,15 @@ bdev_cbt_epoch_open(const char *cbt_name, const char *epoch_id,
 	snprintf(ep->epoch_id, sizeof(ep->epoch_id), "%s", epoch_id);
 	snprintf(ep->stale_backend_id, sizeof(ep->stale_backend_id),
 		 "%s", stale_backend_id);
+	snprintf(ep->nonce, sizeof(ep->nonce), "%s", nonce ? nonce : "");
 	ep->generation = generation;
 	ep->state = CBT_EPOCH_OPEN;
 
 	TAILQ_INSERT_TAIL(&cbt->epochs, ep, link);
 	cbt->epoch_count++;
 
-	SPDK_NOTICELOG("CBT: epoch_open '%s' for stale backend '%s' gen=%lu\n",
-		       epoch_id, stale_backend_id, (unsigned long)generation);
+	SPDK_NOTICELOG("CBT: epoch_open '%s' nonce='%s' for stale backend '%s' gen=%lu\n",
+		       epoch_id, ep->nonce, stale_backend_id, (unsigned long)generation);
 	return 0;
 }
 
@@ -1144,7 +1209,9 @@ bdev_cbt_epoch_freeze(const char *cbt_name, const char *epoch_id)
 }
 
 int
-bdev_cbt_epoch_close(const char *cbt_name, const char *epoch_id)
+bdev_cbt_epoch_close(const char *cbt_name, const char *epoch_id,
+		     enum cbt_epoch_close_mode mode,
+		     const char *rebuild_token)
 {
 	struct vbdev_cbt *cbt;
 	struct cbt_epoch *ep;
@@ -1173,10 +1240,26 @@ bdev_cbt_epoch_close(const char *cbt_name, const char *epoch_id)
 		return -EBUSY;
 	}
 
-	/* H1: closing an epoch must not lose dirty history. If the frozen delta
-	 * was exchanged out of the live bitmap and never proven copied (rebuild
-	 * aborted/failed/never run), merge it back before discarding. */
-	cbt_epoch_restore_unconsumed_delta(cbt, ep);
+	/* 0014.3 (RPC-CONTRACT §4): CONSUMED deliberately discards the frozen delta —
+	 * the caller certifies it was copied by a verified-successful rebuild. The
+	 * certification is the outcome-registry token: demanded non-empty here, checked
+	 * against the registry as of 0014.5 (the raid-side registry increment). Without
+	 * a token: -EPERM, never a silent downgrade to PRESERVE. */
+	if (mode == CBT_EPOCH_CLOSE_CONSUMED) {
+		if (rebuild_token == NULL || rebuild_token[0] == '\0') {
+			SPDK_ERRLOG("CBT: epoch_close '%s' mode=consumed refused: no "
+				    "rebuild token (-EPERM)\n", epoch_id);
+			return -EPERM;
+		}
+		SPDK_NOTICELOG("CBT: epoch_close '%s' CONSUMED under token '%s' — "
+			       "frozen delta discarded by certification\n",
+			       epoch_id, rebuild_token);
+	} else {
+		/* H1: closing an epoch must not lose dirty history. If the frozen delta
+		 * was exchanged out of the live bitmap and never proven copied (rebuild
+		 * aborted/failed/never run), merge it back before discarding. */
+		cbt_epoch_restore_unconsumed_delta(cbt, ep);
+	}
 
 	ep->state = CBT_EPOCH_COMPLETED;
 	TAILQ_REMOVE(&cbt->epochs, ep, link);
@@ -1184,7 +1267,8 @@ bdev_cbt_epoch_close(const char *cbt_name, const char *epoch_id)
 	free(ep->bitmap_frozen);
 	free(ep);
 
-	SPDK_NOTICELOG("CBT: epoch_close '%s'\n", epoch_id);
+	SPDK_NOTICELOG("CBT: epoch_close '%s' (%s)\n", epoch_id,
+		       mode == CBT_EPOCH_CLOSE_CONSUMED ? "consumed" : "preserve");
 	return 0;
 }
 
@@ -2375,7 +2459,7 @@ bdev_cbt_cancel_rebuild(const char *rebuild_id, uint64_t *out_chunks_copied)
 int
 bdev_cbt_start_tracking(const char *cbt_name)
 {
-	return bdev_cbt_epoch_open(cbt_name, "__legacy__", "__legacy__", 0);
+	return bdev_cbt_epoch_open(cbt_name, "__legacy__", "__legacy__", 0, NULL);
 }
 
 int

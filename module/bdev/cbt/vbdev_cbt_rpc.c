@@ -151,6 +151,7 @@ struct rpc_epoch_open {
 	char     *epoch_id;
 	char     *stale_backend_id;
 	uint64_t  generation;
+	char     *nonce;    /* 0014.1: optional, opaque CP nonce */
 };
 
 static void
@@ -159,6 +160,7 @@ free_rpc_epoch_open(struct rpc_epoch_open *r)
 	free(r->name);
 	free(r->epoch_id);
 	free(r->stale_backend_id);
+	free(r->nonce);
 }
 
 static const struct spdk_json_object_decoder rpc_epoch_open_decoders[] = {
@@ -166,6 +168,7 @@ static const struct spdk_json_object_decoder rpc_epoch_open_decoders[] = {
 	{"epoch_id",         offsetof(struct rpc_epoch_open, epoch_id),         spdk_json_decode_string},
 	{"stale_backend_id", offsetof(struct rpc_epoch_open, stale_backend_id), spdk_json_decode_string},
 	{"generation",       offsetof(struct rpc_epoch_open, generation),       spdk_json_decode_uint64},
+	{"nonce",            offsetof(struct rpc_epoch_open, nonce),            spdk_json_decode_string, true},
 };
 
 static void
@@ -183,7 +186,7 @@ rpc_bdev_cbt_epoch_open(struct spdk_jsonrpc_request *request,
 	}
 
 	rc = bdev_cbt_epoch_open(req.name, req.epoch_id, req.stale_backend_id,
-				 req.generation);
+				 req.generation, req.nonce);
 	if (rc != 0) {
 		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
 		goto cleanup;
@@ -252,21 +255,61 @@ SPDK_RPC_REGISTER("bdev_cbt_epoch_freeze", rpc_bdev_cbt_epoch_freeze, SPDK_RPC_R
 /* bdev_cbt_epoch_close                                               */
 /* ================================================================== */
 
+struct rpc_epoch_close {
+	char *name;
+	char *epoch_id;
+	char *mode;           /* 0014.3: "preserve" (default) | "consumed" */
+	char *rebuild_token;  /* 0014.3: required for consumed */
+};
+
+static void
+free_rpc_epoch_close(struct rpc_epoch_close *r)
+{
+	free(r->name);
+	free(r->epoch_id);
+	free(r->mode);
+	free(r->rebuild_token);
+}
+
+static const struct spdk_json_object_decoder rpc_epoch_close_decoders[] = {
+	{"name",          offsetof(struct rpc_epoch_close, name),          spdk_json_decode_string},
+	{"epoch_id",      offsetof(struct rpc_epoch_close, epoch_id),      spdk_json_decode_string},
+	{"mode",          offsetof(struct rpc_epoch_close, mode),          spdk_json_decode_string, true},
+	{"rebuild_token", offsetof(struct rpc_epoch_close, rebuild_token), spdk_json_decode_string, true},
+};
+
 static void
 rpc_bdev_cbt_epoch_close(struct spdk_jsonrpc_request *request,
 			  const struct spdk_json_val *params)
 {
-	struct rpc_epoch_simple req = {NULL};
+	struct rpc_epoch_close req = {NULL};
+	enum cbt_epoch_close_mode mode = CBT_EPOCH_CLOSE_PRESERVE;
 	int rc;
 
-	if (spdk_json_decode_object(params, rpc_epoch_simple_decoders,
-				    SPDK_COUNTOF(rpc_epoch_simple_decoders), &req)) {
+	if (spdk_json_decode_object(params, rpc_epoch_close_decoders,
+				    SPDK_COUNTOF(rpc_epoch_close_decoders), &req)) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
 						 "Failed to decode parameters");
 		goto cleanup;
 	}
 
-	rc = bdev_cbt_epoch_close(req.name, req.epoch_id);
+	/* 0014.3: an unknown mode is an error, never a silent PRESERVE fallback. */
+	if (req.mode != NULL) {
+		if (strcmp(req.mode, "consumed") == 0) {
+			mode = CBT_EPOCH_CLOSE_CONSUMED;
+		} else if (strcmp(req.mode, "preserve") != 0) {
+			spdk_jsonrpc_send_error_response(request, -EINVAL,
+							 "mode must be 'preserve' or 'consumed'");
+			goto cleanup;
+		}
+	}
+
+	if (req.rebuild_token != NULL && strlen(req.rebuild_token) >= CBT_REBUILD_TOKEN_MAX) {
+		spdk_jsonrpc_send_error_response(request, -ENAMETOOLONG, "rebuild_token too long");
+		goto cleanup;
+	}
+
+	rc = bdev_cbt_epoch_close(req.name, req.epoch_id, mode, req.rebuild_token);
 	if (rc != 0) {
 		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
 		goto cleanup;
@@ -277,7 +320,7 @@ rpc_bdev_cbt_epoch_close(struct spdk_jsonrpc_request *request,
 	spdk_jsonrpc_end_result(request, w);
 
 cleanup:
-	free_rpc_epoch_simple(&req);
+	free_rpc_epoch_close(&req);
 }
 SPDK_RPC_REGISTER("bdev_cbt_epoch_close", rpc_bdev_cbt_epoch_close, SPDK_RPC_RUNTIME)
 

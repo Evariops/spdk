@@ -191,6 +191,25 @@ a split-brain across disks.
 - `bdev_cbt_epoch_freeze` / `epoch_close` / `epoch_open` (higher generation):
   return **-EBUSY** while a rebuild is RUNNING on the epoch (**CBT-1/2/c5**) —
   the control-plane must `bdev_cbt_cancel_rebuild` first.
+- **0014.1** — `bdev_cbt_epoch_open {…, nonce?}`: opaque CP-generated nonce
+  (≤31 chars), stored on the epoch and echoed in `get_bdevs` — kills the
+  epoch-id ABA across maintenance rounds. A generation takeover re-stamps the
+  nonce of the NEW round.
+- **0014.2** — resize under a live epoch ⇒ `truncated: true` on that epoch
+  (get_bdevs): the live bitmap does not cover the growth zone — the delta is a
+  lie, the control-plane must route to a FULL rebuild (D14). Never cleared:
+  survives generation takeovers, dies with the epoch.
+- **0014.3** — `bdev_cbt_epoch_close {…, mode?: "preserve"|"consumed",
+  rebuild_token?}`: `preserve` (default) restores any unconsumed frozen delta
+  to the live bitmap (H1 discipline); `consumed` deliberately DISCARDS it under
+  caller certification and **requires a non-empty rebuild_token (-EPERM
+  otherwise)** — the SUCCEEDED-verified outcome-registry token (validated
+  against the registry as of 0014.5). An unknown `mode` is -EINVAL, never a
+  silent preserve.
+- **0014.6 (cbt part)** — `get_bdevs` exposes `driver_specific.cbt.epochs[]`:
+  `{epoch_id, nonce, state: open|frozen|rebuilding|completed|invalid,
+  generation, truncated}` — the control-plane's `EpochObservation` source (no
+  dedicated poll).
 - `bdev_cbt_partial_rebuild` / `bdev_cbt_start_rebuild`: one rebuild per
   (cbt, epoch); a second returns -EBUSY (interpret as "already running", not a
   failure). **CBT-4**: the rebuild FLUSHes the target before COMPLETED.
