@@ -1,0 +1,370 @@
+diff --git a/module/bdev/raid/Makefile b/module/bdev/raid/Makefile
+index 120700c..c90b4a2 100644
+--- a/module/bdev/raid/Makefile
++++ b/module/bdev/raid/Makefile
+@@ -10,7 +10,7 @@ SO_VER := 7
+ SO_MINOR := 0
+ 
+ CFLAGS += -I$(SPDK_ROOT_DIR)/lib/bdev/
+-C_SRCS = bdev_raid.c bdev_raid_rpc.c bdev_raid_sb.c bdev_raid_heat.c bdev_raid_repair.c bdev_raid_outcomes.c raid0.c raid1.c concat.c
++C_SRCS = bdev_raid.c bdev_raid_rpc.c bdev_raid_sb.c bdev_raid_heat.c bdev_raid_repair.c bdev_raid_outcomes.c bdev_raid_envelopes.c raid0.c raid1.c concat.c
+ 
+ ifeq ($(CONFIG_RAID5F),y)
+ C_SRCS += raid5f.c
+diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
+index 94e0b34..762e892 100644
+--- a/module/bdev/raid/bdev_raid.c
++++ b/module/bdev/raid/bdev_raid.c
+@@ -6,6 +6,7 @@
+ 
+ #include "bdev_raid.h"
+ #include "bdev_raid_outcomes.h"	/* Evariops 0014.5 */
++#include "bdev_raid_envelopes.h"	/* Evariops 0014.9 */
+ /* Evariops 0014.6: per-member epoch facts come from the cbt module wrapping
+  * each member (nexus topology: raid1 → cbt → nvme). The module dir is injected
+  * before patches apply (Dockerfile copy-before-apply); symbol resolves via
+@@ -3971,13 +3972,24 @@ raid_bdev_process_alloc(struct raid_bdev *raid_bdev, enum raid_process_type type
+ 	TAILQ_INIT(&process->requests);
+ 	TAILQ_INIT(&process->finish_actions);
+ 
+-	if (g_opts.process_max_bandwidth_mb_sec != 0) {
+-		process->qos.enable_qos = true;
+-		process->qos.last_tsc = spdk_get_ticks();
+-		process->qos.bytes_per_tsc = g_opts.process_max_bandwidth_mb_sec * 1024 * 1024.0 /
+-					     spdk_get_ticks_hz();
+-		process->qos.bytes_max = g_opts.process_max_bandwidth_mb_sec * 1024 * 1024.0 / SPDK_SEC_TO_MSEC;
+-		process->qos.bytes_available = 0.0;
++	/* Evariops 0014.9 (RPC-CONTRACT §6): the rebuild envelope (under the
++	 * current regime) takes precedence over the legacy global option and is
++	 * FROZEN here — a regime change only applies to processes started after
++	 * it (bytes_per_tsc is per-process by design). 0 = unlimited. */
++	{
++		uint32_t max_bw_mb_sec = raid_envelope_active_mb_sec(RAID_ENVELOPE_REBUILD);
++
++		if (max_bw_mb_sec == 0) {
++			max_bw_mb_sec = g_opts.process_max_bandwidth_mb_sec;
++		}
++		if (max_bw_mb_sec != 0) {
++			process->qos.enable_qos = true;
++			process->qos.last_tsc = spdk_get_ticks();
++			process->qos.bytes_per_tsc = max_bw_mb_sec * 1024 * 1024.0 /
++						     spdk_get_ticks_hz();
++			process->qos.bytes_max = max_bw_mb_sec * 1024 * 1024.0 / SPDK_SEC_TO_MSEC;
++			process->qos.bytes_available = 0.0;
++		}
+ 	}
+ 
+ 	for (i = 0; i < RAID_BDEV_PROCESS_MAX_QD; i++) {
+@@ -4001,6 +4013,16 @@ raid_bdev_start_rebuild(struct raid_base_bdev_info *target)
+ 
+ 	assert(spdk_get_thread() == spdk_thread_get_app_thread());
+ 
++	/* Evariops 0014.9: the auto rebuild at attach is ADMITTED over the
++	 * concurrency bound — refusing here would leave an attached member
++	 * silently unrebuilt with nothing to retry it. Loud, not blocking:
++	 * the control plane paces attaches itself. */
++	if (!raid_envelopes_admit_rebuild()) {
++		SPDK_WARNLOG("raid bdev '%s': rebuild concurrency bound exceeded — "
++			     "admitting the attach-triggered rebuild anyway\n",
++			     target->raid_bdev->bdev.name);
++	}
++
+ 	process = raid_bdev_process_alloc(target->raid_bdev, RAID_PROCESS_REBUILD, target);
+ 	if (process == NULL) {
+ 		return -ENOMEM;
+@@ -4040,6 +4062,13 @@ raid_bdev_start_seeded_rebuild(struct raid_base_bdev_info *target,
+ 		return -EINVAL;
+ 	}
+ 
++	/* Evariops 0014.9 (RPC-CONTRACT §6): RPC-driven rebuilds respect the
++	 * per-node concurrency bound — N rebuilds are N × cap otherwise. The
++	 * control plane maps -EAGAIN to a retry, nothing is lost. */
++	if (!raid_envelopes_admit_rebuild()) {
++		return -EAGAIN;
++	}
++
+ 	process = raid_bdev_process_alloc(target->raid_bdev, RAID_PROCESS_REBUILD, target);
+ 	if (process == NULL) {
+ 		return -ENOMEM;
+diff --git a/module/bdev/raid/bdev_raid_envelopes.c b/module/bdev/raid/bdev_raid_envelopes.c
+new file mode 100644
+index 0000000..7fd32b7
+--- /dev/null
++++ b/module/bdev/raid/bdev_raid_envelopes.c
+@@ -0,0 +1,73 @@
++/*   SPDX-License-Identifier: BSD-3-Clause
++ *   Copyright (C) 2026 Evariops.
++ *   All rights reserved.
++ */
++
++/* Evariops 0014.9 (spdk-csi RPC-CONTRACT §6): see bdev_raid_envelopes.h. */
++
++#include "bdev_raid.h"
++#include "bdev_raid_envelopes.h"
++
++#include "spdk/log.h"
++#include "spdk/thread.h"
++
++static struct raid_envelopes g_raid_envelopes;
++
++void
++raid_envelopes_get(struct raid_envelopes *out)
++{
++	assert(spdk_get_thread() == spdk_thread_get_app_thread());
++	*out = g_raid_envelopes;
++}
++
++void
++raid_envelopes_set(const struct raid_envelopes *envelopes)
++{
++	assert(spdk_get_thread() == spdk_thread_get_app_thread());
++	g_raid_envelopes = *envelopes;
++
++	SPDK_NOTICELOG("raid envelopes: regime=%s rebuild=%u/%u verify=%u/%u "
++		       "relocate=%u/%u MiB/s (nominal/maintenance, 0=unlimited), "
++		       "max_concurrent_rebuilds=%u\n",
++		       g_raid_envelopes.maintenance_regime ? "maintenance" : "nominal",
++		       g_raid_envelopes.classes[RAID_ENVELOPE_REBUILD].nominal_mb_sec,
++		       g_raid_envelopes.classes[RAID_ENVELOPE_REBUILD].maintenance_mb_sec,
++		       g_raid_envelopes.classes[RAID_ENVELOPE_VERIFY].nominal_mb_sec,
++		       g_raid_envelopes.classes[RAID_ENVELOPE_VERIFY].maintenance_mb_sec,
++		       g_raid_envelopes.classes[RAID_ENVELOPE_RELOCATE].nominal_mb_sec,
++		       g_raid_envelopes.classes[RAID_ENVELOPE_RELOCATE].maintenance_mb_sec,
++		       g_raid_envelopes.max_concurrent_rebuilds);
++}
++
++uint32_t
++raid_envelope_active_mb_sec(enum raid_envelope_class klass)
++{
++	const struct raid_envelope *env;
++
++	assert(klass < RAID_ENVELOPE_CLASS_MAX);
++	env = &g_raid_envelopes.classes[klass];
++
++	return g_raid_envelopes.maintenance_regime ? env->maintenance_mb_sec
++						   : env->nominal_mb_sec;
++}
++
++bool
++raid_envelopes_admit_rebuild(void)
++{
++	struct raid_bdev *raid_bdev;
++	uint32_t active = 0;
++
++	assert(spdk_get_thread() == spdk_thread_get_app_thread());
++
++	if (g_raid_envelopes.max_concurrent_rebuilds == 0) {
++		return true;
++	}
++
++	TAILQ_FOREACH(raid_bdev, &g_raid_bdev_list, global_link) {
++		if (raid_bdev->process != NULL) {
++			active++;
++		}
++	}
++
++	return active < g_raid_envelopes.max_concurrent_rebuilds;
++}
+diff --git a/module/bdev/raid/bdev_raid_envelopes.h b/module/bdev/raid/bdev_raid_envelopes.h
+new file mode 100644
+index 0000000..a5aa0db
+--- /dev/null
++++ b/module/bdev/raid/bdev_raid_envelopes.h
+@@ -0,0 +1,55 @@
++/*   SPDX-License-Identifier: BSD-3-Clause
++ *   Copyright (C) 2026 Evariops.
++ *   All rights reserved.
++ */
++
++/* Evariops 0014.9 (spdk-csi RPC-CONTRACT §6): process-wide I/O envelopes.
++ *
++ * CAPS, never shares (there is no mClock/WFQ here): one cap per executor
++ * class, each in TWO values (nominal, maintenance), plus a per-node bound on
++ * concurrent rebuilds — N rebuilds would otherwise consume N × cap. The
++ * data-plane default is 0 = UNLIMITED: the control plane MUST set these at
++ * handshake, and a failed set is an INCIDENT there, never a silent fallback.
++ * The rebuild cap is consumed at process allocation (bytes_per_tsc is frozen
++ * there — a regime change only applies to processes started after it); the
++ * verify cap is consumed by bdev_raid_verify_ranges (§10b; the integrated
++ * verify phase samples ~64 MiB and is deliberately unpaced); the relocate cap
++ * is stored here for the tier module to consume.
++ */
++
++#ifndef SPDK_BDEV_RAID_ENVELOPES_H
++#define SPDK_BDEV_RAID_ENVELOPES_H
++
++#include "spdk/stdinc.h"
++
++enum raid_envelope_class {
++	RAID_ENVELOPE_REBUILD = 0,
++	RAID_ENVELOPE_VERIFY,
++	RAID_ENVELOPE_RELOCATE,
++	RAID_ENVELOPE_CLASS_MAX,
++};
++
++struct raid_envelope {
++	/* MiB/s caps; 0 = unlimited (the loud default). */
++	uint32_t	nominal_mb_sec;
++	uint32_t	maintenance_mb_sec;
++};
++
++struct raid_envelopes {
++	struct raid_envelope	classes[RAID_ENVELOPE_CLASS_MAX];
++	/* 0 = unbounded. */
++	uint32_t		max_concurrent_rebuilds;
++	bool			maintenance_regime;
++};
++
++/* All app-thread only (RPC handlers + process allocation). */
++void raid_envelopes_get(struct raid_envelopes *out);
++void raid_envelopes_set(const struct raid_envelopes *envelopes);
++
++/* Active cap for a class under the current regime; 0 = unlimited. */
++uint32_t raid_envelope_active_mb_sec(enum raid_envelope_class klass);
++
++/* Concurrency bound (counts raids with a live background process). */
++bool raid_envelopes_admit_rebuild(void);
++
++#endif /* SPDK_BDEV_RAID_ENVELOPES_H */
+diff --git a/module/bdev/raid/bdev_raid_rpc.c b/module/bdev/raid/bdev_raid_rpc.c
+index f65ea35..92e33e5 100644
+--- a/module/bdev/raid/bdev_raid_rpc.c
++++ b/module/bdev/raid/bdev_raid_rpc.c
+@@ -7,6 +7,7 @@
+ #include "spdk/bdev.h"
+ #include "bdev_raid.h"
+ #include "bdev_raid_outcomes.h"	/* Evariops 0014.5 */
++#include "bdev_raid_envelopes.h"	/* Evariops 0014.9 */
+ #include "spdk/util.h"
+ #include "spdk/string.h"
+ #include "spdk/log.h"
+@@ -909,6 +910,129 @@ err:
+ }
+ SPDK_RPC_REGISTER("bdev_raid_remove_base_bdev", rpc_bdev_raid_remove_base_bdev, SPDK_RPC_RUNTIME)
+ 
++/* ---- Evariops 0014.9 (RPC-CONTRACT §6): bdev_raid_set_envelopes /
++ * bdev_raid_get_envelopes — process-wide caps (never shares), each class in
++ * two values (nominal, maintenance) + the per-node rebuild concurrency bound
++ * + the current regime. Data-plane default is 0 = UNLIMITED: the control
++ * plane sets these at handshake and treats a failed set as an INCIDENT. ---- */
++
++struct rpc_bdev_raid_set_envelopes {
++	uint32_t rebuild_nominal_mb_sec;
++	uint32_t rebuild_maintenance_mb_sec;
++	uint32_t verify_nominal_mb_sec;
++	uint32_t verify_maintenance_mb_sec;
++	uint32_t relocate_nominal_mb_sec;
++	uint32_t relocate_maintenance_mb_sec;
++	uint32_t max_concurrent_rebuilds;
++	char *regime;
++};
++
++static const struct spdk_json_object_decoder rpc_bdev_raid_set_envelopes_decoders[] = {
++	{"rebuild_nominal_mb_sec", offsetof(struct rpc_bdev_raid_set_envelopes, rebuild_nominal_mb_sec), spdk_json_decode_uint32, true},
++	{"rebuild_maintenance_mb_sec", offsetof(struct rpc_bdev_raid_set_envelopes, rebuild_maintenance_mb_sec), spdk_json_decode_uint32, true},
++	{"verify_nominal_mb_sec", offsetof(struct rpc_bdev_raid_set_envelopes, verify_nominal_mb_sec), spdk_json_decode_uint32, true},
++	{"verify_maintenance_mb_sec", offsetof(struct rpc_bdev_raid_set_envelopes, verify_maintenance_mb_sec), spdk_json_decode_uint32, true},
++	{"relocate_nominal_mb_sec", offsetof(struct rpc_bdev_raid_set_envelopes, relocate_nominal_mb_sec), spdk_json_decode_uint32, true},
++	{"relocate_maintenance_mb_sec", offsetof(struct rpc_bdev_raid_set_envelopes, relocate_maintenance_mb_sec), spdk_json_decode_uint32, true},
++	{"max_concurrent_rebuilds", offsetof(struct rpc_bdev_raid_set_envelopes, max_concurrent_rebuilds), spdk_json_decode_uint32, true},
++	{"regime", offsetof(struct rpc_bdev_raid_set_envelopes, regime), spdk_json_decode_string, true},
++};
++
++static void
++rpc_bdev_raid_envelopes_write(struct spdk_json_write_ctx *w, const struct raid_envelopes *env)
++{
++	spdk_json_write_object_begin(w);
++	spdk_json_write_named_string(w, "regime", env->maintenance_regime ? "maintenance" : "nominal");
++	spdk_json_write_named_uint32(w, "rebuild_nominal_mb_sec", env->classes[RAID_ENVELOPE_REBUILD].nominal_mb_sec);
++	spdk_json_write_named_uint32(w, "rebuild_maintenance_mb_sec", env->classes[RAID_ENVELOPE_REBUILD].maintenance_mb_sec);
++	spdk_json_write_named_uint32(w, "verify_nominal_mb_sec", env->classes[RAID_ENVELOPE_VERIFY].nominal_mb_sec);
++	spdk_json_write_named_uint32(w, "verify_maintenance_mb_sec", env->classes[RAID_ENVELOPE_VERIFY].maintenance_mb_sec);
++	spdk_json_write_named_uint32(w, "relocate_nominal_mb_sec", env->classes[RAID_ENVELOPE_RELOCATE].nominal_mb_sec);
++	spdk_json_write_named_uint32(w, "relocate_maintenance_mb_sec", env->classes[RAID_ENVELOPE_RELOCATE].maintenance_mb_sec);
++	spdk_json_write_named_uint32(w, "max_concurrent_rebuilds", env->max_concurrent_rebuilds);
++	spdk_json_write_object_end(w);
++}
++
++static void
++rpc_bdev_raid_set_envelopes(struct spdk_jsonrpc_request *request,
++			    const struct spdk_json_val *params)
++{
++	struct rpc_bdev_raid_set_envelopes req = {};
++	struct raid_envelopes env;
++	struct spdk_json_write_ctx *w;
++
++	/* Start from the current state so a partial set is an update, and the
++	 * regime can flip alone at a maintenance-intent change. */
++	raid_envelopes_get(&env);
++	req.rebuild_nominal_mb_sec = env.classes[RAID_ENVELOPE_REBUILD].nominal_mb_sec;
++	req.rebuild_maintenance_mb_sec = env.classes[RAID_ENVELOPE_REBUILD].maintenance_mb_sec;
++	req.verify_nominal_mb_sec = env.classes[RAID_ENVELOPE_VERIFY].nominal_mb_sec;
++	req.verify_maintenance_mb_sec = env.classes[RAID_ENVELOPE_VERIFY].maintenance_mb_sec;
++	req.relocate_nominal_mb_sec = env.classes[RAID_ENVELOPE_RELOCATE].nominal_mb_sec;
++	req.relocate_maintenance_mb_sec = env.classes[RAID_ENVELOPE_RELOCATE].maintenance_mb_sec;
++	req.max_concurrent_rebuilds = env.max_concurrent_rebuilds;
++
++	if (params != NULL &&
++	    spdk_json_decode_object(params, rpc_bdev_raid_set_envelopes_decoders,
++				    SPDK_COUNTOF(rpc_bdev_raid_set_envelopes_decoders), &req)) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_PARSE_ERROR,
++						 "spdk_json_decode_object failed");
++		free(req.regime);
++		return;
++	}
++
++	if (req.regime != NULL) {
++		if (strcmp(req.regime, "nominal") == 0) {
++			env.maintenance_regime = false;
++		} else if (strcmp(req.regime, "maintenance") == 0) {
++			env.maintenance_regime = true;
++		} else {
++			/* Unknown regime is -EINVAL, never a silent fallback. */
++			spdk_jsonrpc_send_error_response_fmt(request, -EINVAL,
++							     "unknown regime '%s'", req.regime);
++			free(req.regime);
++			return;
++		}
++	}
++
++	env.classes[RAID_ENVELOPE_REBUILD].nominal_mb_sec = req.rebuild_nominal_mb_sec;
++	env.classes[RAID_ENVELOPE_REBUILD].maintenance_mb_sec = req.rebuild_maintenance_mb_sec;
++	env.classes[RAID_ENVELOPE_VERIFY].nominal_mb_sec = req.verify_nominal_mb_sec;
++	env.classes[RAID_ENVELOPE_VERIFY].maintenance_mb_sec = req.verify_maintenance_mb_sec;
++	env.classes[RAID_ENVELOPE_RELOCATE].nominal_mb_sec = req.relocate_nominal_mb_sec;
++	env.classes[RAID_ENVELOPE_RELOCATE].maintenance_mb_sec = req.relocate_maintenance_mb_sec;
++	env.max_concurrent_rebuilds = req.max_concurrent_rebuilds;
++
++	raid_envelopes_set(&env);
++	free(req.regime);
++
++	w = spdk_jsonrpc_begin_result(request);
++	rpc_bdev_raid_envelopes_write(w, &env);
++	spdk_jsonrpc_end_result(request, w);
++}
++SPDK_RPC_REGISTER("bdev_raid_set_envelopes", rpc_bdev_raid_set_envelopes,
++		  SPDK_RPC_STARTUP | SPDK_RPC_RUNTIME)
++
++static void
++rpc_bdev_raid_get_envelopes(struct spdk_jsonrpc_request *request,
++			    const struct spdk_json_val *params)
++{
++	struct raid_envelopes env;
++	struct spdk_json_write_ctx *w;
++
++	if (params != NULL) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
++						 "bdev_raid_get_envelopes takes no parameters");
++		return;
++	}
++
++	raid_envelopes_get(&env);
++	w = spdk_jsonrpc_begin_result(request);
++	rpc_bdev_raid_envelopes_write(w, &env);
++	spdk_jsonrpc_end_result(request, w);
++}
++SPDK_RPC_REGISTER("bdev_raid_get_envelopes", rpc_bdev_raid_get_envelopes, SPDK_RPC_RUNTIME)
++
+ /* ---- Evariops 0014.5 (RPC-CONTRACT §2): bdev_raid_get_rebuild_outcomes
+  * {token?} — read the process-wide rebuild outcome registry. Entries survive
+  * the raid bdev (15 min TTL after finishing); the control plane matches by

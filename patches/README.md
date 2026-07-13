@@ -32,6 +32,10 @@ IS the contract; do not rely on any other ordering. Order matters:
 | 0016 | raid extended superblock — per-member `content_generation`/`view_epoch`, same-transaction (GCCP 0014.7, V-2) | bdev_raid (SB minor 0→1, carved from reserved bytes) | 0013 |
 | 0017 | raid per-member observation — `state`/`since`/generations + cbt live-epoch facts in get_bdevs (GCCP 0014.6) | bdev_raid; `#include`s `../cbt/vbdev_cbt_query.h` (requires the cbt module, like 0005 requires tier) | 0013, 0016, cbt module |
 | 0018 | raid integrated verify — K=64 sampled windows post-copy under quiesce_range, re-copy before DIVERGENT, `verified` registry seal gating `epoch_close(consumed)` (GCCP 0014.8) | bdev_raid | 0013, 0015, 0016 |
+| 0019 | raid auto epoch at member ejection — survivors' cbt bounds the delta, nonce reported via get_bdevs (GCCP 0014.10) | bdev_raid; calls `vbdev_cbt_auto_epoch_open` (cbt module) | 0013, cbt module |
+| 0020 | nvmf explicit audited force-resume — fence path breaks a standing barrier by design, DÉC-11 (GCCP 0014.11) | lib/nvmf (nvmf_pause_rpc.c) | 0003, 0011 |
+| 0021 | raid envelopes — per-class caps ×(nominal, maintenance) + rebuild concurrency bound, `bdev_raid_set/get_envelopes` (GCCP 0014.9) | bdev_raid (adds `bdev_raid_envelopes.{c,h}`) | 0013 |
+| 0022 | raid verify_ranges — exhaustive divergence detector, LBA-locked chunks, verify-envelope paced, reports & never repairs (GCCP 0014.12) | bdev_raid (adds `bdev_raid_verify_ranges.c`) | 0008, 0014, 0015, 0021 |
 
 0005 `#include`s `vbdev_tier.h` and adds `-I module/bdev/tier` to the lvol module
 CFLAGS via its own Makefile hunk; the Dockerfile injects the module dirs before
