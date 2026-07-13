@@ -1,0 +1,514 @@
+diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
+index de4ec92..a523787 100644
+--- a/module/bdev/raid/bdev_raid.c
++++ b/module/bdev/raid/bdev_raid.c
+@@ -102,6 +102,14 @@ struct raid_bdev_process {
+ 	 * NULL when the registry could not allocate — the rebuild still runs,
+ 	 * it is just unobservable there. Sealed exactly once at finish. */
+ 	struct raid_rebuild_outcome	*outcome;
++	/* Evariops 0014.8 (RPC-CONTRACT §10a): integrated verify phase state.
++	 * verify_done guards re-entry; verified feeds the registry seal (and
++	 * thereby gates bdev_cbt_epoch_close(consumed)); outcome_divergent
++	 * routes the seal to DIVERGENT instead of FAILED. */
++	struct raid_process_verify	*verify;
++	bool				verify_done;
++	bool				verified;
++	bool				outcome_divergent;
+ };
+ 
+ struct raid_process_finish_action {
+@@ -2843,18 +2851,21 @@ raid_bdev_process_finish_done(void *ctx)
+ 	 * broke, its subject went away. All process writes have ceased at this
+ 	 * point, so a bdev_raid_delete reply (which is gated behind this
+ 	 * process stopping) honors "no writes after the RPC returns" (T-D5).
+-	 * verified stays false until 0014.8 delivers the integrated verify. */
++	 * Evariops 0014.8: verified comes from the integrated verify phase;
++	 * a verify double-mismatch seals DIVERGENT, not FAILED. */
+ 	if (process->outcome != NULL) {
+ 		enum raid_rebuild_outcome_state terminal;
+ 
+ 		if (process->status == 0) {
+ 			terminal = RAID_REBUILD_OUTCOME_SUCCEEDED;
++		} else if (process->outcome_divergent) {
++			terminal = RAID_REBUILD_OUTCOME_DIVERGENT;
+ 		} else if (process->status == -ECANCELED || process->status == -ENODEV) {
+ 			terminal = RAID_REBUILD_OUTCOME_CANCELED;
+ 		} else {
+ 			terminal = RAID_REBUILD_OUTCOME_FAILED;
+ 		}
+-		raid_rebuild_outcome_finish(process->outcome, terminal, false);
++		raid_rebuild_outcome_finish(process->outcome, terminal, process->verified);
+ 		process->outcome = NULL;
+ 	}
+ 
+@@ -3248,6 +3259,442 @@ raid_bdev_process_lock_window_range(struct raid_bdev_process *process)
+ 	return true;
+ }
+ 
++/* ── Evariops 0014.8 (RPC-CONTRACT §10a): integrated verify phase ──────────
++ *
++ * After the copy completes (window_offset == blockcnt) and before the process
++ * concludes, sample RAID_PROCESS_VERIFY_WINDOWS windows across the copied
++ * extent (the seed ranges for a seeded rebuild, the whole raid otherwise) and
++ * compare the two legs under quiesce_range. A mismatch is re-copied from the
++ * arbiter (the source leg) and re-verified once; a second mismatch under the
++ * same lock proves the copy process itself is broken → DIVERGENT. Honest
++ * scope (T-C12): ~64 MiB of a multi-TiB extent — a PROBABILISTIC process-bug
++ * detector, not an exhaustive one (that is bdev_raid_verify_ranges, §10b).
++ * Success seals the registry entry verified=true, which is exactly what
++ * bdev_cbt_epoch_close(mode=consumed) demands before discarding a delta.
++ * The CONFIGURED flip happens at finish — promotion is gated on this phase. */
++
++#define RAID_PROCESS_VERIFY_WINDOWS	64
++
++enum raid_process_verify_phase {
++	RAID_PROCESS_VERIFY_READS,
++	RAID_PROCESS_VERIFY_RECOPY_WRITE,
++	RAID_PROCESS_VERIFY_REREAD,
++};
++
++struct raid_process_verify {
++	struct raid_base_bdev_info	*source;
++	void				*buf_src;
++	void				*buf_tgt;
++	struct iovec			iov_src;
++	struct iovec			iov_tgt;
++	/* Nominal verify window (blocks) — process->max_window_size shrinks on
++	 * the last copy window, so it cannot be reused here. */
++	uint64_t			window_size;
++	uint64_t			offsets[RAID_PROCESS_VERIFY_WINDOWS];
++	uint32_t			num_windows;
++	uint32_t			window_idx;
++	uint64_t			window_offset;
++	uint64_t			window_blocks;
++	bool				range_locked;
++	bool				recopied;
++	enum raid_process_verify_phase	phase;
++	int				ios_remaining;
++	int				status;
++};
++
++static void raid_bdev_process_verify_next_window(struct raid_bdev_process *process);
++
++static void
++raid_bdev_process_verify_free(struct raid_process_verify *verify)
++{
++	spdk_dma_free(verify->buf_src);
++	spdk_dma_free(verify->buf_tgt);
++	free(verify);
++}
++
++/* Terminal for the whole phase — the window range is already unlocked. */
++static void
++raid_bdev_process_verify_conclude(struct raid_bdev_process *process)
++{
++	struct raid_process_verify *verify = process->verify;
++	int status = verify->status;
++	bool complete = verify->window_idx >= verify->num_windows;
++	uint32_t num_windows = verify->num_windows;
++
++	assert(verify->range_locked == false);
++
++	process->verify = NULL;
++	process->verify_done = true;
++	raid_bdev_process_verify_free(verify);
++
++	if (process->state >= RAID_PROCESS_STATE_STOPPING) {
++		/* Cancelled mid-verify (status/-ECANCELED already recorded) —
++		 * unwind exactly like the copy loop does. */
++		raid_bdev_process_do_finish(process);
++		return;
++	}
++
++	if (status == 0 && complete) {
++		process->verified = true;
++		SPDK_NOTICELOG("raid bdev '%s': verify passed (%u windows) on '%s'\n",
++			       process->raid_bdev->bdev.name, num_windows,
++			       process->target->name);
++	}
++
++	raid_bdev_process_finish(process, status);
++}
++
++static void
++raid_bdev_process_verify_range_unlocked(void *ctx, int status)
++{
++	struct raid_bdev_process *process = ctx;
++	struct raid_process_verify *verify = process->verify;
++
++	verify->range_locked = false;
++	if (status != 0 && verify->status == 0) {
++		verify->status = status;
++	}
++
++	if (verify->status != 0 || process->state >= RAID_PROCESS_STATE_STOPPING) {
++		raid_bdev_process_verify_conclude(process);
++		return;
++	}
++
++	verify->window_idx++;
++	raid_bdev_process_verify_next_window(process);
++}
++
++static void
++raid_bdev_process_verify_unlock(struct raid_bdev_process *process)
++{
++	struct raid_process_verify *verify = process->verify;
++	int rc;
++
++	assert(verify->range_locked == true);
++
++	rc = spdk_bdev_unquiesce_range(&process->raid_bdev->bdev, &g_raid_if,
++				       verify->window_offset, verify->window_blocks,
++				       raid_bdev_process_verify_range_unlocked, process);
++	if (rc != 0) {
++		raid_bdev_process_verify_range_unlocked(process, rc);
++	}
++}
++
++static void raid_bdev_process_verify_window_io_done(struct raid_bdev_process *process);
++
++static void
++raid_bdev_process_verify_io_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
++{
++	struct raid_bdev_process *process = cb_arg;
++	struct raid_process_verify *verify = process->verify;
++
++	spdk_bdev_free_io(bdev_io);
++
++	if (!success && verify->status == 0) {
++		verify->status = -EIO;
++	}
++
++	assert(verify->ios_remaining > 0);
++	if (--verify->ios_remaining > 0) {
++		return;
++	}
++
++	raid_bdev_process_verify_window_io_done(process);
++}
++
++static void
++raid_bdev_process_verify_window_io_done(struct raid_bdev_process *process)
++{
++	struct raid_process_verify *verify = process->verify;
++	struct raid_bdev *raid_bdev = process->raid_bdev;
++	uint64_t len = verify->window_blocks * raid_bdev->bdev.blocklen;
++	int rc;
++
++	assert(spdk_get_thread() == process->thread);
++
++	if (verify->status != 0 || process->state >= RAID_PROCESS_STATE_STOPPING) {
++		raid_bdev_process_verify_unlock(process);
++		return;
++	}
++
++	switch (verify->phase) {
++	case RAID_PROCESS_VERIFY_READS:
++	case RAID_PROCESS_VERIFY_REREAD:
++		if (memcmp(verify->buf_src, verify->buf_tgt, len) == 0) {
++			if (verify->phase == RAID_PROCESS_VERIFY_REREAD) {
++				SPDK_NOTICELOG("raid bdev '%s': verify window [%" PRIu64
++					       ", +%" PRIu64 ") healed by re-copy on '%s'\n",
++					       raid_bdev->bdev.name, verify->window_offset,
++					       verify->window_blocks, process->target->name);
++			}
++			raid_bdev_process_verify_unlock(process);
++			return;
++		}
++		if (verify->recopied) {
++			/* Second mismatch under the SAME lock: no host write can
++			 * explain it — the copy process is broken. Arbiter (the
++			 * source leg) stays authoritative; the target is divergent. */
++			SPDK_ERRLOG("raid bdev '%s': verify window [%" PRIu64 ", +%" PRIu64
++				    ") DIVERGENT on '%s' after re-copy\n",
++				    raid_bdev->bdev.name, verify->window_offset,
++				    verify->window_blocks, process->target->name);
++			process->outcome_divergent = true;
++			verify->status = -EILSEQ;
++			raid_bdev_process_verify_unlock(process);
++			return;
++		}
++		/* First mismatch: re-copy the window from the arbiter, then
++		 * re-verify. buf_src already holds the source content and the
++		 * range is still quiesced. */
++		verify->recopied = true;
++		verify->phase = RAID_PROCESS_VERIFY_RECOPY_WRITE;
++		verify->ios_remaining = 1;
++		rc = raid_bdev_writev_blocks_ext(process->target,
++						 process->raid_ch->process.target_ch,
++						 &verify->iov_src, 1, verify->window_offset,
++						 verify->window_blocks,
++						 raid_bdev_process_verify_io_cb, process, NULL);
++		if (rc != 0) {
++			verify->status = rc;
++			raid_bdev_process_verify_unlock(process);
++		}
++		return;
++	case RAID_PROCESS_VERIFY_RECOPY_WRITE:
++		/* The re-copy is a real copy — it counts (registry bytes). */
++		raid_rebuild_outcome_add_bytes(process->outcome, len);
++		verify->phase = RAID_PROCESS_VERIFY_REREAD;
++		verify->ios_remaining = 1;
++		rc = raid_bdev_readv_blocks_ext(process->target,
++						process->raid_ch->process.target_ch,
++						&verify->iov_tgt, 1, verify->window_offset,
++						verify->window_blocks,
++						raid_bdev_process_verify_io_cb, process, NULL);
++		if (rc != 0) {
++			verify->status = rc;
++			raid_bdev_process_verify_unlock(process);
++		}
++		return;
++	default:
++		assert(false);
++	}
++}
++
++static void
++raid_bdev_process_verify_range_locked(void *ctx, int status)
++{
++	struct raid_bdev_process *process = ctx;
++	struct raid_process_verify *verify = process->verify;
++	struct spdk_io_channel *src_ch;
++	int rc;
++
++	if (status != 0) {
++		verify->status = status;
++		raid_bdev_process_verify_conclude(process);
++		return;
++	}
++	verify->range_locked = true;
++
++	if (process->state >= RAID_PROCESS_STATE_STOPPING) {
++		raid_bdev_process_verify_unlock(process);
++		return;
++	}
++
++	verify->iov_src.iov_len = verify->window_blocks * process->raid_bdev->bdev.blocklen;
++	verify->iov_tgt.iov_len = verify->iov_src.iov_len;
++	verify->phase = RAID_PROCESS_VERIFY_READS;
++	verify->ios_remaining = 2;
++
++	src_ch = raid_bdev_channel_get_base_channel(process->raid_ch,
++			raid_bdev_base_bdev_slot(verify->source));
++	rc = raid_bdev_readv_blocks_ext(verify->source, src_ch, &verify->iov_src, 1,
++					verify->window_offset, verify->window_blocks,
++					raid_bdev_process_verify_io_cb, process, NULL);
++	if (rc != 0) {
++		verify->status = rc;
++		verify->ios_remaining = 0;
++		raid_bdev_process_verify_unlock(process);
++		return;
++	}
++
++	rc = raid_bdev_readv_blocks_ext(process->target, process->raid_ch->process.target_ch,
++					&verify->iov_tgt, 1, verify->window_offset,
++					verify->window_blocks,
++					raid_bdev_process_verify_io_cb, process, NULL);
++	if (rc != 0) {
++		if (verify->status == 0) {
++			verify->status = rc;
++		}
++		/* The source read is in flight — its completion routes through
++		 * io_done, which sees status != 0 and unlocks. */
++		verify->ios_remaining = 1;
++	}
++}
++
++static void
++raid_bdev_process_verify_next_window(struct raid_bdev_process *process)
++{
++	struct raid_process_verify *verify = process->verify;
++	struct raid_bdev *raid_bdev = process->raid_bdev;
++	int rc;
++
++	if (process->state >= RAID_PROCESS_STATE_STOPPING ||
++	    verify->window_idx >= verify->num_windows) {
++		raid_bdev_process_verify_conclude(process);
++		return;
++	}
++
++	verify->window_offset = verify->offsets[verify->window_idx];
++	verify->window_blocks = spdk_min(verify->window_size,
++					 raid_bdev->bdev.blockcnt - verify->window_offset);
++	verify->recopied = false;
++
++	rc = spdk_bdev_quiesce_range(&raid_bdev->bdev, &g_raid_if,
++				     verify->window_offset, verify->window_blocks,
++				     raid_bdev_process_verify_range_locked, process);
++	if (rc != 0) {
++		verify->status = rc;
++		raid_bdev_process_verify_conclude(process);
++	}
++}
++
++/* Map the k-th sampled logical offset to a physical block offset. For a
++ * seeded rebuild the copied extent is the seed ranges (logical = cumulative
++ * position inside them); otherwise it is the whole raid. A window may spill
++ * past a seed range's end — those blocks were write-replicated live, so
++ * comparing them is valid (and strictly stronger). */
++static uint64_t
++raid_bdev_process_verify_translate(struct raid_bdev_process *process, uint64_t logical)
++{
++	uint32_t i;
++
++	if (!process->seeded || process->num_seed_ranges == 0) {
++		return logical;
++	}
++
++	for (i = 0; i < process->num_seed_ranges; i++) {
++		const struct raid_bdev_seed_range *range = &process->seed_ranges[i];
++
++		if (logical < range->num_blocks) {
++			return range->offset_blocks + logical;
++		}
++		logical -= range->num_blocks;
++	}
++
++	/* Off the end (rounding) — verify the tail of the last range. */
++	return process->seed_ranges[process->num_seed_ranges - 1].offset_blocks;
++}
++
++static void
++raid_bdev_process_verify_start(struct raid_bdev_process *process)
++{
++	struct raid_bdev *raid_bdev = process->raid_bdev;
++	struct raid_process_verify *verify;
++	struct raid_base_bdev_info *base_info, *source = NULL;
++	uint64_t total_blocks, step, buf_len, prev_end = 0;
++	uint32_t i, k;
++
++	assert(spdk_get_thread() == process->thread);
++	assert(process->state == RAID_PROCESS_STATE_RUNNING);
++
++	process->verify_done = true;	/* re-entry guard, whatever path exits */
++
++	/* Scope: raid1 nexus with plain data. Anything else completes
++	 * UNVERIFIED — the registry entry stays verified=false, and
++	 * bdev_cbt_epoch_close(consumed) stays locked for its token. */
++	if (raid_bdev->level != RAID1 ||
++	    spdk_bdev_get_dif_type(&raid_bdev->bdev) != SPDK_DIF_DISABLE) {
++		raid_bdev_process_finish(process, 0);
++		return;
++	}
++
++	RAID_FOR_EACH_BASE_BDEV(raid_bdev, base_info) {
++		if (base_info != process->target && base_info->desc != NULL &&
++		    base_info->is_configured && !base_info->read_excluded) {
++			source = base_info;
++			break;
++		}
++	}
++	if (source == NULL) {
++		SPDK_WARNLOG("raid bdev '%s': no arbiter leg for verify — completing "
++			     "unverified\n", raid_bdev->bdev.name);
++		raid_bdev_process_finish(process, 0);
++		return;
++	}
++
++	verify = calloc(1, sizeof(*verify));
++	if (verify == NULL) {
++		SPDK_ERRLOG("raid bdev '%s': verify allocation failed — completing "
++			    "unverified\n", raid_bdev->bdev.name);
++		raid_bdev_process_finish(process, 0);
++		return;
++	}
++
++	/* Nominal copy window (process->max_window_size shrank on the last
++	 * window) — same formula as raid_bdev_process_alloc. */
++	verify->window_size = spdk_max(spdk_divide_round_up(g_opts.process_window_size_kb * 1024UL,
++					spdk_bdev_get_data_block_size(&raid_bdev->bdev)),
++				       raid_bdev->bdev.write_unit_size);
++	verify->window_size = spdk_min(verify->window_size, raid_bdev->bdev.blockcnt);
++
++	buf_len = verify->window_size * raid_bdev->bdev.blocklen;
++	verify->buf_src = spdk_dma_malloc(buf_len, 4096, NULL);
++	verify->buf_tgt = spdk_dma_malloc(buf_len, 4096, NULL);
++	if (verify->buf_src == NULL || verify->buf_tgt == NULL) {
++		SPDK_ERRLOG("raid bdev '%s': verify buffers allocation failed — "
++			    "completing unverified\n", raid_bdev->bdev.name);
++		raid_bdev_process_verify_free(verify);
++		raid_bdev_process_finish(process, 0);
++		return;
++	}
++	verify->iov_src.iov_base = verify->buf_src;
++	verify->iov_tgt.iov_base = verify->buf_tgt;
++	verify->source = source;
++
++	if (process->seeded && process->num_seed_ranges > 0) {
++		total_blocks = 0;
++		for (i = 0; i < process->num_seed_ranges; i++) {
++			total_blocks += process->seed_ranges[i].num_blocks;
++		}
++	} else {
++		total_blocks = raid_bdev->bdev.blockcnt;
++	}
++
++	/* Uniform-stride sampling: honest, reproducible, no RNG needed. Windows
++	 * never overlap (monotonic physical offsets enforced below). */
++	step = spdk_max(total_blocks / RAID_PROCESS_VERIFY_WINDOWS, verify->window_size);
++	for (k = 0; k < RAID_PROCESS_VERIFY_WINDOWS; k++) {
++		uint64_t logical = (uint64_t)k * step;
++		uint64_t offset;
++
++		if (logical >= total_blocks) {
++			break;
++		}
++		offset = raid_bdev_process_verify_translate(process, logical);
++		if (offset >= raid_bdev->bdev.blockcnt) {
++			break;
++		}
++		if (verify->num_windows > 0 && offset < prev_end) {
++			continue;
++		}
++		verify->offsets[verify->num_windows++] = offset;
++		prev_end = offset + verify->window_size;
++	}
++	if (verify->num_windows == 0) {
++		verify->offsets[verify->num_windows++] =
++			raid_bdev_process_verify_translate(process, 0);
++	}
++
++	SPDK_NOTICELOG("raid bdev '%s': verifying '%s' against arbiter '%s' "
++		       "(%u sampled windows of %" PRIu64 " blocks)\n",
++		       raid_bdev->bdev.name, process->target->name, source->name,
++		       verify->num_windows, verify->window_size);
++
++	raid_rebuild_outcome_set_verifying(process->outcome);
++	process->verify = verify;
++	process->verify_done = false;	/* armed: conclude() is the only exit */
++	raid_bdev_process_verify_next_window(process);
++}
++
+ static int
+ raid_bdev_process_continue_poll(void *arg)
+ {
+@@ -3275,6 +3722,14 @@ raid_bdev_process_thread_run(struct raid_bdev_process *process)
+ 
+ 	if (process->window_offset == raid_bdev->bdev.blockcnt) {
+ 		SPDK_DEBUGLOG(bdev_raid, "process completed on %s\n", raid_bdev->bdev.name);
++		/* Evariops 0014.8: the copy is complete — run the integrated verify
++		 * phase before concluding. Both the registry seal and the SB
++		 * CONFIGURED flip happen at finish, so promotion is gated on it. */
++		if (process->type == RAID_PROCESS_REBUILD && !process->verify_done &&
++		    process->status == 0 && process->window_status == 0) {
++			raid_bdev_process_verify_start(process);
++			return;
++		}
+ 		raid_bdev_process_finish(process, 0);
+ 		return;
+ 	}
+@@ -3460,6 +3915,12 @@ raid_bdev_process_free(struct raid_bdev_process *process)
+ 		raid_rebuild_outcome_finish(process->outcome, RAID_REBUILD_OUTCOME_FAILED, false);
+ 		process->outcome = NULL;
+ 	}
++	/* Evariops 0014.8: same defensive discipline for the verify state —
++	 * conclude() frees it on every live path. */
++	if (process->verify != NULL) {
++		raid_bdev_process_verify_free(process->verify);
++		process->verify = NULL;
++	}
+ 	free(process);
+ }
+ 
