@@ -543,6 +543,48 @@ cbt_epoch_state_name(enum cbt_epoch_state state)
 	}
 }
 
+/* 0014.10 (RPC-CONTRACT §12): epoch-at-ejection — see vbdev_cbt_query.h.
+ * Refuses (-EEXIST) when an OPEN epoch already bounds the round: the CP's own
+ * round (or a previous auto-open) suffices, and an implicit takeover would
+ * steal the nonce from under the controller. FROZEN/REBUILDING epochs do not
+ * block: those are prior rounds being digested, while the live bitmap keeps
+ * tracking — the new epoch bounds the NEW ejection. */
+int
+vbdev_cbt_auto_epoch_open(const char *bdev_name, const char *stale_backend_id)
+{
+	struct vbdev_cbt *cbt;
+	struct cbt_epoch *ep;
+	char epoch_id[CBT_EPOCH_ID_MAX];
+	char nonce[CBT_NONCE_MAX];
+	uint64_t max_gen = 0;
+	uint64_t ticks = spdk_get_ticks();
+
+	assert(spdk_get_thread() == spdk_thread_get_app_thread());
+
+	cbt = cbt_find_by_name(bdev_name);
+	if (cbt == NULL) {
+		return -ENODEV;
+	}
+
+	TAILQ_FOREACH(ep, &cbt->epochs, link) {
+		if (ep->state == CBT_EPOCH_OPEN) {
+			return -EEXIST;
+		}
+		if (ep->generation > max_gen) {
+			max_gen = ep->generation;
+		}
+	}
+
+	snprintf(epoch_id, sizeof(epoch_id), "auto-%016" PRIx64, ticks);
+	snprintf(nonce, sizeof(nonce), "auto%08x", (uint32_t)ticks);
+
+	SPDK_NOTICELOG("CBT: auto epoch '%s' (nonce %s) on '%s' — member '%s' ejected\n",
+		       epoch_id, nonce, bdev_name, stale_backend_id);
+
+	return bdev_cbt_epoch_open(bdev_name, epoch_id, stale_backend_id,
+				   max_gen + 1, nonce);
+}
+
 /* 0014.6 (RPC-CONTRACT §3): cross-module query — the raid module publishes
  * these facts per member in ITS get_bdevs output (see vbdev_cbt_query.h).
  * Epochs are appended at open, so the last list entry is the most recently
