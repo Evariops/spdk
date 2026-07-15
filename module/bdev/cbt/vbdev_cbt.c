@@ -1139,10 +1139,23 @@ bdev_cbt_epoch_open(const char *cbt_name, const char *epoch_id,
 		if (!oldest || oldest->state == CBT_EPOCH_FROZEN ||
 		    oldest->state == CBT_EPOCH_REBUILDING ||
 		    oldest->state == CBT_EPOCH_OPEN) {
-			SPDK_ERRLOG("CBT: max epochs reached, cannot evict "
-				    "active epoch '%s' (state=%d)\n",
-				    oldest ? oldest->epoch_id : "?",
-				    oldest ? (int)oldest->state : -1);
+			/* Diagnostic (§4.5): a FROZEN/REBUILDING oldest is legitimately in flight.
+			 * But the OLDEST epoch being stuck OPEN means it was opened and then NEVER
+			 * frozen/consumed — the tell-tale of an orchestrator that opened it under a
+			 * stale_backend_id the observer never matches (CP node-id vs observer lvol-id),
+			 * so D7/D8/D9 never engage and the epoch leaks until it wedges opens here. */
+			if (oldest && oldest->state == CBT_EPOCH_OPEN) {
+				SPDK_ERRLOG("CBT: max epochs reached, OLDEST epoch '%s' stuck OPEN "
+					    "(stale_backend='%s', never frozen/consumed) — likely an "
+					    "unmatched maintenance epoch (§4.5 key mismatch); new epochs "
+					    "now WEDGED. Verify stale_backend_id keying vs observer join.\n",
+					    oldest->epoch_id, oldest->stale_backend_id);
+			} else {
+				SPDK_ERRLOG("CBT: max epochs reached, cannot evict "
+					    "active epoch '%s' (state=%d)\n",
+					    oldest ? oldest->epoch_id : "?",
+					    oldest ? (int)oldest->state : -1);
+			}
 			return -ENOSPC;
 		}
 		/* C3 (defense-in-depth): with the epoch_invalidate rebuild guard an
