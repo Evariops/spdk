@@ -84,8 +84,10 @@ RUN dnf install -y --setopt=install_weak_deps=False --nodocs liburing-devel liba
 #
 # Modules KEPT (required by project features):
 #   bdev_lvol   — thin provisioning, snapshots, clones
-#   bdev_raid   — RAID-1 (Nexus), RAID-0 (striping), RAID-10
-#   raid5f      — Erasure Coding (RAID-5f / RAID-6)
+#   bdev_raid   — raid0, raid1 (Nexus), concat (real levels; no raid6/raid10
+#                 exists anywhere in SPDK — SPEC-75G)
+#   raid5f      — XOR single-parity full-stripe-write raid (m=1) — the
+#                 EcImage capacity strate (SPEC-75G; NOT Reed-Solomon)
 #   bdev_nvme   — NVMe-oF initiator for remote replicas
 #   bdev_malloc — RAM disks for testing / fast scratch
 #   bdev_uring  — io_uring bdev for modern kernels (>= 5.1), SATA SSDs
@@ -239,7 +241,7 @@ CMD ["-r", "/var/tmp/spdk.sock", "-m", "0x1", "--wait-for-rpc"]
 FROM scratch
 
 LABEL org.opencontainers.image.title="SPDK Data Engine" \
-      org.opencontainers.image.description="Ultra-minimal hardened SPDK for NVMe-oF TCP/RDMA" \
+      org.opencontainers.image.description="Ultra-minimal hardened SPDK for NVMe-oF TCP (built without RDMA — SPEC-75G SF-11)" \
       org.opencontainers.image.vendor="Evariops" \
       org.opencontainers.image.source="https://github.com/Evariops/containers" \
       org.opencontainers.image.licenses="Apache-2.0" \

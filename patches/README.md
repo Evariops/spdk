@@ -35,7 +35,9 @@ IS the contract; do not rely on any other ordering. Order matters:
 | 0019 | raid auto epoch at member ejection — survivors' cbt bounds the delta, nonce reported via get_bdevs (GCCP 0014.10) | bdev_raid; calls `vbdev_cbt_auto_epoch_open` (cbt module) | 0013, cbt module |
 | 0020 | nvmf explicit audited force-resume — fence path breaks a standing barrier by design, DÉC-11 (GCCP 0014.11) | lib/nvmf (nvmf_pause_rpc.c) | 0003, 0011 |
 | 0021 | raid envelopes — per-class caps ×(nominal, maintenance) + rebuild concurrency bound, `bdev_raid_set/get_envelopes` (GCCP 0014.9) | bdev_raid (adds `bdev_raid_envelopes.{c,h}`) | 0013 |
-| 0022 | raid verify_ranges — exhaustive divergence detector, LBA-locked chunks, verify-envelope paced, reports & never repairs (GCCP 0014.12) | bdev_raid (adds `bdev_raid_verify_ranges.c`) | 0008, 0014, 0015, 0021 |
+| 0022 | raid verify_ranges — exhaustive divergence detector, LBA-locked chunks, verify-envelope paced, reports & never repairs (GCCP 0014.12). **Bi-mode** (SPEC-75G F-b): raid1 = copy-compare; raid5f = XOR-syndrome per stripe (all members required, -EAGAIN when degraded; ranges full-stripe-aligned) | bdev_raid (adds `bdev_raid_verify_ranges.c`) | 0008, 0014, 0015, 0021 |
+| 0023 | raid5f degraded-service observability (SPEC-75G F-d) — `reconstruct_reads_absent`/`reconstruct_reads_error`/`degraded_write_stripes`/`last_degraded_ts` in get_bdevs, relaxed-atomic counters on the I/O paths | bdev_raid (raid5f.c increments, bdev_raid.c emission) | 0006, 0008 |
+| 0024 | spdk_dd propagates bdev I/O errors — upstream ignores `success` in all three bdev completion callbacks, so dd exited 0 while every write was rejected (found by vec-smoke); a silently failed READ is worse (stale buffer written as data) | app/spdk_dd | — |
 
 0005 `#include`s `vbdev_tier.h` and adds `-I module/bdev/tier` to the lvol module
 CFLAGS via its own Makefile hunk; the Dockerfile injects the module dirs before
@@ -90,15 +92,22 @@ scripts/patches.sh regen   /path/to/spdk-worktree
 
 ### To change a patch
 
-1. Apply the series into a clean SPDK checkout at the pinned commit, committing
-   one patch per commit (in order).
-2. Edit the source, `git commit --amend` (or a fixup) into the owning commit.
+1. Build a worktree: clean SPDK checkout at the pinned commit (`vendor/spdk`
+   clones offline), apply the series **one commit per patch, in order**, with
+   `git apply` + `git commit -m "<patch filename stem>"` — the commit SUBJECT
+   must be the `NNNN-name` stem, it becomes the regenerated filename.
+2. Edit the source, `git commit --amend` (or a fixup) into the owning commit;
+   a NEW patch = a new commit with the next `NNNN-name` subject.
 3. `scripts/patches.sh regen <worktree>` to rewrite `patches/*.patch`.
-4. `scripts/patches.sh verify` to confirm the whole series still applies.
+4. `scripts/patches.sh verify` (or `check` against a pinned clone) to confirm
+   the whole series still applies.
 
-`git format-patch --zero-commit` is used so the `From <sha>` line is a constant
-(all-zero) instead of a per-regeneration hash — this keeps the patch files stable
-under review. The `From: 000…` header line is therefore expected, not a bug.
+**Series format (homogenized 2026-07-16): RAW `git diff` output, no mail
+header.** `git apply` (Dockerfile + `check`/`apply`) is the only consumer;
+**`git am` is NOT part of the contract** (it chokes on raw diffs — the series
+was format-mixed mbox/raw until 2026-07-16, which is how that was learned).
+`regen` emits raw per-commit diffs with the commit subject as filename, so a
+regen of an untouched series is byte-stable. Never hand-edit hunks.
 
 ## Upstreaming (UP4)
 
