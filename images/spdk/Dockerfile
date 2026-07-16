@@ -212,6 +212,11 @@ RUN dnf install -y --setopt=install_weak_deps=False --nodocs \
 # Binary only (runtime .so provided by Fedora packages above)
 COPY --from=builder /build/spdk/build/bin/spdk_tgt /usr/local/bin/spdk_tgt
 
+# SPEC-75G G1: spdk_dd is the V-EC bench's full-stripe writer (raid5f only accepts
+# full-stripe writes — EC-3 — and remote initiators are MDTS-bounded, so the writer
+# must run INSIDE the target pod). Patch 0024 makes its exit code honest.
+COPY --from=builder /build/spdk/build/bin/spdk_dd /usr/local/bin/spdk_dd
+
 # SPDK RPC scripts (useful for live debugging: rpc.py, spdkcli, etc.)
 COPY --from=builder /build/spdk/scripts/ /usr/local/share/spdk/scripts/
 
