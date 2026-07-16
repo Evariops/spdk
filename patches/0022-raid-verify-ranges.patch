@@ -13,23 +13,33 @@ index c90b4a2..d381b3b 100644
  C_SRCS += raid5f.c
 diff --git a/module/bdev/raid/bdev_raid_verify_ranges.c b/module/bdev/raid/bdev_raid_verify_ranges.c
 new file mode 100644
-index 0000000..6ae24bf
+index 0000000..cca7fc4
 --- /dev/null
 +++ b/module/bdev/raid/bdev_raid_verify_ranges.c
-@@ -0,0 +1,632 @@
+@@ -0,0 +1,857 @@
 +/*   SPDX-License-Identifier: BSD-3-Clause
 + *   Copyright (C) 2026 Evariops.
 + *   All rights reserved.
 + */
 +
-+/* Evariops 0014.12 (spdk-csi RPC-CONTRACT §10b): bdev_raid_verify_ranges —
-+ * the EXHAUSTIVE divergence detector (the integrated verify phase, §10a, is
-+ * the probabilistic one). Compares the first configured leg (implicit
-+ * arbiter) against every other configured leg of a raid1, chunk by chunk,
-+ * each chunk under a channel-owned LBA lock (host writes overlapping the
-+ * chunk are held and replayed — patch 0008 discipline). It REPORTS divergent
-+ * ranges and never repairs: arbitration is the control plane's (R >= 3 vote,
-+ * or DivergenceUnarbitrated at R == 2 — T-D2).
++/* Evariops 0014.12 + SPEC-75G F-b (spdk-csi RPC-CONTRACT §10b):
++ * bdev_raid_verify_ranges — the EXHAUSTIVE divergence detector (the
++ * integrated verify phase, §10a, is the probabilistic one). Two modes,
++ * selected by the raid level:
++ *
++ *  - raid1 (copy-compare): compares the first configured leg (implicit
++ *    arbiter) against every other configured leg, chunk by chunk.
++ *  - raid5f (syndrome, SPEC-75G F-b): recomputes the RAID-5 consistency
++ *    relation per stripe — the XOR of all k+1 members' strips must be
++ *    zero (see the syndrome section below). Requires EVERY member
++ *    readable (-EAGAIN otherwise: with m = 1 there is no redundancy left
++ *    to check against — repair first, verify after).
++ *
++ * Each chunk runs under a channel-owned LBA lock (host writes overlapping
++ * the chunk are held and replayed — patch 0008 discipline). It REPORTS
++ * divergent ranges and never repairs: arbitration is the control plane's
++ * (mirror: R >= 3 vote, or DivergenceUnarbitrated at R == 2 — T-D2;
++ * raid5f: re-fold the stripe from its source, or EcContentDivergence).
 + *
 + * Pacing: the `verify` envelope class (0014.9), frozen at dispatch. The
 + * caller drives bounded batches and re-drives the tail, exactly like
@@ -79,10 +89,19 @@ index 0000000..6ae24bf
 +	void				*buf_leg;
 +	struct iovec			iov_arb;
 +	struct iovec			iov_leg;
-+	/* Leg currently being compared for the in-flight chunk (slot walk). */
++	/* Leg currently being compared for the in-flight chunk (slot walk).
++	 * The syndrome mode reuses it as the member being accumulated. */
 +	uint8_t				leg_slot;
 +	int				ios_remaining;
 +	int				io_status;
++	/* raid5f syndrome mode (level == RAID5F): geometry + strip walk.
++	 * io_lba/io_blocks stay in RAID LBA space (the locked stripe);
++	 * member reads use member LBA = stripe_index × strip_blocks. */
++	bool				syndrome;
++	uint64_t			strip_blocks;	/* per-member strip (blocks) */
++	uint64_t			stripe_blocks;	/* full stripe, raid LBA (blocks) */
++	uint64_t			member_off;	/* progress within the strip (blocks) */
++	uint64_t			member_len;	/* in-flight sub-read (blocks) */
 +	/* Pacing (verify envelope, frozen at dispatch; 0 = unlimited). */
 +	double				bytes_per_tsc;
 +	double				bytes_available;
@@ -148,6 +167,8 @@ index 0000000..6ae24bf
 +		spdk_json_write_named_bool(w, "divergent_ranges_truncated",
 +					   c->divergent_blocks > 0 &&
 +					   c->num_divergent == RAID_VERIFY_MAX_REPORTED);
++		spdk_json_write_named_string(w, "mode",
++					     c->syndrome ? "syndrome" : "copy-compare");
 +		spdk_json_write_object_end(w);
 +		spdk_jsonrpc_end_result(c->request, w);
 +	} else {
@@ -325,6 +346,150 @@ index 0000000..6ae24bf
 +	}
 +}
 +
++/* ── raid5f syndrome mode (SPEC-75G F-b) ─────────────────────────────────
++ * Mirror legs are copies; raid5f members hold DISTINCT strips, so equality
++ * is meaningless there. The checkable invariant is the RAID-5 consistency
++ * relation itself: parity == XOR of the k data strips, i.e. the XOR of ALL
++ * k+1 members' strips is zero for every stripe — whichever member holds
++ * the rotating parity (the rotation is irrelevant to the check). Every
++ * member stores stripe S's strip at member LBA S × strip_size
++ * (raid5f_chunk_submit), so the walk needs only generic raid_bdev geometry
++ * — no raid5f internals, no parity-position math.
++ *
++ * The strip is accumulated in bounded sub-reads (≤ RAID_VERIFY_CHUNK_BLOCKS)
++ * so memory stays two buffers whatever the strip size: buf_arb is the XOR
++ * accumulator, buf_leg the per-member read scratch. Strictly QD=1.
++ *
++ * All members must stay readable: a member read error or a membership
++ * change mid-walk aborts with -EAGAIN — with m = 1 a stripe missing one
++ * strip has nothing left to check against; the contract is repair first
++ * (rebuild_ranges 0008 / process), verify after. Divergence is reported
++ * per STRIPE in raid LBA space; like the mirror mode this REPORTS and
++ * never repairs. */
++
++static void raid_verify_syndrome_next_member(struct raid_verify_ctx *c);
++
++static void
++raid_verify_syndrome_subchunk(struct raid_verify_ctx *c)
++{
++	c->member_len = spdk_min(c->strip_blocks - c->member_off,
++				 (uint64_t)RAID_VERIFY_CHUNK_BLOCKS);
++	memset(c->buf_arb, 0, c->member_len * c->raid_bdev->bdev.blocklen);
++	c->leg_slot = 0;
++	raid_verify_syndrome_next_member(c);
++}
++
++static void
++raid_verify_record_divergent_stripe(struct raid_verify_ctx *c)
++{
++	SPDK_ERRLOG("raid verify: '%s' stripe %" PRIu64 " [%" PRIu64 ", +%" PRIu64
++		    ") syndrome DIVERGES (xor of %u strips != 0)\n",
++		    c->raid_bdev->bdev.name, c->io_lba / c->stripe_blocks,
++		    c->io_lba, c->io_blocks, c->raid_bdev->num_base_bdevs);
++	c->divergent_blocks += c->io_blocks;
++	if (c->num_divergent < RAID_VERIFY_MAX_REPORTED) {
++		c->divergent[c->num_divergent].start_lba = c->io_lba;
++		c->divergent[c->num_divergent].num_blocks = c->io_blocks;
++		c->num_divergent++;
++	}
++}
++
++static void
++raid_verify_syndrome_read_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
++{
++	struct raid_verify_ctx *c = cb_arg;
++	uint64_t *acc = c->buf_arb;
++	const uint64_t *src = c->buf_leg;
++	uint64_t i, n = c->member_len * c->raid_bdev->bdev.blocklen / sizeof(uint64_t);
++
++	spdk_bdev_free_io(bdev_io);
++	if (!success) {
++		/* A present member failed to read: the stripe cannot be
++		 * syndrome-checked and the raid needs REPAIR, not a retry
++		 * here — same contract as degraded-at-entry. */
++		SPDK_ERRLOG("raid verify: '%s' member '%s' read failed in stripe %" PRIu64
++			    " — repair first\n", c->raid_bdev->bdev.name,
++			    c->raid_bdev->base_bdev_info[c->leg_slot].name,
++			    c->io_lba / c->stripe_blocks);
++		raid_verify_finish(c, -EAGAIN);
++		return;
++	}
++
++	for (i = 0; i < n; i++) {
++		acc[i] ^= src[i];
++	}
++	c->leg_slot++;
++	raid_verify_syndrome_next_member(c);
++}
++
++static void
++raid_verify_syndrome_next_member(struct raid_verify_ctx *c)
++{
++	struct raid_bdev *raid_bdev = c->raid_bdev;
++	struct raid_base_bdev_info *base_info;
++	uint64_t member_lba;
++	int rc;
++
++	if (c->removed) {
++		raid_verify_finish(c, -ENODEV);
++		return;
++	}
++	/* Same guard as the mirror walk: a background process (rebuild)
++	 * rewrites strips under us — phantom divergences. Abort cleanly;
++	 * the caller re-drives. */
++	if (raid_bdev->process != NULL) {
++		raid_verify_finish(c, -EBUSY);
++		return;
++	}
++
++	if (c->leg_slot == raid_bdev->num_base_bdevs) {
++		/* Sub-chunk accumulated across all members — a consistent
++		 * stripe XORs to exactly zero. */
++		const uint64_t *acc = c->buf_arb;
++		uint64_t i, n = c->member_len * raid_bdev->bdev.blocklen / sizeof(uint64_t);
++
++		for (i = 0; i < n; i++) {
++			if (acc[i] != 0) {
++				raid_verify_record_divergent_stripe(c);
++				/* The control plane re-folds whole stripes:
++				 * skip the rest of this one. */
++				c->member_off = c->strip_blocks;
++				break;
++			}
++		}
++		if (i == n) {
++			c->member_off += c->member_len;
++		}
++		if (c->member_off >= c->strip_blocks) {
++			/* Stripe covered — unlock and advance one stripe
++			 * (io_blocks == stripe_blocks). */
++			raid_verify_chunk_done(c);
++		} else {
++			raid_verify_syndrome_subchunk(c);
++		}
++		return;
++	}
++
++	base_info = &raid_bdev->base_bdev_info[c->leg_slot];
++	if (!base_info->is_configured || base_info->read_excluded ||
++	    base_info->desc == NULL || base_info->app_thread_ch == NULL) {
++		/* Membership changed since admission — degraded now. */
++		SPDK_ERRLOG("raid verify: '%s' member slot %u became unreadable — repair first\n",
++			    raid_bdev->bdev.name, c->leg_slot);
++		raid_verify_finish(c, -EAGAIN);
++		return;
++	}
++
++	c->iov_leg.iov_len = c->member_len * raid_bdev->bdev.blocklen;
++	member_lba = (c->io_lba / c->stripe_blocks) * c->strip_blocks + c->member_off;
++	rc = raid_bdev_readv_blocks_ext(base_info, base_info->app_thread_ch,
++					&c->iov_leg, 1, member_lba, c->member_len,
++					raid_verify_syndrome_read_cb, c, NULL);
++	if (rc != 0) {
++		raid_verify_finish(c, rc);
++	}
++}
++
 +static void
 +raid_verify_chunk_locked(struct lba_range *range, void *cb_arg, int status)
 +{
@@ -336,8 +501,13 @@ index 0000000..6ae24bf
 +		return;
 +	}
 +	c->locked = true;
-+	c->leg_slot = 0;
-+	raid_verify_compare_leg(c);
++	if (c->syndrome) {
++		c->member_off = 0;
++		raid_verify_syndrome_subchunk(c);
++	} else {
++		c->leg_slot = 0;
++		raid_verify_compare_leg(c);
++	}
 +}
 +
 +static int
@@ -379,7 +549,7 @@ index 0000000..6ae24bf
 +raid_verify_next(struct raid_verify_ctx *c)
 +{
 +	struct raid_verify_range *range;
-+	uint64_t remaining;
++	uint64_t remaining, pace_bytes;
 +	int rc;
 +
 +	if (c->removed) {
@@ -397,9 +567,20 @@ index 0000000..6ae24bf
 +		}
 +
 +		c->io_lba = range->start_lba + c->cur_off;
-+		c->io_blocks = spdk_min(remaining, (uint64_t)RAID_VERIFY_CHUNK_BLOCKS);
++		if (c->syndrome) {
++			/* One full stripe per lock — ranges are validated
++			 * stripe-aligned, so remaining is a stripe multiple.
++			 * Pace on the bytes actually READ (all k+1 strips,
++			 * not the k-data raid LBA span). */
++			c->io_blocks = c->stripe_blocks;
++			pace_bytes = (uint64_t)c->raid_bdev->num_base_bdevs *
++				     c->strip_blocks * c->raid_bdev->bdev.blocklen;
++		} else {
++			c->io_blocks = spdk_min(remaining, (uint64_t)RAID_VERIFY_CHUNK_BLOCKS);
++			pace_bytes = c->io_blocks * c->raid_bdev->bdev.blocklen;
++		}
 +
-+		if (!raid_verify_pace_admit(c, c->io_blocks * c->raid_bdev->bdev.blocklen)) {
++		if (!raid_verify_pace_admit(c, pace_bytes)) {
 +			return;	/* poller re-enters raid_verify_next */
 +		}
 +
@@ -489,7 +670,8 @@ index 0000000..6ae24bf
 +	struct raid_bdev *raid_bdev;
 +	struct raid_base_bdev_info *base_info, *arbiter = NULL;
 +	uint32_t configured = 0, verify_mb_sec, i;
-+	uint64_t buf_len;
++	uint64_t buf_len, strip_blocks = 0, stripe_blocks = 0;
++	bool syndrome;
 +	char detail[192];
 +	char auto_token[RAID_REBUILD_TOKEN_MAX];
 +	const char *token;
@@ -516,9 +698,19 @@ index 0000000..6ae24bf
 +		goto cleanup;
 +	}
 +
-+	if (raid_bdev->level != RAID1 || raid_bdev->state != RAID_BDEV_STATE_ONLINE) {
++	if ((raid_bdev->level != RAID1 && raid_bdev->level != RAID5F) ||
++	    raid_bdev->state != RAID_BDEV_STATE_ONLINE) {
 +		spdk_jsonrpc_send_error_response(request, -EINVAL,
-+						 "verify_ranges requires an ONLINE raid1 bdev");
++						 "verify_ranges requires an ONLINE raid1 or raid5f bdev");
++		goto cleanup;
++	}
++	syndrome = raid_bdev->level == RAID5F;
++	if (syndrome &&
++	    (raid_bdev->bdev.md_len != 0 || raid_bdev->bdev.blocklen % sizeof(uint64_t) != 0)) {
++		/* EcImage chunks are plain lvols; interleaved metadata would
++		 * need md-aware parity accounting — honest bound, not a TODO. */
++		spdk_jsonrpc_send_error_response(request, -ENOTSUP,
++						 "raid5f syndrome verify supports plain data bdevs only");
 +		goto cleanup;
 +	}
 +	if (raid_bdev->process != NULL) {
@@ -536,7 +728,24 @@ index 0000000..6ae24bf
 +			configured++;
 +		}
 +	}
-+	if (configured < 2) {
++	if (syndrome) {
++		/* m = 1: with any member unreadable there is no redundancy
++		 * left to check against — repair first (0008), verify after. */
++		if (configured != raid_bdev->num_base_bdevs) {
++			spdk_jsonrpc_send_error_response_fmt(request, -EAGAIN,
++							     "syndrome verify requires all %u members readable "
++							     "(%u are) — repair first",
++							     raid_bdev->num_base_bdevs, configured);
++			goto cleanup;
++		}
++		strip_blocks = raid_bdev->strip_size;
++		stripe_blocks = strip_blocks * raid_bdev->min_base_bdevs_operational;
++		if (strip_blocks == 0 || stripe_blocks == 0) {
++			spdk_jsonrpc_send_error_response(request, -EINVAL,
++							 "raid bdev has no stripe geometry");
++			goto cleanup;
++		}
++	} else if (configured < 2) {
 +		spdk_jsonrpc_send_error_response(request, -EINVAL,
 +						 "verify_ranges needs at least 2 readable legs");
 +		goto cleanup;
@@ -572,6 +781,18 @@ index 0000000..6ae24bf
 +			spdk_jsonrpc_send_error_response_fmt(request,
 +							     SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 +							     "range %u is empty or exceeds the raid size", i);
++			goto cleanup;
++		}
++		/* Syndrome walks whole stripes — 0008's alignment discipline,
++		 * validated up front. (The whole-device default is aligned by
++		 * construction: blockcnt = total_stripes × stripe_blocks.) */
++		if (syndrome && (range->start_lba % stripe_blocks != 0 ||
++				 range->num_blocks % stripe_blocks != 0)) {
++			spdk_jsonrpc_send_error_response_fmt(request,
++							     SPDK_JSONRPC_ERROR_INVALID_PARAMS,
++							     "range %u [%" PRIu64 ", +%" PRIu64 ") not aligned to the "
++							     "full stripe (%" PRIu64 " blocks)", i,
++							     range->start_lba, range->num_blocks, stripe_blocks);
 +			goto cleanup;
 +		}
 +	}
@@ -633,12 +854,16 @@ index 0000000..6ae24bf
 +	raid_rebuild_outcome_set_verifying(c->outcome);
 +
 +	/* SEC1 audit (0011 discipline): long-lived reader holding LBA locks. */
-+	snprintf(detail, sizeof(detail), "raid=%s ranges=%zu", req.name, req.num_ranges);
++	snprintf(detail, sizeof(detail), "raid=%s ranges=%zu mode=%s", req.name,
++		 req.num_ranges, syndrome ? "syndrome" : "copy-compare");
 +	spdk_jsonrpc_request_audit(request, "bdev_raid_verify_ranges", detail);
 +
 +	c->request = request;
 +	c->raid_bdev = raid_bdev;
 +	c->arbiter = arbiter;
++	c->syndrome = syndrome;
++	c->strip_blocks = strip_blocks;
++	c->stripe_blocks = stripe_blocks;
 +	c->ranges = (struct raid_verify_range *)req.ranges;
 +	c->num_ranges = (uint32_t)req.num_ranges;
 +	req.ranges = NULL;	/* ownership moved */

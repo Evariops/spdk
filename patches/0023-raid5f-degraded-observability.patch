@@ -1,0 +1,102 @@
+diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
+index 762e892..c9ee0e4 100644
+--- a/module/bdev/raid/bdev_raid.c
++++ b/module/bdev/raid/bdev_raid.c
+@@ -1240,6 +1240,21 @@ raid_bdev_write_info_json(struct raid_bdev *raid_bdev, struct spdk_json_write_ct
+ 					     (uint64_t)raid_bdev->strip_size *
+ 					     raid_bdev->min_base_bdevs_operational);
+ 	}
++	/* Evariops 0023 (SPEC-75G F-d): degraded-service counters — the control
++	 * plane's "serving degraded since T" gauge (EcRebuildDebt.since). 0 =
++	 * never. Loads mirror the relaxed-atomic writers on the I/O paths. */
++	spdk_json_write_named_uint64(w, "reconstruct_reads_absent",
++				     __atomic_load_n(&raid_bdev->reconstruct_reads_absent,
++						     __ATOMIC_RELAXED));
++	spdk_json_write_named_uint64(w, "reconstruct_reads_error",
++				     __atomic_load_n(&raid_bdev->reconstruct_reads_error,
++						     __ATOMIC_RELAXED));
++	spdk_json_write_named_uint64(w, "degraded_write_stripes",
++				     __atomic_load_n(&raid_bdev->degraded_write_stripes,
++						     __ATOMIC_RELAXED));
++	spdk_json_write_named_int64(w, "last_degraded_ts",
++				    __atomic_load_n(&raid_bdev->last_degraded_ts,
++						    __ATOMIC_RELAXED));
+ 	if (raid_bdev->process) {
+ 		struct raid_bdev_process *process = raid_bdev->process;
+ 		uint64_t offset = process->window_offset;
+diff --git a/module/bdev/raid/bdev_raid.h b/module/bdev/raid/bdev_raid.h
+index 2c36491..343615e 100644
+--- a/module/bdev/raid/bdev_raid.h
++++ b/module/bdev/raid/bdev_raid.h
+@@ -296,6 +296,17 @@ struct raid_bdev {
+ 	/* Raid bdev background process, e.g. rebuild */
+ 	struct raid_bdev_process	*process;
+ 
++	/* Evariops 0023 (SPEC-75G F-d): degraded-service observability — how
++	 * long/how much this raid has been SERVING in degraded mode, the
++	 * control plane's "EcRebuildDebt.since" gauge. Written on raid5f I/O
++	 * paths with relaxed atomics (single reactor today — D5 —, still safe
++	 * if the core mask ever widens); read by get_bdevs. Generic slots:
++	 * other levels may feed them later. 0 = never. */
++	uint64_t			reconstruct_reads_absent;	/* member missing (vanilla path) */
++	uint64_t			reconstruct_reads_error;	/* member present-but-erroring (0006) */
++	uint64_t			degraded_write_stripes;		/* stripes written at zero margin */
++	int64_t				last_degraded_ts;		/* unix seconds of the last event */
++
+ 	/* Callback and context for raid_bdev configuration */
+ 	raid_bdev_configure_cb		configure_cb;
+ 	void				*configure_cb_ctx;
+diff --git a/module/bdev/raid/raid5f.c b/module/bdev/raid/raid5f.c
+index 1d02ec8..e7122c9 100644
+--- a/module/bdev/raid/raid5f.c
++++ b/module/bdev/raid/raid5f.c
+@@ -16,6 +16,17 @@
+ /* Maximum concurrent full stripe writes per io channel */
+ #define RAID5F_MAX_STRIPES 32
+ 
++/* Evariops 0023 (SPEC-75G F-d): stamp a degraded-service event — counter +
++ * last_degraded_ts. Relaxed atomics: single reactor today (D5), safe if the
++ * core mask ever widens; never ordered against data I/O. */
++static inline void
++raid5f_note_degraded(struct raid_bdev *raid_bdev, uint64_t *counter)
++{
++	__atomic_fetch_add(counter, 1, __ATOMIC_RELAXED);
++	__atomic_store_n(&raid_bdev->last_degraded_ts, (int64_t)time(NULL),
++			 __ATOMIC_RELAXED);
++}
++
+ struct chunk {
+ 	/* Corresponds to base_bdev index */
+ 	uint8_t index;
+@@ -436,6 +447,11 @@ raid5f_chunk_submit(struct chunk *chunk)
+ 	switch (stripe_req->type) {
+ 	case STRIPE_REQ_WRITE:
+ 		if (base_ch == NULL) {
++			/* Evariops 0023: the stripe is being written with this
++			 * member missing — reconstructible, but at zero margin
++			 * (F-e: the CP freezes folds on a degraded EcImage; a
++			 * nonzero counter here is the violation gauge). */
++			raid5f_note_degraded(raid_bdev, &raid_bdev->degraded_write_stripes);
+ 			raid_bdev_io_complete_part(raid_io, 1, SPDK_BDEV_IO_STATUS_SUCCESS);
+ 			return 0;
+ 		}
+@@ -685,6 +701,9 @@ raid5f_chunk_read_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_
+ 	chunk_idx = chunk_data_idx < p_idx ? chunk_data_idx : chunk_data_idx + 1;
+ 	chunk_offset = stripe_offset - ((uint64_t)chunk_data_idx << raid_bdev->strip_size_shift);
+ 
++	/* Evariops 0023: degraded service on a PRESENT member (error path). */
++	raid5f_note_degraded(raid_bdev, &raid_bdev->reconstruct_reads_error);
++
+ 	ret = raid5f_submit_reconstruct_read(raid_io, stripe_index, chunk_idx, chunk_offset,
+ 					     raid5f_stripe_request_reconstruct_xor_done);
+ 	if (ret != 0) {
+@@ -830,6 +849,9 @@ raid5f_submit_read_request(struct raid_bdev_io *raid_io, uint64_t stripe_index,
+ 
+ 	raid5f_init_ext_io_opts(&io_opts, raid_io);
+ 	if (base_ch == NULL) {
++		/* Evariops 0023: degraded service, member ABSENT (vanilla
++		 * reconstruct-read path). */
++		raid5f_note_degraded(raid_bdev, &raid_bdev->reconstruct_reads_absent);
+ 		return raid5f_submit_reconstruct_read(raid_io, stripe_index, chunk_idx, chunk_offset,
+ 						      raid5f_stripe_request_reconstruct_xor_done);
+ 	}
