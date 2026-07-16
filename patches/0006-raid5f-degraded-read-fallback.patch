@@ -1,13 +1,3 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Evariops <dev@evariops.com>
-Date: Sat, 4 Jul 2026 10:32:48 +0200
-Subject: [PATCH 06/12] raid5f: degraded-read fallback + double-fault guard
- (Evariops 0006)
-
----
- module/bdev/raid/raid5f.c | 55 +++++++++++++++++++++++++++++++++++++--
- 1 file changed, 53 insertions(+), 2 deletions(-)
-
 diff --git a/module/bdev/raid/raid5f.c b/module/bdev/raid/raid5f.c
 index 0a2274f..1d02ec8 100644
 --- a/module/bdev/raid/raid5f.c
@@ -88,6 +78,3 @@ index 0a2274f..1d02ec8 100644
  	stripe_req = TAILQ_FIRST(&r5ch->free_stripe_requests.reconstruct);
  	if (!stripe_req) {
  		return -ENOMEM;
--- 
-2.50.1 (Apple Git-155)
-

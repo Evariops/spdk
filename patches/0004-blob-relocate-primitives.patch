@@ -1,21 +1,3 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Evariops <dev@evariops.com>
-Date: Sat, 4 Jul 2026 10:58:26 +0200
-Subject: [PATCH 04/12] blob: relocate primitives + public blob I/O freeze
-
-Evariops 0004. claim/commit/release relocate primitives (invariants A/B) and
-spdk_blob_freeze_io/spdk_blob_unfreeze_io - the blob-level barrier that
-closes the C1 lost-write (held I/O re-translates through the updated L2P on
-release). m8: assert the bit-pool claim invariant.
----
- include/spdk/bit_pool.h |  16 ++
- include/spdk/blob.h     |  69 +++++++++
- lib/blob/blobstore.c    | 330 ++++++++++++++++++++++++++++++++++++++++
- lib/blob/spdk_blob.map  |   7 +
- lib/util/bit_array.c    |   6 +
- lib/util/spdk_util.map  |   1 +
- 6 files changed, 429 insertions(+)
-
 diff --git a/include/spdk/bit_pool.h b/include/spdk/bit_pool.h
 index 316c66a..81297f1 100644
 --- a/include/spdk/bit_pool.h
@@ -518,6 +500,3 @@ index bf2df25..40ee55b 100644
  	spdk_bit_pool_allocate_bit;
  	spdk_bit_pool_set_bit_allocated;
  	spdk_bit_pool_free_bit;
--- 
-2.50.1 (Apple Git-155)
-
