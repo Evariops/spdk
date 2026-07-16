@@ -1,19 +1,3 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Evariops <dev@evariops.com>
-Date: Sat, 4 Jul 2026 10:58:25 +0200
-Subject: [PATCH 01/12] raid: add skip_rebuild parameter to
- bdev_raid_add_base_bdev
-
-Evariops 0001. Promotes a CBT-resynced member without a full rebuild.
-Includes: CBT-6 channel-promotion error propagation + unwind (never ONLINE
-with a NULL channel on a reactor), P-5 runtime slot check (was an
-NDEBUG-erased assert), membership rollback on quiesce failure.
----
- module/bdev/raid/bdev_raid.c     | 217 ++++++++++++++++++++++++++++++-
- module/bdev/raid/bdev_raid.h     |   4 +
- module/bdev/raid/bdev_raid_rpc.c |   9 +-
- 3 files changed, 227 insertions(+), 3 deletions(-)
-
 diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
 index 7ab1607..cc515bc 100644
 --- a/module/bdev/raid/bdev_raid.c
@@ -330,6 +314,3 @@ index b1913c7..b1f3d92 100644
  	if (rc != 0) {
  		spdk_jsonrpc_send_error_response_fmt(request, rc,
  						     "Failed to add base bdev %s to RAID bdev %s: %s",
--- 
-2.50.1 (Apple Git-155)
-

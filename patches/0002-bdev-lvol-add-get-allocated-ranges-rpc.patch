@@ -1,15 +1,3 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Evariops <dev@evariops.com>
-Date: Sat, 4 Jul 2026 10:32:48 +0200
-Subject: [PATCH 02/12] lvol: add bdev_lvol_get_allocated_ranges RPC (Evariops
- 0002)
-
----
- module/bdev/lvol/Makefile                |   2 +-
- module/bdev/lvol/vbdev_lvol_ranges_rpc.c | 102 +++++++++++++++++++++++
- 2 files changed, 103 insertions(+), 1 deletion(-)
- create mode 100644 module/bdev/lvol/vbdev_lvol_ranges_rpc.c
-
 diff --git a/module/bdev/lvol/Makefile b/module/bdev/lvol/Makefile
 index dc0c559..aba6620 100644
 --- a/module/bdev/lvol/Makefile
@@ -131,6 +119,3 @@ index 0000000..fde05cb
 +}
 +SPDK_RPC_REGISTER("bdev_lvol_get_allocated_ranges", rpc_bdev_lvol_get_allocated_ranges,
 +		  SPDK_RPC_RUNTIME)
--- 
-2.50.1 (Apple Git-155)
-
