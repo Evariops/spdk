@@ -1,14 +1,3 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Evariops <dev@evariops.com>
-Date: Sat, 4 Jul 2026 15:26:58 +0200
-Subject: [PATCH 05/12] 0005-lvol-get-cluster-placement-rpc.patch
-
----
- module/bdev/lvol/Makefile              |    3 +-
- module/bdev/lvol/vbdev_lvol_tier_rpc.c | 1441 ++++++++++++++++++++++++
- 2 files changed, 1443 insertions(+), 1 deletion(-)
- create mode 100644 module/bdev/lvol/vbdev_lvol_tier_rpc.c
-
 diff --git a/module/bdev/lvol/Makefile b/module/bdev/lvol/Makefile
 index aba6620..a8ed387 100644
 --- a/module/bdev/lvol/Makefile
@@ -1470,6 +1459,3 @@ index 0000000..6bf3ca1
 +	free(req.items);
 +}
 +SPDK_RPC_REGISTER("bdev_lvol_remap_clusters", rpc_bdev_lvol_remap_clusters, SPDK_RPC_RUNTIME)
--- 
-2.50.1 (Apple Git-155)
-

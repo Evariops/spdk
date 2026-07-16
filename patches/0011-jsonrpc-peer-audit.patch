@@ -1,22 +1,3 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Evariops <dev@evariops.com>
-Date: Sat, 4 Jul 2026 19:16:48 +0200
-Subject: [PATCH 11/12] jsonrpc: SO_PEERCRED peer-credential audit hook
- (Evariops 0011, SEC1)
-
-Capture the RPC client's Unix-socket credentials (SO_PEERCRED) at accept and
-expose spdk_jsonrpc_request_get_peer_ucred() + spdk_jsonrpc_request_audit(), so
-destructive mutation handlers (bdev_tier_delete/retire, relocate/remap, pause,
-rebuild_ranges) log pid/uid/gid + operation. Applied with the series; earlier
-patches (0003/0005/0008) call the helper defined here.
----
- include/spdk/jsonrpc.h           | 27 ++++++++++++++++++++++
- lib/jsonrpc/jsonrpc_internal.h   |  7 ++++++
- lib/jsonrpc/jsonrpc_server.c     | 39 ++++++++++++++++++++++++++++++++
- lib/jsonrpc/jsonrpc_server_tcp.c | 17 ++++++++++++++
- lib/jsonrpc/spdk_jsonrpc.map     |  2 ++
- 5 files changed, 92 insertions(+)
-
 diff --git a/include/spdk/jsonrpc.h b/include/spdk/jsonrpc.h
 index 760039d..7a157ad 100644
 --- a/include/spdk/jsonrpc.h
@@ -164,6 +145,3 @@ index a62f4a4..5555990 100644
  	spdk_jsonrpc_conn_add_close_cb;
  	spdk_jsonrpc_conn_del_close_cb;
  	spdk_jsonrpc_begin_result;
--- 
-2.50.1 (Apple Git-155)
-

@@ -1,20 +1,3 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Evariops <dev@evariops.com>
-Date: Sat, 4 Jul 2026 10:58:26 +0200
-Subject: [PATCH 07/12] raid: nexus logical heat instrumentation
-
-Evariops 0007. M7: release-publish / acquire-load of the heat pointer
-(arm64-safe), per-region TSC recency instead of a shared tick counter.
-N-8/P-4: disable_heat reclaims the sketch after a for_each_channel grace
-period (the old "reclaimed at teardown" claim was false - it leaked).
----
- module/bdev/raid/Makefile         |   2 +-
- module/bdev/raid/bdev_raid.c      |  17 ++
- module/bdev/raid/bdev_raid.h      |   9 +
- module/bdev/raid/bdev_raid_heat.c | 311 ++++++++++++++++++++++++++++++
- 4 files changed, 338 insertions(+), 1 deletion(-)
- create mode 100644 module/bdev/raid/bdev_raid_heat.c
-
 diff --git a/module/bdev/raid/Makefile b/module/bdev/raid/Makefile
 index 3dff369..cb46945 100644
 --- a/module/bdev/raid/Makefile
@@ -405,6 +388,3 @@ index 0000000..027a55d
 +	free(req.name);
 +}
 +SPDK_RPC_REGISTER("vbdev_nexus_get_heat", rpc_vbdev_nexus_get_heat, SPDK_RPC_RUNTIME)
--- 
-2.50.1 (Apple Git-155)
-

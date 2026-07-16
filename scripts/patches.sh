@@ -71,15 +71,28 @@ cmd_apply() {
 	done < <(patches)
 }
 
+# Regenerate patches/*.patch as RAW git diffs, one per commit on top of the
+# pinned base, in order. The commit SUBJECT is the patch filename stem and
+# must match NNNN-name. Raw diffs (no mail header) are the series format:
+# `git apply` consumes them (Dockerfile + check/apply); `git am` is NOT part
+# of the contract (it chokes on raw diffs — build the worktree with
+# `git apply` + one commit per patch, subject = filename stem).
 cmd_regen() {
 	local wt="${1:?usage: patches.sh regen <spdk_worktree>}"
-	local base
+	local base commit subject n=0
 	base="$(pinned_sha)"
-	local n
-	n="$(patches_count)"
 	rm -f "$PATCH_DIR"/[0-9]*.patch
-	git -C "$wt" format-patch --zero-commit "$base..HEAD" -o "$PATCH_DIR" >/dev/null
-	echo "Regenerated $(patches_count) patches from $wt ($base..HEAD); was $n."
+	while IFS= read -r commit; do
+		subject="$(git -C "$wt" log -1 --format=%s "$commit")"
+		case "$subject" in
+			[0-9][0-9][0-9][0-9]-*) ;;
+			*) echo "FATAL: commit $commit subject '$subject' is not NNNN-name (the subject IS the patch filename)" >&2
+			   return 1;;
+		esac
+		git -C "$wt" diff "$commit^..$commit" > "$PATCH_DIR/$subject.patch"
+		n=$((n + 1))
+	done < <(git -C "$wt" rev-list --reverse "$base..HEAD")
+	echo "Regenerated $n raw-diff patches from $wt ($base..HEAD)."
 }
 
 cmd_verify() {
