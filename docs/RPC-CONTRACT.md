@@ -236,15 +236,65 @@ a split-brain across disks.
 - **0014.12 — verify_ranges (patch 0022).** `bdev_raid_verify_ranges {name,
   ranges?:[{start_lba,num_blocks}], token?, expected_incarnation?}` — the
   EXHAUSTIVE detector (§10a's integrated phase is the probabilistic one).
-  First configured leg = implicit arbiter, compared to every other readable
-  leg, 1 MiB chunks each under a channel-owned LBA lock (host writes held +
-  replayed); paced by the verify envelope (frozen at dispatch). REPORTS
-  `{verified_blocks, divergent_blocks, divergent_ranges (≤128, exact count +
-  truncated flag)}` and never repairs — arbitration is the CP's (R ≥ 3, T-D2).
-  No ranges = the whole raid; callers drive bounded batches and re-drive, like
-  rebuild_ranges. -EBUSY with a live background process (and aborts cleanly if
-  one appears mid-run); registry mirrors progress under the token
-  (verifying → succeeded+verified on zero divergence / divergent otherwise).
+  Two modes, selected by the raid LEVEL (reported back as `mode` in the
+  result): **raid1 = copy-compare** (below), **raid5f = syndrome** (see the
+  Erasure-coding section). raid1: first configured leg = implicit arbiter,
+  compared to every other readable leg, 1 MiB chunks each under a
+  channel-owned LBA lock (host writes held + replayed); paced by the verify
+  envelope (frozen at dispatch). REPORTS `{verified_blocks, divergent_blocks,
+  divergent_ranges (≤128, exact count + truncated flag), mode}` and never
+  repairs — arbitration is the CP's (R ≥ 3, T-D2). No ranges = the whole
+  raid; callers drive bounded batches and re-drive, like rebuild_ranges.
+  -EBUSY with a live background process (and aborts cleanly if one appears
+  mid-run); registry mirrors progress under the token (verifying →
+  succeeded+verified on zero divergence / divergent otherwise).
+
+## Erasure coding — raid5f (SPEC-75G F-b/F-d, patches 0022/0023)
+
+The raid5f strate is CP-written only (DÉC-EC-0: no host ever writes a
+raid5f); these contracts serve the `EcImage` lifecycle (seal-verify, periodic
+verify, degraded-service observation).
+
+- **verify_ranges, syndrome mode (patch 0022, F-b).** On a raid5f, the same
+  RPC recomputes the RAID-5 consistency relation per stripe: the XOR of all
+  k+1 members' strips must be zero (the rotating parity position is
+  irrelevant to the check — no raid5f internals involved). Result field
+  `mode: "syndrome"`.
+  - **Preconditions**: ONLINE; no background process (-EBUSY); **every
+    member readable, else -EAGAIN** ("repair first") — with m = 1 a stripe
+    missing one strip has nothing left to check against. A member read
+    error or membership change mid-run also aborts -EAGAIN. Plain-data
+    bdevs only (interleaved md ⇒ -ENOTSUP).
+  - **Ranges** must be full-stripe aligned (`full_stripe_blocks` from
+    get_bdevs, 0008 discipline) — -EINVAL otherwise. No ranges = the whole
+    raid (aligned by construction).
+  - **Reporting** is per STRIPE in raid LBA space; report-only, never
+    repairs. Divergence handling is the CP's: re-fold the stripe from its
+    source, or raise `EcContentDivergence`.
+  - Same LBA-lock, verify-envelope pacing (charged on the k+1 strips
+    actually read), token/outcome-registry and incarnation semantics as the
+    raid1 mode.
+- **Verify-at-seal is EXPLICIT (0018 interplay).** The integrated verify
+  phase (0014.8) is raid1-only and completes a raid5f rebuild process
+  UNVERIFIED (clean no-op, registry `verified=false`). A raid5f is therefore
+  NEVER auto-sealed by a rebuild: the CP must run a syndrome verify_ranges
+  pass to seal (INV-EC-5) — including after `bdev_raid_rebuild_ranges` and
+  after a full rebuild process.
+- **Degraded-service counters (patch 0023, F-d).** get_bdevs
+  `driver_specific.raid` gains `reconstruct_reads_absent` (member missing —
+  vanilla reconstruct-read), `reconstruct_reads_error` (member
+  present-but-erroring — 0006 fallback), `degraded_write_stripes` (stripes
+  written at zero margin; F-e: the CP freezes folds on a degraded EcImage,
+  so nonzero here is a contract-violation gauge), `last_degraded_ts` (unix
+  seconds, 0 = never). Written on the I/O paths with relaxed atomics
+  (single reactor today — D5). These feed `EcRebuildDebt.since` and the
+  "serving degraded since T" incident escalation. The rebuild process's own
+  reconstruct reads are intentionally NOT counted (they are repair work,
+  not degraded host service).
+- **Seeded rebuild / auto-epoch stay raid1-only by design** (0013 refuses
+  -EINVAL; 0019 is gated): EC repair = re-provision the chunk +
+  `bdev_raid_rebuild_ranges` bounded to allocated ranges (thin-preserving,
+  INV-EC-9), or the native full process for a near-full image.
 
 ## Incarnation & rebuild outcomes (GCCP 0014.4/0014.5, patches 0014/0015)
 
