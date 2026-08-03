@@ -1,0 +1,25 @@
+diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
+index c9ee0e4..4c3d481 100644
+--- a/module/bdev/raid/bdev_raid.c
++++ b/module/bdev/raid/bdev_raid.c
+@@ -4976,6 +4976,20 @@ raid_bdev_examine_sb(const struct raid_bdev_superblock *sb, struct spdk_bdev *bd
+ 	}
+ 
+ 	if (raid_bdev->state == RAID_BDEV_STATE_ONLINE) {
++		/* Evariops 0026: NEVER auto re-add a returning member into a CLAIMED raid — the
++		 * control plane owns re-admission (write_only attach + seeded rebuild, its D7
++		 * chain). The examine-driven re-add + auto-rebuild raced the controller's own
++		 * attach ('raid ... is in process') on a live raid whose remote member flapped,
++		 * and the collision corrupted the heap (SIGSEGV, caught live 2026-08-03). An
++		 * UNCLAIMED raid (examine-assembled, no controller yet) keeps the upstream
++		 * behavior — reassembly-at-boot is the superblock's whole purpose. */
++		if (raid_bdev->incarnation != NULL) {
++			SPDK_NOTICELOG("Not re-adding bdev %s to claimed raid bdev %s (incarnation '%s') — "
++				       "member re-admission belongs to the control plane (Evariops 0026)\n",
++				       bdev->name, raid_bdev->bdev.name, raid_bdev->incarnation);
++			rc = -EPERM;
++			goto out;
++		}
+ 		assert(sb_base_bdev->slot < raid_bdev->num_base_bdevs);
+ 		base_info = &raid_bdev->base_bdev_info[sb_base_bdev->slot];
+ 		assert(base_info->is_configured == false);
