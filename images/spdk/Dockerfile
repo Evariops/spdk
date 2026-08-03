@@ -28,7 +28,10 @@
 # ============================================================================
 # Stage 1: Build SPDK from source
 # ============================================================================
-FROM docker.io/library/fedora:43 AS builder
+# Digest-pinned (2026-08-03): the rolling :43 tag shipped a broken python3-pip
+# (pip-internal TypeError in pkgdep.sh) — this is the digest of the last green
+# build (2026-07-16). Bump deliberately, never by drift.
+FROM docker.io/library/fedora:43@sha256:762d73ba1c455232b0272c5d445a34f36c4b9f421cbc05ce8102552325b6a222 AS builder
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -186,7 +189,8 @@ RUN set -euo pipefail && \
 # Built only when explicitly targeted:
 #   docker build --target debug --build-arg BUILD_TYPE=debug .
 # ============================================================================
-FROM docker.io/library/fedora:43 AS debug
+# Same digest pin as the builder stage (see comment there).
+FROM docker.io/library/fedora:43@sha256:762d73ba1c455232b0272c5d445a34f36c4b9f421cbc05ce8102552325b6a222 AS debug
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
