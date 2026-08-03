@@ -74,12 +74,13 @@ RUN sed -i '/^DIRS-y += delay/s/$/ cbt tier/' module/bdev/Makefile && \
 
 # Fedora's CMake rejects cmake_minimum_required(<3.5) in SPDK subprojects (ISA-L, etc.)
 ENV CMAKE_POLICY_VERSION_MINIMUM=3.5
-# PyPI drift-pin (2026-08-03): pip-tools 7.6.0 (released after our last green
-# build) breaks against pip 26.2 inside pkgdep's pip-compile (pip-internal
-# TypeError: make_requirement_preparer missing 'allow_editables'). Constrain to
-# the 2026-07-16 green pair; PIP_CONSTRAINT is honored by every pip invocation
-# in pkgdep.sh (including `python3 -m venv --upgrade-deps`). Bump deliberately.
-RUN printf 'pip-tools==7.5.3\nsetuptools==83.0.0\n' > /tmp/pip-constraints.txt
+# PyPI drift-pin (2026-08-03): pip 26.2 (pulled by `venv --upgrade-deps`) added
+# a required kwarg to make_requirement_preparer that NO pip-tools release passes
+# yet — pkgdep's pip-compile dies on a pip-internal TypeError ('allow_editables').
+# Constrain the whole 2026-07-16 green triple (pip 26.1.2 / pip-tools 7.5.3 /
+# setuptools 83.0.0); PIP_CONSTRAINT is honored by every pip invocation in
+# pkgdep.sh, venv --upgrade-deps included. Bump deliberately.
+RUN printf 'pip==26.1.2\npip-tools==7.5.3\nsetuptools==83.0.0\n' > /tmp/pip-constraints.txt
 ENV PIP_CONSTRAINT=/tmp/pip-constraints.txt
 RUN ./scripts/pkgdep.sh -d
 
