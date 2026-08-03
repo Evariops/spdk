@@ -1,0 +1,184 @@
+diff --git a/module/bdev/raid/bdev_raid_rpc.c b/module/bdev/raid/bdev_raid_rpc.c
+index 92e33e5..7b7c697 100644
+--- a/module/bdev/raid/bdev_raid_rpc.c
++++ b/module/bdev/raid/bdev_raid_rpc.c
+@@ -1104,3 +1104,179 @@ rpc_bdev_raid_set_options(struct spdk_jsonrpc_request *request, const struct spd
+ }
+ SPDK_RPC_REGISTER("bdev_raid_set_options", rpc_bdev_raid_set_options,
+ 		  SPDK_RPC_STARTUP | SPDK_RPC_RUNTIME)
++
++/* Evariops 0025: clear a stale raid superblock from an UNCLAIMED base bdev.
++ *
++ * A clean raid teardown never erases the base bdevs' superblocks (upstream
++ * raid_bdev_delete only frees resources — examine/reassembly feeds on the
++ * surviving SB), so re-creating a raid under a NEW name/incarnation over
++ * previously-stamped bases is refused by the configure-time superblock check
++ * ("Superblock of a different raid bdev found"). The control plane authorizes
++ * the clear per base bdev; this RPC:
++ *   - opens the bdev for WRITE — a claimed bdev (live raid member) fails the
++ *     open, so an in-use leg can never be cleared;
++ *   - loads AND validates the superblock through the standard loader
++ *     (signature + CRC): a bdev without a valid raid superblock is an
++ *     idempotent no-op success ("cleared": false) — this RPC never writes to
++ *     a bdev that does not carry one;
++ *   - zeroes the superblock's first block (the signature block: parsing fails
++ *     without it, examine ignores the base, a new create accepts it).
++ */
++struct rpc_bdev_raid_clear_superblock {
++	char *base_bdev;
++};
++
++static void
++free_rpc_bdev_raid_clear_superblock(struct rpc_bdev_raid_clear_superblock *req)
++{
++	free(req->base_bdev);
++}
++
++static const struct spdk_json_object_decoder rpc_bdev_raid_clear_superblock_decoders[] = {
++	{"base_bdev", offsetof(struct rpc_bdev_raid_clear_superblock, base_bdev), spdk_json_decode_string},
++};
++
++struct rpc_clear_sb_ctx {
++	struct rpc_bdev_raid_clear_superblock req;
++	struct spdk_jsonrpc_request *request;
++	struct spdk_bdev_desc *desc;
++	struct spdk_io_channel *ch;
++	void *zero_buf;
++	bool cleared;
++};
++
++static void
++rpc_clear_sb_ctx_free(struct rpc_clear_sb_ctx *ctx)
++{
++	spdk_dma_free(ctx->zero_buf);
++	if (ctx->ch != NULL) {
++		spdk_put_io_channel(ctx->ch);
++	}
++	if (ctx->desc != NULL) {
++		spdk_bdev_close(ctx->desc);
++	}
++	free_rpc_bdev_raid_clear_superblock(&ctx->req);
++	free(ctx);
++}
++
++static void
++rpc_clear_sb_complete(struct rpc_clear_sb_ctx *ctx, int status)
++{
++	struct spdk_jsonrpc_request *request = ctx->request;
++	struct spdk_json_write_ctx *w;
++
++	if (status != 0) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
++						 spdk_strerror(-status));
++	} else {
++		w = spdk_jsonrpc_begin_result(request);
++		spdk_json_write_object_begin(w);
++		spdk_json_write_named_bool(w, "cleared", ctx->cleared);
++		spdk_json_write_object_end(w);
++		spdk_jsonrpc_end_result(request, w);
++	}
++	rpc_clear_sb_ctx_free(ctx);
++}
++
++static void
++rpc_clear_sb_write_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
++{
++	struct rpc_clear_sb_ctx *ctx = cb_arg;
++
++	spdk_bdev_free_io(bdev_io);
++	ctx->cleared = success;
++	rpc_clear_sb_complete(ctx, success ? 0 : -EIO);
++}
++
++static void
++rpc_clear_sb_load_cb(const struct raid_bdev_superblock *sb, int status, void *cb_ctx)
++{
++	struct rpc_clear_sb_ctx *ctx = cb_ctx;
++	struct spdk_bdev *bdev = spdk_bdev_desc_get_bdev(ctx->desc);
++	uint32_t block_size = spdk_bdev_get_block_size(bdev);
++	int rc;
++
++	if (status != 0 || sb == NULL) {
++		/* No valid raid superblock — the goal state already holds. */
++		SPDK_NOTICELOG("bdev '%s': no valid raid superblock (%s) — clear is a no-op\n",
++			       ctx->req.base_bdev, spdk_strerror(-status));
++		rpc_clear_sb_complete(ctx, 0);
++		return;
++	}
++
++	SPDK_NOTICELOG("bdev '%s': clearing superblock of raid '%.*s' (seq %" PRIu64 ")\n",
++		       ctx->req.base_bdev, (int)sizeof(sb->name), sb->name, sb->seq_number);
++
++	/* Plain write of a zeroed block — no dependency on WRITE_ZEROES support
++	 * in the (possibly remote NVMe-oF) base bdev. */
++	ctx->zero_buf = spdk_dma_zmalloc(block_size, spdk_bdev_get_buf_align(bdev), NULL);
++	if (ctx->zero_buf == NULL) {
++		rpc_clear_sb_complete(ctx, -ENOMEM);
++		return;
++	}
++
++	rc = spdk_bdev_write(ctx->desc, ctx->ch, ctx->zero_buf, 0, block_size,
++			     rpc_clear_sb_write_done, ctx);
++	if (rc != 0) {
++		rpc_clear_sb_complete(ctx, rc);
++	}
++}
++
++static void
++rpc_clear_sb_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev, void *event_ctx)
++{
++	SPDK_DEBUGLOG(bdev_raid, "clear_superblock: unhandled bdev event %d\n", type);
++}
++
++static void
++rpc_bdev_raid_clear_superblock(struct spdk_jsonrpc_request *request,
++			       const struct spdk_json_val *params)
++{
++	struct rpc_clear_sb_ctx *ctx;
++	char detail[256];
++	int rc;
++
++	ctx = calloc(1, sizeof(*ctx));
++	if (ctx == NULL) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
++						 spdk_strerror(ENOMEM));
++		return;
++	}
++	ctx->request = request;
++
++	if (spdk_json_decode_object(params, rpc_bdev_raid_clear_superblock_decoders,
++				    SPDK_COUNTOF(rpc_bdev_raid_clear_superblock_decoders),
++				    &ctx->req)) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
++						 "spdk_json_decode_object failed");
++		free_rpc_bdev_raid_clear_superblock(&ctx->req);
++		free(ctx);
++		return;
++	}
++
++	snprintf(detail, sizeof(detail), "base_bdev=%s", ctx->req.base_bdev);
++	spdk_jsonrpc_request_audit(request, "bdev_raid_clear_superblock", detail);
++
++	rc = spdk_bdev_open_ext(ctx->req.base_bdev, true, rpc_clear_sb_event_cb, NULL, &ctx->desc);
++	if (rc != 0) {
++		SPDK_ERRLOG("bdev '%s': open for superblock clear failed: %s\n",
++			    ctx->req.base_bdev, spdk_strerror(-rc));
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
++						 spdk_strerror(-rc));
++		free_rpc_bdev_raid_clear_superblock(&ctx->req);
++		free(ctx);
++		return;
++	}
++
++	ctx->ch = spdk_bdev_get_io_channel(ctx->desc);
++	if (ctx->ch == NULL) {
++		rpc_clear_sb_complete(ctx, -ENOMEM);
++		return;
++	}
++
++	rc = raid_bdev_load_base_bdev_superblock(ctx->desc, ctx->ch, rpc_clear_sb_load_cb, ctx);
++	if (rc != 0) {
++		rpc_clear_sb_complete(ctx, rc);
++	}
++}
++SPDK_RPC_REGISTER("bdev_raid_clear_superblock", rpc_bdev_raid_clear_superblock, SPDK_RPC_RUNTIME)
