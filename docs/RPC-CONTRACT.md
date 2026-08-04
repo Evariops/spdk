@@ -377,6 +377,12 @@ verify, degraded-service observation).
   was removed with the dead healthy-clear poller (`backends_healthy` was
   constant `false`: `bdev_cbt_set_backends_healthy` never had a caller). Strict
   parsers must drop these keys.
+- **SPEC-77A A1**: `bdev_cbt_epoch_list` epochs[] now also carry `nonce` and
+  `truncated`, making the list the union of the two epoch views (it alone carries
+  `stale_backend_id`; `get_bdevs` alone carried `nonce`/`truncated`). The nonce is
+  the ABA-free identity the control-plane addresses freeze/close with: without it
+  in this reply, every resolution of a real nonce failed and the epoch could never
+  be frozen or consumed.
 - `bdev_cbt_epoch_invalidate`: refused with `-EBUSY` while a rebuild is RUNNING
   on the epoch (**C3** — an INVALID epoch is evictable; evicting it under the
   rebuild would free the frozen bitmap the rebuild is scanning). Cancel first.
