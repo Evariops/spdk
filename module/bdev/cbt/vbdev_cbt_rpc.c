@@ -511,13 +511,20 @@ rpc_bdev_cbt_epoch_list(struct spdk_jsonrpc_request *request,
 	/* D3: healthy_clear_suspended / backends_healthy removed with the dead
 	 * healthy-clear poller (bitmap clearing is reset-driven). */
 
+	/* SPEC-77A A1 (RPC-CONTRACT §5): the nonce is the ABA-free epoch identity — the
+	 * control-plane addresses freeze/close BY NONCE and resolves the epoch_id against
+	 * this list, so omitting it made every real resolution fail. `truncated` rides
+	 * along for the same reason (D14 routing). Both already ship in get_bdevs; this
+	 * list stays the union of the two views (it alone carries stale_backend_id). */
 	spdk_json_write_named_array_begin(w, "epochs");
 	TAILQ_FOREACH(ep, &cbt->epochs, link) {
 		spdk_json_write_object_begin(w);
 		spdk_json_write_named_string(w, "epoch_id", ep->epoch_id);
+		spdk_json_write_named_string(w, "nonce", ep->nonce);
 		spdk_json_write_named_string(w, "stale_backend_id", ep->stale_backend_id);
 		spdk_json_write_named_uint64(w, "generation", ep->generation);
 		spdk_json_write_named_string(w, "state", epoch_state_str(ep->state));
+		spdk_json_write_named_bool(w, "truncated", ep->truncated);
 		spdk_json_write_object_end(w);
 	}
 	spdk_json_write_array_end(w);
