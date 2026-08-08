@@ -1,0 +1,57 @@
+diff --git a/module/bdev/nvme/bdev_nvme.c b/module/bdev/nvme/bdev_nvme.c
+index 23a47e0b6..78c5774db 100644
+--- a/module/bdev/nvme/bdev_nvme.c
++++ b/module/bdev/nvme/bdev_nvme.c
+@@ -849,6 +849,14 @@ nvme_ctrlr_put_ref_ext(struct nvme_ctrlr *nvme_ctrlr, nvme_ctrlr_put_ref_cb cb_f
+ 	nvme_ctrlr->ref--;
+ 
+ 	if (!nvme_ctrlr_can_be_unregistered(nvme_ctrlr)) {
++		if (nvme_ctrlr->destruct) {
++			/* Evariops 0028: the destruct is DEFERRED here — name what defers it,
++			 * or a leaked continuation reads as an unexplained immortal ctrlr. */
++			NVME_CTRLR_NOTICELOG(nvme_ctrlr,
++					     "destruct deferred at put_ref: ref %d resetting %d reconnect_delayed %d (Evariops 0028)\n",
++					     (int)nvme_ctrlr->ref, (int)nvme_ctrlr->resetting,
++					     (int)nvme_ctrlr->reconnect_is_delayed);
++		}
+ 		if (cb_fn) {
+ 			cb_fn(nvme_ctrlr);
+ 		}
+@@ -2290,7 +2298,24 @@ bdev_nvme_reconnect_delay_timer_expired(void *ctx)
+ 	nvme_ctrlr->reconnect_is_delayed = false;
+ 
+ 	if (nvme_ctrlr->destruct) {
++		/* Evariops 0028: a delete that lands inside the reconnect-delay window defers
++		 * its destruct (put_ref sees the ctrlr mid-lifecycle), and this branch was the
++		 * only continuation — returning without acting LEAKED the pending destruct:
++		 * no reconnect, adminq poller left paused, nothing ever unregisters. The dead
++		 * controller then pins its TRID until ctrlr_loss_timeout fires (~10 min),
++		 * parking every re-attach of a returned member (caught live, turing runs
++		 * 10-12). Mirror OP_COMPLETE_PENDING_DESTRUCT here. */
++		bool unregister = nvme_ctrlr_can_be_unregistered(nvme_ctrlr);
++
++		NVME_CTRLR_NOTICELOG(nvme_ctrlr,
++				     "reconnect delay expired with destruct pending: ref %d — %s (Evariops 0028)\n",
++				     (int)nvme_ctrlr->ref,
++				     unregister ? "unregistering now" : "waiting for refs");
+ 		pthread_mutex_unlock(&nvme_ctrlr->mutex);
++
++		if (unregister) {
++			nvme_ctrlr_unregister(nvme_ctrlr);
++		}
+ 		return SPDK_POLLER_BUSY;
+ 	}
+ 
+@@ -6163,6 +6188,12 @@ bdev_nvme_delete_ctrlr_unsafe(struct nvme_ctrlr *nvme_ctrlr, bool hotplug)
+ 	}
+ 
+ 	nvme_ctrlr->destruct = true;
++	/* Evariops 0028: destruct-deferral observability — when a delete lands on a ctrlr
++	 * mid-reset or mid-reconnect-delay, WHO completes it later must be traceable. */
++	NVME_CTRLR_NOTICELOG(nvme_ctrlr,
++			     "delete requested: ref %d resetting %d reconnect_delayed %d (Evariops 0028)\n",
++			     (int)nvme_ctrlr->ref, (int)nvme_ctrlr->resetting,
++			     (int)nvme_ctrlr->reconnect_is_delayed);
+ 	return 0;
+ }
+ 
