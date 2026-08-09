@@ -1,0 +1,358 @@
+diff --git a/module/bdev/nvme/bdev_nvme.c b/module/bdev/nvme/bdev_nvme.c
+index 78c5774db..329c31ca1 100644
+--- a/module/bdev/nvme/bdev_nvme.c
++++ b/module/bdev/nvme/bdev_nvme.c
+@@ -838,9 +838,45 @@ nvme_ctrlr_can_be_unregistered(struct nvme_ctrlr *nvme_ctrlr)
+ 	return true;
+ }
+ 
++/* Evariops 0029: printable names of the ref-holder categories, indexed by
++ * enum nvme_ctrlr_ref_holder. */
++static const char *g_nvme_ctrlr_ref_holder_names[NVME_CTRLR_REF_HOLDER_COUNT] = {
++	"base", "ns", "qpair", "disable", "cache_clear", "ana", "keys",
++};
++
++#define NVME_CTRLR_REF_HOLDERS_STR_LEN 192
++
++/* Evariops 0029: format the non-zero holder categories ("base:1 ns:1 qpair:2").
++ * Caller holds nvme_ctrlr->mutex. */
++static const char *
++nvme_ctrlr_ref_holders_str(struct nvme_ctrlr *nvme_ctrlr, char *buf, size_t len)
++{
++	size_t off = 0;
++	int i, n;
++
++	buf[0] = '\0';
++	for (i = 0; i < NVME_CTRLR_REF_HOLDER_COUNT; i++) {
++		if (nvme_ctrlr->ref_by[i] == 0) {
++			continue;
++		}
++		n = snprintf(buf + off, len - off, "%s%s:%d",
++			     off > 0 ? " " : "",
++			     g_nvme_ctrlr_ref_holder_names[i], nvme_ctrlr->ref_by[i]);
++		if (n < 0 || (size_t)n >= len - off) {
++			break;
++		}
++		off += (size_t)n;
++	}
++	if (buf[0] == '\0') {
++		snprintf(buf, len, "none");
++	}
++	return buf;
++}
++
+ /* Invokes cb_fn under the ctrlr’s lock but only if not scheduled to unregister. */
+ static void
+-nvme_ctrlr_put_ref_ext(struct nvme_ctrlr *nvme_ctrlr, nvme_ctrlr_put_ref_cb cb_fn)
++nvme_ctrlr_put_ref_ext(struct nvme_ctrlr *nvme_ctrlr, enum nvme_ctrlr_ref_holder holder,
++		       nvme_ctrlr_put_ref_cb cb_fn)
+ {
+ 	pthread_mutex_lock(&nvme_ctrlr->mutex);
+ 	SPDK_DTRACE_PROBE2(bdev_nvme_ctrlr_release, nvme_ctrlr->nbdev_ctrlr->name, nvme_ctrlr->ref);
+@@ -848,14 +884,29 @@ nvme_ctrlr_put_ref_ext(struct nvme_ctrlr *nvme_ctrlr, nvme_ctrlr_put_ref_cb cb_f
+ 	assert(nvme_ctrlr->ref > 0);
+ 	nvme_ctrlr->ref--;
+ 
++	/* Evariops 0029: keep the per-holder ledger honest — an underflow means a
++	 * mistagged call site; say so instead of silently corrupting the breakdown. */
++	if (spdk_unlikely(nvme_ctrlr->ref_by[holder] <= 0)) {
++		NVME_CTRLR_ERRLOG(nvme_ctrlr,
++				  "ref accounting underflow for holder '%s' (Evariops 0029)\n",
++				  g_nvme_ctrlr_ref_holder_names[holder]);
++	} else {
++		nvme_ctrlr->ref_by[holder]--;
++	}
++
+ 	if (!nvme_ctrlr_can_be_unregistered(nvme_ctrlr)) {
+ 		if (nvme_ctrlr->destruct) {
++			char holders[NVME_CTRLR_REF_HOLDERS_STR_LEN];
++
+ 			/* Evariops 0028: the destruct is DEFERRED here — name what defers it,
+-			 * or a leaked continuation reads as an unexplained immortal ctrlr. */
++			 * or a leaked continuation reads as an unexplained immortal ctrlr.
++			 * Evariops 0029: name the holders too, not just the count. */
+ 			NVME_CTRLR_NOTICELOG(nvme_ctrlr,
+-					     "destruct deferred at put_ref: ref %d resetting %d reconnect_delayed %d (Evariops 0028)\n",
++					     "destruct deferred at put_ref (released by %s): ref %d resetting %d reconnect_delayed %d holders[%s] (Evariops 0028/0029)\n",
++					     g_nvme_ctrlr_ref_holder_names[holder],
+ 					     (int)nvme_ctrlr->ref, (int)nvme_ctrlr->resetting,
+-					     (int)nvme_ctrlr->reconnect_is_delayed);
++					     (int)nvme_ctrlr->reconnect_is_delayed,
++					     nvme_ctrlr_ref_holders_str(nvme_ctrlr, holders, sizeof(holders)));
+ 		}
+ 		if (cb_fn) {
+ 			cb_fn(nvme_ctrlr);
+@@ -870,17 +921,30 @@ nvme_ctrlr_put_ref_ext(struct nvme_ctrlr *nvme_ctrlr, nvme_ctrlr_put_ref_cb cb_f
+ }
+ 
+ static void
+-nvme_ctrlr_put_ref(struct nvme_ctrlr *nvme_ctrlr)
++nvme_ctrlr_put_ref(struct nvme_ctrlr *nvme_ctrlr, enum nvme_ctrlr_ref_holder holder)
+ {
+-	nvme_ctrlr_put_ref_ext(nvme_ctrlr, NULL);
++	nvme_ctrlr_put_ref_ext(nvme_ctrlr, holder, NULL);
+ }
+ 
+ static void
+-nvme_ctrlr_get_ref(struct nvme_ctrlr *nvme_ctrlr)
++nvme_ctrlr_get_ref(struct nvme_ctrlr *nvme_ctrlr, enum nvme_ctrlr_ref_holder holder)
+ {
+ 	pthread_mutex_lock(&nvme_ctrlr->mutex);
+ 	assert(nvme_ctrlr->ref > 0);
+ 	nvme_ctrlr->ref++;
++	nvme_ctrlr->ref_by[holder]++;
++	if (spdk_unlikely(nvme_ctrlr->destruct)) {
++		char holders[NVME_CTRLR_REF_HOLDERS_STR_LEN];
++
++		/* Evariops 0029: a ref taken on a DESTRUCTING ctrlr re-pins a corpse —
++		 * this is the re-admission vector at zombie reconnect (turing run 14:
++		 * the reborn target re-populates ns/qpairs on a ctrlr whose destruct
++		 * is pending). Name the taker. */
++		NVME_CTRLR_NOTICELOG(nvme_ctrlr,
++				     "ref taken by %s on a DESTRUCTING ctrlr: ref %d holders[%s] (Evariops 0029)\n",
++				     g_nvme_ctrlr_ref_holder_names[holder], (int)nvme_ctrlr->ref,
++				     nvme_ctrlr_ref_holders_str(nvme_ctrlr, holders, sizeof(holders)));
++	}
+ 	pthread_mutex_unlock(&nvme_ctrlr->mutex);
+ }
+ 
+@@ -1756,7 +1820,7 @@ bdev_nvme_clear_io_path_caches_done(struct nvme_ctrlr *nvme_ctrlr,
+ 	pthread_mutex_lock(&nvme_ctrlr->mutex);
+ 	assert(nvme_ctrlr->io_path_cache_clearing == true);
+ 	nvme_ctrlr->io_path_cache_clearing = false;
+-	nvme_ctrlr_put_ref(nvme_ctrlr);
++	nvme_ctrlr_put_ref(nvme_ctrlr, NVME_CTRLR_REF_CACHE_CLEAR);
+ 	pthread_mutex_unlock(&nvme_ctrlr->mutex);
+ }
+ 
+@@ -1797,7 +1861,7 @@ bdev_nvme_clear_io_path_caches(struct nvme_ctrlr *nvme_ctrlr)
+ 	}
+ 
+ 	nvme_ctrlr->io_path_cache_clearing = true;
+-	nvme_ctrlr_get_ref(nvme_ctrlr);
++	nvme_ctrlr_get_ref(nvme_ctrlr, NVME_CTRLR_REF_CACHE_CLEAR);
+ 	pthread_mutex_unlock(&nvme_ctrlr->mutex);
+ 
+ 	nvme_ctrlr_for_each_channel(nvme_ctrlr,
+@@ -2306,10 +2370,12 @@ bdev_nvme_reconnect_delay_timer_expired(void *ctx)
+ 		 * parking every re-attach of a returned member (caught live, turing runs
+ 		 * 10-12). Mirror OP_COMPLETE_PENDING_DESTRUCT here. */
+ 		bool unregister = nvme_ctrlr_can_be_unregistered(nvme_ctrlr);
++		char holders[NVME_CTRLR_REF_HOLDERS_STR_LEN];
+ 
+ 		NVME_CTRLR_NOTICELOG(nvme_ctrlr,
+-				     "reconnect delay expired with destruct pending: ref %d — %s (Evariops 0028)\n",
++				     "reconnect delay expired with destruct pending: ref %d holders[%s] — %s (Evariops 0028/0029)\n",
+ 				     (int)nvme_ctrlr->ref,
++				     nvme_ctrlr_ref_holders_str(nvme_ctrlr, holders, sizeof(holders)),
+ 				     unregister ? "unregistering now" : "waiting for refs");
+ 		pthread_mutex_unlock(&nvme_ctrlr->mutex);
+ 
+@@ -2790,7 +2856,7 @@ bdev_nvme_disable_ctrlr_complete(struct nvme_ctrlr *nvme_ctrlr)
+ 		ctrlr_op_cb_fn(ctrlr_op_cb_arg, 0);
+ 	}
+ 
+-	nvme_ctrlr_put_ref(nvme_ctrlr);
++	nvme_ctrlr_put_ref(nvme_ctrlr, NVME_CTRLR_REF_DISABLE);
+ }
+ 
+ static void
+@@ -2875,7 +2941,7 @@ bdev_nvme_disable_ctrlr(struct nvme_ctrlr *nvme_ctrlr)
+ 
+ 	nvme_ctrlr->reset_start_tsc = spdk_get_ticks();
+ 
+-	nvme_ctrlr_get_ref(nvme_ctrlr);
++	nvme_ctrlr_get_ref(nvme_ctrlr, NVME_CTRLR_REF_DISABLE);
+ 	pthread_mutex_unlock(&nvme_ctrlr->mutex);
+ 
+ 	spdk_thread_send_msg(spdk_thread_get_app_thread(), msg_fn, nvme_ctrlr);
+@@ -3707,7 +3773,7 @@ nvme_qpair_create(struct nvme_ctrlr *nvme_ctrlr, struct nvme_ctrlr_channel *ctrl
+ 
+ 	ctrlr_ch->qpair = nvme_qpair;
+ 
+-	nvme_ctrlr_get_ref(nvme_ctrlr);
++	nvme_ctrlr_get_ref(nvme_ctrlr, NVME_CTRLR_REF_QPAIR);
+ 
+ 	return 0;
+ }
+@@ -3737,7 +3803,7 @@ nvme_qpair_delete(struct nvme_qpair *nvme_qpair)
+ 
+ 	spdk_put_io_channel(spdk_io_channel_from_ctx(nvme_qpair->group));
+ 
+-	nvme_ctrlr_put_ref(nvme_qpair->ctrlr);
++	nvme_ctrlr_put_ref(nvme_qpair->ctrlr, NVME_CTRLR_REF_QPAIR);
+ 
+ 	free(nvme_qpair);
+ }
+@@ -4941,7 +5007,7 @@ nvme_ns_create(struct nvme_ctrlr *nvme_ctrlr, uint32_t nsid, struct nvme_async_p
+ 	nvme_ns->ns = ns;
+ 	nvme_ns->ana_state = SPDK_NVME_ANA_OPTIMIZED_STATE;
+ 
+-	nvme_ctrlr_get_ref(nvme_ctrlr);
++	nvme_ctrlr_get_ref(nvme_ctrlr, NVME_CTRLR_REF_NS);
+ 	return nvme_ns;
+ }
+ 
+@@ -4954,7 +5020,7 @@ nvme_ns_free(struct nvme_ns *nvme_ns)
+ static void
+ nvme_ns_delete(struct nvme_ns *nvme_ns)
+ {
+-	nvme_ctrlr_put_ref(nvme_ns->ctrlr);
++	nvme_ctrlr_put_ref(nvme_ns->ctrlr, NVME_CTRLR_REF_NS);
+ 	nvme_ns_free(nvme_ns);
+ }
+ 
+@@ -5362,7 +5428,7 @@ nvme_ctrlr_read_ana_log_page_done(void *ctx, const struct spdk_nvme_cpl *cpl)
+ 	pthread_mutex_lock(&nvme_ctrlr->mutex);
+ 	assert(nvme_ctrlr->ana_log_page_updating == true);
+ 	nvme_ctrlr->ana_log_page_updating = false;
+-	nvme_ctrlr_put_ref_ext(nvme_ctrlr, bdev_nvme_clear_io_path_caches);
++	nvme_ctrlr_put_ref_ext(nvme_ctrlr, NVME_CTRLR_REF_ANA, bdev_nvme_clear_io_path_caches);
+ 	pthread_mutex_unlock(&nvme_ctrlr->mutex);
+ }
+ 
+@@ -5393,7 +5459,7 @@ nvme_ctrlr_read_ana_log_page(struct nvme_ctrlr *nvme_ctrlr)
+ 	}
+ 
+ 	nvme_ctrlr->ana_log_page_updating = true;
+-	nvme_ctrlr_get_ref(nvme_ctrlr);
++	nvme_ctrlr_get_ref(nvme_ctrlr, NVME_CTRLR_REF_ANA);
+ 	pthread_mutex_unlock(&nvme_ctrlr->mutex);
+ 
+ 	rc = spdk_nvme_ctrlr_cmd_get_log_page(nvme_ctrlr->ctrlr,
+@@ -6041,6 +6107,7 @@ nvme_ctrlr_create(struct spdk_nvme_ctrlr *ctrlr,
+ 
+ 	nvme_ctrlr->ctrlr = ctrlr;
+ 	nvme_ctrlr->ref = 1;
++	nvme_ctrlr->ref_by[NVME_CTRLR_REF_BASE] = 1;
+ 
+ 	if (spdk_nvme_ctrlr_is_ocssd_supported(ctrlr)) {
+ 		SPDK_ERRLOG("OCSSDs are not supported");
+@@ -6164,7 +6231,7 @@ _nvme_ctrlr_destruct(void *ctx)
+ 
+ 	NVME_CTRLR_INFOLOG(nvme_ctrlr, "destructing ctrlr\n");
+ 	nvme_ctrlr_depopulate_namespaces(nvme_ctrlr);
+-	nvme_ctrlr_put_ref(nvme_ctrlr);
++	nvme_ctrlr_put_ref(nvme_ctrlr, NVME_CTRLR_REF_BASE);
+ }
+ 
+ static int
+@@ -6190,10 +6257,15 @@ bdev_nvme_delete_ctrlr_unsafe(struct nvme_ctrlr *nvme_ctrlr, bool hotplug)
+ 	nvme_ctrlr->destruct = true;
+ 	/* Evariops 0028: destruct-deferral observability — when a delete lands on a ctrlr
+ 	 * mid-reset or mid-reconnect-delay, WHO completes it later must be traceable. */
+-	NVME_CTRLR_NOTICELOG(nvme_ctrlr,
+-			     "delete requested: ref %d resetting %d reconnect_delayed %d (Evariops 0028)\n",
+-			     (int)nvme_ctrlr->ref, (int)nvme_ctrlr->resetting,
+-			     (int)nvme_ctrlr->reconnect_is_delayed);
++	{
++		char holders[NVME_CTRLR_REF_HOLDERS_STR_LEN];
++
++		NVME_CTRLR_NOTICELOG(nvme_ctrlr,
++				     "delete requested: ref %d resetting %d reconnect_delayed %d holders[%s] (Evariops 0028/0029)\n",
++				     (int)nvme_ctrlr->ref, (int)nvme_ctrlr->resetting,
++				     (int)nvme_ctrlr->reconnect_is_delayed,
++				     nvme_ctrlr_ref_holders_str(nvme_ctrlr, holders, sizeof(holders)));
++	}
+ 	return 0;
+ }
+ 
+@@ -7081,6 +7153,30 @@ _bdev_nvme_delete(struct nvme_ctrlr *nvme_ctrlr, const struct spdk_nvme_path_id
+ 	if (rc == 0) {
+ 		msg_fn(nvme_ctrlr);
+ 	} else if (rc == -EALREADY) {
++		/* Evariops 0029: an idempotent re-delete of an already-destructing ctrlr
++		 * reports success while doing nothing. Under a wedged destruct the control
++		 * plane's detach loops on that "success" forever (×308 in 7 min, turing
++		 * run 14) with nothing naming what pins the ctrlr — so each re-delete
++		 * samples the holder breakdown: log when it changed, plus a heartbeat.
++		 * The failover branch also returns -EALREADY without destruct (delayed
++		 * reconnect / disabled) — only the destructing case is the wedge. */
++		if (nvme_ctrlr->destruct) {
++			nvme_ctrlr->redelete_attempts++;
++			if (memcmp(nvme_ctrlr->ref_by_logged, nvme_ctrlr->ref_by,
++				   sizeof(nvme_ctrlr->ref_by)) != 0 ||
++			    nvme_ctrlr->redelete_attempts % 64 == 1) {
++				char holders[NVME_CTRLR_REF_HOLDERS_STR_LEN];
++
++				NVME_CTRLR_NOTICELOG(nvme_ctrlr,
++						     "re-delete of destructing ctrlr (attempt %u): ref %d resetting %d reconnect_delayed %d holders[%s] (Evariops 0029)\n",
++						     nvme_ctrlr->redelete_attempts, (int)nvme_ctrlr->ref,
++						     (int)nvme_ctrlr->resetting,
++						     (int)nvme_ctrlr->reconnect_is_delayed,
++						     nvme_ctrlr_ref_holders_str(nvme_ctrlr, holders, sizeof(holders)));
++				memcpy(nvme_ctrlr->ref_by_logged, nvme_ctrlr->ref_by,
++				       sizeof(nvme_ctrlr->ref_by));
++			}
++		}
+ 		rc = 0;
+ 	}
+ 
+@@ -9291,6 +9387,7 @@ bdev_nvme_next_ctrlr(struct nvme_bdev_ctrlr *nbdev_ctrlr, struct nvme_ctrlr *pre
+ 		pthread_mutex_lock(&next->mutex);
+ 		if (next->ref > 0) {
+ 			next->ref++;
++			next->ref_by[NVME_CTRLR_REF_KEYS]++;
+ 			pthread_mutex_unlock(&next->mutex);
+ 			return next;
+ 		}
+@@ -9327,7 +9424,7 @@ bdev_nvme_set_keys_done(struct bdev_nvme_set_keys_ctx *ctx, int status)
+ {
+ 	ctx->cb_fn(ctx->cb_ctx, status);
+ 	if (ctx->nctrlr != NULL) {
+-		nvme_ctrlr_put_ref(ctx->nctrlr);
++		nvme_ctrlr_put_ref(ctx->nctrlr, NVME_CTRLR_REF_KEYS);
+ 	}
+ 
+ 	bdev_nvme_free_set_keys_ctx(ctx);
+@@ -9343,7 +9440,7 @@ bdev_nvme_authenticate_ctrlr_continue(struct bdev_nvme_set_keys_ctx *ctx)
+ 	assert(spdk_thread_is_app_thread(NULL));
+ 
+ 	next = bdev_nvme_next_ctrlr(NULL, ctx->nctrlr);
+-	nvme_ctrlr_put_ref(ctx->nctrlr);
++	nvme_ctrlr_put_ref(ctx->nctrlr, NVME_CTRLR_REF_KEYS);
+ 	ctx->nctrlr = next;
+ 
+ 	if (next == NULL) {
+diff --git a/module/bdev/nvme/bdev_nvme.h b/module/bdev/nvme/bdev_nvme.h
+index 3618f5621..678d6857b 100644
+--- a/module/bdev/nvme/bdev_nvme.h
++++ b/module/bdev/nvme/bdev_nvme.h
+@@ -75,6 +75,21 @@ struct spdk_nvme_path_id {
+ typedef void (*bdev_nvme_ctrlr_op_cb)(void *cb_arg, int rc);
+ typedef void (*nvme_ctrlr_disconnected_cb)(struct nvme_ctrlr *nvme_ctrlr);
+ 
++/* Evariops 0029: every ref taken on an nvme_ctrlr belongs to a named holder
++ * category — when a destruct defers on "ref N", the log must name the holders,
++ * not print an opaque integer (turing runs 13-14: a dead ctrlr sat on "ref 2"
++ * for the whole run and nothing could say who held them). */
++enum nvme_ctrlr_ref_holder {
++	NVME_CTRLR_REF_BASE = 0,	/* creation ref, released by _nvme_ctrlr_destruct */
++	NVME_CTRLR_REF_NS,		/* one per populated namespace (nvme_ns) */
++	NVME_CTRLR_REF_QPAIR,		/* one per nvme_qpair (io channel) */
++	NVME_CTRLR_REF_DISABLE,		/* disable operation in flight */
++	NVME_CTRLR_REF_CACHE_CLEAR,	/* io_path cache clearing in flight */
++	NVME_CTRLR_REF_ANA,		/* ANA log page update in flight */
++	NVME_CTRLR_REF_KEYS,		/* set-keys / authenticate iteration */
++	NVME_CTRLR_REF_HOLDER_COUNT
++};
++
+ struct nvme_ctrlr {
+ 	/**
+ 	 * points to pinned, physically contiguous memory region;
+@@ -85,6 +100,15 @@ struct nvme_ctrlr {
+ 	struct spdk_nvme_path_id		*active_path_id;
+ 	int					ref;
+ 
++	/* Evariops 0029: per-holder breakdown of `ref` (guarded by `mutex`).
++	 * ref_by_logged/redelete_attempts back the re-delete sampler: an idempotent
++	 * re-delete of an already-destructing ctrlr logs the breakdown when it
++	 * changed, plus a heartbeat — the control plane's detach loop becomes a
++	 * free periodic probe of what still pins the ctrlr. */
++	int					ref_by[NVME_CTRLR_REF_HOLDER_COUNT];
++	int					ref_by_logged[NVME_CTRLR_REF_HOLDER_COUNT];
++	uint32_t				redelete_attempts;
++
+ 	uint32_t				resetting : 1;
+ 	uint32_t				reconnect_is_delayed : 1;
+ 	uint32_t				in_failover : 1;
