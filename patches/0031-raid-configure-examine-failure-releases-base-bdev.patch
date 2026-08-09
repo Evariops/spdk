@@ -1,0 +1,22 @@
+diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
+index 4c3d48179..a3146b897 100644
+--- a/module/bdev/raid/bdev_raid.c
++++ b/module/bdev/raid/bdev_raid.c
+@@ -4460,6 +4460,17 @@ raid_bdev_configure_base_bdev_check_sb_cb(const struct raid_bdev_superblock *sb,
+ 	default:
+ 		SPDK_ERRLOG("Failed to examine bdev %s: %s\n",
+ 			    base_info->name, spdk_strerror(-status));
++		/* Evariops 0031: this error path kept everything raid_bdev_configure_base_bdev
++		 * had taken — desc, module claim, app-thread io channel — so the slot squatted
++		 * as "configuring" and the open desc/channel pinned the member's nvme_ctrlr
++		 * destruct forever (holders[ns:1 qpair:1] for the whole run, named live by
++		 * 0029 on turing run 15: a re-attach decided at raid-eject speed reads the SB
++		 * of a just-killed member, gets -EIO, and the rollback's delete then defers on
++		 * refs this leak holds). Upstream has the same hole — only reachable when the
++		 * SB read fails against a dying member, exotic there, systematic under a
++		 * powercycled node. Release exactly like the UUID-mismatch branch above. */
++		base_info->configure_cb = NULL;
++		raid_bdev_free_base_bdev_resource(base_info);
+ 		break;
+ 	}
+ 
