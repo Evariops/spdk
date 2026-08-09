@@ -1,0 +1,34 @@
+diff --git a/module/bdev/raid/bdev_raid_rpc.c b/module/bdev/raid/bdev_raid_rpc.c
+index 7b7c697b3..772f6c490 100644
+--- a/module/bdev/raid/bdev_raid_rpc.c
++++ b/module/bdev/raid/bdev_raid_rpc.c
+@@ -889,6 +889,29 @@ rpc_bdev_raid_remove_base_bdev(struct spdk_jsonrpc_request *request,
+ 
+ 	rc = spdk_bdev_open_ext(req.name, false, rpc_bdev_raid_event_cb, NULL, &desc);
+ 	if (rc != 0) {
++		/* Evariops 0030: remove-by-name cannot address a slot whose bdev died — the
++		 * open fails, the caller reads "already removed", and the slot squats the
++		 * raid (turing run 14: DetachMember Applied ×308 while the phantom member
++		 * slot stayed). Before erroring, NAME every slot still referencing this
++		 * bdev name: the unaddressable squatter becomes a visible fact. */
++		struct raid_bdev *raid_bdev;
++		struct raid_base_bdev_info *base_info;
++
++		TAILQ_FOREACH(raid_bdev, &g_raid_bdev_list, global_link) {
++			RAID_FOR_EACH_BASE_BDEV(raid_bdev, base_info) {
++				if (base_info->name != NULL && strcmp(base_info->name, req.name) == 0) {
++					SPDK_NOTICELOG("remove_base_bdev '%s': bdev is gone (%s) but raid '%s' [%s] slot %u still references it — configured %d failed %d remove_scheduled %d desc %s (Evariops 0030)\n",
++						       req.name, spdk_strerror(-rc),
++						       raid_bdev->bdev.name,
++						       raid_bdev_state_to_str(raid_bdev->state),
++						       raid_bdev_base_bdev_slot(base_info),
++						       (int)base_info->is_configured,
++						       (int)base_info->is_failed,
++						       (int)base_info->remove_scheduled,
++						       base_info->desc != NULL ? "open" : "null");
++				}
++			}
++		}
+ 		goto err;
+ 	}
+ 
