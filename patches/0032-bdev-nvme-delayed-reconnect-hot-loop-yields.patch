@@ -1,0 +1,49 @@
+diff --git a/module/bdev/nvme/bdev_nvme.c b/module/bdev/nvme/bdev_nvme.c
+--- a/module/bdev/nvme/bdev_nvme.c
++++ b/module/bdev/nvme/bdev_nvme.c
+@@ -2273,6 +2273,7 @@
+ }
+ 
+ static void bdev_nvme_reset_ctrlr_complete(struct nvme_ctrlr *nvme_ctrlr, bool success);
++static void bdev_nvme_start_reconnect_delay_timer(struct nvme_ctrlr *nvme_ctrlr);
+ 
+ static void
+ nvme_ctrlr_disconnect(struct nvme_ctrlr *nvme_ctrlr, nvme_ctrlr_disconnected_cb cb_fn)
+@@ -2283,8 +2284,36 @@
+ 
+ 	rc = spdk_nvme_ctrlr_disconnect(nvme_ctrlr->ctrlr);
+ 	if (rc != 0) {
+-		NVME_CTRLR_WARNLOG(nvme_ctrlr, "disconnecting ctrlr failed.\n");
++		NVME_CTRLR_WARNLOG(nvme_ctrlr, "disconnecting ctrlr failed (%d).\n", rc);
+ 
++		/* Evariops 0032: this is a HOT LOOP on the delayed-reconnect path, and it
++		 * costs the consumer its path. spdk_nvme_ctrlr_disconnect() returns -EBUSY
++		 * (already resetting) or -ENXIO (removed) — both STICKY for as long as the
++		 * condition holds. Completing the reset here makes
++		 * bdev_nvme_check_op_after_reset() answer OP_DELAYED_RECONNECT, whose action
++		 * is… nvme_ctrlr_disconnect() again, which fails again, with nothing in the
++		 * cycle that yields: the delay timer that was supposed to pace it is armed by
++		 * the CALLBACK, which never runs. Measured on turing (SPEC-77L run 23, a
++		 * replica node power-cycled under load): 221 991 iterations in 28,0 s — ~8 000
++		 * spins per second on the nexus' single poller core, from the instant the raid
++		 * failed the dead member until ctrlr_loss_timeout_sec finally answered
++		 * OP_DESTRUCT and broke the cycle. The nvmf target sharing that core stopped
++		 * answering the CONSUMER's keep-alive within 5 s, so the initiator kernel
++		 * declared the path dead (opcode 0x18 QID 0 timeout → error recovery) and the
++		 * volume froze 28 s — where the failover itself costs 2 s.
++		 *
++		 * Arm the delay timer ourselves when that is what the caller wanted: one
++		 * attempt per reconnect_delay_sec, the pacing upstream intended, and the core
++		 * goes back to serving I/O between attempts. Every other caller keeps the
++		 * upstream behaviour — they pass callbacks that do not pace, and their reset
++		 * genuinely has to fail. */
++		if (cb_fn == bdev_nvme_start_reconnect_delay_timer &&
++		    !nvme_ctrlr->reconnect_is_delayed &&
++		    !bdev_nvme_check_ctrlr_loss_timeout(nvme_ctrlr)) {
++			bdev_nvme_start_reconnect_delay_timer(nvme_ctrlr);
++			return;
++		}
++
+ 		/* Disconnect fails if ctrlr is already resetting or removed. In this case,
+ 		 * fail the reset sequence immediately.
+ 		 */
