@@ -1,5 +1,5 @@
 diff --git a/lib/nvme/nvme_tcp.c b/lib/nvme/nvme_tcp.c
-index 7f093ec88..f17276238 100644
+index 7f093ec..f172762 100644
 --- a/lib/nvme/nvme_tcp.c
 +++ b/lib/nvme/nvme_tcp.c
 @@ -2165,6 +2165,18 @@ nvme_tcp_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_c
