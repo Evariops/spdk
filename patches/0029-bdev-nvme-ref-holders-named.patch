@@ -1,5 +1,5 @@
 diff --git a/module/bdev/nvme/bdev_nvme.c b/module/bdev/nvme/bdev_nvme.c
-index 78c5774db..329c31ca1 100644
+index 78c5774..329c31c 100644
 --- a/module/bdev/nvme/bdev_nvme.c
 +++ b/module/bdev/nvme/bdev_nvme.c
 @@ -838,9 +838,45 @@ nvme_ctrlr_can_be_unregistered(struct nvme_ctrlr *nvme_ctrlr)
@@ -315,7 +315,7 @@ index 78c5774db..329c31ca1 100644
  
  	if (next == NULL) {
 diff --git a/module/bdev/nvme/bdev_nvme.h b/module/bdev/nvme/bdev_nvme.h
-index 3618f5621..678d6857b 100644
+index 3618f56..678d685 100644
 --- a/module/bdev/nvme/bdev_nvme.h
 +++ b/module/bdev/nvme/bdev_nvme.h
 @@ -75,6 +75,21 @@ struct spdk_nvme_path_id {

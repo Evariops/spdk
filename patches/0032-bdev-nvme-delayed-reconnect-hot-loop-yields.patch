@@ -1,7 +1,8 @@
 diff --git a/module/bdev/nvme/bdev_nvme.c b/module/bdev/nvme/bdev_nvme.c
+index 329c31c..2f8fe10 100644
 --- a/module/bdev/nvme/bdev_nvme.c
 +++ b/module/bdev/nvme/bdev_nvme.c
-@@ -2273,6 +2273,7 @@
+@@ -2273,6 +2273,7 @@ bdev_nvme_check_fast_io_fail_timeout(struct nvme_ctrlr *nvme_ctrlr)
  }
  
  static void bdev_nvme_reset_ctrlr_complete(struct nvme_ctrlr *nvme_ctrlr, bool success);
@@ -9,13 +10,13 @@ diff --git a/module/bdev/nvme/bdev_nvme.c b/module/bdev/nvme/bdev_nvme.c
  
  static void
  nvme_ctrlr_disconnect(struct nvme_ctrlr *nvme_ctrlr, nvme_ctrlr_disconnected_cb cb_fn)
-@@ -2283,8 +2284,36 @@
+@@ -2283,7 +2284,35 @@ nvme_ctrlr_disconnect(struct nvme_ctrlr *nvme_ctrlr, nvme_ctrlr_disconnected_cb
  
  	rc = spdk_nvme_ctrlr_disconnect(nvme_ctrlr->ctrlr);
  	if (rc != 0) {
 -		NVME_CTRLR_WARNLOG(nvme_ctrlr, "disconnecting ctrlr failed.\n");
 +		NVME_CTRLR_WARNLOG(nvme_ctrlr, "disconnecting ctrlr failed (%d).\n", rc);
- 
++
 +		/* Evariops 0032: this is a HOT LOOP on the delayed-reconnect path, and it
 +		 * costs the consumer its path. spdk_nvme_ctrlr_disconnect() returns -EBUSY
 +		 * (already resetting) or -ENXIO (removed) — both STICKY for as long as the
@@ -43,7 +44,6 @@ diff --git a/module/bdev/nvme/bdev_nvme.c b/module/bdev/nvme/bdev_nvme.c
 +			bdev_nvme_start_reconnect_delay_timer(nvme_ctrlr);
 +			return;
 +		}
-+
+ 
  		/* Disconnect fails if ctrlr is already resetting or removed. In this case,
  		 * fail the reset sequence immediately.
- 		 */
