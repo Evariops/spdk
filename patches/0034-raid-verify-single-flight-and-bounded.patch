@@ -1,0 +1,228 @@
+diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
+index 7f94477..9fed533 100644
+--- a/module/bdev/raid/bdev_raid.c
++++ b/module/bdev/raid/bdev_raid.c
+@@ -1227,6 +1227,14 @@ raid_bdev_write_info_json(struct raid_bdev *raid_bdev, struct spdk_json_write_ct
+ 		spdk_json_write_named_string(w, "incarnation", raid_bdev->incarnation);
+ 	}
+ 	spdk_json_write_named_string(w, "state", raid_bdev_state_to_str(raid_bdev->state));
++	/* Evariops 0034 (Q-024-4): the verify is a long-lived LBA-lock holder, and an
++	 * invisible lock holder cost an hour of pure deduction at run 42. It now says
++	 * who it is and since when — the same lesson as 0029's named refs. */
++	spdk_json_write_named_bool(w, "verify_active", raid_bdev->verify_active);
++	if (raid_bdev->verify_active) {
++		spdk_json_write_named_string(w, "verify_token", raid_bdev->verify_token);
++		spdk_json_write_named_int64(w, "verify_since", raid_bdev->verify_since);
++	}
+ 	spdk_json_write_named_string(w, "raid_level", raid_bdev_level_to_str(raid_bdev->level));
+ 	spdk_json_write_named_bool(w, "superblock", raid_bdev->superblock_enabled);
+ 	spdk_json_write_named_uint32(w, "num_base_bdevs", raid_bdev->num_base_bdevs);
+diff --git a/module/bdev/raid/bdev_raid.h b/module/bdev/raid/bdev_raid.h
+index 3e33a04..b0cd999 100644
+--- a/module/bdev/raid/bdev_raid.h
++++ b/module/bdev/raid/bdev_raid.h
+@@ -232,6 +232,11 @@ typedef void (*raid_bdev_configure_cb)(void *cb_ctx, int rc);
+  * and the information related to any raid bdev either configured or
+  * in configuring list. io device is created on this.
+  */
++/* Evariops 0034: verify token length — mirrors RAID_REBUILD_TOKEN_MAX
++ * (bdev_raid_outcomes.h), duplicated rather than included so this header keeps
++ * no dependency on the outcome registry. */
++#define RAID_VERIFY_TOKEN_MAX		192
++
+ struct raid_bdev {
+ 	/* raid bdev device, this will get registered in bdev layer */
+ 	struct spdk_bdev		bdev;
+@@ -317,6 +322,19 @@ struct raid_bdev {
+ 	uint64_t			degraded_write_stripes;		/* stripes written at zero margin */
+ 	int64_t				last_degraded_ts;		/* unix seconds of the last event */
+ 
++	/* Evariops 0034 (SPEC-77L Q-024-1): THE SINGLE in-flight verify_ranges on
++	 * this raid. A verify holds an LBA-range lock per chunk and releases it
++	 * between chunks — alone, it leaves gaps, and a whole-device quiesce (the
++	 * member-removal path) is promoted in one of them. TWO of them interleave so
++	 * that no instant is ever lock-free, and the quiesce is then NEVER promoted:
++	 * measured on turing run 42, where a detach stayed "in flight" for the
++	 * raid's entire life behind ~10 stacked verifies, each leaked by a client
++	 * deadline that does not cancel server-side work. One at a time — and it
++	 * NAMES its holder, because an invisible lock cost an hour of deduction. */
++	bool				verify_active;
++	char				verify_token[RAID_VERIFY_TOKEN_MAX];
++	int64_t				verify_since;		/* unix seconds, 0 = none */
++
+ 	/* Callback and context for raid_bdev configuration */
+ 	raid_bdev_configure_cb		configure_cb;
+ 	void				*configure_cb_ctx;
+diff --git a/module/bdev/raid/bdev_raid_verify_ranges.c b/module/bdev/raid/bdev_raid_verify_ranges.c
+index cca7fc4..167daaa 100644
+--- a/module/bdev/raid/bdev_raid_verify_ranges.c
++++ b/module/bdev/raid/bdev_raid_verify_ranges.c
+@@ -89,6 +89,15 @@ struct raid_verify_ctx {
+ 	double				bytes_max;
+ 	uint64_t			last_tsc;
+ 	struct spdk_poller		*pace_poller;
++	/* Evariops 0034: bounded batch. `max_blocks` = 0 keeps the old unbounded
++	 * behaviour (no caller does that any more); otherwise the scan stops on the
++	 * next chunk boundary once that many raid blocks are verified, and reports
++	 * where to resume. A scan that cannot finish inside its caller's deadline is
++	 * a scan that never finishes at all — and, before this, one that leaked a
++	 * lock-holding scanner per attempt (Q-024-1). */
++	uint64_t			max_blocks;
++	uint64_t			next_lba;	/* resume point; meaningless when complete */
++	bool				complete;	/* every requested range was walked */
+ 	/* Results. */
+ 	uint64_t			verified_blocks;
+ 	uint64_t			divergent_blocks;
+@@ -106,6 +115,14 @@ raid_verify_complete(struct raid_verify_ctx *c, int rc)
+ 	uint32_t i;
+ 
+ 	spdk_poller_unregister(&c->pace_poller);
++	/* Evariops 0034: the single-flight claim is released HERE — the one terminal
++	 * every path funnels through, success or failure. Releasing it anywhere else
++	 * would eventually leak the raid into a permanent -EBUSY. */
++	if (c->raid_bdev != NULL && c->raid_bdev->verify_active) {
++		c->raid_bdev->verify_active = false;
++		c->raid_bdev->verify_token[0] = '\0';
++		c->raid_bdev->verify_since = 0;
++	}
+ 	if (c->ch != NULL) {
+ 		spdk_put_io_channel(c->ch);
+ 	}
+@@ -135,6 +152,11 @@ raid_verify_complete(struct raid_verify_ctx *c, int rc)
+ 		spdk_json_write_object_begin(w);
+ 		spdk_json_write_named_uint64(w, "verified_blocks", c->verified_blocks);
+ 		spdk_json_write_named_uint64(w, "divergent_blocks", c->divergent_blocks);
++		/* Evariops 0034: where to resume, and whether there is anything left to
++		 * resume. `complete` is the ONLY thing that licenses a caller to call a
++		 * pass finished — verified_blocks alone cannot say it. */
++		spdk_json_write_named_bool(w, "complete", c->complete);
++		spdk_json_write_named_uint64(w, "next_lba", c->complete ? 0 : c->next_lba);
+ 		spdk_json_write_named_array_begin(w, "divergent_ranges");
+ 		for (i = 0; i < c->num_divergent; i++) {
+ 			spdk_json_write_object_begin(w);
+@@ -548,6 +570,16 @@ raid_verify_next(struct raid_verify_ctx *c)
+ 		}
+ 
+ 		c->io_lba = range->start_lba + c->cur_off;
++
++		/* Evariops 0034: the batch budget is spent — stop on THIS chunk
++		 * boundary and hand back the resume point. Checked before the lock so
++		 * the scan never ends holding one. */
++		if (c->max_blocks != 0 && c->verified_blocks >= c->max_blocks) {
++			c->next_lba = c->io_lba;
++			raid_verify_finish(c, 0);
++			return;
++		}
++
+ 		if (c->syndrome) {
+ 			/* One full stripe per lock — ranges are validated
+ 			 * stripe-aligned, so remaining is a stripe multiple.
+@@ -573,6 +605,9 @@ raid_verify_next(struct raid_verify_ctx *c)
+ 		return;
+ 	}
+ 
++	/* Every requested range walked — Evariops 0034: this, and only this, is a
++	 * COMPLETE pass. The caller stamps its "last verified" fact on it. */
++	c->complete = true;
+ 	raid_verify_finish(c, 0);
+ }
+ 
+@@ -595,6 +630,11 @@ struct rpc_bdev_raid_verify_ranges {
+ 	struct raid_verify_range	*ranges;
+ 	char				*expected_incarnation;
+ 	char				*token;
++	/* Evariops 0034: whole-raid scan RESUMED at start_lba and BOUNDED to
++	 * max_blocks. Both optional and both defaulting to the pre-0034 behaviour
++	 * (0 / unbounded), so an older control plane keeps working unchanged. */
++	uint64_t			start_lba;
++	uint64_t			max_blocks;
+ };
+ 
+ static int
+@@ -631,6 +671,8 @@ static const struct spdk_json_object_decoder rpc_bdev_raid_verify_ranges_decoder
+ 	{"ranges", offsetof(struct rpc_bdev_raid_verify_ranges, ranges), decode_verify_ranges, true},
+ 	{"expected_incarnation", offsetof(struct rpc_bdev_raid_verify_ranges, expected_incarnation), spdk_json_decode_string, true},
+ 	{"token", offsetof(struct rpc_bdev_raid_verify_ranges, token), spdk_json_decode_string, true},
++	{"start_lba", offsetof(struct rpc_bdev_raid_verify_ranges, start_lba), spdk_json_decode_uint64, true},
++	{"max_blocks", offsetof(struct rpc_bdev_raid_verify_ranges, max_blocks), spdk_json_decode_uint64, true},
+ };
+ 
+ static void
+@@ -700,6 +742,25 @@ rpc_bdev_raid_verify_ranges(struct spdk_jsonrpc_request *request,
+ 		goto cleanup;
+ 	}
+ 
++	/* Evariops 0034 (SPEC-77L Q-024-1): ONE verify at a time on a raid. Two of
++	 * them interleave their per-chunk LBA locks so that no instant is lock-free,
++	 * and a whole-device quiesce — the member-removal path — is then never
++	 * promoted: on turing run 42 a detach stayed "in flight" for the raid's
++	 * entire life behind ~10 stacked verifies. They stacked because a client
++	 * deadline does NOT cancel server-side work and the failure was classed
++	 * retryable, so every timeout leaked another scanner. The data plane must
++	 * therefore hold this invariant itself, whatever a caller retries. */
++	if (raid_bdev->verify_active) {
++		SPDK_NOTICELOG("verify_ranges on raid bdev '%s' REFUSED: '%s' has been running since "
++			       "unix %" PRId64 " (%" PRId64 " s) — one verify at a time (Evariops 0034)\n",
++			       raid_bdev->bdev.name, raid_bdev->verify_token, raid_bdev->verify_since,
++			       (int64_t)time(NULL) - raid_bdev->verify_since);
++		spdk_jsonrpc_send_error_response_fmt(request, -EBUSY,
++						     "a verify ('%s') is already running on raid bdev %s",
++						     raid_bdev->verify_token, req.name);
++		goto cleanup;
++	}
++
+ 	RAID_FOR_EACH_BASE_BDEV(raid_bdev, base_info) {
+ 		if (base_info->is_configured && !base_info->read_excluded &&
+ 		    base_info->desc != NULL) {
+@@ -740,18 +801,31 @@ rpc_bdev_raid_verify_ranges(struct spdk_jsonrpc_request *request,
+ 		goto cleanup;
+ 	}
+ 
+-	/* Default: verify every allocated block — the whole raid (the caller
+-	 * bounds batches with explicit ranges when it wants increments). */
++	/* Default: verify every allocated block — the whole raid, RESUMED at
++	 * start_lba (Evariops 0034). The caller carries the cursor this call
++	 * returns, so a scan crosses as many calls as its budget needs instead of
++	 * restarting from zero and never reaching the end. */
+ 	if (req.num_ranges == 0) {
++		if (req.start_lba >= raid_bdev->bdev.blockcnt) {
++			spdk_jsonrpc_send_error_response_fmt(request, -EINVAL,
++							     "start_lba %" PRIu64 " is past the raid (%" PRIu64 " blocks)",
++							     req.start_lba, raid_bdev->bdev.blockcnt);
++			goto cleanup;
++		}
+ 		free(req.ranges);
+ 		req.ranges = calloc(1, sizeof(struct raid_verify_range));
+ 		if (req.ranges == NULL) {
+ 			spdk_jsonrpc_send_error_response(request, -ENOMEM, spdk_strerror(ENOMEM));
+ 			goto cleanup;
+ 		}
+-		req.ranges[0].start_lba = 0;
+-		req.ranges[0].num_blocks = raid_bdev->bdev.blockcnt;
++		req.ranges[0].start_lba = req.start_lba;
++		req.ranges[0].num_blocks = raid_bdev->bdev.blockcnt - req.start_lba;
+ 		req.num_ranges = 1;
++	} else if (req.start_lba != 0) {
++		spdk_jsonrpc_send_error_response(request, -EINVAL,
++						 "start_lba applies to the whole-raid scan only — "
++						 "explicit ranges already say where to start");
++		goto cleanup;
+ 	}
+ 
+ 	for (i = 0; i < req.num_ranges; i++) {
+@@ -847,8 +921,15 @@ rpc_bdev_raid_verify_ranges(struct spdk_jsonrpc_request *request,
+ 	c->stripe_blocks = stripe_blocks;
+ 	c->ranges = (struct raid_verify_range *)req.ranges;
+ 	c->num_ranges = (uint32_t)req.num_ranges;
++	c->max_blocks = req.max_blocks;
+ 	req.ranges = NULL;	/* ownership moved */
+ 
++	/* Evariops 0034: claim the raid's single verify slot. Taken LAST, once every
++	 * refusal is behind us, and released only in raid_verify_complete. */
++	raid_bdev->verify_active = true;
++	snprintf(raid_bdev->verify_token, sizeof(raid_bdev->verify_token), "%s", token);
++	raid_bdev->verify_since = (int64_t)time(NULL);
++
+ 	raid_verify_next(c);
+ 
+ cleanup:
