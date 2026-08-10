@@ -1,0 +1,206 @@
+diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
+index a3146b8..7f94477 100644
+--- a/module/bdev/raid/bdev_raid.c
++++ b/module/bdev/raid/bdev_raid.c
+@@ -513,6 +513,10 @@ raid_bdev_free_base_bdev_resource(struct raid_base_bdev_info *base_info)
+ 		spdk_uuid_set_null(&base_info->uuid);
+ 	}
+ 	base_info->is_failed = false;
++	/* Evariops 0033: the removal-failure record dies with the membership — the
++	 * symmetric reset to is_failed, so a reused slot never inherits the previous
++	 * incarnation's grievance. */
++	base_info->remove_error = 0;
+ 	raid_bdev_base_bdev_state_touch(base_info);
+ 
+ 	/* clear `data_offset` to allow it to be recalculated during configuration */
+@@ -1291,6 +1295,9 @@ raid_bdev_write_info_json(struct raid_bdev *raid_bdev, struct spdk_json_write_ct
+ 		spdk_json_write_named_string(w, "state",
+ 					     raid_bdev_base_bdev_state_name(base_info));
+ 		spdk_json_write_named_int64(w, "since", base_info->state_since);
++		/* Evariops 0033: a removal this member refused to honour is a FACT it
++		 * carries, not a WARNLOG nobody reads. 0 = no failed removal. */
++		spdk_json_write_named_int32(w, "remove_error", base_info->remove_error);
+ 		spdk_json_write_named_uint64(w, "content_generation",
+ 					     base_info->content_generation);
+ 		spdk_json_write_named_uint64(w, "view_epoch", base_info->view_epoch);
+@@ -2462,7 +2469,28 @@ _raid_bdev_remove_base_bdev(struct raid_base_bdev_info *base_info,
+ 
+ 	assert(spdk_get_thread() == spdk_thread_get_app_thread());
+ 
+-	if (base_info->remove_scheduled || !base_info->is_configured) {
++	/* Evariops 0033: ONE code for TWO opposite realities was the whole bug.
++	 * Upstream answered -ENODEV both when a removal was already in flight
++	 * (benign — the wanted state is on its way) and when the bdev is not a
++	 * member of this raid (the real absence). The caller cannot tell them
++	 * apart, so the control plane read "a removal is in flight" as "already
++	 * removed", declared the detach done in 0 ms and moved on — while the slot
++	 * stayed configured (SPEC-77L Q-023-3, turing run 41:
++	 * spdk.raid.members{configured}=3 before, during AND after the detach).
++	 * -EALREADY now means WAIT AND OBSERVE; -ENODEV means the end state IS
++	 * reached. A refusal names itself. */
++	if (base_info->remove_scheduled) {
++		SPDK_NOTICELOG("remove_base_bdev '%s' of raid bdev '%s' slot %d: a removal is ALREADY in flight — "
++			       "-EALREADY (configured %d failed %d remove_error %d); the caller must wait and observe, "
++			       "not conclude (Evariops 0033)\n",
++			       base_info->name != NULL ? base_info->name : "(null)",
++			       raid_bdev->bdev.name, raid_bdev_base_bdev_slot(base_info),
++			       (int)base_info->is_configured, (int)base_info->is_failed,
++			       base_info->remove_error);
++		return -EALREADY;
++	}
++
++	if (!base_info->is_configured) {
+ 		return -ENODEV;
+ 	}
+ 
+@@ -2550,12 +2578,48 @@ static void
+ raid_bdev_fail_base_remove_cb(void *ctx, int status)
+ {
+ 	struct raid_base_bdev_info *base_info = ctx;
++	struct raid_bdev *raid_bdev = base_info->raid_bdev;
+ 
+-	if (status != 0) {
+-		SPDK_WARNLOG("Failed to remove base bdev %s\n", base_info->name);
+-		base_info->is_failed = false;
+-		raid_bdev_base_bdev_state_touch(base_info);
++	if (status == 0) {
++		return;
++	}
++
++	if (status == -EALREADY) {
++		/* Evariops 0033: nothing failed — a removal was already scheduled, so
++		 * the ejection IS proceeding. Un-failing the member here (upstream's
++		 * blanket reset below) was the purest form of the lie: the member is
++		 * both failed and on its way out, and every observer was told it was a
++		 * healthy full member. Leave it failed; do not re-arm. */
++		SPDK_NOTICELOG("Failing base bdev in slot %d ('%s') of raid bdev '%s': its removal was already "
++			       "in flight — the ejection proceeds, the member stays FAILED (Evariops 0033)\n",
++			       raid_bdev_base_bdev_slot(base_info),
++			       base_info->name != NULL ? base_info->name : "(null)",
++			       raid_bdev->bdev.name);
++		return;
+ 	}
++
++	/* Evariops 0033: a removal that did NOT happen must not look like a member
++	 * that never failed. Upstream answered a failed removal with one WARNLOG and
++	 * `is_failed = false` — a silent resurrection: the member went back to
++	 * "configured" for every observer (get_bdevs 0017, the superblock state at a
++	 * later ejection, spdk.raid.members) with nothing upstream ever learning that
++	 * the raid had refused to shed it. That is the data-plane half of the detach
++	 * that lies (SPEC-77L Q-023-3, turing run 41).
++	 *
++	 * The failure is now CARRIED by the member: it stays FAILED, it names the
++	 * errno, and putting it back in service becomes a decision of the control
++	 * plane — which can finally see the state — instead of a local reflex.
++	 * Service I/O is untouched: raid1 routes on the slot's channel, never on
++	 * is_failed, so a failed-but-present member keeps serving exactly as it did
++	 * under upstream's reset. What changes is only that it is VISIBLE. */
++	base_info->remove_error = status;
++	raid_bdev_base_bdev_state_touch(base_info);
++
++	SPDK_NOTICELOG("Failed to remove failed base bdev '%s' from raid bdev '%s' slot %d: %s (%d) — the member "
++		       "stays FAILED and still in the raid; the local fail path is re-armed for a later attempt and "
++		       "re-admission belongs to the control plane (Evariops 0033)\n",
++		       base_info->name != NULL ? base_info->name : "(null)", raid_bdev->bdev.name,
++		       raid_bdev_base_bdev_slot(base_info), spdk_strerror(-status), status);
+ }
+ 
+ static void
+@@ -2564,9 +2628,16 @@ _raid_bdev_fail_base_bdev(void *ctx)
+ 	struct raid_base_bdev_info *base_info = ctx;
+ 	int rc;
+ 
+-	if (base_info->is_failed) {
++	/* Evariops 0033: upstream bought the right to retry a failed removal by
++	 * clearing is_failed, i.e. by lying about the member for as long as nothing
++	 * failed again. The latch is now explicit and costs no visibility: re-entry
++	 * is allowed for exactly one reason — the previous attempt's removal
++	 * genuinely failed (remove_error != 0). A member whose removal is merely in
++	 * flight (remove_error == 0) still short-circuits, as before. */
++	if (base_info->is_failed && base_info->remove_error == 0) {
+ 		return;
+ 	}
++	base_info->remove_error = 0;
+ 	base_info->is_failed = true;
+ 	raid_bdev_base_bdev_state_touch(base_info);
+ 
+@@ -2678,7 +2749,14 @@ raid_bdev_event_base_bdev(enum spdk_bdev_event_type type, struct spdk_bdev *bdev
+ 	switch (type) {
+ 	case SPDK_BDEV_EVENT_REMOVE:
+ 		rc = raid_bdev_remove_base_bdev(bdev, NULL, NULL, NULL);
+-		if (rc != 0) {
++		if (rc == -EALREADY) {
++			/* Evariops 0033: the hot-unplug event and the control plane's own
++			 * detach raced — benign, the removal is in flight. Under the old
++			 * single code this branch manufactured an ERRLOG for a normal
++			 * concurrency; a false alarm costs as much as a missing one. */
++			SPDK_NOTICELOG("Base bdev %s removed: a removal was already in flight (Evariops 0033)\n",
++				       spdk_bdev_get_name(bdev));
++		} else if (rc != 0) {
+ 			SPDK_ERRLOG("Failed to remove base bdev %s: %s\n",
+ 				    spdk_bdev_get_name(bdev), spdk_strerror(-rc));
+ 		}
+@@ -2833,8 +2911,25 @@ raid_bdev_process_finish_target_removed(void *ctx, int status)
+ {
+ 	struct raid_bdev_process *process = ctx;
+ 
+-	if (status != 0) {
+-		SPDK_ERRLOG("Failed to remove target bdev: %s\n", spdk_strerror(-status));
++	/* Evariops 0033: the registry entry sealed just below tells the truth about
++	 * the REBUILD (CANCELED/FAILED per process->status) — but the ERRLOG was the
++	 * only trace that its target had ALSO refused to leave the raid, and a reader
++	 * of the outcome would reasonably assume the target was gone. The member now
++	 * carries that fact itself (get_bdevs remove_error), so the two statements
++	 * can never disagree. -EALREADY is not a failure: the ejection is in flight. */
++	if (status != 0 && status != -EALREADY) {
++		process->target->remove_error = status;
++		raid_bdev_base_bdev_state_touch(process->target);
++		SPDK_ERRLOG("Failed to remove target bdev '%s' after a failed %s on raid bdev '%s': %s — the target "
++			    "stays in the raid and now carries remove_error (Evariops 0033)\n",
++			    process->target->name != NULL ? process->target->name : "(null)",
++			    raid_bdev_process_to_str(process->type), process->raid_bdev->bdev.name,
++			    spdk_strerror(-status));
++	} else if (status == -EALREADY) {
++		SPDK_NOTICELOG("Target bdev '%s' of raid bdev '%s': removal already in flight after a failed %s "
++			       "(Evariops 0033)\n",
++			       process->target->name != NULL ? process->target->name : "(null)",
++			       process->raid_bdev->bdev.name, raid_bdev_process_to_str(process->type));
+ 	}
+ 
+ 	spdk_thread_send_msg(process->thread, _raid_bdev_process_finish_done, process);
+diff --git a/module/bdev/raid/bdev_raid.h b/module/bdev/raid/bdev_raid.h
+index 343615e..3e33a04 100644
+--- a/module/bdev/raid/bdev_raid.h
++++ b/module/bdev/raid/bdev_raid.h
+@@ -110,6 +110,16 @@ struct raid_base_bdev_info {
+ 	/* Set to true to indicate that the base bdev is being removed because of a failure */
+ 	bool			is_failed;
+ 
++	/* Evariops 0033: errno of the LAST removal attempt that genuinely FAILED on
++	 * this member (0 = none, and -EALREADY never lands here — an in-flight
++	 * removal is not a failure). Upstream had no such field: it answered a
++	 * failed removal by clearing is_failed, so the member silently returned to
++	 * "configured" and the control plane saw a healthy raid while its detach had
++	 * done nothing (SPEC-77L Q-023-3, turing run 41). Two jobs, both explicit:
++	 * it is reported per-member in get_bdevs (0014.6), and it is the ONLY thing
++	 * that re-arms the local fail path. */
++	int			remove_error;
++
+ 	/* callback for base bdev configuration */
+ 	raid_base_bdev_cb	configure_cb;
+ 
+@@ -353,6 +363,14 @@ enum raid_bdev_state raid_bdev_str_to_state(const char *str);
+ const char *raid_bdev_state_to_str(enum raid_bdev_state state);
+ const char *raid_bdev_process_to_str(enum raid_process_type value);
+ void raid_bdev_write_info_json(struct raid_bdev *raid_bdev, struct spdk_json_write_ctx *w);
++/* Return contract (Evariops 0033 — the caller MUST distinguish these):
++ *   0         the removal was accepted; the cb reports its completion.
++ *   -EALREADY a removal is already in flight on this member. The wanted end
++ *             state is ARRIVING: wait and observe, never conclude "removed".
++ *   -ENODEV   the bdev is not a member of any raid (or the slot is not
++ *             configured) — the end state IS reached.
++ * Upstream answered -ENODEV for both of the last two, which is how a detach
++ * came to report success over a member that never left (SPEC-77L Q-023-3). */
+ int raid_bdev_remove_base_bdev(struct spdk_bdev *base_bdev, const char *expected_incarnation,
+ 			       raid_base_bdev_cb cb_fn, void *cb_ctx);
+ 
