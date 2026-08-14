@@ -1,0 +1,86 @@
+diff --git a/module/bdev/raid/bdev_raid_rpc.c b/module/bdev/raid/bdev_raid_rpc.c
+--- a/module/bdev/raid/bdev_raid_rpc.c
++++ b/module/bdev/raid/bdev_raid_rpc.c
+@@ -325,12 +334,82 @@ cleanup:
+ }
+ SPDK_RPC_REGISTER("bdev_raid_create", rpc_bdev_raid_create, SPDK_RPC_RUNTIME)
+ 
++/* Evariops 0037: CLAIM an examine-reassembled (unclaimed) raid for a control-plane
++ * incarnation — CAS semantics: succeeds only when no incarnation is held, -EEXIST
++ * names the current owner otherwise. Without it an ADOPTED raid stayed unclaimed
++ * forever, every claimed-required reader called it a ghost (Faulted), and the
++ * create/compensate loop destroyed what it had just built (2026-08-14). */
++struct rpc_bdev_raid_claim {
++	char *name;
++	char *incarnation;
++};
++
++static void
++free_rpc_bdev_raid_claim(struct rpc_bdev_raid_claim *req)
++{
++	free(req->name);
++	free(req->incarnation);
++}
++
++static const struct spdk_json_object_decoder rpc_bdev_raid_claim_decoders[] = {
++	{"name", offsetof(struct rpc_bdev_raid_claim, name), spdk_json_decode_string},
++	{"incarnation", offsetof(struct rpc_bdev_raid_claim, incarnation), spdk_json_decode_string},
++};
++
++static void
++rpc_bdev_raid_claim(struct spdk_jsonrpc_request *request, const struct spdk_json_val *params)
++{
++	struct rpc_bdev_raid_claim req = {};
++	struct raid_bdev *raid_bdev;
++
++	if (spdk_json_decode_object(params, rpc_bdev_raid_claim_decoders,
++				    SPDK_COUNTOF(rpc_bdev_raid_claim_decoders), &req)) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
++						 "Invalid parameters");
++		free_rpc_bdev_raid_claim(&req);
++		return;
++	}
++
++	raid_bdev = raid_bdev_find_by_name(req.name);
++	if (raid_bdev == NULL) {
++		spdk_jsonrpc_send_error_response_fmt(request, -ENODEV,
++						     "No such raid bdev: %s", req.name);
++		free_rpc_bdev_raid_claim(&req);
++		return;
++	}
++
++	if (raid_bdev->incarnation != NULL) {
++		spdk_jsonrpc_send_error_response_fmt(request, -EEXIST,
++						     "raid bdev %s already claimed by '%s'",
++						     req.name, raid_bdev->incarnation);
++		free_rpc_bdev_raid_claim(&req);
++		return;
++	}
++
++	raid_bdev->incarnation = strdup(req.incarnation);
++	if (raid_bdev->incarnation == NULL) {
++		spdk_jsonrpc_send_error_response(request, -ENOMEM, spdk_strerror(ENOMEM));
++		free_rpc_bdev_raid_claim(&req);
++		return;
++	}
++
++	SPDK_NOTICELOG("raid bdev %s CLAIMED by incarnation '%s' (Evariops 0037)\n",
++		       req.name, raid_bdev->incarnation);
++	spdk_jsonrpc_send_bool_response(request, true);
++	free_rpc_bdev_raid_claim(&req);
++}
++SPDK_RPC_REGISTER("bdev_raid_claim", rpc_bdev_raid_claim, SPDK_RPC_RUNTIME)
++
+ /*
+  * Input structure for RPC deleting a raid bdev
+  */
+ struct rpc_bdev_raid_delete {
+ 	/* raid bdev name */
+ 	char *name;
++
++	/* Evariops 0014.4: -ESTALE on mismatch; omission is reserved for manual
++	 * rescue tooling (the control-plane client always sends it) */
++	char *expected_incarnation;
+ };
+ 
+ /*
