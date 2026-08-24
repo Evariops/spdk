@@ -1,13 +1,11 @@
 diff --git a/module/bdev/raid/raid5f.c b/module/bdev/raid/raid5f.c
-index 0a2274f..1d02ec8 100644
+index 0a2274f..9d8e2c6 100644
 --- a/module/bdev/raid/raid5f.c
 +++ b/module/bdev/raid/raid5f.c
-@@ -649,15 +649,48 @@ raid5f_submit_write_request(struct raid_bdev_io *raid_io, uint64_t stripe_index)
+@@ -649,15 +649,46 @@ raid5f_submit_write_request(struct raid_bdev_io *raid_io, uint64_t stripe_index)
  	return 0;
  }
  
-+/* SPEC-73 M3: forward declarations so the read-completion path can fall back to
-+ * a degraded reconstruct read (both defined later in this file). */
 +static int raid5f_submit_reconstruct_read(struct raid_bdev_io *raid_io, uint64_t stripe_index,
 +		uint8_t chunk_idx, uint64_t chunk_offset, stripe_req_xor_cb cb);
 +static void raid5f_stripe_request_reconstruct_xor_done(struct stripe_request *stripe_req, int status);
@@ -31,10 +29,10 @@ index 0a2274f..1d02ec8 100644
 +		return;
 +	}
 +
-+	/* A PRESENT member returned a read error (e.g. a degraded band of the
-+	 * bdev_tier composite). Fall back to a degraded read: reconstruct this chunk
-+	 * from the survivors + parity instead of failing. The direct read path did
-+	 * not touch base_bdev_io_submitted, so the reconstruct path starts clean. */
++	/* Evariops 0006: a present member returned a read error. Reconstruct the
++	 * chunk from the survivors and parity instead of failing. The direct read
++	 * path leaves base_bdev_io_submitted untouched, so the reconstruct path
++	 * starts from a clean state. */
 +	raid_bdev = raid_io->raid_bdev;
 +	r5f_info = raid_bdev->module_private;
 +	stripe_index = raid_io->offset_blocks / r5f_info->stripe_blocks;
@@ -53,16 +51,15 @@ index 0a2274f..1d02ec8 100644
  }
  
  static void raid5f_submit_rw_request(struct raid_bdev_io *raid_io);
-@@ -709,6 +742,24 @@ raid5f_submit_reconstruct_read(struct raid_bdev_io *raid_io, uint64_t stripe_ind
+@@ -709,6 +740,23 @@ raid5f_submit_reconstruct_read(struct raid_bdev_io *raid_io, uint64_t stripe_ind
  
  	assert(cb != NULL);
  
-+	/* SPEC-73 M3 double-fault guard: a reconstruct read consumes EVERY other member
-+	 * (raid5 tolerates a single fault). If a second member is unavailable (its base
-+	 * bdev was removed → NULL channel), reconstruction is impossible — fail cleanly with
-+	 * -EIO instead of submitting a read to a missing base bdev (crash / silent garbage).
-+	 * A present-but-erroring member (e.g. a degraded bdev_tier band) keeps a valid channel
-+	 * and is handled by the read-completion path, not here. */
++	/* Double-fault guard: a reconstruct read consumes every other member, so a
++	 * second absent one (NULL channel) makes reconstruction impossible. Fail
++	 * with -EIO rather than submit a read to a missing base bdev. A member that
++	 * is present but erroring keeps a valid channel and is handled by the
++	 * read-completion path instead. */
 +	{
 +		uint8_t i;
 +		for (i = 0; i < raid_bdev->num_base_bdevs; i++) {

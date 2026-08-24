@@ -4,16 +4,10 @@
  */
 
 /*
- * CBT resilience tests — negative paths, error injection, failure modes.
- *
- * These tests verify that the code handles EVERY failure gracefully:
- *   - malloc failures at every allocation site
- *   - invalid state transitions
- *   - invalid / adversarial inputs
- *   - resource exhaustion (max epochs)
- *   - double-free / use-after-close patterns
- *   - concurrent mark during clear (TOCTOU)
- *   - overflow / underflow edge cases in arithmetic
+ * CBT resilience tests — negative paths, error injection, failure modes, run
+ * against a standalone model of the module: allocation failure at every site,
+ * invalid state transitions, adversarial inputs, epoch exhaustion, concurrent
+ * mark against clear, and arithmetic edge cases.
  *
  * Build:  make -f Makefile.test test-resilience
  * Run:    ./test_cbt_resilience
@@ -37,10 +31,8 @@
 static _Atomic int g_malloc_fail_countdown = -1;  /* -1 = no injection */
 static _Atomic int g_malloc_fail_count = 0;
 
-/*
- * Wraps malloc/calloc with a countdown — when it reaches 0, return NULL.
- * This lets us systematically test every allocation failure path.
- */
+/* Wraps malloc/calloc with a countdown: the nth allocation returns NULL, which
+ * is how each allocation failure path gets exercised in turn. */
 static void *
 fi_malloc(size_t size)
 {
@@ -120,11 +112,10 @@ struct cbt_epoch {
 	uint64_t                generation;
 	enum cbt_epoch_state    state;
 	uint8_t                *bitmap_frozen;
-	/* H1 (mirrors vbdev_cbt.h): true while bitmap_frozen holds bits exchanged
-	 * OUT of the live bitmap and not yet proven copied by a COMPLETED rebuild. */
+	/* True while bitmap_frozen holds bits exchanged OUT of the live bitmap and
+	 * not yet proven copied by a COMPLETED rebuild (mirrors vbdev_cbt.h). */
 	bool                    frozen_live_consumed;
-	/* Model equivalent of production's g_rebuild_registry RUNNING lookup
-	 * (cbt_rebuild_find_active_for_epoch). */
+	/* Model equivalent of the production rebuild-registry RUNNING lookup. */
 	bool                    rebuild_running;
 	struct cbt_epoch       *next;
 };
@@ -151,7 +142,7 @@ cbt_create(uint64_t total_blocks, uint32_t chunk_size_kb, uint32_t block_size)
 	dev->chunk_size_blocks = ((uint64_t)chunk_size_kb * 1024) / block_size;
 	if (dev->chunk_size_blocks == 0) dev->chunk_size_blocks = 1;
 
-	/* P2 round-up. */
+	/* Chunk size must be a power of two for the shift-based fast path. */
 	if ((dev->chunk_size_blocks & (dev->chunk_size_blocks - 1)) != 0) {
 		uint64_t v = dev->chunk_size_blocks;
 		v--; v |= v >> 1; v |= v >> 2; v |= v >> 4;
@@ -209,10 +200,9 @@ cbt_mark_dirty(struct cbt_device *dev, uint64_t offset_blocks, uint64_t num_bloc
 	}
 }
 
-/* H2 (mirrors vbdev_cbt.c two-phase marking): the dirty bit is set at SUBMIT
- * (crash conservatism) and RE-set at COMPLETION before the host ack. A freeze
- * exchanging the submit-time bit of a still-in-flight write is therefore
- * harmless: the completion re-mark lands the chunk in the next delta. */
+/* Two-phase marking, as in production: the dirty bit is set at SUBMIT (crash
+ * conservatism) and re-set at COMPLETION before the host ack, so a freeze that
+ * exchanges out the submit-time bit of an in-flight write is harmless. */
 static void
 cbt_write_submit(struct cbt_device *dev, uint64_t offset_blocks, uint64_t num_blocks)
 {
@@ -225,11 +215,10 @@ cbt_write_complete(struct cbt_device *dev, uint64_t offset_blocks, uint64_t num_
 	cbt_mark_dirty(dev, offset_blocks, num_blocks);
 }
 
-/* M1 (mirrors cbt_rebuild_finish + cbt_rebuild_finalize classification, R1):
- * the terminal flush is only submitted when the rebuild is a genuine success
- * candidate — error==0, not cancelled, NOT ABORTED, chunks copied, target
- * present. A flush failure maps to FAILED; the R1 order is
- * cancelled → error → aborted → completed. */
+/* Mirrors the production terminal classification: the flush is submitted only
+ * for a genuine success candidate (error 0, not cancelled, NOT aborted, chunks
+ * copied, target present), a flush failure maps to FAILED, and the order of
+ * tests is cancelled, then error, then aborted, then completed. */
 enum cbt_rebuild_final_state {
 	REB_COMPLETED = 0,
 	REB_FAILED    = 1,
@@ -304,9 +293,8 @@ cbt_epoch_open(struct cbt_device *dev, const char *epoch_id,
 	}
 
 	if (dev->epoch_count >= CBT_MAX_EPOCHS) {
-		/* Mirrors production: evict the oldest ONLY if safe — never an
-		 * active epoch (OPEN/FROZEN/REBUILDING) and never one a rebuild
-		 * still points at (C3 defense-in-depth). */
+		/* Evict the oldest ONLY if safe: never an active epoch
+		 * (OPEN/FROZEN/REBUILDING) and never one a rebuild still points at. */
 		struct cbt_epoch *oldest = dev->epochs_head;
 		if (!oldest || oldest->state == CBT_EPOCH_OPEN ||
 		    oldest->state == CBT_EPOCH_FROZEN ||
@@ -314,7 +302,7 @@ cbt_epoch_open(struct cbt_device *dev, const char *epoch_id,
 		    oldest->rebuild_running) {
 			return -ENOSPC;
 		}
-		/* H1: an INVALID epoch may still hold an unconsumed exchanged delta. */
+		/* An INVALID epoch may still hold an unconsumed exchanged delta. */
 		cbt_epoch_restore_unconsumed_delta(dev, oldest);
 		dev->epochs_head = oldest->next;
 		dev->epoch_count--;
@@ -345,8 +333,8 @@ cbt_epoch_open(struct cbt_device *dev, const char *epoch_id,
 	return 0;
 }
 
-/* Mirrors vbdev_cbt.c cbt_has_other_active_epoch: epochs share the live bitmap,
- * so snapshot-and-clear is only safe when no OTHER epoch needs the accumulated view. */
+/* Epochs share the live bitmap, so snapshot-and-clear is only safe when no
+ * OTHER epoch still needs the accumulated view. */
 static bool
 cbt_has_other_active_epoch(struct cbt_device *dev, struct cbt_epoch *self)
 {
@@ -360,9 +348,8 @@ cbt_has_other_active_epoch(struct cbt_device *dev, struct cbt_epoch *self)
 	return false;
 }
 
-/* H1 (mirrors vbdev_cbt.c cbt_epoch_restore_unconsumed_delta): OR an
- * unconsumed exchanged delta back into the live bitmap before its buffer is
- * discarded. Pessimistic (already-copied chunks get re-copied), never lossy. */
+/* OR an unconsumed exchanged delta back into the live bitmap before its buffer
+ * is discarded. Pessimistic — already-copied chunks get re-copied — never lossy. */
 static void
 cbt_epoch_restore_unconsumed_delta(struct cbt_device *dev, struct cbt_epoch *ep)
 {
@@ -387,18 +374,16 @@ cbt_epoch_freeze(struct cbt_device *dev, const char *epoch_id)
 	    ep->state != CBT_EPOCH_REBUILDING) {
 		return -EINVAL;
 	}
-	/* CBT-1 (mirrors production): never free/realloc the frozen bitmap a
-	 * RUNNING rebuild is scanning. */
+	/* Never free or realloc the frozen bitmap a RUNNING rebuild is scanning. */
 	if (ep->rebuild_running) return -EBUSY;
 
-	/* H1: allocate BEFORE touching the old snapshot — ENOMEM must leave the
-	 * epoch (and the previous delta) exactly as they were. */
+	/* Allocate BEFORE touching the old snapshot: ENOMEM must leave the epoch,
+	 * and the previous delta, exactly as they were. */
 	uint8_t *new_frozen = fi_malloc(dev->bitmap_size_bytes);
 	if (!new_frozen) return -ENOMEM;
 
-	/* H1: an unconsumed previous delta (rebuild aborted/failed/never run) is
-	 * merged back first, so the exchange below re-captures it: new snapshot =
-	 * old unconsumed delta ∪ writes since last freeze. */
+	/* An unconsumed previous delta is merged back first, so the exchange below
+	 * re-captures it together with the writes since the last freeze. */
 	if (ep->bitmap_frozen != NULL) {
 		cbt_epoch_restore_unconsumed_delta(dev, ep);
 		free(ep->bitmap_frozen);
@@ -406,10 +391,10 @@ cbt_epoch_freeze(struct cbt_device *dev, const char *epoch_id)
 	ep->bitmap_frozen = new_frozen;
 
 	if (!cbt_has_other_active_epoch(dev, ep)) {
-		/* Snapshot-AND-CLEAR (atomic per-byte exchange): each freeze captures
-		 * the DELTA since the previous freeze — iterative rebuilds converge.
-		 * Exchange, not memcpy+memset: a concurrent OR between copy and clear
-		 * would be lost (missed chunk under skip_rebuild = silent divergence). */
+		/* Snapshot-AND-CLEAR: each freeze captures the DELTA since the previous
+		 * one, so iterative rebuilds converge. Per-byte exchange, not
+		 * memcpy+memset: a concurrent OR between a copy and a clear would be
+		 * lost, and a missed chunk is silent divergence. */
 		for (uint64_t i = 0; i < dev->bitmap_size_bytes; i++) {
 			ep->bitmap_frozen[i] = __atomic_exchange_n(&dev->bitmap[i], 0,
 								   __ATOMIC_ACQ_REL);
@@ -430,8 +415,8 @@ cbt_epoch_rebuild_start(struct cbt_device *dev, const char *epoch_id)
 
 	struct cbt_epoch *ep = cbt_find_epoch(dev, epoch_id);
 	if (!ep) return -ENOENT;
-	/* Mirrors production: FROZEN or REBUILDING (retry), frozen bitmap
-	 * required, one rebuild per epoch. */
+	/* FROZEN or REBUILDING (a retry), a frozen bitmap is required, and one
+	 * rebuild per epoch. */
 	if (ep->state != CBT_EPOCH_FROZEN && ep->state != CBT_EPOCH_REBUILDING) {
 		return -EINVAL;
 	}
@@ -443,9 +428,8 @@ cbt_epoch_rebuild_start(struct cbt_device *dev, const char *epoch_id)
 	return 0;
 }
 
-/* Model of the rebuild terminating (cbt_rebuild_finalize): on COMPLETED the
- * exchanged delta is proven copied (H1 flag cleared); on abort/failure the
- * delta stays owned by bitmap_frozen until merged back. */
+/* Model of the rebuild terminating: on COMPLETED the exchanged delta is proven
+ * copied; on abort or failure it stays owned by bitmap_frozen until merged back. */
 static int
 cbt_epoch_rebuild_finish(struct cbt_device *dev, const char *epoch_id, bool completed)
 {
@@ -468,10 +452,10 @@ cbt_epoch_close(struct cbt_device *dev, const char *epoch_id)
 	struct cbt_epoch *ep = cbt_find_epoch(dev, epoch_id);
 	if (!ep) return -ENOENT;
 	if (ep->state == CBT_EPOCH_OPEN) return -EINVAL;
-	/* CBT-2 (mirrors production): a RUNNING rebuild writes into the epoch. */
+	/* A RUNNING rebuild writes into the epoch. */
 	if (ep->rebuild_running) return -EBUSY;
 
-	/* H1: closing must not lose un-copied dirty history. */
+	/* Closing must not lose un-copied dirty history. */
 	cbt_epoch_restore_unconsumed_delta(dev, ep);
 
 	/* Remove from list. */
@@ -496,8 +480,8 @@ cbt_epoch_invalidate(struct cbt_device *dev, const char *epoch_id)
 
 	struct cbt_epoch *ep = cbt_find_epoch(dev, epoch_id);
 	if (!ep) return -ENOENT;
-	/* C3 (mirrors production): invalidating a REBUILDING epoch would make it
-	 * evictable under the RUNNING rebuild → UAF. Cancel the rebuild first. */
+	/* Invalidating a REBUILDING epoch would make it evictable under the RUNNING
+	 * rebuild, freeing memory that rebuild still reads. Cancel it first. */
 	if (ep->rebuild_running) return -EBUSY;
 
 	ep->state = CBT_EPOCH_INVALID;
@@ -595,6 +579,7 @@ static int g_failed = 0;
 /* SECTION 1: Allocation failures (fault injection)                   */
 /* ================================================================== */
 
+/* A failed device allocation yields NULL, not a half-built device. */
 static void test_create_malloc_fail_struct(void)
 {
 	TEST(test_create_malloc_fail_struct);
@@ -605,6 +590,7 @@ static void test_create_malloc_fail_struct(void)
 	PASS();
 }
 
+/* A failed bitmap allocation frees the device struct and yields NULL. */
 static void test_create_malloc_fail_bitmap(void)
 {
 	TEST(test_create_malloc_fail_bitmap);
@@ -615,6 +601,7 @@ static void test_create_malloc_fail_bitmap(void)
 	PASS();
 }
 
+/* A failed epoch allocation returns -ENOMEM and adds no epoch. */
 static void test_epoch_open_malloc_fail(void)
 {
 	TEST(test_epoch_open_malloc_fail);
@@ -632,6 +619,8 @@ static void test_epoch_open_malloc_fail(void)
 	PASS();
 }
 
+/* A failed freeze allocation returns -ENOMEM and leaves the epoch OPEN with no
+ * frozen bitmap, so a retry is possible. */
 static void test_epoch_freeze_malloc_fail(void)
 {
 	TEST(test_epoch_freeze_malloc_fail);
@@ -646,7 +635,6 @@ static void test_epoch_freeze_malloc_fail(void)
 	int rc = cbt_epoch_freeze(dev, "ep1");
 	ASSERT_RC(rc, -ENOMEM);
 
-	/* Epoch still exists but state unchanged. */
 	struct cbt_epoch *ep = cbt_find_epoch(dev, "ep1");
 	ASSERT(ep != NULL);
 	ASSERT_EQ(ep->state, CBT_EPOCH_OPEN);
@@ -657,6 +645,7 @@ static void test_epoch_freeze_malloc_fail(void)
 	PASS();
 }
 
+/* A failed range-array allocation returns -ENOMEM and leaves *out_ranges NULL. */
 static void test_get_ranges_malloc_fail(void)
 {
 	TEST(test_get_ranges_malloc_fail);
@@ -684,6 +673,8 @@ static void test_get_ranges_malloc_fail(void)
 /* SECTION 2: Invalid state transitions                               */
 /* ================================================================== */
 
+/* Re-freeze is refused while a rebuild RUNS, allowed once it terminates (the
+ * convergence loop), and refused for good on an INVALID epoch. */
 static void test_freeze_non_open_epoch(void)
 {
 	TEST(test_freeze_non_open_epoch);
@@ -694,15 +685,11 @@ static void test_freeze_non_open_epoch(void)
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
 	ASSERT_RC(cbt_epoch_rebuild_start(dev, "ep1"), 0);
 
-	/* CBT-1: re-freeze refused while the rebuild is RUNNING. */
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), -EBUSY);
 
-	/* Re-freeze from REBUILDING is allowed once no rebuild runs
-	 * (convergence loop). */
 	ASSERT_RC(cbt_epoch_rebuild_finish(dev, "ep1", true), 0);
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
 
-	/* Invalidate, then try to freeze — INVALID is rejected. */
 	ASSERT_RC(cbt_epoch_invalidate(dev, "ep1"), 0);
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), -EINVAL);
 
@@ -710,6 +697,7 @@ static void test_freeze_non_open_epoch(void)
 	PASS();
 }
 
+/* An OPEN epoch cannot be closed: it must be frozen first. */
 static void test_close_open_epoch(void)
 {
 	TEST(test_close_open_epoch);
@@ -717,7 +705,6 @@ static void test_close_open_epoch(void)
 	struct cbt_device *dev = cbt_create(2048, 64, 512);
 
 	ASSERT_RC(cbt_epoch_open(dev, "ep1", "b", 1), 0);
-	/* Can't close an OPEN epoch — must freeze first. */
 	ASSERT_RC(cbt_epoch_close(dev, "ep1"), -EINVAL);
 	ASSERT_EQ(dev->epoch_count, 1);
 
@@ -725,6 +712,7 @@ static void test_close_open_epoch(void)
 	PASS();
 }
 
+/* A rebuild cannot start on an epoch that is still OPEN. */
 static void test_rebuild_start_non_frozen(void)
 {
 	TEST(test_rebuild_start_non_frozen);
@@ -732,13 +720,13 @@ static void test_rebuild_start_non_frozen(void)
 	struct cbt_device *dev = cbt_create(2048, 64, 512);
 
 	ASSERT_RC(cbt_epoch_open(dev, "ep1", "b", 1), 0);
-	/* Can't start rebuild on OPEN epoch. */
 	ASSERT_RC(cbt_epoch_rebuild_start(dev, "ep1"), -EINVAL);
 
 	cbt_destroy(dev);
 	PASS();
 }
 
+/* Ranges can only be read from a frozen bitmap, never from an OPEN epoch. */
 static void test_get_ranges_from_open_epoch(void)
 {
 	TEST(test_get_ranges_from_open_epoch);
@@ -750,7 +738,6 @@ static void test_get_ranges_from_open_epoch(void)
 
 	struct dirty_range *ranges = NULL;
 	uint32_t count = 0;
-	/* Can't get ranges from non-frozen epoch. */
 	ASSERT_RC(cbt_epoch_get_dirty_ranges(dev, "ep1", 0, &ranges, &count), -EINVAL);
 	ASSERT(ranges == NULL);
 
@@ -758,6 +745,7 @@ static void test_get_ranges_from_open_epoch(void)
 	PASS();
 }
 
+/* An INVALID epoch exposes no ranges. */
 static void test_get_ranges_from_invalid_epoch(void)
 {
 	TEST(test_get_ranges_from_invalid_epoch);
@@ -870,13 +858,13 @@ static void test_backend_id_too_long(void)
 	PASS();
 }
 
+/* An id of exactly CBT_EPOCH_ID_MAX - 1 characters is accepted and kept whole. */
 static void test_epoch_id_max_length(void)
 {
 	TEST(test_epoch_id_max_length);
 	fi_reset();
 	struct cbt_device *dev = cbt_create(2048, 64, 512);
 
-	/* Exactly CBT_EPOCH_ID_MAX - 1 chars should succeed. */
 	char max_id[CBT_EPOCH_ID_MAX];
 	memset(max_id, 'X', CBT_EPOCH_ID_MAX - 1);
 	max_id[CBT_EPOCH_ID_MAX - 1] = '\0';
@@ -892,13 +880,13 @@ static void test_epoch_id_max_length(void)
 	PASS();
 }
 
+/* An empty epoch id is accepted: only the length bound is enforced. */
 static void test_empty_epoch_id(void)
 {
 	TEST(test_empty_epoch_id);
 	fi_reset();
 	struct cbt_device *dev = cbt_create(2048, 64, 512);
 
-	/* Empty string is technically valid (strlen < MAX). */
 	ASSERT_RC(cbt_epoch_open(dev, "", "backend", 1), 0);
 	struct cbt_epoch *ep = cbt_find_epoch(dev, "");
 	ASSERT(ep != NULL);
@@ -907,6 +895,8 @@ static void test_empty_epoch_id(void)
 	PASS();
 }
 
+/* Re-opening an epoch id at a lower or equal generation is rejected and leaves
+ * the existing epoch untouched. */
 static void test_duplicate_epoch_id_lower_gen(void)
 {
 	TEST(test_duplicate_epoch_id_lower_gen);
@@ -914,12 +904,9 @@ static void test_duplicate_epoch_id_lower_gen(void)
 	struct cbt_device *dev = cbt_create(2048, 64, 512);
 
 	ASSERT_RC(cbt_epoch_open(dev, "ep1", "b1", 5), 0);
-	/* Same epoch_id, lower generation → reject. */
 	ASSERT_RC(cbt_epoch_open(dev, "ep1", "b2", 3), -EEXIST);
-	/* Same generation → also reject. */
 	ASSERT_RC(cbt_epoch_open(dev, "ep1", "b2", 5), -EEXIST);
 
-	/* Verify original is unchanged. */
 	struct cbt_epoch *ep = cbt_find_epoch(dev, "ep1");
 	ASSERT_EQ(ep->generation, 5);
 	ASSERT_EQ(strcmp(ep->stale_backend_id, "b1"), 0);
@@ -928,6 +915,8 @@ static void test_duplicate_epoch_id_lower_gen(void)
 	PASS();
 }
 
+/* A higher generation takes the epoch over in place: new backend id, state back
+ * to OPEN, still one epoch. */
 static void test_duplicate_epoch_id_higher_gen(void)
 {
 	TEST(test_duplicate_epoch_id_higher_gen);
@@ -935,14 +924,13 @@ static void test_duplicate_epoch_id_higher_gen(void)
 	struct cbt_device *dev = cbt_create(2048, 64, 512);
 
 	ASSERT_RC(cbt_epoch_open(dev, "ep1", "b1", 5), 0);
-	/* Higher generation → re-open (reset to OPEN state). */
 	ASSERT_RC(cbt_epoch_open(dev, "ep1", "b2", 10), 0);
 
 	struct cbt_epoch *ep = cbt_find_epoch(dev, "ep1");
 	ASSERT_EQ(ep->generation, 10);
 	ASSERT_EQ(strcmp(ep->stale_backend_id, "b2"), 0);
 	ASSERT_EQ(ep->state, CBT_EPOCH_OPEN);
-	ASSERT_EQ(dev->epoch_count, 1);  /* Still 1, not 2 */
+	ASSERT_EQ(dev->epoch_count, 1);
 
 	cbt_destroy(dev);
 	PASS();
@@ -952,23 +940,22 @@ static void test_duplicate_epoch_id_higher_gen(void)
 /* SECTION 5: Resource exhaustion                                     */
 /* ================================================================== */
 
+/* With every slot active, a further open returns -ENOSPC; invalidating the
+ * oldest makes it evictable and the open then succeeds. */
 static void test_max_epochs_eviction(void)
 {
 	TEST(test_max_epochs_eviction);
 	fi_reset();
 	struct cbt_device *dev = cbt_create(2048, 64, 512);
 
-	/* Fill up to max. */
 	ASSERT_RC(cbt_epoch_open(dev, "ep1", "b1", 1), 0);
 	ASSERT_RC(cbt_epoch_open(dev, "ep2", "b2", 2), 0);
 	ASSERT_RC(cbt_epoch_open(dev, "ep3", "b3", 3), 0);
 	ASSERT_RC(cbt_epoch_open(dev, "ep4", "b4", 4), 0);
 	ASSERT_EQ(dev->epoch_count, CBT_MAX_EPOCHS);
 
-	/* All epochs are OPEN (active) → production refuses to evict. */
 	ASSERT_RC(cbt_epoch_open(dev, "ep5", "b5", 5), -ENOSPC);
 
-	/* Invalidate the oldest → now evictable. */
 	ASSERT_RC(cbt_epoch_invalidate(dev, "ep1"), 0);
 	ASSERT_RC(cbt_epoch_open(dev, "ep5", "b5", 5), 0);
 	ASSERT_EQ(dev->epoch_count, CBT_MAX_EPOCHS);
@@ -979,13 +966,14 @@ static void test_max_epochs_eviction(void)
 	PASS();
 }
 
+/* Evicting an epoch that holds a frozen delta merges that delta back into the
+ * live bitmap instead of destroying it. */
 static void test_max_epochs_eviction_with_frozen_bitmap(void)
 {
 	TEST(test_max_epochs_eviction_with_frozen_bitmap);
 	fi_reset();
 	struct cbt_device *dev = cbt_create(2048, 64, 512);
 
-	/* Fill, freeze first one (so it has bitmap_frozen allocated). */
 	ASSERT_RC(cbt_epoch_open(dev, "ep1", "b1", 1), 0);
 	cbt_mark_dirty(dev, 0, 128);
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
@@ -994,14 +982,10 @@ static void test_max_epochs_eviction_with_frozen_bitmap(void)
 	ASSERT_RC(cbt_epoch_open(dev, "ep3", "b3", 3), 0);
 	ASSERT_RC(cbt_epoch_open(dev, "ep4", "b4", 4), 0);
 
-	/* FROZEN is active → refused; invalidate first, then evict. */
 	ASSERT_RC(cbt_epoch_open(dev, "ep5", "b5", 5), -ENOSPC);
 	ASSERT_RC(cbt_epoch_invalidate(dev, "ep1"), 0);
 	ASSERT_RC(cbt_epoch_open(dev, "ep5", "b5", 5), 0);
 	ASSERT(cbt_find_epoch(dev, "ep1") == NULL);
-	/* If we get here without ASan complaining, no leak. And H1: ep1's
-	 * exchanged-out delta must have been merged back into the live bitmap
-	 * by the eviction, not silently destroyed. */
 	ASSERT(count_bits(dev->bitmap, dev->bitmap_size_bytes) > 0);
 
 	cbt_destroy(dev);
@@ -1012,6 +996,8 @@ static void test_max_epochs_eviction_with_frozen_bitmap(void)
 /* SECTION 6: Double operations / idempotence                         */
 /* ================================================================== */
 
+/* Freezing twice with no rebuild in between keeps both ranges: the first,
+ * never-copied delta is merged back and re-captured. */
 static void test_double_freeze(void)
 {
 	TEST(test_double_freeze);
@@ -1022,11 +1008,6 @@ static void test_double_freeze(void)
 	cbt_mark_dirty(dev, 0, 128);
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
 
-	/* Mark more, re-freeze → succeeds. H1: the first delta was consumed from
-	 * the live bitmap but NEVER copied (no rebuild ran) — the re-freeze must
-	 * merge it back and re-capture it, so the new snapshot holds BOTH ranges.
-	 * (Only a COMPLETED rebuild licenses dropping a consumed delta; see
-	 * test_freeze_clears_live_when_sole_epoch for the pure-delta flow.) */
 	cbt_mark_dirty(dev, 256, 128);
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
 
@@ -1042,6 +1023,7 @@ static void test_double_freeze(void)
 	PASS();
 }
 
+/* Closing an already-closed epoch reports -ENOENT rather than double-freeing. */
 static void test_double_close(void)
 {
 	TEST(test_double_close);
@@ -1052,13 +1034,13 @@ static void test_double_close(void)
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
 	ASSERT_RC(cbt_epoch_close(dev, "ep1"), 0);
 
-	/* Second close → epoch not found. */
 	ASSERT_RC(cbt_epoch_close(dev, "ep1"), -ENOENT);
 
 	cbt_destroy(dev);
 	PASS();
 }
 
+/* Invalidation is idempotent. */
 static void test_double_invalidate(void)
 {
 	TEST(test_double_invalidate);
@@ -1067,7 +1049,6 @@ static void test_double_invalidate(void)
 
 	ASSERT_RC(cbt_epoch_open(dev, "ep1", "b", 1), 0);
 	ASSERT_RC(cbt_epoch_invalidate(dev, "ep1"), 0);
-	/* Second invalidate on same epoch is fine (idempotent). */
 	ASSERT_RC(cbt_epoch_invalidate(dev, "ep1"), 0);
 
 	struct cbt_epoch *ep = cbt_find_epoch(dev, "ep1");
@@ -1081,6 +1062,7 @@ static void test_double_invalidate(void)
 /* SECTION 7: Lifecycle correctness                                   */
 /* ================================================================== */
 
+/* Opening an epoch suspends the clear; closing the last one resumes it. */
 static void test_close_resumes_healthy_clear(void)
 {
 	TEST(test_close_resumes_healthy_clear);
@@ -1100,6 +1082,7 @@ static void test_close_resumes_healthy_clear(void)
 	PASS();
 }
 
+/* One remaining open epoch keeps the clear suspended. */
 static void test_close_with_remaining_epochs(void)
 {
 	TEST(test_close_with_remaining_epochs);
@@ -1111,7 +1094,6 @@ static void test_close_with_remaining_epochs(void)
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
 	ASSERT_RC(cbt_epoch_close(dev, "ep1"), 0);
 
-	/* ep2 still open → healthy_clear stays suspended. */
 	ASSERT_EQ(dev->healthy_clear_suspended, true);
 	ASSERT_EQ(dev->epoch_count, 1);
 
@@ -1119,26 +1101,25 @@ static void test_close_with_remaining_epochs(void)
 	PASS();
 }
 
+/* The nominal open, freeze, rebuild, close sequence works end to end, ranges
+ * stay readable during REBUILDING, and close waits for the rebuild to end. */
 static void test_full_lifecycle_sequence(void)
 {
 	TEST(test_full_lifecycle_sequence);
 	fi_reset();
 	struct cbt_device *dev = cbt_create(2048, 64, 512);
 
-	/* OPEN → FREEZE → REBUILD_START → CLOSE */
 	ASSERT_RC(cbt_epoch_open(dev, "ep1", "backend_a", 1), 0);
 	cbt_mark_dirty(dev, 0, 256);
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
 	ASSERT_RC(cbt_epoch_rebuild_start(dev, "ep1"), 0);
 
-	/* Can still get ranges during REBUILDING. */
 	struct dirty_range *ranges = NULL;
 	uint32_t count = 0;
 	ASSERT_RC(cbt_epoch_get_dirty_ranges(dev, "ep1", 0, &ranges, &count), 0);
 	ASSERT(count > 0);
 	free(ranges);
 
-	/* CBT-2: close waits for the rebuild to terminate. */
 	ASSERT_RC(cbt_epoch_close(dev, "ep1"), -EBUSY);
 	ASSERT_RC(cbt_epoch_rebuild_finish(dev, "ep1", true), 0);
 	ASSERT_RC(cbt_epoch_close(dev, "ep1"), 0);
@@ -1149,6 +1130,8 @@ static void test_full_lifecycle_sequence(void)
 	PASS();
 }
 
+/* An INVALID epoch refuses freeze, rebuild and get_ranges, but can still be
+ * closed for cleanup. */
 static void test_invalidated_epoch_cannot_proceed(void)
 {
 	TEST(test_invalidated_epoch_cannot_proceed);
@@ -1159,16 +1142,12 @@ static void test_invalidated_epoch_cannot_proceed(void)
 	cbt_mark_dirty(dev, 0, 128);
 	ASSERT_RC(cbt_epoch_invalidate(dev, "ep1"), 0);
 
-	/* Can't freeze an invalid epoch. */
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), -EINVAL);
-	/* Can't rebuild an invalid epoch. */
 	ASSERT_RC(cbt_epoch_rebuild_start(dev, "ep1"), -EINVAL);
-	/* Can't get ranges from invalid epoch. */
 	struct dirty_range *ranges = NULL;
 	uint32_t count = 0;
 	ASSERT_RC(cbt_epoch_get_dirty_ranges(dev, "ep1", 0, &ranges, &count), -EINVAL);
 
-	/* But CAN close it (cleanup). */
 	ASSERT_RC(cbt_epoch_close(dev, "ep1"), 0);
 
 	cbt_destroy(dev);
@@ -1179,20 +1158,18 @@ static void test_invalidated_epoch_cannot_proceed(void)
 /* SECTION 8: Bitmap edge cases under failure                         */
 /* ================================================================== */
 
+/* Marking an already fully dirty bitmap is idempotent. */
 static void test_mark_dirty_after_bitmap_full(void)
 {
 	TEST(test_mark_dirty_after_bitmap_full);
 	fi_reset();
 	struct cbt_device *dev = cbt_create(2048, 64, 512);
 
-	/* Mark everything dirty. */
 	cbt_mark_dirty(dev, 0, 2048);
 
-	/* Mark again (idempotent, no crash). */
 	cbt_mark_dirty(dev, 0, 2048);
 	cbt_mark_dirty(dev, 1000, 500);
 
-	/* Verify all bits still set. */
 	for (uint64_t i = 0; i < dev->bitmap_size_bits; i++) {
 		ASSERT((dev->bitmap[i >> 3] & (1u << (i & 7))) != 0);
 	}
@@ -1201,34 +1178,29 @@ static void test_mark_dirty_after_bitmap_full(void)
 	PASS();
 }
 
+/* An offset plus length that overflows uint64 stays inside the bitmap: the end
+ * chunk wraps but the clamp catches it. */
 static void test_mark_dirty_uint64_overflow(void)
 {
 	TEST(test_mark_dirty_uint64_overflow);
 	fi_reset();
 	struct cbt_device *dev = cbt_create(2048, 64, 512);
 
-	/* offset + num_blocks would overflow uint64.
-	 * The clamp to bitmap_size_bits - 1 should save us. */
 	cbt_mark_dirty(dev, UINT64_MAX - 10, 20);
 
-	/* Should not crash (ASan validates). */
-	/* The overflow in (offset + num_blocks - 1) wraps, but chunk_end
-	 * gets clamped. Verify bitmap isn't corrupted. */
 	cbt_destroy(dev);
 	PASS();
 }
 
+/* A write past the end of the volume sets no bit at all. */
 static void test_mark_dirty_offset_beyond_volume(void)
 {
 	TEST(test_mark_dirty_offset_beyond_volume);
 	fi_reset();
 	struct cbt_device *dev = cbt_create(2048, 64, 512);
 
-	/* Offset way beyond volume. chunk_start > bitmap_size_bits. */
 	cbt_mark_dirty(dev, 100000, 1);
 
-	/* chunk_start = 100000/128 = 781. bitmap_size_bits = 16.
-	 * chunk_start > chunk_end (after clamp). No bits set. */
 	for (uint64_t i = 0; i < dev->bitmap_size_bytes; i++) {
 		ASSERT_EQ(dev->bitmap[i], 0);
 	}
@@ -1237,6 +1209,8 @@ static void test_mark_dirty_offset_beyond_volume(void)
 	PASS();
 }
 
+/* Wiping the live bitmap does not touch a frozen delta: the two buffers are
+ * independent, so the epoch keeps its ranges. */
 static void test_clear_during_active_epoch(void)
 {
 	TEST(test_clear_during_active_epoch);
@@ -1247,11 +1221,8 @@ static void test_clear_during_active_epoch(void)
 	cbt_mark_dirty(dev, 0, 2048);
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
 
-	/* Clear live bitmap (simulates healthy-clear bug where epoch
-	 * check is bypassed). Frozen should be safe. */
 	memset(dev->bitmap, 0, dev->bitmap_size_bytes);
 
-	/* Frozen is still intact. */
 	struct dirty_range *ranges = NULL;
 	uint32_t count = 0;
 	ASSERT_RC(cbt_epoch_get_dirty_ranges(dev, "ep1", 0, &ranges, &count), 0);
@@ -1299,6 +1270,8 @@ race_clearer_thread(void *arg)
 	return NULL;
 }
 
+/* A marker thread and a clearer thread racing on the same bitmap stay memory
+ * safe: neither tears nor corrupts it. */
 static void test_concurrent_mark_and_clear(void)
 {
 	TEST(test_concurrent_mark_and_clear);
@@ -1317,7 +1290,6 @@ static void test_concurrent_mark_and_clear(void)
 	pthread_create(&t_mark, NULL, race_marker_thread, &ctx);
 	pthread_create(&t_clear, NULL, race_clearer_thread, &ctx);
 
-	/* Let them race for a bit. */
 	struct timespec ts = {0, 50000000}; /* 50ms */
 	nanosleep(&ts, NULL);
 
@@ -1325,8 +1297,6 @@ static void test_concurrent_mark_and_clear(void)
 	pthread_join(t_mark, NULL);
 	pthread_join(t_clear, NULL);
 
-	/* If we get here, no segfault/ASan violation → memory safe.
-	 * Some bits may be set (mark after last clear), that's fine. */
 	ASSERT(atomic_load(&ctx.mark_ops) > 0);
 	ASSERT(atomic_load(&ctx.clear_ops) > 0);
 
@@ -1338,6 +1308,8 @@ static void test_concurrent_mark_and_clear(void)
 /* SECTION 10: Destroy / cleanup correctness                          */
 /* ================================================================== */
 
+/* Destroying a device frees every epoch and frozen bitmap whatever state each
+ * epoch is in. */
 static void test_destroy_with_all_epoch_states(void)
 {
 	TEST(test_destroy_with_all_epoch_states);
@@ -1358,13 +1330,11 @@ static void test_destroy_with_all_epoch_states(void)
 	ASSERT_RC(cbt_epoch_open(dev, "invalid", "b", 4), 0);
 	ASSERT_RC(cbt_epoch_invalidate(dev, "invalid"), 0);
 
-	/* Destroy with epochs in every state.
-	 * Must free all bitmap_frozen + epoch structs. */
 	cbt_destroy(dev);
-	/* ASan validates no leaks. */
 	PASS();
 }
 
+/* Destroying a device that never had an epoch is clean. */
 static void test_destroy_empty_device(void)
 {
 	TEST(test_destroy_empty_device);
@@ -1374,11 +1344,12 @@ static void test_destroy_empty_device(void)
 	PASS();
 }
 
+/* Destroying NULL is a no-op. */
 static void test_destroy_null(void)
 {
 	TEST(test_destroy_null);
 	fi_reset();
-	cbt_destroy(NULL);  /* Must not crash. */
+	cbt_destroy(NULL);
 	PASS();
 }
 
@@ -1386,6 +1357,8 @@ static void test_destroy_null(void)
 /* SECTION 11: Epoch open with re-open (generation upgrade)           */
 /* ================================================================== */
 
+/* Re-opening a FROZEN epoch at a higher generation puts it back to OPEN and
+ * keeps it freezable; the previous frozen buffer is reused, not leaked. */
 static void test_reopen_frozen_epoch_with_higher_gen(void)
 {
 	TEST(test_reopen_frozen_epoch_with_higher_gen);
@@ -1396,19 +1369,12 @@ static void test_reopen_frozen_epoch_with_higher_gen(void)
 	cbt_mark_dirty(dev, 0, 128);
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
 
-	/* Re-open with higher gen resets to OPEN.
-	 * Note: the old bitmap_frozen is still allocated but orphaned
-	 * since state goes back to OPEN. Let's verify the behavior. */
 	ASSERT_RC(cbt_epoch_open(dev, "ep1", "b2", 5), 0);
 
 	struct cbt_epoch *ep = cbt_find_epoch(dev, "ep1");
 	ASSERT_EQ(ep->state, CBT_EPOCH_OPEN);
 	ASSERT_EQ(ep->generation, 5);
-	/* bitmap_frozen from previous freeze still exists (leaked if never freed).
-	 * The production code doesn't free it on re-open — this is by design:
-	 * the epoch is "reused" and a subsequent freeze will free+realloc. */
 
-	/* Verify we can freeze again. */
 	cbt_mark_dirty(dev, 512, 128);
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
 
@@ -1420,11 +1386,11 @@ static void test_reopen_frozen_epoch_with_higher_gen(void)
 /* SECTION 12: Chunk size edge cases                                  */
 /* ================================================================== */
 
+/* A zero chunk size falls back to one block per chunk. */
 static void test_zero_chunk_size_kb(void)
 {
 	TEST(test_zero_chunk_size_kb);
 	fi_reset();
-	/* chunk_size_kb=0 → chunk_size_blocks = 0 → forced to 1 */
 	struct cbt_device *dev = cbt_create(100, 0, 512);
 	ASSERT(dev != NULL);
 	ASSERT_EQ(dev->chunk_size_blocks, 1);
@@ -1437,11 +1403,12 @@ static void test_zero_chunk_size_kb(void)
 	PASS();
 }
 
+/* A chunk wider than the volume gives a single-bit bitmap, and the reported
+ * range is clamped to the real volume size. */
 static void test_chunk_larger_than_volume(void)
 {
 	TEST(test_chunk_larger_than_volume);
 	fi_reset();
-	/* 10 blocks, but chunk = 64KB/512B = 128 blocks → 1 chunk total */
 	struct cbt_device *dev = cbt_create(10, 64, 512);
 	ASSERT(dev != NULL);
 	ASSERT_EQ(dev->bitmap_size_bits, 1);
@@ -1449,7 +1416,6 @@ static void test_chunk_larger_than_volume(void)
 	cbt_mark_dirty(dev, 0, 1);
 	ASSERT((dev->bitmap[0] & 1) != 0);
 
-	/* Get ranges should clamp to actual volume size. */
 	ASSERT_RC(cbt_epoch_open(dev, "ep", "b", 1), 0);
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep"), 0);
 
@@ -1465,18 +1431,18 @@ static void test_chunk_larger_than_volume(void)
 	PASS();
 }
 
+/* A chunk size that is not a power of two is rounded up to one (100 KB over
+ * 512-byte blocks is 200 blocks, rounded to 256). */
 static void test_non_power_of_2_chunk_rounded(void)
 {
 	TEST(test_non_power_of_2_chunk_rounded);
 	fi_reset();
-	/* 100KB chunk with 512B blocks = 200 blocks → rounded to 256 (P2). */
 	struct cbt_device *dev = cbt_create(10000, 100, 512);
 	ASSERT(dev != NULL);
 	ASSERT_EQ(dev->chunk_size_blocks, 256);
 	ASSERT_EQ(dev->chunk_shift, 8);  /* log2(256) = 8 */
 
 	cbt_mark_dirty(dev, 0, 256);
-	/* chunk_start = 0, chunk_end = 255/256 = 0. One chunk. */
 	ASSERT((dev->bitmap[0] & 1) != 0);
 	ASSERT((dev->bitmap[0] & 2) == 0);
 
@@ -1488,6 +1454,8 @@ static void test_non_power_of_2_chunk_rounded(void)
 /* SECTION: Partial rebuild state machine validation                  */
 /* ================================================================== */
 
+/* A rebuild needs a FROZEN epoch, and a second concurrent rebuild on the same
+ * epoch is refused with -EBUSY. */
 static void test_rebuild_start_requires_frozen_state(void)
 {
 	TEST(test_rebuild_start_requires_frozen_state);
@@ -1495,24 +1463,18 @@ static void test_rebuild_start_requires_frozen_state(void)
 	struct cbt_device *dev = cbt_create(2048, 64, 512);
 	ASSERT(dev != NULL);
 
-	/* Open epoch — not yet frozen. */
 	ASSERT_RC(cbt_epoch_open(dev, "ep1", "backend1", 1), 0);
 
-	/* rebuild_start should fail with -EINVAL (not FROZEN). */
 	ASSERT_RC(cbt_epoch_rebuild_start(dev, "ep1"), -EINVAL);
 
-	/* Freeze, then rebuild_start should succeed. */
 	cbt_mark_dirty(dev, 0, 128);
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
 	ASSERT_RC(cbt_epoch_rebuild_start(dev, "ep1"), 0);
 
-	/* Verify state is now REBUILDING. */
 	struct cbt_epoch *ep = cbt_find_epoch(dev, "ep1");
 	ASSERT(ep != NULL);
 	ASSERT_EQ(ep->state, CBT_EPOCH_REBUILDING);
 
-	/* Double rebuild_start should fail: one rebuild per epoch (-EBUSY,
-	 * mirrors production's registry guard). */
 	ASSERT_RC(cbt_epoch_rebuild_start(dev, "ep1"), -EBUSY);
 
 	cbt_destroy(dev);
@@ -1532,6 +1494,8 @@ static void test_rebuild_start_nonexistent_epoch(void)
 	PASS();
 }
 
+/* Writes arriving during a rebuild land in the live bitmap only: the frozen
+ * bitmap the rebuild is copying stays byte-for-byte identical. */
 static void test_rebuild_preserves_frozen_bitmap(void)
 {
 	TEST(test_rebuild_preserves_frozen_bitmap);
@@ -1548,18 +1512,14 @@ static void test_rebuild_preserves_frozen_bitmap(void)
 	ASSERT(ep != NULL);
 	ASSERT(ep->bitmap_frozen != NULL);
 
-	/* Save a copy of the frozen bitmap. */
 	uint8_t *saved = malloc(dev->bitmap_size_bytes);
 	ASSERT(saved != NULL);
 	memcpy(saved, ep->bitmap_frozen, dev->bitmap_size_bytes);
 
-	/* Start rebuild — transition to REBUILDING. */
 	ASSERT_RC(cbt_epoch_rebuild_start(dev, "ep1"), 0);
 
-	/* New writes arrive during rebuild — modify live bitmap. */
 	cbt_mark_dirty(dev, 1024, 128);
 
-	/* The frozen bitmap should be unchanged. */
 	ASSERT(memcmp(ep->bitmap_frozen, saved, dev->bitmap_size_bytes) == 0);
 
 	free(saved);
@@ -1567,6 +1527,8 @@ static void test_rebuild_preserves_frozen_bitmap(void)
 	PASS();
 }
 
+/* Once in REBUILDING, the epoch and its frozen bitmap stay intact across
+ * further operations. */
 static void test_rebuild_epoch_cannot_be_evicted(void)
 {
 	TEST(test_rebuild_epoch_cannot_be_evicted);
@@ -1574,27 +1536,23 @@ static void test_rebuild_epoch_cannot_be_evicted(void)
 	struct cbt_device *dev = cbt_create(2048, 64, 512);
 	ASSERT(dev != NULL);
 
-	/* In production code, a REBUILDING epoch cannot be evicted.
-	 * Here we verify the state machine property: once in REBUILDING,
-	 * the epoch stays intact through additional operations.
-	 */
 	ASSERT_RC(cbt_epoch_open(dev, "ep1", "b1", 1), 0);
 	cbt_mark_dirty(dev, 0, 128);
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
 	ASSERT_RC(cbt_epoch_rebuild_start(dev, "ep1"), 0);
 
-	/* The epoch is in REBUILDING — verify it persists. */
 	struct cbt_epoch *ep = cbt_find_epoch(dev, "ep1");
 	ASSERT(ep != NULL);
 	ASSERT_EQ(ep->state, CBT_EPOCH_REBUILDING);
 
-	/* The frozen bitmap is still accessible. */
 	ASSERT(ep->bitmap_frozen != NULL);
 
 	cbt_destroy(dev);
 	PASS();
 }
 
+/* Close is refused while the rebuild runs and succeeds from REBUILDING once it
+ * has terminated. */
 static void test_rebuild_close_after_rebuild(void)
 {
 	TEST(test_rebuild_close_after_rebuild);
@@ -1607,14 +1565,11 @@ static void test_rebuild_close_after_rebuild(void)
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
 	ASSERT_RC(cbt_epoch_rebuild_start(dev, "ep1"), 0);
 
-	/* CBT-2: close is refused while the rebuild is RUNNING. */
 	ASSERT_RC(cbt_epoch_close(dev, "ep1"), -EBUSY);
 
-	/* Once the rebuild terminates, close succeeds from REBUILDING state. */
 	ASSERT_RC(cbt_epoch_rebuild_finish(dev, "ep1", true), 0);
 	ASSERT_RC(cbt_epoch_close(dev, "ep1"), 0);
 
-	/* Epoch should be gone. */
 	ASSERT(cbt_find_epoch(dev, "ep1") == NULL);
 	ASSERT_EQ(dev->epoch_count, 0);
 
@@ -1622,6 +1577,7 @@ static void test_rebuild_close_after_rebuild(void)
 	PASS();
 }
 
+/* Invalidation is refused while the rebuild runs and legal afterwards. */
 static void test_rebuild_invalidate_during_rebuild(void)
 {
 	TEST(test_rebuild_invalidate_during_rebuild);
@@ -1634,12 +1590,8 @@ static void test_rebuild_invalidate_during_rebuild(void)
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
 	ASSERT_RC(cbt_epoch_rebuild_start(dev, "ep1"), 0);
 
-	/* C3: invalidation is REFUSED while the rebuild is RUNNING — an INVALID
-	 * epoch is evictable, and evicting it would free the bitmap under the
-	 * rebuild (UAF). */
 	ASSERT_RC(cbt_epoch_invalidate(dev, "ep1"), -EBUSY);
 
-	/* After the rebuild terminates (aborted here), invalidation is legal. */
 	ASSERT_RC(cbt_epoch_rebuild_finish(dev, "ep1", false), 0);
 	ASSERT_RC(cbt_epoch_invalidate(dev, "ep1"), 0);
 
@@ -1651,6 +1603,7 @@ static void test_rebuild_invalidate_during_rebuild(void)
 	PASS();
 }
 
+/* Ranges remain readable while the epoch is REBUILDING. */
 static void test_rebuild_get_ranges_during_rebuild(void)
 {
 	TEST(test_rebuild_get_ranges_during_rebuild);
@@ -1663,7 +1616,6 @@ static void test_rebuild_get_ranges_during_rebuild(void)
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
 	ASSERT_RC(cbt_epoch_rebuild_start(dev, "ep1"), 0);
 
-	/* get_dirty_ranges should work during REBUILDING (epoch has frozen bitmap). */
 	struct dirty_range *ranges = NULL;
 	uint32_t count = 0;
 	ASSERT_RC(cbt_epoch_get_dirty_ranges(dev, "ep1", 0, &ranges, &count), 0);
@@ -1674,6 +1626,8 @@ static void test_rebuild_get_ranges_during_rebuild(void)
 	PASS();
 }
 
+/* The convergence loop runs: freeze, rebuild, re-freeze, rebuild again, close —
+ * an epoch can cycle between FROZEN and REBUILDING as many times as needed. */
 static void test_rebuild_convergence_refreeze(void)
 {
 	TEST(test_rebuild_convergence_refreeze);
@@ -1681,35 +1635,28 @@ static void test_rebuild_convergence_refreeze(void)
 	struct cbt_device *dev = cbt_create(2048, 64, 512);
 	ASSERT(dev != NULL);
 
-	/* Full convergence loop: open → freeze → rebuild → re-freeze → rebuild → close */
 	ASSERT_RC(cbt_epoch_open(dev, "ep1", "backend1", 1), 0);
 	cbt_mark_dirty(dev, 0, 128);
 
-	/* Pass 1: freeze (OPEN→FROZEN) */
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
 	struct cbt_epoch *ep = cbt_find_epoch(dev, "ep1");
 	ASSERT(ep != NULL);
 	ASSERT_EQ(ep->state, CBT_EPOCH_FROZEN);
 
-	/* Simulate partial_rebuild running then COMPLETING (FROZEN→REBUILDING) */
 	ASSERT_RC(cbt_epoch_rebuild_start(dev, "ep1"), 0);
 	ASSERT_EQ(ep->state, CBT_EPOCH_REBUILDING);
 
-	/* New writes arrive during rebuild */
 	cbt_mark_dirty(dev, 512, 64);
 
 	ASSERT_RC(cbt_epoch_rebuild_finish(dev, "ep1", true), 0);
 
-	/* Pass 2: re-freeze (REBUILDING→FROZEN) — the key fix */
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
 	ASSERT_EQ(ep->state, CBT_EPOCH_FROZEN);
 	ASSERT(ep->bitmap_frozen != NULL);
 
-	/* Pass 2: rebuild again (FROZEN→REBUILDING) */
 	ASSERT_RC(cbt_epoch_rebuild_start(dev, "ep1"), 0);
 	ASSERT_EQ(ep->state, CBT_EPOCH_REBUILDING);
 
-	/* Close from REBUILDING state (after the rebuild terminates) */
 	ASSERT_RC(cbt_epoch_rebuild_finish(dev, "ep1", true), 0);
 	ASSERT_RC(cbt_epoch_close(dev, "ep1"), 0);
 	ASSERT(cbt_find_epoch(dev, "ep1") == NULL);
@@ -1722,6 +1669,8 @@ static void test_rebuild_convergence_refreeze(void)
 /* SECTION 12: Freeze delta semantics (snapshot-and-clear)            */
 /* ================================================================== */
 
+/* When one epoch owns the bitmap, each freeze that follows a COMPLETED rebuild
+ * captures only the writes since the previous freeze, down to an empty delta. */
 static void test_freeze_clears_live_when_sole_epoch(void)
 {
 	TEST(test_freeze_clears_live_when_sole_epoch);
@@ -1732,31 +1681,26 @@ static void test_freeze_clears_live_when_sole_epoch(void)
 	ASSERT_RC(cbt_epoch_open(dev, "ep1", "b", 1), 0);
 	cbt_mark_dirty(dev, 0, 512);
 
-	/* Freeze #1: captures the marks AND clears the live bitmap. */
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
 	struct cbt_epoch *ep = cbt_find_epoch(dev, "ep1");
 	ASSERT(ep != NULL);
 	ASSERT(count_bits(ep->bitmap_frozen, dev->bitmap_size_bytes) > 0);
 	ASSERT_EQ(count_bits(dev->bitmap, dev->bitmap_size_bytes), 0);
 
-	/* Delta #1 is proven copied by a COMPLETED rebuild — only then does the
-	 * next freeze produce a PURE delta (H1: without a completed rebuild the
-	 * un-copied delta is merged back and re-captured, see the H1 tests). */
+	/* Only a COMPLETED rebuild licenses dropping the consumed delta, so the next
+	 * freeze can be a pure delta. */
 	ASSERT_RC(cbt_epoch_rebuild_start(dev, "ep1"), 0);
 	ASSERT_RC(cbt_epoch_rebuild_finish(dev, "ep1", true), 0);
 
-	/* New writes land AFTER the freeze. */
 	cbt_mark_dirty(dev, 1024, 128);
 	uint64_t delta_chunks = count_bits(dev->bitmap, dev->bitmap_size_bytes);
 	ASSERT(delta_chunks > 0);
 
-	/* Freeze #2 (re-freeze after COMPLETED rebuild): frozen must contain ONLY
-	 * the new delta — geometric convergence depends on this. */
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
 	ASSERT_EQ(count_bits(ep->bitmap_frozen, dev->bitmap_size_bytes), delta_chunks);
 	ASSERT_EQ(count_bits(dev->bitmap, dev->bitmap_size_bytes), 0);
 
-	/* Freeze #3 with no new writes (delta #2 copied): empty delta → converged. */
+	/* No new writes: the next delta is empty, which is what convergence means. */
 	ASSERT_RC(cbt_epoch_rebuild_start(dev, "ep1"), 0);
 	ASSERT_RC(cbt_epoch_rebuild_finish(dev, "ep1", true), 0);
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
@@ -1766,6 +1710,8 @@ static void test_freeze_clears_live_when_sole_epoch(void)
 	PASS();
 }
 
+/* While another epoch is still active, a freeze copies without clearing: the
+ * live bitmap keeps the accumulated view that epoch needs. */
 static void test_freeze_preserves_live_with_other_active_epoch(void)
 {
 	TEST(test_freeze_preserves_live_with_other_active_epoch);
@@ -1780,7 +1726,6 @@ static void test_freeze_preserves_live_with_other_active_epoch(void)
 	uint64_t before = count_bits(dev->bitmap, dev->bitmap_size_bytes);
 	ASSERT(before > 0);
 
-	/* ep2 is still OPEN and needs the accumulated view → freeze must NOT clear. */
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
 	ASSERT_EQ(count_bits(dev->bitmap, dev->bitmap_size_bytes), before);
 
@@ -1788,9 +1733,9 @@ static void test_freeze_preserves_live_with_other_active_epoch(void)
 	PASS();
 }
 
-/* Property: under a concurrent writer, the union of all frozen snapshots plus
- * the live bitmap must equal exactly the set of chunks the writer marked —
- * the per-byte atomic exchange must never lose (or invent) a bit. */
+/* Under a concurrent writer, the union of every frozen snapshot plus the live
+ * bitmap must equal exactly the set of chunks the writer marked: the per-byte
+ * exchange may neither lose nor invent a bit. */
 struct delta_race_ctx {
 	struct cbt_device *dev;
 	uint8_t           *shadow;      /* same layout as dev->bitmap */
@@ -1834,7 +1779,7 @@ static void test_concurrent_refreeze_never_loses_bits(void)
 	pthread_t t;
 	pthread_create(&t, NULL, delta_marker_thread, &ctx);
 
-	/* Re-freeze repeatedly under fire, accumulating every captured delta. */
+	/* Re-freeze repeatedly under the writer, accumulating every captured delta. */
 	for (int pass = 0; pass < 200; pass++) {
 		ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
 		for (uint64_t i = 0; i < dev->bitmap_size_bytes; i++) {
@@ -1846,13 +1791,11 @@ static void test_concurrent_refreeze_never_loses_bits(void)
 	pthread_join(t, NULL);
 	ASSERT(atomic_load(&ctx.marks) > 0);
 
-	/* Tail: whatever the writer marked after the last freeze is still live. */
+	/* Whatever the writer marked after the last freeze is still live. */
 	for (uint64_t i = 0; i < dev->bitmap_size_bytes; i++) {
 		acc[i] |= dev->bitmap[i];
 	}
 
-	/* Exact equality: no lost bits (missed chunk = silent divergence under
-	 * skip_rebuild) and no phantom bits. */
 	ASSERT_EQ(memcmp(acc, shadow, dev->bitmap_size_bytes), 0);
 
 	free(shadow);
@@ -1862,14 +1805,12 @@ static void test_concurrent_refreeze_never_loses_bits(void)
 }
 
 /* ================================================================== */
-/* SECTION 13: Audit findings framing (H1/H2/C3/M1)                   */
-/* Each test pins the exact failure scenario from the SPEC-73 audit.  */
+/* SECTION 13: Delta preservation and terminal classification         */
 /* ================================================================== */
 
-/* H1 — the core loss scenario: freeze consumes delta D1, the rebuild ABORTS
- * (hot-remove at 10%), the orchestrator retries with a re-freeze. The old
- * code freed the only copy of D1's un-copied 90%; the fix merges it back so
- * the retry snapshot = D1 ∪ (writes since freeze #1). */
+/* A freeze consumes a delta, the rebuild aborts, and the retry re-freezes: the
+ * new snapshot must hold the un-copied delta together with the writes that
+ * arrived since — three chunks, not one. */
 static void test_h1_refreeze_after_aborted_rebuild_preserves_delta(void)
 {
 	TEST(test_h1_refreeze_after_aborted_rebuild_preserves_delta);
@@ -1878,19 +1819,17 @@ static void test_h1_refreeze_after_aborted_rebuild_preserves_delta(void)
 	ASSERT(dev != NULL);
 
 	ASSERT_RC(cbt_epoch_open(dev, "ep1", "b", 1), 0);
-	cbt_mark_dirty(dev, 0, 128);      /* chunk 0 — delta D1 */
-	cbt_mark_dirty(dev, 256, 128);    /* chunk 2 — delta D1 */
+	cbt_mark_dirty(dev, 0, 128);      /* chunk 0 */
+	cbt_mark_dirty(dev, 256, 128);    /* chunk 2 */
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
 	ASSERT_EQ(count_bits(dev->bitmap, dev->bitmap_size_bytes), 0);
 
 	ASSERT_RC(cbt_epoch_rebuild_start(dev, "ep1"), 0);
-	/* Target hot-removed mid-rebuild: ABORTED, D1 not (fully) copied. */
+	/* Target hot-removed mid-rebuild: aborted, the delta is not fully copied. */
 	ASSERT_RC(cbt_epoch_rebuild_finish(dev, "ep1", false), 0);
 
-	/* Writes since freeze #1. */
-	cbt_mark_dirty(dev, 512, 128);    /* chunk 4 — delta D2 */
+	cbt_mark_dirty(dev, 512, 128);    /* chunk 4 */
 
-	/* Retry: re-freeze. Fixed semantics: snapshot = D1 ∪ D2 (3 chunks). */
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
 	struct cbt_epoch *ep = cbt_find_epoch(dev, "ep1");
 	ASSERT(ep != NULL);
@@ -1900,8 +1839,8 @@ static void test_h1_refreeze_after_aborted_rebuild_preserves_delta(void)
 	PASS();
 }
 
-/* H1 — closing (abandoning) an epoch whose delta was consumed but never
- * copied must return the delta to the live bitmap, not destroy it. */
+/* Closing an epoch whose delta was consumed but never copied returns that delta
+ * to the live bitmap instead of destroying it. */
 static void test_h1_close_merges_back_unconsumed_delta(void)
 {
 	TEST(test_h1_close_merges_back_unconsumed_delta);
@@ -1916,16 +1855,14 @@ static void test_h1_close_merges_back_unconsumed_delta(void)
 
 	ASSERT_RC(cbt_epoch_close(dev, "ep1"), 0);
 
-	/* The delta survived the abandon: a later epoch for the same stale
-	 * backend recaptures it. */
 	ASSERT_EQ(count_bits(dev->bitmap, dev->bitmap_size_bytes), 1);
 
 	cbt_destroy(dev);
 	PASS();
 }
 
-/* H1 — a COMPLETED rebuild consumes the delta legitimately: close must NOT
- * re-inject it (that would force a spurious re-copy of everything). */
+/* A COMPLETED rebuild consumes the delta legitimately, so close must NOT
+ * re-inject it: that would force a spurious re-copy of everything. */
 static void test_h1_completed_rebuild_does_not_merge_back(void)
 {
 	TEST(test_h1_completed_rebuild_does_not_merge_back);
@@ -1946,10 +1883,8 @@ static void test_h1_completed_rebuild_does_not_merge_back(void)
 	PASS();
 }
 
-/* H1 — ENOMEM on re-freeze: the old code free'd the previous delta BEFORE
- * malloc, so a failed allocation bricked the epoch (bitmap_frozen == NULL)
- * AND lost the delta. Fixed: allocate first — ENOMEM leaves everything
- * exactly as it was and the retry succeeds. */
+/* An ENOMEM on re-freeze leaves the previous delta untouched — the epoch is
+ * neither bricked nor emptied — and the retry then succeeds. */
 static void test_h1_refreeze_enomem_preserves_previous_delta(void)
 {
 	TEST(test_h1_refreeze_enomem_preserves_previous_delta);
@@ -1969,11 +1904,9 @@ static void test_h1_refreeze_enomem_preserves_previous_delta(void)
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), -ENOMEM);
 	fi_reset();
 
-	/* Previous delta untouched — not bricked, not lost. */
 	ASSERT(ep->bitmap_frozen == frozen_before);
 	ASSERT_EQ(count_bits(ep->bitmap_frozen, dev->bitmap_size_bytes), 1);
 
-	/* Retry works and still holds the delta. */
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
 	ASSERT_EQ(count_bits(ep->bitmap_frozen, dev->bitmap_size_bytes), 1);
 
@@ -1981,10 +1914,9 @@ static void test_h1_refreeze_enomem_preserves_previous_delta(void)
 	PASS();
 }
 
-/* H2 — a write in flight across a clearing freeze: the submit-time bit is
- * consumed by the exchange, but the completion re-mark (before the host ack)
- * puts the chunk back in the live bitmap → captured by the next delta.
- * Lock-free: no drain, no host-I/O freeze anywhere. */
+/* A write in flight across a clearing freeze loses its submit-time bit to the
+ * exchange, but the completion re-mark puts the chunk back in the live bitmap,
+ * so the next delta re-copies it. No drain, no host-I/O freeze. */
 static void test_h2_inflight_write_survives_clearing_freeze(void)
 {
 	TEST(test_h2_inflight_write_survives_clearing_freeze);
@@ -1994,19 +1926,17 @@ static void test_h2_inflight_write_survives_clearing_freeze(void)
 
 	ASSERT_RC(cbt_epoch_open(dev, "ep1", "b", 1), 0);
 
-	/* Write W submitted (bit set) but not yet completed. */
+	/* Write submitted (bit set) but not yet completed. */
 	cbt_write_submit(dev, 0, 128);
 
-	/* Freeze consumes the submit-time bit. */
+	/* The freeze consumes the submit-time bit, and the rebuild may read the
+	 * chunk before the write lands — that copy is stale. */
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
 	ASSERT_EQ(count_bits(dev->bitmap, dev->bitmap_size_bytes), 0);
-	/* Rebuild of this delta may read the chunk BEFORE W lands — that copy
-	 * is stale. Completed + closed: consumed delta legitimately dropped. */
 	ASSERT_RC(cbt_epoch_rebuild_start(dev, "ep1"), 0);
 	ASSERT_RC(cbt_epoch_rebuild_finish(dev, "ep1", true), 0);
 
-	/* W completes AFTER the rebuild read: the re-mark lands the chunk in
-	 * the live bitmap — the next delta re-copies it with W's data. */
+	/* The write completes after that read; the re-mark saves the chunk. */
 	cbt_write_complete(dev, 0, 128);
 	ASSERT_EQ(count_bits(dev->bitmap, dev->bitmap_size_bytes), 1);
 
@@ -2019,9 +1949,8 @@ static void test_h2_inflight_write_survives_clearing_freeze(void)
 	PASS();
 }
 
-/* C3 — invalidate is refused while a rebuild is RUNNING (would make the
- * epoch evictable under the rebuild → UAF), and eviction refuses an epoch a
- * rebuild still points at even if its state says INVALID. */
+/* Invalidate is refused while a rebuild RUNS, and eviction refuses an epoch a
+ * rebuild still points at even when its state already says INVALID. */
 static void test_c3_invalidate_and_evict_guards_running_rebuild(void)
 {
 	TEST(test_c3_invalidate_and_evict_guards_running_rebuild);
@@ -2034,11 +1963,8 @@ static void test_c3_invalidate_and_evict_guards_running_rebuild(void)
 	ASSERT_RC(cbt_epoch_freeze(dev, "ep1"), 0);
 	ASSERT_RC(cbt_epoch_rebuild_start(dev, "ep1"), 0);
 
-	/* Guard #1: invalidate refused while RUNNING. */
 	ASSERT_RC(cbt_epoch_invalidate(dev, "ep1"), -EBUSY);
 
-	/* Guard #2 (defense-in-depth): even with state forced to INVALID, the
-	 * eviction path must refuse while the rebuild holds the epoch. */
 	struct cbt_epoch *ep = cbt_find_epoch(dev, "ep1");
 	ASSERT(ep != NULL);
 	ep->state = CBT_EPOCH_INVALID;	/* test backdoor: simulate the race */
@@ -2048,7 +1974,6 @@ static void test_c3_invalidate_and_evict_guards_running_rebuild(void)
 	ASSERT_RC(cbt_epoch_open(dev, "ep5", "b5", 5), -ENOSPC);
 	ASSERT(cbt_find_epoch(dev, "ep1") != NULL);	/* NOT freed under the rebuild */
 
-	/* Rebuild terminates → epoch becomes truly evictable. */
 	ASSERT_RC(cbt_epoch_rebuild_finish(dev, "ep1", false), 0);
 	ASSERT_RC(cbt_epoch_open(dev, "ep5", "b5", 5), 0);
 	ASSERT(cbt_find_epoch(dev, "ep1") == NULL);
@@ -2057,27 +1982,24 @@ static void test_c3_invalidate_and_evict_guards_running_rebuild(void)
 	PASS();
 }
 
-/* M1 — terminal-state classification (R1): a hot-remove abort (aborted only,
- * error==0) must classify ABORTED even when a flush WOULD fail — the fixed
- * gate no longer submits the flush on an aborted run. The old gate (no
- * !aborted) turned the abort into FAILED via the failing flush. */
+/* Terminal classification: a hot-remove abort stays ABORTED even when the flush
+ * would fail, because no flush is submitted on an aborted run — plus the rest of
+ * the matrix (completed, flush failure, I/O error, cancelled, zero chunks). */
 static void test_m1_hotremove_abort_classified_aborted_not_failed(void)
 {
 	TEST(test_m1_hotremove_abort_classified_aborted_not_failed);
 	fi_reset();
 
-	/* The audit scenario: aborted=true, error==0, chunks copied, target
-	 * still open (dst_desc != NULL after hot-remove), flush would fail. */
+	/* Aborted, no error, chunks copied, target still open, flush would fail. */
 	ASSERT_EQ(cbt_rebuild_finish_classify(0, false, true, 5, true, true),
 		  REB_ABORTED);
 
-	/* Sanity: the full R1 matrix. */
 	ASSERT_EQ(cbt_rebuild_finish_classify(0, false, false, 5, true, false),
 		  REB_COMPLETED);
 	ASSERT_EQ(cbt_rebuild_finish_classify(0, false, false, 5, true, true),
 		  REB_FAILED);	/* genuine flush failure on a clean run */
 	ASSERT_EQ(cbt_rebuild_finish_classify(-EIO, false, true, 5, true, false),
-		  REB_FAILED);	/* I/O error sets both → FAILED wins */
+		  REB_FAILED);	/* an I/O error sets both flags: FAILED wins */
 	ASSERT_EQ(cbt_rebuild_finish_classify(0, true, false, 5, true, false),
 		  REB_CANCELLED);
 	ASSERT_EQ(cbt_rebuild_finish_classify(0, false, false, 0, true, true),
@@ -2177,7 +2099,6 @@ main(void)
 	test_freeze_preserves_live_with_other_active_epoch();
 	test_concurrent_refreeze_never_loses_bits();
 
-	/* SECTION 13: audit findings framing */
 	test_h1_refreeze_after_aborted_rebuild_preserves_delta();
 	test_h1_close_merges_back_unconsumed_delta();
 	test_h1_completed_rebuild_does_not_merge_back();

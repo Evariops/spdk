@@ -1,16 +1,16 @@
 diff --git a/module/bdev/raid/bdev_raid_rpc.c b/module/bdev/raid/bdev_raid_rpc.c
-index 7b7c697..772f6c4 100644
+index 720a6cb..85ac078 100644
 --- a/module/bdev/raid/bdev_raid_rpc.c
 +++ b/module/bdev/raid/bdev_raid_rpc.c
-@@ -889,6 +889,29 @@ rpc_bdev_raid_remove_base_bdev(struct spdk_jsonrpc_request *request,
+@@ -885,6 +885,29 @@ rpc_bdev_raid_remove_base_bdev(struct spdk_jsonrpc_request *request,
  
  	rc = spdk_bdev_open_ext(req.name, false, rpc_bdev_raid_event_cb, NULL, &desc);
  	if (rc != 0) {
-+		/* Evariops 0030: remove-by-name cannot address a slot whose bdev died — the
-+		 * open fails, the caller reads "already removed", and the slot squats the
-+		 * raid (turing run 14: DetachMember Applied ×308 while the phantom member
-+		 * slot stayed). Before erroring, NAME every slot still referencing this
-+		 * bdev name: the unaddressable squatter becomes a visible fact. */
++		/* Evariops 0030: removal is addressed by bdev, so a slot whose bdev is
++		 * already gone cannot be removed at all — the open fails and the caller
++		 * would read that as "already removed" while the slot keeps squatting the
++		 * raid. Log every slot still referencing this name before failing, so the
++		 * unaddressable member is at least visible. */
 +		struct raid_bdev *raid_bdev;
 +		struct raid_base_bdev_info *base_info;
 +

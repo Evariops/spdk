@@ -4,16 +4,10 @@
  */
 
 /*
- * CBT post-fix validation tests.
- *
- * These tests validate the behaviors introduced by the audit fixes:
- *   - H1: reset refuses during active epoch
- *   - H2: truncation flag in get_dirty_ranges
- *   - H4: deferred delete cleanup
- *   - H5: rollback on create failure
- *   - H6: eviction refuses active epochs (-ENOSPC)
- *   - C4: healthy-clear requires backends_healthy signal
- *   - M5: optimized mark_dirty correctness at byte boundaries
+ * CBT validation tests, run against a standalone model of the module rather
+ * than the SPDK build: reset refusal, range-truncation reporting, deferred-name
+ * cleanup, epoch eviction rules, and byte-boundary correctness of the optimized
+ * mark_dirty against a per-bit reference.
  *
  * Build:  make -f Makefile.test
  * Run:    ./test_cbt_postfix
@@ -30,7 +24,7 @@
 #include <errno.h>
 
 /* ================================================================== */
-/* Simulated CBT module — reflects post-fix production logic          */
+/* Simulated CBT module — mirrors the production logic               */
 /* ================================================================== */
 
 #define CBT_EPOCH_ID_MAX        64
@@ -199,7 +193,7 @@ cbt_destroy(struct cbt_device *dev)
 	free(dev);
 }
 
-/* ── Optimized mark_dirty (mirrors post-fix production code) ── */
+/* ── Optimized mark_dirty (mirrors the production code) ── */
 
 static inline void
 cbt_mark_dirty(struct cbt_device *dev, uint64_t offset_blocks, uint64_t num_blocks)
@@ -223,18 +217,15 @@ cbt_mark_dirty(struct cbt_device *dev, uint64_t offset_blocks, uint64_t num_bloc
 		}
 		__atomic_fetch_or(&dev->bitmap[byte_start], mask, __ATOMIC_RELAXED);
 	} else {
-		/* First partial byte. */
 		uint8_t first_mask = (uint8_t)(0xFF << (chunk_start & 7));
 		__atomic_fetch_or(&dev->bitmap[byte_start], first_mask, __ATOMIC_RELAXED);
 
-		/* Full bytes in between. */
 		uint64_t full_start = byte_start + 1;
 		uint64_t full_end   = byte_end;
 		if (full_end > full_start) {
 			memset(&dev->bitmap[full_start], 0xFF, full_end - full_start);
 		}
 
-		/* Last partial byte. */
 		uint8_t last_mask = (uint8_t)(0xFF >> (7 - (chunk_end & 7)));
 		__atomic_fetch_or(&dev->bitmap[byte_end], last_mask, __ATOMIC_RELAXED);
 	}
@@ -306,7 +297,7 @@ cbt_epoch_open(struct cbt_device *dev, const char *epoch_id,
 	}
 
 	if (dev->epoch_count >= CBT_MAX_EPOCHS) {
-		/* Post-fix: refuse eviction if oldest epoch is active. */
+		/* Refuse eviction while the oldest epoch is active. */
 		struct cbt_epoch *oldest = dev->epochs_head;
 		if (!oldest || oldest->state == CBT_EPOCH_OPEN ||
 		    oldest->state == CBT_EPOCH_FROZEN ||
@@ -412,7 +403,7 @@ cbt_epoch_close(struct cbt_device *dev, const char *epoch_id)
 	return 0;
 }
 
-/* ── Reset (post-fix: refuses during active epochs) ── */
+/* ── Reset (refuses during active epochs) ── */
 
 static int
 cbt_reset(struct cbt_device *dev)
@@ -425,7 +416,7 @@ cbt_reset(struct cbt_device *dev)
 	return 0;
 }
 
-/* ── Healthy-clear poller (post-fix: requires backends_healthy) ── */
+/* ── Healthy-clear poller: model only — production clears on reset ── */
 
 static bool
 cbt_healthy_clear_tick(struct cbt_device *dev)
@@ -437,7 +428,6 @@ cbt_healthy_clear_tick(struct cbt_device *dev)
 		return false;
 	}
 
-	/* Check if any bits are set. */
 	for (uint64_t i = 0; i < dev->bitmap_size_bytes; i++) {
 		if (dev->bitmap[i] != 0) {
 			memset(dev->bitmap, 0, dev->bitmap_size_bytes);
@@ -447,7 +437,7 @@ cbt_healthy_clear_tick(struct cbt_device *dev)
 	return false;
 }
 
-/* ── get_dirty_ranges (post-fix: with truncated flag) ── */
+/* ── get_dirty_ranges (reports truncation) ── */
 
 static int
 cbt_get_dirty_ranges(struct cbt_device *dev, const char *epoch_id,
@@ -529,9 +519,10 @@ static int g_tests_passed = 0;
 } while (0)
 
 /* ================================================================== */
-/* H1: reset refuses during active epochs                             */
+/* Reset refuses during active epochs                                 */
 /* ================================================================== */
 
+/* An OPEN epoch makes reset return -EBUSY and leaves the bitmap untouched. */
 TEST(test_reset_refuses_during_open_epoch)
 {
 	struct cbt_device *dev = cbt_create(1024 * 128, 64, 512);
@@ -541,11 +532,9 @@ TEST(test_reset_refuses_during_open_epoch)
 	int rc = cbt_epoch_open(dev, "ep1", "backend1", 1);
 	ASSERT(rc == 0);
 
-	/* Reset must refuse while epoch is OPEN. */
 	rc = cbt_reset(dev);
 	ASSERT(rc == -EBUSY);
 
-	/* Bitmap must NOT have been cleared. */
 	bool any_set = false;
 	for (uint64_t i = 0; i < dev->bitmap_size_bytes; i++) {
 		if (dev->bitmap[i]) { any_set = true; break; }
@@ -555,6 +544,7 @@ TEST(test_reset_refuses_during_open_epoch)
 	cbt_destroy(dev);
 }
 
+/* A FROZEN epoch also blocks reset. */
 TEST(test_reset_refuses_during_frozen_epoch)
 {
 	struct cbt_device *dev = cbt_create(1024 * 128, 64, 512);
@@ -570,6 +560,7 @@ TEST(test_reset_refuses_during_frozen_epoch)
 	cbt_destroy(dev);
 }
 
+/* A REBUILDING epoch also blocks reset. */
 TEST(test_reset_refuses_during_rebuilding_epoch)
 {
 	struct cbt_device *dev = cbt_create(1024 * 128, 64, 512);
@@ -586,6 +577,7 @@ TEST(test_reset_refuses_during_rebuilding_epoch)
 	cbt_destroy(dev);
 }
 
+/* Once the last epoch is closed, reset succeeds and zeroes the bitmap. */
 TEST(test_reset_succeeds_after_all_epochs_closed)
 {
 	struct cbt_device *dev = cbt_create(1024 * 128, 64, 512);
@@ -599,7 +591,6 @@ TEST(test_reset_succeeds_after_all_epochs_closed)
 	int rc = cbt_reset(dev);
 	ASSERT(rc == 0);
 
-	/* Bitmap must be clear. */
 	for (uint64_t i = 0; i < dev->bitmap_size_bytes; i++) {
 		ASSERT(dev->bitmap[i] == 0);
 	}
@@ -608,18 +599,16 @@ TEST(test_reset_succeeds_after_all_epochs_closed)
 }
 
 /* ================================================================== */
-/* H2: truncation flag                                                */
+/* Truncation flag                                                    */
 /* ================================================================== */
 
+/* 50 alternating dirty chunks make 50 ranges: asking for 5 reports truncated,
+ * asking for 100 does not. */
 TEST(test_truncation_flag_when_ranges_exceeded)
 {
-	/* Create device with many alternating dirty/clean chunks
-	 * to generate more ranges than the limit.
-	 */
 	struct cbt_device *dev = cbt_create(1024 * 1024, 64, 512);
 	ASSERT(dev != NULL);
 
-	/* Mark every other chunk dirty → each becomes a separate range. */
 	for (uint64_t i = 0; i < dev->bitmap_size_bits && i < 100; i += 2) {
 		uint64_t offset = i * dev->chunk_size_blocks;
 		cbt_mark_dirty(dev, offset, dev->chunk_size_blocks);
@@ -632,14 +621,12 @@ TEST(test_truncation_flag_when_ranges_exceeded)
 	uint32_t count = 0;
 	bool truncated = false;
 
-	/* Request only 5 ranges — there should be 50, so truncation. */
 	int rc = cbt_get_dirty_ranges(dev, "ep1", 5, &ranges, &count, &truncated);
 	ASSERT(rc == 0);
 	ASSERT(count == 5);
 	ASSERT(truncated == true);
 	free(ranges);
 
-	/* Request enough — no truncation. */
 	rc = cbt_get_dirty_ranges(dev, "ep1", 100, &ranges, &count, &truncated);
 	ASSERT(rc == 0);
 	ASSERT(count == 50);
@@ -649,6 +636,7 @@ TEST(test_truncation_flag_when_ranges_exceeded)
 	cbt_destroy(dev);
 }
 
+/* A range list that fits leaves the truncated flag clear. */
 TEST(test_truncation_flag_not_set_when_fits)
 {
 	struct cbt_device *dev = cbt_create(1024 * 128, 64, 512);
@@ -672,32 +660,30 @@ TEST(test_truncation_flag_not_set_when_fits)
 }
 
 /* ================================================================== */
-/* H4: deferred delete cleanup                                        */
+/* Deferred delete cleanup                                            */
 /* ================================================================== */
 
+/* Deleting a vbdev whose create is still deferred drops the pending name entry
+ * instead of leaving it behind. */
 TEST(test_deferred_delete_cleans_name_entry)
 {
 	names_clear();
 
-	/* Simulate deferred create (no actual bdev). */
 	int rc = names_insert("base0", "cbt0", 64);
 	ASSERT(rc == 0);
 	ASSERT(names_find("cbt0") != NULL);
 
-	/* Simulate delete of deferred entry (bdev doesn't exist → -ENODEV).
-	 * The fix removes the name entry anyway.
-	 */
 	names_remove("cbt0");
 	ASSERT(names_find("cbt0") == NULL);
 
 	names_clear();
 }
 
+/* Deleting an unknown name is a no-op, not a crash. */
 TEST(test_deferred_delete_nonexistent_is_noop)
 {
 	names_clear();
 
-	/* Deleting something that doesn't exist should not crash. */
 	names_remove("ghost");
 	ASSERT(names_find("ghost") == NULL);
 
@@ -705,25 +691,25 @@ TEST(test_deferred_delete_nonexistent_is_noop)
 }
 
 /* ================================================================== */
-/* H5: rollback on create failure                                     */
+/* Rollback on create failure                                         */
 /* ================================================================== */
 
+/* A failed registration rolls the name entry back, so the name stays free. */
 TEST(test_rollback_name_on_register_failure)
 {
 	names_clear();
 
-	/* Insert a name entry. */
 	int rc = names_insert("base_fail", "cbt_fail", 64);
 	ASSERT(rc == 0);
 	ASSERT(names_find("cbt_fail") != NULL);
 
-	/* Simulate registration failure → rollback. */
 	names_remove("cbt_fail");
 	ASSERT(names_find("cbt_fail") == NULL);
 
 	names_clear();
 }
 
+/* A second vbdev with an existing name is rejected with -EEXIST. */
 TEST(test_duplicate_name_rejected)
 {
 	names_clear();
@@ -738,15 +724,16 @@ TEST(test_duplicate_name_rejected)
 }
 
 /* ================================================================== */
-/* H6: eviction refuses active epochs                                 */
+/* Eviction refuses active epochs                                     */
 /* ================================================================== */
 
+/* With every slot holding an OPEN epoch, one more open returns -ENOSPC rather
+ * than evicting. */
 TEST(test_eviction_refuses_all_active)
 {
 	struct cbt_device *dev = cbt_create(1024 * 128, 64, 512);
 	ASSERT(dev != NULL);
 
-	/* Fill all 4 epoch slots with OPEN epochs. */
 	for (int i = 0; i < CBT_MAX_EPOCHS; i++) {
 		char id[16];
 		snprintf(id, sizeof(id), "ep%d", i);
@@ -755,7 +742,6 @@ TEST(test_eviction_refuses_all_active)
 	}
 	ASSERT(dev->epoch_count == CBT_MAX_EPOCHS);
 
-	/* Trying to open a 5th must fail with -ENOSPC. */
 	int rc = cbt_epoch_open(dev, "ep_overflow", "b", 99);
 	ASSERT(rc == -ENOSPC);
 	ASSERT(dev->epoch_count == CBT_MAX_EPOCHS);
@@ -763,6 +749,7 @@ TEST(test_eviction_refuses_all_active)
 	cbt_destroy(dev);
 }
 
+/* A FROZEN oldest epoch is not evictable. */
 TEST(test_eviction_refuses_frozen_oldest)
 {
 	struct cbt_device *dev = cbt_create(1024 * 128, 64, 512);
@@ -770,7 +757,6 @@ TEST(test_eviction_refuses_frozen_oldest)
 
 	cbt_mark_dirty(dev, 0, 128);
 
-	/* Fill slots: freeze the first one. */
 	cbt_epoch_open(dev, "ep0", "b", 1);
 	cbt_epoch_freeze(dev, "ep0");
 
@@ -780,13 +766,13 @@ TEST(test_eviction_refuses_frozen_oldest)
 		cbt_epoch_open(dev, id, "b", (uint64_t)i + 1);
 	}
 
-	/* Oldest is FROZEN → must refuse. */
 	int rc = cbt_epoch_open(dev, "ep_new", "b", 99);
 	ASSERT(rc == -ENOSPC);
 
 	cbt_destroy(dev);
 }
 
+/* A REBUILDING oldest epoch is not evictable. */
 TEST(test_eviction_refuses_rebuilding_oldest)
 {
 	struct cbt_device *dev = cbt_create(1024 * 128, 64, 512);
@@ -804,13 +790,13 @@ TEST(test_eviction_refuses_rebuilding_oldest)
 		cbt_epoch_open(dev, id, "b", (uint64_t)i + 1);
 	}
 
-	/* Oldest is REBUILDING → must refuse. */
 	int rc = cbt_epoch_open(dev, "ep_new", "b", 99);
 	ASSERT(rc == -ENOSPC);
 
 	cbt_destroy(dev);
 }
 
+/* A closed epoch frees its slot, so the next open succeeds. */
 TEST(test_eviction_succeeds_when_oldest_completed)
 {
 	struct cbt_device *dev = cbt_create(1024 * 128, 64, 512);
@@ -818,12 +804,10 @@ TEST(test_eviction_succeeds_when_oldest_completed)
 
 	cbt_mark_dirty(dev, 0, 128);
 
-	/* First epoch: open → freeze → close (becomes COMPLETED and removed). */
 	cbt_epoch_open(dev, "ep0", "b", 1);
 	cbt_epoch_freeze(dev, "ep0");
 	cbt_epoch_close(dev, "ep0");
 
-	/* Fill remaining slots. */
 	for (int i = 1; i <= CBT_MAX_EPOCHS; i++) {
 		char id[16];
 		snprintf(id, sizeof(id), "ep%d", i);
@@ -835,9 +819,10 @@ TEST(test_eviction_succeeds_when_oldest_completed)
 }
 
 /* ================================================================== */
-/* C4: healthy-clear requires backends_healthy                        */
+/* Healthy-clear requires an explicit backends_healthy signal          */
 /* ================================================================== */
 
+/* Without the healthy signal the clear never fires and the bits survive. */
 TEST(test_clear_blocked_when_not_healthy)
 {
 	struct cbt_device *dev = cbt_create(1024 * 128, 64, 512);
@@ -849,7 +834,6 @@ TEST(test_clear_blocked_when_not_healthy)
 	bool cleared = cbt_healthy_clear_tick(dev);
 	ASSERT(cleared == false);
 
-	/* Bitmap should still have dirty bits. */
 	bool any_set = false;
 	for (uint64_t i = 0; i < dev->bitmap_size_bytes; i++) {
 		if (dev->bitmap[i]) { any_set = true; break; }
@@ -859,6 +843,7 @@ TEST(test_clear_blocked_when_not_healthy)
 	cbt_destroy(dev);
 }
 
+/* With the healthy signal set and no epoch open, the clear zeroes the bitmap. */
 TEST(test_clear_proceeds_when_healthy)
 {
 	struct cbt_device *dev = cbt_create(1024 * 128, 64, 512);
@@ -870,7 +855,6 @@ TEST(test_clear_proceeds_when_healthy)
 	bool cleared = cbt_healthy_clear_tick(dev);
 	ASSERT(cleared == true);
 
-	/* Bitmap should be zeroed. */
 	for (uint64_t i = 0; i < dev->bitmap_size_bytes; i++) {
 		ASSERT(dev->bitmap[i] == 0);
 	}
@@ -878,6 +862,7 @@ TEST(test_clear_proceeds_when_healthy)
 	cbt_destroy(dev);
 }
 
+/* An open epoch blocks the clear even when the backends are healthy. */
 TEST(test_clear_blocked_during_epoch_even_if_healthy)
 {
 	struct cbt_device *dev = cbt_create(1024 * 128, 64, 512);
@@ -893,6 +878,7 @@ TEST(test_clear_blocked_during_epoch_even_if_healthy)
 	cbt_destroy(dev);
 }
 
+/* The clear follows the healthy flag in both directions, revocation included. */
 TEST(test_healthy_flag_transition)
 {
 	struct cbt_device *dev = cbt_create(1024 * 128, 64, 512);
@@ -900,15 +886,12 @@ TEST(test_healthy_flag_transition)
 
 	cbt_mark_dirty(dev, 0, 1024);
 
-	/* Initially not healthy — no clear. */
 	dev->backends_healthy = false;
 	ASSERT(cbt_healthy_clear_tick(dev) == false);
 
-	/* Signal healthy — clear happens. */
 	dev->backends_healthy = true;
 	ASSERT(cbt_healthy_clear_tick(dev) == true);
 
-	/* Dirty again, then revoke health — no clear. */
 	cbt_mark_dirty(dev, 0, 1024);
 	dev->backends_healthy = false;
 	ASSERT(cbt_healthy_clear_tick(dev) == false);
@@ -917,39 +900,32 @@ TEST(test_healthy_flag_transition)
 }
 
 /* ================================================================== */
-/* M5: optimized mark_dirty correctness                               */
+/* Optimized mark_dirty correctness                                   */
 /* ================================================================== */
 
+/* A range confined to one byte sets exactly the chunks it covers (2 to 5). */
 TEST(test_mark_dirty_single_byte_range)
 {
-	/* Range fits in one byte — must produce correct mask. */
 	struct cbt_device *dev = cbt_create(64 * 128, 64, 512);
 	ASSERT(dev != NULL);
 
-	/* Mark chunks 2-5 (all in byte 0). */
 	uint64_t start = 2 * dev->chunk_size_blocks;
 	uint64_t len   = 4 * dev->chunk_size_blocks;
 	cbt_mark_dirty(dev, start, len);
 
-	/* Bits 2,3,4,5 of byte 0 should be set. */
 	ASSERT((dev->bitmap[0] & 0x3C) == 0x3C);
-	/* Bits 0,1,6,7 should NOT be set. */
 	ASSERT((dev->bitmap[0] & 0xC3) == 0);
 
 	cbt_destroy(dev);
 }
 
+/* A range crossing byte boundaries sets the leading partial byte, the full byte
+ * and the trailing partial byte, and nothing else (chunks 5 to 20). */
 TEST(test_mark_dirty_spans_multiple_bytes)
 {
-	/* Range crosses byte boundaries: first partial + full + last partial. */
 	struct cbt_device *dev = cbt_create(256 * 128, 64, 512);
 	ASSERT(dev != NULL);
 
-	/* Mark chunks 5 through 20 (inclusive).
-	 * Byte 0: bits 5,6,7 (first partial)
-	 * Byte 1: all 8 bits (full byte)
-	 * Byte 2: bits 0,1,2,3,4 (last partial)
-	 */
 	uint64_t start = 5 * dev->chunk_size_blocks;
 	uint64_t len   = 16 * dev->chunk_size_blocks;
 	cbt_mark_dirty(dev, start, len);
@@ -963,15 +939,15 @@ TEST(test_mark_dirty_spans_multiple_bytes)
 	cbt_destroy(dev);
 }
 
+/* Over a spread of ranges (single block, boundaries, whole device, past the
+ * end), the optimized marker produces exactly the reference bitmap. */
 TEST(test_mark_dirty_large_range_matches_reference)
 {
-	/* Compare optimized vs reference implementation on large ranges. */
 	uint64_t total_blocks = 1024 * 1024;  /* ~1M blocks */
 	struct cbt_device *dev_opt = cbt_create(total_blocks, 64, 512);
 	struct cbt_device *dev_ref = cbt_create(total_blocks, 64, 512);
 	ASSERT(dev_opt != NULL && dev_ref != NULL);
 
-	/* Several diverse operations. */
 	struct { uint64_t off; uint64_t len; } ops[] = {
 		{0, 1},                           /* single block */
 		{127, 1},                         /* boundary */
@@ -989,7 +965,6 @@ TEST(test_mark_dirty_large_range_matches_reference)
 		cbt_mark_dirty_reference(dev_ref, ops[i].off, ops[i].len);
 	}
 
-	/* Bitmaps must be identical. */
 	ASSERT(dev_opt->bitmap_size_bytes == dev_ref->bitmap_size_bytes);
 	ASSERT(memcmp(dev_opt->bitmap, dev_ref->bitmap, dev_opt->bitmap_size_bytes) == 0);
 
@@ -997,13 +972,12 @@ TEST(test_mark_dirty_large_range_matches_reference)
 	cbt_destroy(dev_ref);
 }
 
+/* A range starting on a byte boundary fills that byte and no neighbour. */
 TEST(test_mark_dirty_first_bit_of_byte)
 {
-	/* Edge: range starts at bit 0 of a byte. */
 	struct cbt_device *dev = cbt_create(128 * 128, 64, 512);
 	ASSERT(dev != NULL);
 
-	/* Chunk 8 = bit 0 of byte 1. Mark chunks 8-15. */
 	uint64_t start = 8 * dev->chunk_size_blocks;
 	uint64_t len   = 8 * dev->chunk_size_blocks;
 	cbt_mark_dirty(dev, start, len);
@@ -1015,13 +989,12 @@ TEST(test_mark_dirty_first_bit_of_byte)
 	cbt_destroy(dev);
 }
 
+/* A range ending on a byte boundary fills that byte and no neighbour. */
 TEST(test_mark_dirty_last_bit_of_byte)
 {
-	/* Edge: range ends at bit 7 of a byte. */
 	struct cbt_device *dev = cbt_create(128 * 128, 64, 512);
 	ASSERT(dev != NULL);
 
-	/* Mark chunks 0-7 = full first byte. */
 	uint64_t start = 0;
 	uint64_t len   = 8 * dev->chunk_size_blocks;
 	cbt_mark_dirty(dev, start, len);
@@ -1032,20 +1005,18 @@ TEST(test_mark_dirty_last_bit_of_byte)
 	cbt_destroy(dev);
 }
 
+/* The narrowest cross-byte range sets one bit on each side and no other. */
 TEST(test_mark_dirty_cross_byte_boundary_two_bits)
 {
-	/* Range crosses one byte boundary with minimal bits. */
 	struct cbt_device *dev = cbt_create(128 * 128, 64, 512);
 	ASSERT(dev != NULL);
 
-	/* Chunks 7 and 8: bit 7 of byte 0, bit 0 of byte 1. */
 	uint64_t start = 7 * dev->chunk_size_blocks;
 	uint64_t len   = 2 * dev->chunk_size_blocks;
 	cbt_mark_dirty(dev, start, len);
 
 	ASSERT((dev->bitmap[0] & 0x80) == 0x80);  /* bit 7 */
 	ASSERT((dev->bitmap[1] & 0x01) == 0x01);  /* bit 0 */
-	/* No other bits. */
 	ASSERT((dev->bitmap[0] & 0x7F) == 0x00);
 	ASSERT((dev->bitmap[1] & 0xFE) == 0x00);
 
@@ -1072,11 +1043,10 @@ concurrent_mark_thread(void *arg)
 	return NULL;
 }
 
+/* Eight threads marking overlapping ranges lose no bit: every bit the
+ * single-threaded reference replay sets is also set in the concurrent bitmap. */
 TEST(test_mark_dirty_concurrent_no_loss)
 {
-	/* Parallel mark_dirty on overlapping and non-overlapping ranges.
-	 * Verify no bits are lost.
-	 */
 	uint64_t total = 1024 * 1024;
 	struct cbt_device *dev = cbt_create(total, 64, 512);
 	ASSERT(dev != NULL);
@@ -1096,7 +1066,6 @@ TEST(test_mark_dirty_concurrent_no_loss)
 		pthread_join(threads[i], NULL);
 	}
 
-	/* Now replay single-threaded with reference and verify all reference bits are set. */
 	struct cbt_device *ref = cbt_create(total, 64, 512);
 	ASSERT(ref != NULL);
 
@@ -1110,7 +1079,6 @@ TEST(test_mark_dirty_concurrent_no_loss)
 		}
 	}
 
-	/* Every bit set in ref must also be set in dev. */
 	for (uint64_t i = 0; i < dev->bitmap_size_bytes; i++) {
 		ASSERT((dev->bitmap[i] & ref->bitmap[i]) == ref->bitmap[i]);
 	}
@@ -1122,9 +1090,10 @@ TEST(test_mark_dirty_concurrent_no_loss)
 }
 
 /* ================================================================== */
-/* H3: max_ranges bounded by CBT_MAX_RANGES_LIMIT                     */
+/* max_ranges bounded by CBT_MAX_RANGES_LIMIT                         */
 /* ================================================================== */
 
+/* An absurd max_ranges is capped instead of driving a huge allocation. */
 TEST(test_max_ranges_capped_to_limit)
 {
 	struct cbt_device *dev = cbt_create(1024 * 128, 64, 512);
@@ -1138,7 +1107,6 @@ TEST(test_max_ranges_capped_to_limit)
 	uint32_t count = 0;
 	bool truncated = false;
 
-	/* Request absurdly large max_ranges — should be capped, not OOM. */
 	int rc = cbt_get_dirty_ranges(dev, "ep1", 999999, &ranges, &count, &truncated);
 	ASSERT(rc == 0);
 	ASSERT(count >= 1);
@@ -1148,15 +1116,15 @@ TEST(test_max_ranges_capped_to_limit)
 }
 
 /* ================================================================== */
-/* H7: dirty_history_valid reflects state                             */
+/* dirty_history_valid reflects state                                 */
 /* ================================================================== */
 
+/* A freshly created device starts with a valid dirty history. */
 TEST(test_dirty_history_valid_initial)
 {
 	struct cbt_device *dev = cbt_create(1024 * 128, 64, 512);
 	ASSERT(dev != NULL);
 
-	/* After fresh creation, history should be valid. */
 	ASSERT(dev->dirty_history_valid == true);
 
 	cbt_destroy(dev);
@@ -1171,37 +1139,37 @@ int main(void)
 	printf("CBT post-fix validation tests\n");
 	printf("==============================\n\n");
 
-	printf("── H1: reset refuses during active epochs ──\n");
+	printf("── reset refuses during active epochs ──\n");
 	RUN(test_reset_refuses_during_open_epoch);
 	RUN(test_reset_refuses_during_frozen_epoch);
 	RUN(test_reset_refuses_during_rebuilding_epoch);
 	RUN(test_reset_succeeds_after_all_epochs_closed);
 
-	printf("\n── H2: truncation flag ──\n");
+	printf("\n── truncation flag ──\n");
 	RUN(test_truncation_flag_when_ranges_exceeded);
 	RUN(test_truncation_flag_not_set_when_fits);
 
-	printf("\n── H4: deferred delete cleanup ──\n");
+	printf("\n── deferred delete cleanup ──\n");
 	RUN(test_deferred_delete_cleans_name_entry);
 	RUN(test_deferred_delete_nonexistent_is_noop);
 
-	printf("\n── H5: rollback on create failure ──\n");
+	printf("\n── rollback on create failure ──\n");
 	RUN(test_rollback_name_on_register_failure);
 	RUN(test_duplicate_name_rejected);
 
-	printf("\n── H6: eviction refuses active epochs ──\n");
+	printf("\n── eviction refuses active epochs ──\n");
 	RUN(test_eviction_refuses_all_active);
 	RUN(test_eviction_refuses_frozen_oldest);
 	RUN(test_eviction_refuses_rebuilding_oldest);
 	RUN(test_eviction_succeeds_when_oldest_completed);
 
-	printf("\n── C4: healthy-clear requires backends_healthy ──\n");
+	printf("\n── healthy-clear requires backends_healthy ──\n");
 	RUN(test_clear_blocked_when_not_healthy);
 	RUN(test_clear_proceeds_when_healthy);
 	RUN(test_clear_blocked_during_epoch_even_if_healthy);
 	RUN(test_healthy_flag_transition);
 
-	printf("\n── M5: optimized mark_dirty correctness ──\n");
+	printf("\n── optimized mark_dirty correctness ──\n");
 	RUN(test_mark_dirty_single_byte_range);
 	RUN(test_mark_dirty_spans_multiple_bytes);
 	RUN(test_mark_dirty_large_range_matches_reference);
@@ -1210,10 +1178,10 @@ int main(void)
 	RUN(test_mark_dirty_cross_byte_boundary_two_bits);
 	RUN(test_mark_dirty_concurrent_no_loss);
 
-	printf("\n── H3: max_ranges bounded ──\n");
+	printf("\n── max_ranges bounded ──\n");
 	RUN(test_max_ranges_capped_to_limit);
 
-	printf("\n── H7: dirty_history_valid ──\n");
+	printf("\n── dirty_history_valid ──\n");
 	RUN(test_dirty_history_valid_initial);
 
 	printf("\n==============================\n");

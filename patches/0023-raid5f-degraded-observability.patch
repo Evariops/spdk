@@ -1,14 +1,29 @@
 diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
-index 762e892..c9ee0e4 100644
+index 40d393d..dd3cb51 100644
 --- a/module/bdev/raid/bdev_raid.c
 +++ b/module/bdev/raid/bdev_raid.c
-@@ -1240,6 +1240,21 @@ raid_bdev_write_info_json(struct raid_bdev *raid_bdev, struct spdk_json_write_ct
+@@ -1228,17 +1228,30 @@ raid_bdev_write_info_json(struct raid_bdev *raid_bdev, struct spdk_json_write_ct
+ 	spdk_json_write_named_uint32(w, "num_base_bdevs_discovered", raid_bdev->num_base_bdevs_discovered);
+ 	spdk_json_write_named_uint32(w, "num_base_bdevs_operational",
+ 				     raid_bdev->num_base_bdevs_operational);
+-	/* SPEC-73 C3: expose the full-stripe size (in blocks) that bdev_raid_rebuild_ranges
+-	 * requires its ranges to be aligned to, so the control-plane reads it instead of
+-	 * re-deriving `k` (data chunks) per raid level. This is EXACTLY the value the repair
+-	 * validates: strip_size × min_base_bdevs_operational (for raid5f, min == num-1 == the
+-	 * data-chunk count `k`; for a striped non-parity raid, min == num == k). Emitted only
+-	 * for striped raids — raid1/concat (strip_size == 0) have no full-stripe constraint. */
++	/* Publish the full-stripe size (blocks) that bdev_raid_rebuild_ranges requires
++	 * its ranges to be aligned to, so the control plane reads it instead of
++	 * re-deriving the data-chunk count per raid level. Striped raids only:
++	 * raid1/concat have strip_size == 0 and no full-stripe constraint. */
+ 	if (raid_bdev->strip_size > 0) {
+ 		spdk_json_write_named_uint64(w, "full_stripe_blocks",
  					     (uint64_t)raid_bdev->strip_size *
  					     raid_bdev->min_base_bdevs_operational);
  	}
-+	/* Evariops 0023 (SPEC-75G F-d): degraded-service counters — the control
-+	 * plane's "serving degraded since T" gauge (EcRebuildDebt.since). 0 =
-+	 * never. Loads mirror the relaxed-atomic writers on the I/O paths. */
++	/* Evariops 0023: degraded-service counters, feeding the control plane's
++	 * "serving degraded since T" gauge; 0 means never. The loads must mirror
++	 * the relaxed-atomic writers on the I/O paths. */
 +	spdk_json_write_named_uint64(w, "reconstruct_reads_absent",
 +				     __atomic_load_n(&raid_bdev->reconstruct_reads_absent,
 +						     __ATOMIC_RELAXED));
@@ -25,7 +40,7 @@ index 762e892..c9ee0e4 100644
  		struct raid_bdev_process *process = raid_bdev->process;
  		uint64_t offset = process->window_offset;
 diff --git a/module/bdev/raid/bdev_raid.h b/module/bdev/raid/bdev_raid.h
-index 2c36491..343615e 100644
+index ebe39cc..d137c1a 100644
 --- a/module/bdev/raid/bdev_raid.h
 +++ b/module/bdev/raid/bdev_raid.h
 @@ -296,6 +296,17 @@ struct raid_bdev {
@@ -47,16 +62,16 @@ index 2c36491..343615e 100644
  	raid_bdev_configure_cb		configure_cb;
  	void				*configure_cb_ctx;
 diff --git a/module/bdev/raid/raid5f.c b/module/bdev/raid/raid5f.c
-index 1d02ec8..e7122c9 100644
+index 9d8e2c6..1d7dbba 100644
 --- a/module/bdev/raid/raid5f.c
 +++ b/module/bdev/raid/raid5f.c
 @@ -16,6 +16,17 @@
  /* Maximum concurrent full stripe writes per io channel */
  #define RAID5F_MAX_STRIPES 32
  
-+/* Evariops 0023 (SPEC-75G F-d): stamp a degraded-service event — counter +
-+ * last_degraded_ts. Relaxed atomics: single reactor today (D5), safe if the
-+ * core mask ever widens; never ordered against data I/O. */
++/* Evariops 0023: stamp a degraded-service event — bump a counter and refresh
++ * last_degraded_ts. Relaxed atomics: these gauges are never ordered against
++ * data I/O, they only have to stay non-torn if the core mask widens. */
 +static inline void
 +raid5f_note_degraded(struct raid_bdev *raid_bdev, uint64_t *counter)
 +{
@@ -68,34 +83,29 @@ index 1d02ec8..e7122c9 100644
  struct chunk {
  	/* Corresponds to base_bdev index */
  	uint8_t index;
-@@ -436,6 +447,11 @@ raid5f_chunk_submit(struct chunk *chunk)
+@@ -436,6 +447,9 @@ raid5f_chunk_submit(struct chunk *chunk)
  	switch (stripe_req->type) {
  	case STRIPE_REQ_WRITE:
  		if (base_ch == NULL) {
-+			/* Evariops 0023: the stripe is being written with this
-+			 * member missing — reconstructible, but at zero margin
-+			 * (F-e: the CP freezes folds on a degraded EcImage; a
-+			 * nonzero counter here is the violation gauge). */
++			/* Evariops 0023: this stripe is written with a member
++			 * missing — still reconstructible, but at zero margin. */
 +			raid5f_note_degraded(raid_bdev, &raid_bdev->degraded_write_stripes);
  			raid_bdev_io_complete_part(raid_io, 1, SPDK_BDEV_IO_STATUS_SUCCESS);
  			return 0;
  		}
-@@ -685,6 +701,9 @@ raid5f_chunk_read_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_
+@@ -683,6 +697,8 @@ raid5f_chunk_read_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_
  	chunk_idx = chunk_data_idx < p_idx ? chunk_data_idx : chunk_data_idx + 1;
  	chunk_offset = stripe_offset - ((uint64_t)chunk_data_idx << raid_bdev->strip_size_shift);
  
-+	/* Evariops 0023: degraded service on a PRESENT member (error path). */
 +	raid5f_note_degraded(raid_bdev, &raid_bdev->reconstruct_reads_error);
 +
  	ret = raid5f_submit_reconstruct_read(raid_io, stripe_index, chunk_idx, chunk_offset,
  					     raid5f_stripe_request_reconstruct_xor_done);
  	if (ret != 0) {
-@@ -830,6 +849,9 @@ raid5f_submit_read_request(struct raid_bdev_io *raid_io, uint64_t stripe_index,
+@@ -827,6 +843,7 @@ raid5f_submit_read_request(struct raid_bdev_io *raid_io, uint64_t stripe_index,
  
  	raid5f_init_ext_io_opts(&io_opts, raid_io);
  	if (base_ch == NULL) {
-+		/* Evariops 0023: degraded service, member ABSENT (vanilla
-+		 * reconstruct-read path). */
 +		raid5f_note_degraded(raid_bdev, &raid_bdev->reconstruct_reads_absent);
  		return raid5f_submit_reconstruct_read(raid_io, stripe_index, chunk_idx, chunk_offset,
  						      raid5f_stripe_request_reconstruct_xor_done);

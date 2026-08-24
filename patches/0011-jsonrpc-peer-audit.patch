@@ -1,5 +1,5 @@
 diff --git a/include/spdk/jsonrpc.h b/include/spdk/jsonrpc.h
-index 760039d..7a157ad 100644
+index 760039d..0be1c32 100644
 --- a/include/spdk/jsonrpc.h
 +++ b/include/spdk/jsonrpc.h
 @@ -124,6 +124,33 @@ void spdk_jsonrpc_server_shutdown(struct spdk_jsonrpc_server *server);
@@ -7,9 +7,9 @@ index 760039d..7a157ad 100644
  struct spdk_jsonrpc_server_conn *spdk_jsonrpc_get_conn(struct spdk_jsonrpc_request *request);
  
 +/**
-+ * SPEC-73 SEC1: peer credentials of the client that issued \c request, captured
-+ * with SO_PEERCRED at connection accept. Only meaningful over a Unix-domain
-+ * socket on Linux; a TCP transport or a non-Linux build has none.
++ * Get the credentials of the client that issued \c request, captured with
++ * SO_PEERCRED when the connection was accepted. Available only over a Unix-domain
++ * socket on Linux.
 + *
 + * \param request JSON-RPC request
 + * \param pid  filled with the peer PID (may be NULL)
@@ -21,14 +21,14 @@ index 760039d..7a157ad 100644
 +					pid_t *pid, uid_t *uid, gid_t *gid);
 +
 +/**
-+ * SPEC-73 SEC1: emit an audit NOTICELOG line for a destructive RPC, prefixed
-+ * with the caller's peer credentials (pid/uid/gid, or "unknown"). Intended to be
-+ * called at the top of every mutation handler (delete, retire, relocate/remap,
-+ * pause, rebuild). \c detail is an optional pre-formatted parameter string.
++ * Emit an audit log line for a destructive RPC, tagged with the caller's peer
++ * credentials, or "unknown" when they are unavailable. Call it at the top of a
++ * mutating handler, before the mutation can fail, so the attempt is recorded
++ * whatever the outcome.
 + *
 + * \param request JSON-RPC request being served
 + * \param method  RPC method name (for the log line)
-+ * \param detail  optional extra context (may be NULL)
++ * \param detail  optional pre-formatted parameter string (may be NULL)
 + */
 +void spdk_jsonrpc_request_audit(struct spdk_jsonrpc_request *request,
 +				const char *method, const char *detail);
@@ -37,16 +37,16 @@ index 760039d..7a157ad 100644
   * Add callback called when connection is closed. Pair of  \c cb and \c ctx must be unique or error is returned.
   * Registered callback is called only once and there is no need to call  \c spdk_jsonrpc_conn_del_close_cb
 diff --git a/lib/jsonrpc/jsonrpc_internal.h b/lib/jsonrpc/jsonrpc_internal.h
-index d13ec7a..81a17a4 100644
+index d13ec7a..d36271b 100644
 --- a/lib/jsonrpc/jsonrpc_internal.h
 +++ b/lib/jsonrpc/jsonrpc_internal.h
 @@ -49,6 +49,13 @@ struct spdk_jsonrpc_server_conn {
  	struct spdk_jsonrpc_server *server;
  	int sockfd;
  	bool closed;
-+	/* SPEC-73 SEC1: peer credentials captured at accept (SO_PEERCRED on a Unix
-+	 * socket, Linux only). peer_cred_valid is false for a TCP transport or a
-+	 * platform without SO_PEERCRED. */
++	/* Evariops 0011: peer credentials captured at accept. The other three fields
++	 * are meaningful only while peer_cred_valid is true, which requires a Unix
++	 * socket on a platform with SO_PEERCRED. */
 +	bool peer_cred_valid;
 +	pid_t peer_pid;
 +	uid_t peer_uid;
@@ -105,16 +105,16 @@ index c122613..158ed7f 100644
  static struct spdk_json_write_ctx *
  begin_response(struct spdk_jsonrpc_request *request)
 diff --git a/lib/jsonrpc/jsonrpc_server_tcp.c b/lib/jsonrpc/jsonrpc_server_tcp.c
-index e30f37f..4312469 100644
+index e30f37f..74d408d 100644
 --- a/lib/jsonrpc/jsonrpc_server_tcp.c
 +++ b/lib/jsonrpc/jsonrpc_server_tcp.c
 @@ -192,6 +192,23 @@ jsonrpc_server_accept(struct spdk_jsonrpc_server *server)
  		conn->server = server;
  		conn->sockfd = rc;
  		conn->closed = false;
-+		/* SPEC-73 SEC1: capture the client's credentials for the audit trail. Works
-+		 * for a Unix-domain socket (the default SPDK RPC transport); a TCP peer or a
-+		 * non-Linux build simply has none (peer_cred_valid stays false). */
++		/* Evariops 0011: capture the peer credentials at accept, the only point where
++		 * they are guaranteed to describe the process that opened the connection. A
++		 * TCP peer or a non-Linux build has none, so peer_cred_valid stays false. */
 +		conn->peer_cred_valid = false;
 +#ifdef __linux__
 +		{

@@ -1,14 +1,14 @@
 diff --git a/app/spdk_dd/spdk_dd.c b/app/spdk_dd/spdk_dd.c
-index 2bbcca1..63b0eec 100644
+index 2bbcca1..4ce2505 100644
 --- a/app/spdk_dd/spdk_dd.c
 +++ b/app/spdk_dd/spdk_dd.c
 @@ -339,6 +339,13 @@ _dd_write_bdev_done(struct spdk_bdev_io *bdev_io,
  {
  	struct dd_io *io = cb_arg;
  
-+	/* Evariops 0024: a failed bdev write MUST fail the copy — upstream
-+	 * ignored `success`, so dd exited 0 while the target rejected every
-+	 * write (e.g. a raid5f write_unit rejection). */
++	/* Evariops 0024: a failed bdev completion must fail the whole copy. dd must
++	 * never exit 0 against a target that rejected writes (a raid5f write_unit
++	 * rejection, for instance). */
 +	if (!success && g_error == 0) {
 +		SPDK_ERRLOG("bdev write failed at offset %" PRIu64 "\n", io->offset);
 +		g_error = -EIO;
@@ -20,8 +20,8 @@ index 2bbcca1..63b0eec 100644
  
  	spdk_bdev_free_io(bdev_io);
  
-+	/* Evariops 0024: a failed bdev read is WORSE than a failed write when
-+	 * ignored — the stale buffer gets written out as if it were data. */
++	/* Evariops 0024: an ignored read failure is worse than an ignored write one —
++	 * the stale buffer would be written out as if it were data. */
 +	if (!success && g_error == 0) {
 +		SPDK_ERRLOG("bdev read failed at offset %" PRIu64 "\n", io->offset);
 +		g_error = -EIO;

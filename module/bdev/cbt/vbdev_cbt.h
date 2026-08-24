@@ -23,8 +23,8 @@ extern "C" {
 #define CBT_MAX_RANGES_LIMIT            65536
 #define CBT_EPOCH_ID_MAX                64
 #define CBT_BACKEND_ID_MAX              128
-#define CBT_NONCE_MAX                   32       /* 0014.1: CP-generated epoch nonce */
-#define CBT_REBUILD_TOKEN_MAX           192      /* 0014.3: consumed-close proof token */
+#define CBT_NONCE_MAX                   32       /* control-plane epoch nonce */
+#define CBT_REBUILD_TOKEN_MAX           192      /* consumed-close proof token */
 #define CBT_REBUILD_DEFAULT_QD          16
 #define CBT_REBUILD_MAX_QD              128
 #define CBT_REBUILD_GC_DELAY_US         60000000 /* 60s before GC of completed entries */
@@ -37,9 +37,9 @@ enum cbt_rebuild_state {
 	CBT_REBUILD_COMPLETED = 1,
 	CBT_REBUILD_FAILED    = 2,
 	CBT_REBUILD_CANCELLED = 3,
-	/* R1: a rebuild aborted by a source/target/cbt hot-remove mid-flight. Distinct
-	 * from FAILED (an I/O error) and COMPLETED: the delta was NOT fully copied, so
-	 * the control-plane must RESUME it, not treat the member as synced. */
+	/* A rebuild aborted by a source/target/cbt hot-remove mid-flight. Distinct
+	 * from FAILED (an I/O error) and COMPLETED: the delta was NOT fully copied,
+	 * so the control-plane must RESUME it, not treat the member as synced. */
 	CBT_REBUILD_ABORTED   = 4,
 };
 
@@ -59,25 +59,23 @@ struct cbt_epoch {
 	uint64_t                generation;
 	enum cbt_epoch_state    state;
 
-	/* 0014.1 (RPC-CONTRACT §5): opaque CP-generated nonce, echoed in get_bdevs —
-	 * kills the epoch-id ABA across maintenance rounds. Empty = pre-0014 caller. */
+	/* Opaque control-plane nonce, echoed in get_bdevs: it tells apart two rounds
+	 * that reuse the same epoch id. Empty when the opener supplied none. */
 	char                    nonce[CBT_NONCE_MAX];
 
-	/* 0014.2 (RPC-CONTRACT §5, T-D6): set when the base bdev is RESIZED while this
-	 * epoch is live — the growth zone is covered by NO bitmap, so the delta is a
-	 * lie. A truncated epoch routes the control-plane to a FULL rebuild (D14).
-	 * Never cleared: it survives generation takeovers (the bitmap still does not
-	 * cover the growth) and dies only with the epoch. */
+	/* Set when the base bdev is RESIZED while this epoch is live: the growth zone
+	 * is covered by no bitmap, so the delta is incomplete and only a full rebuild
+	 * is safe. Never cleared — it survives generation takeovers and dies with the
+	 * epoch. */
 	bool                    truncated;
 
 	/* Per-epoch frozen bitmap (allocated on freeze, freed on close). */
 	uint8_t                *bitmap_frozen;
 
-	/* H1: true while bitmap_frozen holds bits that were exchanged OUT of the
-	 * live bitmap (snapshot-and-clear freeze) and not yet proven copied by a
-	 * COMPLETED rebuild. Discarding such a buffer (re-freeze, close, evict)
-	 * must first OR it back into the live bitmap — those chunks exist nowhere
-	 * else and dropping them is silent divergence under skip_rebuild. */
+	/* True while bitmap_frozen holds bits exchanged OUT of the live bitmap by a
+	 * snapshot-and-clear freeze and not yet proven copied by a COMPLETED rebuild.
+	 * Discarding such a buffer (re-freeze, close, evict) must first OR it back
+	 * into the live bitmap: those chunks exist nowhere else. */
 	bool                    frozen_live_consumed;
 
 	TAILQ_ENTRY(cbt_epoch)  link;
@@ -113,22 +111,22 @@ void bdev_cbt_delete_disk(const char *cbt_name,
 
 /* ── Epoch operations ──────────────────────────────────────────────── */
 
-/* 0014.3 (RPC-CONTRACT §4): how an epoch's frozen delta is disposed of at close. */
+/* How an epoch's frozen delta is disposed of at close. */
 enum cbt_epoch_close_mode {
 	/* Safe default: an unconsumed exchanged delta is OR-ed back into the live
-	 * bitmap before the epoch is freed (the H1 discipline) — no history is lost. */
+	 * bitmap before the epoch is freed — no dirty history is lost. */
 	CBT_EPOCH_CLOSE_PRESERVE = 0,
-	/* The caller CERTIFIES the delta was copied by a verified-successful rebuild
-	 * (raid seeded rebuild, outcome registry token) — the delta is deliberately
-	 * discarded. Requires a non-empty rebuild_token, -EPERM otherwise. */
+	/* The caller CERTIFIES the delta was copied by a verified-successful rebuild,
+	 * and the delta is deliberately discarded. Requires a non-empty
+	 * rebuild_token, -EPERM otherwise. */
 	CBT_EPOCH_CLOSE_CONSUMED = 1,
 };
 
 /**
  * Open a tracking epoch.
  *
- * \param nonce  0014.1: opaque CP-generated nonce (may be NULL/empty for
- *               pre-0014 callers); echoed in get_bdevs, kills epoch-id ABA.
+ * \param nonce  Opaque control-plane nonce (may be NULL or empty); echoed in
+ *               get_bdevs, tells apart rounds that reuse an epoch id.
  */
 int bdev_cbt_epoch_open(const char *cbt_name, const char *epoch_id,
 			const char *stale_backend_id, uint64_t generation,
@@ -137,15 +135,13 @@ int bdev_cbt_epoch_open(const char *cbt_name, const char *epoch_id,
 int bdev_cbt_epoch_freeze(const char *cbt_name, const char *epoch_id);
 
 /**
- * Close an epoch (0014.3).
+ * Close an epoch.
  *
  * \param mode           PRESERVE restores any unconsumed delta to the live
  *                       bitmap; CONSUMED discards it under caller certification.
- * \param rebuild_token  Required non-empty for CONSUMED (-EPERM otherwise); the
- *                       SUCCEEDED-verified outcome-registry token (validated
- *                       against the registry as of 0014.5 — until then it is
- *                       demanded and logged, per the frozen contract the CP
- *                       only sends CONSUMED with a verified token, D12).
+ * \param rebuild_token  Required non-empty for CONSUMED (-EPERM otherwise): a
+ *                       rebuild-outcome token, which must name an outcome in
+ *                       state succeeded and verified.
  */
 int bdev_cbt_epoch_close(const char *cbt_name, const char *epoch_id,
 			 enum cbt_epoch_close_mode mode,

@@ -1,18 +1,16 @@
 diff --git a/include/spdk/bdev_module.h b/include/spdk/bdev_module.h
-index fce200b..79b43f0 100644
+index fce200b..e4a45e7 100644
 --- a/include/spdk/bdev_module.h
 +++ b/include/spdk/bdev_module.h
-@@ -1954,6 +1954,23 @@ int spdk_bdev_unquiesce_range(struct spdk_bdev *bdev, struct spdk_bdev_module *m
+@@ -1954,6 +1954,21 @@ int spdk_bdev_unquiesce_range(struct spdk_bdev *bdev, struct spdk_bdev_module *m
  			      uint64_t offset, uint64_t length,
  			      spdk_bdev_quiesce_cb cb_fn, void *cb_arg);
  
-+/* ── Evariops SPEC-73 C2: channel-owned LBA range lock ─────────────────────
-+ * Holds NEW I/O overlapping [offset, offset+length) (queued, replayed at
-+ * unlock) and waits for in-flight I/O to drain before granting the lock. The
-+ * OWNING channel is exempt: an I/O submitted on `ch` whose cb_arg equals the
-+ * lock's `cb_arg` passes through — the pattern a read-modify-write repair
-+ * needs. This is the same internal primitive COMPARE_AND_WRITE emulation uses.
-+ * Both calls must be made from the thread owning `ch`. */
++/* Evariops 0008: channel-owned LBA range lock. The lock is granted once in-flight
++ * I/O has drained; new I/O overlapping [offset, offset + length) is queued and
++ * replayed at unlock. The owning channel is exempt: an I/O submitted on ch whose
++ * cb_arg equals the lock's cb_arg passes straight through, which is what a
++ * read-modify-write repair needs. Both calls must run on the thread owning ch. */
 +struct lba_range;
 +typedef void (*spdk_bdev_lba_range_cb)(struct lba_range *range, void *ctx, int status);
 +
@@ -27,27 +25,26 @@ index fce200b..79b43f0 100644
   *  Macro used to register module for later initialization.
   */
 diff --git a/lib/bdev/bdev.c b/lib/bdev/bdev.c
-index 98e01ca..80f0cf7 100644
+index 98e01ca..a7ccfe6 100644
 --- a/lib/bdev/bdev.c
 +++ b/lib/bdev/bdev.c
-@@ -11189,6 +11189,31 @@ spdk_bdev_unquiesce_range(struct spdk_bdev *bdev, struct spdk_bdev_module *modul
+@@ -11189,6 +11189,30 @@ spdk_bdev_unquiesce_range(struct spdk_bdev *bdev, struct spdk_bdev_module *modul
  	return _spdk_bdev_quiesce(bdev, module, offset, length, cb_fn, cb_arg, true);
  }
  
-+/* Evariops SPEC-73 C2: expose the channel-owned LBA range lock (the primitive
-+ * COMPARE_AND_WRITE emulation already uses). Unlike quiesce, the OWNER channel
-+ * may keep submitting I/O inside the locked range when the I/O's cb_arg equals
-+ * the lock's cb_arg (see bdev_io_range_is_locked) — exactly what a
-+ * read-reconstruct-writeback repair needs: host I/O to the range is held and
-+ * replayed at unlock, while the repair's own I/O flows. */
++/* Evariops 0008: expose the channel-owned LBA range lock already used by the
++ * COMPARE_AND_WRITE emulation. Unlike quiesce, the owning channel may keep
++ * submitting into the locked range as long as the I/O's cb_arg equals the lock's
++ * cb_arg (see bdev_io_range_is_locked), which is what a read-modify-write repair
++ * needs: host I/O is held and replayed at unlock while the repair's own I/O flows. */
 +int
 +spdk_bdev_lock_lba_range(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 +			 uint64_t offset, uint64_t length,
 +			 spdk_bdev_lba_range_cb cb_fn, void *cb_arg)
 +{
-+	/* No cast: spdk_bdev_lba_range_cb and the internal lock_range_cb have identical
-+	 * signatures, so this compiles as compatible types. Casting instead would hide a
-+	 * future divergence of the internal typedef behind a silent runtime mismatch. */
++	/* Pass cb_fn without a cast: spdk_bdev_lba_range_cb and the internal
++	 * lock_range_cb are compatible types today, and keeping the compiler's check
++	 * means a future divergence breaks the build instead of failing at runtime. */
 +	return bdev_lock_lba_range(desc, ch, offset, length, cb_fn, cb_arg);
 +}
 +
@@ -89,10 +86,10 @@ index cb46945..e118002 100644
  ifeq ($(CONFIG_RAID5F),y)
  C_SRCS += raid5f.c
 diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
-index 636eda1..53b88bc 100644
+index a24f53c..594e47a 100644
 --- a/module/bdev/raid/bdev_raid.c
 +++ b/module/bdev/raid/bdev_raid.c
-@@ -1122,6 +1122,17 @@ raid_bdev_write_info_json(struct raid_bdev *raid_bdev, struct spdk_json_write_ct
+@@ -1121,6 +1121,17 @@ raid_bdev_write_info_json(struct raid_bdev *raid_bdev, struct spdk_json_write_ct
  	spdk_json_write_named_uint32(w, "num_base_bdevs_discovered", raid_bdev->num_base_bdevs_discovered);
  	spdk_json_write_named_uint32(w, "num_base_bdevs_operational",
  				     raid_bdev->num_base_bdevs_operational);
@@ -112,38 +109,24 @@ index 636eda1..53b88bc 100644
  		uint64_t offset = process->window_offset;
 diff --git a/module/bdev/raid/bdev_raid_repair.c b/module/bdev/raid/bdev_raid_repair.c
 new file mode 100644
-index 0000000..f0aff59
+index 0000000..f0664e7
 --- /dev/null
 +++ b/module/bdev/raid/bdev_raid_repair.c
-@@ -0,0 +1,406 @@
+@@ -0,0 +1,389 @@
 +/*   SPDX-License-Identifier: BSD-3-Clause
 + *   Copyright (C) 2026 Evariops.
 + *   All rights reserved.
 + *
-+ *   SPEC-73 M4: bdev_raid_rebuild_ranges — repair lost ranges of a degraded member by
-+ *   READ-RECONSTRUCT-WRITEBACK through the raid bdev.
++ *   bdev_raid_rebuild_ranges — repair lost ranges of a degraded member by
++ *   READ-RECONSTRUCT-WRITEBACK through the raid bdev: the read reconstructs from
++ *   survivors+parity (raid5f) or a healthy mirror (raid1), the write-back recomputes
++ *   parity / rewrites all mirrors. Data never leaves SPDK.
 + *
-+ *   A degraded bdev_tier band means a chunk lost some clusters' data (the disk failed). Repair:
-+ *   for each stripe-aligned range, read it from the raid bdev — M3 (0006) reconstructs the
-+ *   degraded chunk from survivors+parity for raid5f; raid1 reads a healthy mirror — then write
-+ *   the buffer back, which recomputes parity (raid5f) / rewrites all mirrors (raid1), repairing
-+ *   the chunk's data on its relocated/replacement band. INV-T2: data never leaves SPDK.
-+ *
-+ *   C2 (atomicity vs host I/O): each read/write-back pair runs under a CHANNEL-OWNED LBA RANGE
-+ *   LOCK (spdk_bdev_lock_lba_range) on exactly the chunk being repaired. Host writes overlapping
-+ *   the chunk are HELD at submission and replayed after the unlock (so they land AFTER our
-+ *   write-back — host data wins); our own repair I/O is exempt (same channel + same cb_arg as the
-+ *   lock). Without the lock, a host write racing between our read and our write-back was silently
-+ *   overwritten with the stale buffer. Host reads are not held (a plain lock only holds writes).
-+ *
-+ *   P-3: ranges must be stripe-aligned for parity raids (validated at the RPC — the old code
-+ *   trusted the caller and issued a partial trailing write that raid5f rejects -EIO mid-repair).
-+ *   raid1/concat (strip_size == 0) have no full-stripe constraint: a fixed chunk is used.
-+ *
-+ *   N-6: a REMOVE of the raid bdev mid-repair aborts the repair at the next chunk boundary
-+ *   (in-flight I/O completes with an error) instead of holding the desc open indefinitely.
-+ *
-+ *   Sequential (QD=1) — this is a background repair, paced by the control-plane op budget.
++ *   Each read/write-back pair holds a channel-owned LBA range lock on exactly the
++ *   chunk being repaired. Overlapping host writes are HELD at submission and replayed
++ *   after the unlock, so they land after our write-back and host data wins; our own
++ *   repair I/O is exempt (same channel and same cb_arg as the lock). Host reads are
++ *   never held. Ranges must be stripe-aligned on parity raids. Sequential (QD=1).
 + */
 +
 +#include "bdev_raid.h"
@@ -175,8 +158,8 @@ index 0000000..f0aff59
 +	uint64_t			io_blocks;	/* size of the in-flight I/O */
 +	uint64_t			io_lba;		/* start of the in-flight (locked) chunk */
 +	uint64_t			stripe_blocks;	/* chunk size (full stripe for parity raids) */
-+	bool				locked;		/* C2: chunk range lock held */
-+	bool				removed;	/* N-6: REMOVE seen — abort at next boundary */
++	bool				locked;		/* chunk range lock held */
++	bool				removed;	/* REMOVE seen — abort at next boundary */
 +	int				rc;
 +	void				*buf;
 +	uint64_t			ranges_done;
@@ -265,8 +248,8 @@ index 0000000..f0aff59
 +		return;
 +	}
 +	c->cur_off += c->io_blocks;
-+	/* C2: chunk repaired — release the lock (held host writes replay NOW, after
-+	 * our write-back, so the freshest data wins), then move on. */
++	/* Chunk repaired — release the lock: held host writes replay NOW, after our
++	 * write-back, so the freshest data wins. */
 +	c->locked = false;
 +	if (spdk_bdev_unlock_lba_range(c->desc, c->ch, c->io_lba, c->io_blocks,
 +				       raid_repair_chunk_unlocked, c) != 0) {
@@ -283,10 +266,9 @@ index 0000000..f0aff59
 +
 +	spdk_bdev_free_io(bdev_io);
 +	if (!success) {
-+		/* M3 should have reconstructed a degraded read; a hard failure here means the stripe
-+		 * is unrecoverable (>1 fault) — fail cleanly, the data is still protected elsewhere.
-+		 * Name the offending chunk so operators can pinpoint the unrecoverable stripe (which
-+		 * range/LBA lost redundancy) instead of seeing an opaque -EIO from the RPC. */
++		/* The raid layer reconstructs a degraded read, so a hard failure here means
++		 * the stripe has more than one fault and is unrecoverable. Name the chunk:
++		 * an opaque -EIO would not say which stripe lost its redundancy. */
 +		SPDK_ERRLOG("raid repair: unrecoverable read at chunk [%" PRIu64 ", +%" PRIu64
 +			    ") (range %u/%u) — stripe has >1 fault, aborting\n",
 +			    c->io_lba, c->io_blocks, c->cur, c->num_ranges);
@@ -300,9 +282,9 @@ index 0000000..f0aff59
 +	}
 +}
 +
-+/* C2: the chunk range is locked (in-flight host I/O drained, new host writes
-+ * held) — do the read-reconstruct-writeback. Our own I/O passes the lock
-+ * because it is submitted on the locking channel with cb_arg == locked_ctx. */
++/* The chunk range is locked (in-flight host I/O drained, new host writes held) —
++ * do the read-reconstruct-writeback. Our own I/O passes the lock because it is
++ * submitted on the locking channel with cb_arg == locked_ctx. */
 +static void
 +raid_repair_chunk_locked(struct lba_range *range, void *cb_arg, int status)
 +{
@@ -329,10 +311,9 @@ index 0000000..f0aff59
 +	int rc;
 +
 +	if (c->removed) {
-+		raid_repair_finish(c, -ENODEV);	/* N-6: abort on REMOVE */
++		raid_repair_finish(c, -ENODEV);
 +		return;
 +	}
-+	/* Advance past finished ranges. */
 +	while (c->cur < c->num_ranges && c->cur_off >= c->ranges[c->cur].num_blocks) {
 +		c->cur++;
 +		c->cur_off = 0;
@@ -357,8 +338,7 @@ index 0000000..f0aff59
 +struct rpc_raid_repair {
 +	char		*name;
 +	size_t		num_ranges;
-+	/* P-3(c): heap-allocated in the handler (4096×16B on the handler stack
-+	 * before). */
++	/* Heap-allocated by the decoder: too large for the handler stack. */
 +	struct raid_repair_range *ranges;
 +};
 +
@@ -394,8 +374,8 @@ index 0000000..f0aff59
 +	{"ranges", offsetof(struct rpc_raid_repair, ranges), decode_repair_ranges},
 +};
 +
-+/* N-6: remember the REMOVE so the repair aborts at the next chunk boundary
-+ * (the desc is closed by the normal finish path). */
++/* Remember the REMOVE so the repair aborts at the next chunk boundary; the desc
++ * is closed by the normal finish path. */
 +static void
 +raid_repair_base_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev, void *ctx)
 +{
@@ -449,9 +429,9 @@ index 0000000..f0aff59
 +							 "raid has strip_size but zero data chunks");
 +			goto cleanup;
 +		}
-+		/* P-3(a): validate alignment up front — a partial trailing write would
-+		 * fail -EIO in the middle of the repair (raid5f accepts only full
-+		 * stripes) after having already rewritten earlier stripes. */
++		/* Validate alignment up front: raid5f accepts only full stripes, so a
++		 * partial trailing write fails -EIO mid-repair, after earlier stripes
++		 * have already been rewritten. */
 +		for (i = 0; i < req.num_ranges; i++) {
 +			if (req.ranges[i].num_blocks == 0 ||
 +			    req.ranges[i].start_lba % stripe_blocks != 0 ||
@@ -504,7 +484,7 @@ index 0000000..f0aff59
 +		goto cleanup;
 +	}
 +
-+	/* SEC1: audit this data-mutating repair (reads+rewrites full stripes). */
++	/* Audit trail: this repair mutates data (reads and rewrites full stripes). */
 +	{
 +		char detail[128];
 +

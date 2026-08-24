@@ -3,10 +3,9 @@
  *   All rights reserved.
  */
 
-/* Evariops 0014.6 (spdk-csi RPC-CONTRACT §3): minimal cross-module query
- * surface so the raid module can publish per-member epoch facts in its own
- * get_bdevs output — the control-plane's EpochObservation source. This header
- * deliberately exposes NO cbt internals; the raid patch (0017) is its only
+/* Minimal cross-module query surface: the raid module publishes per-member
+ * epoch facts in its own get_bdevs output, which is what the control-plane
+ * observes. No cbt internals are exposed here; the raid module is the only
  * intended consumer. Symbols resolve via --whole-archive at app link. */
 
 #ifndef SPDK_VBDEV_CBT_QUERY_H
@@ -15,11 +14,12 @@
 #include "spdk/stdinc.h"
 
 struct vbdev_cbt_epoch_facts {
-	/* CP-generated nonce (empty for pre-0014 epochs). */
+	/* Control-plane nonce; empty when the opener supplied none. */
 	char		nonce[32];
 	/* Static string: open|frozen|rebuilding|completed|invalid. */
 	const char	*state;
-	/* T-D6: the live bitmap does not cover a growth zone — delta is a lie. */
+	/* The bitmap does not cover the whole device (the base bdev grew): the
+	 * delta is incomplete, only a full rebuild is safe. */
 	bool		truncated;
 };
 
@@ -33,17 +33,15 @@ struct vbdev_cbt_epoch_facts {
 int vbdev_cbt_query_latest_epoch(const char *bdev_name, struct vbdev_cbt_epoch_facts *out);
 
 /**
- * Evariops 0014.10 (spdk-csi RPC-CONTRACT §12): open a delta epoch the moment
- * the raid ejects a member — the unplanned loss is the dominant production
- * event, and without this bound the debt path degrades to a FULL rebuild
- * (D14). Called by the raid module on each surviving member's cbt when a
- * member leaves; the auto-generated epoch id/nonce are REPORTED through
- * get_bdevs (0014.6), which is how the control-plane adopts the round.
+ * Open a delta epoch bounding an unplanned member loss. The raid module calls
+ * this on each surviving member's cbt when a member leaves, so the missing
+ * writes stay a delta instead of degrading to a full rebuild. The generated
+ * epoch id and nonce are reported through get_bdevs, which is how the
+ * control-plane adopts the round.
  *
  * \return 0 on success; -EEXIST if an OPEN epoch already tracks the round
  *         (never take over implicitly); -ENODEV if \c bdev_name is not a cbt
- *         bdev; other negative errno from the underlying epoch machinery.
- *         App thread only.
+ *         bdev; other negative errno from the epoch machinery. App thread only.
  */
 int vbdev_cbt_auto_epoch_open(const char *bdev_name, const char *stale_backend_id);
 

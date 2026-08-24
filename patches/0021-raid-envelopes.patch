@@ -12,18 +12,32 @@ index 120700c..c90b4a2 100644
  ifeq ($(CONFIG_RAID5F),y)
  C_SRCS += raid5f.c
 diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
-index 94e0b34..762e892 100644
+index 0a1cdee..40d393d 100644
 --- a/module/bdev/raid/bdev_raid.c
 +++ b/module/bdev/raid/bdev_raid.c
-@@ -6,6 +6,7 @@
+@@ -5,14 +5,14 @@
+  */
  
  #include "bdev_raid.h"
- #include "bdev_raid_outcomes.h"	/* Evariops 0014.5 */
-+#include "bdev_raid_envelopes.h"	/* Evariops 0014.9 */
- /* Evariops 0014.6: per-member epoch facts come from the cbt module wrapping
-  * each member (nexus topology: raid1 → cbt → nvme). The module dir is injected
-  * before patches apply (Dockerfile copy-before-apply); symbol resolves via
-@@ -3971,13 +3972,24 @@ raid_bdev_process_alloc(struct raid_bdev *raid_bdev, enum raid_process_type type
+-#include "bdev_raid_outcomes.h"	/* Evariops 0014.5 */
+-/* Evariops 0014.6: per-member epoch facts come from the cbt module wrapping
+- * each member (nexus topology: raid1 → cbt → nvme). The module dir is injected
+- * before patches apply (Dockerfile copy-before-apply); symbol resolves via
+- * --whole-archive. This patch (0017) requires the cbt module, like 0005
+- * requires tier. */
++#include "bdev_raid_outcomes.h"	/* Evariops 0015 */
++#include "bdev_raid_envelopes.h"	/* Evariops 0021 */
++/* Evariops 0017: per-member epoch facts come from the cbt module wrapping each
++ * member (nexus topology: raid1 -> cbt -> nvme). The cbt module dir is injected
++ * into the tree before the patch series applies; the symbol resolves through
++ * --whole-archive, so this file requires the cbt module to be built in. */
+ #include "../cbt/vbdev_cbt_query.h"
+-#include "spdk/nvme_spec.h"	/* Evariops C-1 */
++#include "spdk/nvme_spec.h"	/* Evariops 0009 */
+ #include "spdk/env.h"
+ #include "spdk/thread.h"
+ #include "spdk/log.h"
+@@ -3952,13 +3952,23 @@ raid_bdev_process_alloc(struct raid_bdev *raid_bdev, enum raid_process_type type
  	TAILQ_INIT(&process->requests);
  	TAILQ_INIT(&process->finish_actions);
  
@@ -34,10 +48,9 @@ index 94e0b34..762e892 100644
 -					     spdk_get_ticks_hz();
 -		process->qos.bytes_max = g_opts.process_max_bandwidth_mb_sec * 1024 * 1024.0 / SPDK_SEC_TO_MSEC;
 -		process->qos.bytes_available = 0.0;
-+	/* Evariops 0014.9 (RPC-CONTRACT §6): the rebuild envelope (under the
-+	 * current regime) takes precedence over the legacy global option and is
-+	 * FROZEN here — a regime change only applies to processes started after
-+	 * it (bytes_per_tsc is per-process by design). 0 = unlimited. */
++	/* Evariops 0021: the rebuild envelope takes precedence over the legacy
++	 * global option, and is frozen here — bytes_per_tsc is per-process, so a
++	 * regime change only applies to processes started after it. 0 = unlimited. */
 +	{
 +		uint32_t max_bw_mb_sec = raid_envelope_active_mb_sec(RAID_ENVELOPE_REBUILD);
 +
@@ -55,14 +68,13 @@ index 94e0b34..762e892 100644
  	}
  
  	for (i = 0; i < RAID_BDEV_PROCESS_MAX_QD; i++) {
-@@ -4001,6 +4013,16 @@ raid_bdev_start_rebuild(struct raid_base_bdev_info *target)
+@@ -3982,6 +3992,15 @@ raid_bdev_start_rebuild(struct raid_base_bdev_info *target)
  
  	assert(spdk_get_thread() == spdk_thread_get_app_thread());
  
-+	/* Evariops 0014.9: the auto rebuild at attach is ADMITTED over the
-+	 * concurrency bound — refusing here would leave an attached member
-+	 * silently unrebuilt with nothing to retry it. Loud, not blocking:
-+	 * the control plane paces attaches itself. */
++	/* Evariops 0021: the attach-triggered rebuild is admitted even over the
++	 * concurrency bound. Refusing here would leave an attached member silently
++	 * unrebuilt with nothing to retry it; the control plane paces attaches. */
 +	if (!raid_envelopes_admit_rebuild()) {
 +		SPDK_WARNLOG("raid bdev '%s': rebuild concurrency bound exceeded — "
 +			     "admitting the attach-triggered rebuild anyway\n",
@@ -72,13 +84,13 @@ index 94e0b34..762e892 100644
  	process = raid_bdev_process_alloc(target->raid_bdev, RAID_PROCESS_REBUILD, target);
  	if (process == NULL) {
  		return -ENOMEM;
-@@ -4040,6 +4062,13 @@ raid_bdev_start_seeded_rebuild(struct raid_base_bdev_info *target,
+@@ -4020,6 +4039,13 @@ raid_bdev_start_seeded_rebuild(struct raid_base_bdev_info *target,
  		return -EINVAL;
  	}
  
-+	/* Evariops 0014.9 (RPC-CONTRACT §6): RPC-driven rebuilds respect the
-+	 * per-node concurrency bound — N rebuilds are N × cap otherwise. The
-+	 * control plane maps -EAGAIN to a retry, nothing is lost. */
++	/* Evariops 0021: RPC-driven rebuilds respect the per-node concurrency
++	 * bound, otherwise N rebuilds consume N times the bandwidth cap. The
++	 * control plane maps -EAGAIN to a retry, so nothing is lost. */
 +	if (!raid_envelopes_admit_rebuild()) {
 +		return -EAGAIN;
 +	}
@@ -88,7 +100,7 @@ index 94e0b34..762e892 100644
  		return -ENOMEM;
 diff --git a/module/bdev/raid/bdev_raid_envelopes.c b/module/bdev/raid/bdev_raid_envelopes.c
 new file mode 100644
-index 0000000..7fd32b7
+index 0000000..eabf1b4
 --- /dev/null
 +++ b/module/bdev/raid/bdev_raid_envelopes.c
 @@ -0,0 +1,73 @@
@@ -97,7 +109,7 @@ index 0000000..7fd32b7
 + *   All rights reserved.
 + */
 +
-+/* Evariops 0014.9 (spdk-csi RPC-CONTRACT §6): see bdev_raid_envelopes.h. */
++/* Evariops 0021: I/O envelopes — see bdev_raid_envelopes.h. */
 +
 +#include "bdev_raid.h"
 +#include "bdev_raid_envelopes.h"
@@ -167,28 +179,23 @@ index 0000000..7fd32b7
 +}
 diff --git a/module/bdev/raid/bdev_raid_envelopes.h b/module/bdev/raid/bdev_raid_envelopes.h
 new file mode 100644
-index 0000000..a5aa0db
+index 0000000..eb551a5
 --- /dev/null
 +++ b/module/bdev/raid/bdev_raid_envelopes.h
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,51 @@
 +/*   SPDX-License-Identifier: BSD-3-Clause
 + *   Copyright (C) 2026 Evariops.
 + *   All rights reserved.
 + */
 +
-+/* Evariops 0014.9 (spdk-csi RPC-CONTRACT §6): process-wide I/O envelopes.
-+ *
-+ * CAPS, never shares (there is no mClock/WFQ here): one cap per executor
-+ * class, each in TWO values (nominal, maintenance), plus a per-node bound on
-+ * concurrent rebuilds — N rebuilds would otherwise consume N × cap. The
-+ * data-plane default is 0 = UNLIMITED: the control plane MUST set these at
-+ * handshake, and a failed set is an INCIDENT there, never a silent fallback.
-+ * The rebuild cap is consumed at process allocation (bytes_per_tsc is frozen
-+ * there — a regime change only applies to processes started after it); the
-+ * verify cap is consumed by bdev_raid_verify_ranges (§10b; the integrated
-+ * verify phase samples ~64 MiB and is deliberately unpaced); the relocate cap
-+ * is stored here for the tier module to consume.
-+ */
++/* Evariops 0021: process-wide I/O envelopes. These are absolute caps, not
++ * shares — there is no fair-queueing here: one cap per background-work class,
++ * each in a nominal and a maintenance value, plus a bound on concurrent
++ * rebuilds, since N rebuilds would otherwise consume N times the rebuild cap.
++ * Consumption is by class: the rebuild cap is read once when a process is
++ * allocated and frozen there, so a regime change only affects processes started
++ * afterwards; the verify cap is read by bdev_raid_verify_ranges; the relocate
++ * cap is only stored here, for the tier module to consume. */
 +
 +#ifndef SPDK_BDEV_RAID_ENVELOPES_H
 +#define SPDK_BDEV_RAID_ENVELOPES_H
@@ -203,7 +210,8 @@ index 0000000..a5aa0db
 +};
 +
 +struct raid_envelope {
-+	/* MiB/s caps; 0 = unlimited (the loud default). */
++	/* MiB/s caps; 0 = unlimited, which is also the default until something
++	 * sets them. */
 +	uint32_t	nominal_mb_sec;
 +	uint32_t	maintenance_mb_sec;
 +};
@@ -215,7 +223,7 @@ index 0000000..a5aa0db
 +	bool			maintenance_regime;
 +};
 +
-+/* All app-thread only (RPC handlers + process allocation). */
++/* App thread only (RPC handlers and process allocation). */
 +void raid_envelopes_get(struct raid_envelopes *out);
 +void raid_envelopes_set(const struct raid_envelopes *envelopes);
 +
@@ -227,26 +235,27 @@ index 0000000..a5aa0db
 +
 +#endif /* SPDK_BDEV_RAID_ENVELOPES_H */
 diff --git a/module/bdev/raid/bdev_raid_rpc.c b/module/bdev/raid/bdev_raid_rpc.c
-index f65ea35..92e33e5 100644
+index 31896d5..5d9917f 100644
 --- a/module/bdev/raid/bdev_raid_rpc.c
 +++ b/module/bdev/raid/bdev_raid_rpc.c
-@@ -7,6 +7,7 @@
+@@ -6,7 +6,8 @@
+ #include "spdk/rpc.h"
  #include "spdk/bdev.h"
  #include "bdev_raid.h"
- #include "bdev_raid_outcomes.h"	/* Evariops 0014.5 */
-+#include "bdev_raid_envelopes.h"	/* Evariops 0014.9 */
+-#include "bdev_raid_outcomes.h"	/* Evariops 0014.5 */
++#include "bdev_raid_outcomes.h"
++#include "bdev_raid_envelopes.h"
  #include "spdk/util.h"
  #include "spdk/string.h"
  #include "spdk/log.h"
-@@ -909,6 +910,129 @@ err:
+@@ -906,6 +907,127 @@ err:
  }
  SPDK_RPC_REGISTER("bdev_raid_remove_base_bdev", rpc_bdev_raid_remove_base_bdev, SPDK_RPC_RUNTIME)
  
-+/* ---- Evariops 0014.9 (RPC-CONTRACT §6): bdev_raid_set_envelopes /
-+ * bdev_raid_get_envelopes — process-wide caps (never shares), each class in
-+ * two values (nominal, maintenance) + the per-node rebuild concurrency bound
-+ * + the current regime. Data-plane default is 0 = UNLIMITED: the control
-+ * plane sets these at handshake and treats a failed set as an INCIDENT. ---- */
++/* Evariops 0021: get/set the process-wide I/O envelopes — one bandwidth cap per
++ * background-work class in two values (nominal, maintenance), the rebuild
++ * concurrency bound, and the active regime. Set is an update: unspecified fields
++ * keep their value, so the regime can flip alone. See bdev_raid_envelopes.h. */
 +
 +struct rpc_bdev_raid_set_envelopes {
 +	uint32_t rebuild_nominal_mb_sec;
@@ -293,8 +302,8 @@ index f65ea35..92e33e5 100644
 +	struct raid_envelopes env;
 +	struct spdk_json_write_ctx *w;
 +
-+	/* Start from the current state so a partial set is an update, and the
-+	 * regime can flip alone at a maintenance-intent change. */
++	/* Seed the request from the current state: unspecified fields must keep
++	 * their value rather than decode to zero, which means "unlimited". */
 +	raid_envelopes_get(&env);
 +	req.rebuild_nominal_mb_sec = env.classes[RAID_ENVELOPE_REBUILD].nominal_mb_sec;
 +	req.rebuild_maintenance_mb_sec = env.classes[RAID_ENVELOPE_REBUILD].maintenance_mb_sec;
@@ -319,7 +328,6 @@ index f65ea35..92e33e5 100644
 +		} else if (strcmp(req.regime, "maintenance") == 0) {
 +			env.maintenance_regime = true;
 +		} else {
-+			/* Unknown regime is -EINVAL, never a silent fallback. */
 +			spdk_jsonrpc_send_error_response_fmt(request, -EINVAL,
 +							     "unknown regime '%s'", req.regime);
 +			free(req.regime);
@@ -365,6 +373,6 @@ index f65ea35..92e33e5 100644
 +}
 +SPDK_RPC_REGISTER("bdev_raid_get_envelopes", rpc_bdev_raid_get_envelopes, SPDK_RPC_RUNTIME)
 +
- /* ---- Evariops 0014.5 (RPC-CONTRACT §2): bdev_raid_get_rebuild_outcomes
-  * {token?} — read the process-wide rebuild outcome registry. Entries survive
-  * the raid bdev (15 min TTL after finishing); the control plane matches by
+ /* Evariops 0015: bdev_raid_get_rebuild_outcomes {token?} — read the rebuild
+  * outcome registry. Entries outlive the raid bdev they describe and are matched
+  * by token, so an attempt can still be resolved after its raid is gone. See

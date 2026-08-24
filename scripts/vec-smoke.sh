@@ -2,24 +2,24 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # Copyright (c) 2026 Evariops.
 #
-# vec-smoke.sh — single-node raid5f EC smoke (SPEC-75G G1 pre-flight).
+# vec-smoke.sh — single-node raid5f smoke test.
 #
-# Exercises the fork's EC data-plane contract on file-backed AIO bdevs:
+# Exercises the fork's erasure-coding data-plane contract on file-backed AIO
+# bdevs:
 #   1. create raid5f 2+1 (strip 64K, incarnation) and write full stripes
-#      (spdk_dd) — sub-stripe writes are REJECTED (EC-3, negative test);
-#   2. syndrome verify_ranges (patch 0022, F-b) → zero divergence;
+#      (spdk_dd) — sub-stripe writes must be REJECTED (negative test);
+#   2. syndrome verify_ranges (patch 0022) → zero divergence;
 #   3. corrupt the PARITY strip of stripe 0 on the backing file →
 #      verify reports the stripe DIVERGENT (mode=syndrome, report-only);
 #   4. bdev_raid_rebuild_ranges (patch 0008) over that stripe → re-verify
-#      clean. (Parity-strip corruption is the honestly repairable case; a
+#      clean. Parity-strip corruption is the honestly repairable case: a
 #      DATA-strip corruption would be "repaired" into consistent-but-wrong,
-#      which is exactly why verify is report-only and the CP re-folds from
-#      the source — SPEC-75G §4.3.)
+#      which is why verify only reports and the control plane re-folds the
+#      stripe from its source;
 #   5. delete one member → syndrome verify refuses -EAGAIN ("repair first");
-#   6. unaligned range → -EINVAL; degraded-service counters visible (0023).
+#   6. unaligned range → -EINVAL; degraded-service counters visible.
 #
-# This smoke is NOT the V-EC certification (cross-node, real disk pulls, on
-# turing — spdk-csi QA harness). It is the fork-local pre-flight that must
+# This is the fork-local pre-flight, not the cross-node certification: it must
 # be green before any image ships raid5f primitives.
 #
 # Requirements: linux, spdk_tgt + spdk_dd binaries (builder image has both),
@@ -167,7 +167,7 @@ cat > "$WORK/dd-config.json" <<EOF
 ]}]}
 EOF
 
-# ── 1. writer: full stripes OK, sub-stripe REJECTED (EC-3) ───────────────
+# ── 1. writer: full stripes OK, sub-stripe REJECTED ──────────────────────
 # CAUTION: spdk_dd exits 0 even when the bdev FAILS its writes (it logs the
 # IO error and keeps its "Copying: N/N" accounting) — its exit code is NOT
 # an oracle. Write success = readback byte-identical; write rejection = the

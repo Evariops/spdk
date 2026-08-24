@@ -4,21 +4,10 @@
  */
 
 /*
- * JSON-RPC handlers for the CBT vbdev module.
- *
- * RPCs:
- *   bdev_cbt_create          — create CBT wrapper
- *   bdev_cbt_delete          — delete CBT wrapper
- *   bdev_cbt_epoch_open      — open a tracking epoch
- *   bdev_cbt_epoch_freeze    — freeze bitmap for reading
- *   bdev_cbt_epoch_close     — close epoch after rebuild
- *   bdev_cbt_epoch_invalidate— invalidate epoch (fallback)
- *   bdev_cbt_epoch_get_dirty_ranges — read frozen dirty ranges
- *   bdev_cbt_epoch_list      — list active epochs
- *   bdev_cbt_get_dirty_ranges— legacy alias
- *   bdev_cbt_start_tracking  — legacy alias
- *   bdev_cbt_stop_tracking   — legacy alias
- *   bdev_cbt_reset           — reset bitmap
+ * JSON-RPC handlers for the CBT vbdev module: create and delete, the epoch
+ * protocol (open, freeze, get_dirty_ranges, close, invalidate, list), the
+ * rebuild controls, and the legacy tracking aliases. Each handler only decodes
+ * and forwards; the rules live in vbdev_cbt.c.
  */
 
 #include "vbdev_cbt_internal.h"
@@ -151,7 +140,7 @@ struct rpc_epoch_open {
 	char     *epoch_id;
 	char     *stale_backend_id;
 	uint64_t  generation;
-	char     *nonce;    /* 0014.1: optional, opaque CP nonce */
+	char     *nonce;    /* optional, opaque control-plane nonce */
 };
 
 static void
@@ -258,8 +247,8 @@ SPDK_RPC_REGISTER("bdev_cbt_epoch_freeze", rpc_bdev_cbt_epoch_freeze, SPDK_RPC_R
 struct rpc_epoch_close {
 	char *name;
 	char *epoch_id;
-	char *mode;           /* 0014.3: "preserve" (default) | "consumed" */
-	char *rebuild_token;  /* 0014.3: required for consumed */
+	char *mode;           /* "preserve" (default) | "consumed" */
+	char *rebuild_token;  /* required for consumed */
 };
 
 static void
@@ -293,7 +282,7 @@ rpc_bdev_cbt_epoch_close(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	/* 0014.3: an unknown mode is an error, never a silent PRESERVE fallback. */
+	/* An unknown mode is an error, never a silent PRESERVE fallback. */
 	if (req.mode != NULL) {
 		if (strcmp(req.mode, "consumed") == 0) {
 			mode = CBT_EPOCH_CLOSE_CONSUMED;
@@ -508,14 +497,9 @@ rpc_bdev_cbt_epoch_list(struct spdk_jsonrpc_request *request,
 	spdk_json_write_named_uint64(w, "total_chunks", cbt->bitmap_size_bits);
 	spdk_json_write_named_double(w, "dirty_ratio", dirty_ratio);
 	spdk_json_write_named_uint64(w, "total_writes_tracked", writes_tracked);
-	/* D3: healthy_clear_suspended / backends_healthy removed with the dead
-	 * healthy-clear poller (bitmap clearing is reset-driven). */
-
-	/* SPEC-77A A1 (RPC-CONTRACT §5): the nonce is the ABA-free epoch identity — the
-	 * control-plane addresses freeze/close BY NONCE and resolves the epoch_id against
-	 * this list, so omitting it made every real resolution fail. `truncated` rides
-	 * along for the same reason (D14 routing). Both already ship in get_bdevs; this
-	 * list stays the union of the two views (it alone carries stale_backend_id). */
+	/* The control-plane addresses an epoch by nonce and resolves its epoch_id
+	 * against this list, so nonce and truncated must ship here as well as in
+	 * get_bdevs. This list is the only view that also carries stale_backend_id. */
 	spdk_json_write_named_array_begin(w, "epochs");
 	TAILQ_FOREACH(ep, &cbt->epochs, link) {
 		spdk_json_write_object_begin(w);
@@ -740,9 +724,8 @@ free_rpc_cbt_partial_rebuild(struct rpc_cbt_partial_rebuild *r)
 	free(r->source_bdev_name);
 }
 
-/* Note: the C engine supports override_ranges, but this RPC exposes only the
- * bitmap-driven mode (the former decode_override_ranges was ~70 lines of dead,
- * never-wired parsing — removed; re-add via a proper decoder if ever needed). */
+/* The engine supports override_ranges, but this RPC exposes only the
+ * bitmap-driven mode. */
 
 static const struct spdk_json_object_decoder rpc_cbt_partial_rebuild_decoders[] = {
 	{"name",                 offsetof(struct rpc_cbt_partial_rebuild, name),                 spdk_json_decode_string},
@@ -941,7 +924,7 @@ rpc_bdev_cbt_get_rebuild_status(struct spdk_jsonrpc_request *request,
 	case CBT_REBUILD_COMPLETED: state_str = "completed"; break;
 	case CBT_REBUILD_FAILED:    state_str = "failed";    break;
 	case CBT_REBUILD_CANCELLED: state_str = "cancelled"; break;
-	case CBT_REBUILD_ABORTED:   state_str = "aborted";   break;	/* R1 */
+	case CBT_REBUILD_ABORTED:   state_str = "aborted";   break;
 	default:                    state_str = "unknown";    break;
 	}
 	spdk_json_write_named_string(w, "state", state_str);

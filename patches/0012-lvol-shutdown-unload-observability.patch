@@ -1,5 +1,5 @@
 diff --git a/module/bdev/lvol/vbdev_lvol.c b/module/bdev/lvol/vbdev_lvol.c
-index 713f905..f309354 100644
+index 7b40b09..3673b97 100644
 --- a/module/bdev/lvol/vbdev_lvol.c
 +++ b/module/bdev/lvol/vbdev_lvol.c
 @@ -586,8 +586,14 @@ _vbdev_lvol_unregister_unload_lvs(void *cb_arg, int lvserrno)
@@ -7,8 +7,8 @@ index 713f905..f309354 100644
  	struct lvol_store_bdev *lvs_bdev = lvol_bdev->lvs_bdev;
  
 +	/* Evariops 0012: a failed shutdown unload leaves the blobstore superblock
-+	 * dirty — the next load replays md for tens of seconds on SATA. Surface the
-+	 * outcome at NOTICE so field logs pinpoint the errno and the path taken. */
++	 * dirty, so the next load pays a full md recovery. Log both outcomes at
++	 * NOTICE, with the errno and the path taken. */
  	if (lvserrno != 0) {
 -		SPDK_INFOLOG(vbdev_lvol, "Lvol store removed with error: %d.\n", lvserrno);
 +		SPDK_NOTICELOG("shutdown: lvolstore unload FAILED err=%d "

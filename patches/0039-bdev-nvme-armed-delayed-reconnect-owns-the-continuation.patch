@@ -1,22 +1,19 @@
 diff --git a/module/bdev/nvme/bdev_nvme.c b/module/bdev/nvme/bdev_nvme.c
+index fa7fc4f..b022fdd 100644
 --- a/module/bdev/nvme/bdev_nvme.c
 +++ b/module/bdev/nvme/bdev_nvme.c
-@@ -2321,6 +2321,25 @@
+@@ -2303,6 +2303,21 @@ nvme_ctrlr_disconnect(struct nvme_ctrlr *nvme_ctrlr, nvme_ctrlr_disconnected_cb
  			return;
  		}
  
-+		/* Evariops 0039: when a delayed reconnect is ALREADY armed, that timer IS
-+		 * the continuation — returning into "fail the reset sequence immediately"
-+		 * re-enters bdev_nvme_reset_ctrlr_complete(false), which answers
-+		 * OP_DELAYED_RECONNECT, which calls back here, which fails again with the
-+		 * timer still armed: an unbounded mutual recursion with NOTHING between the
-+		 * frames that yields, until the reactor stack overflows. Proven on turing
-+		 * (s39, core dump): SIGSEGV with thousands of alternating
-+		 * reset_ctrlr_complete/nvme_ctrlr_disconnect frames, reconnect_is_delayed=1,
-+		 * reconnect_delay_timer armed, resetting=0 — a reset completion delivered
-+		 * during the armed window (failover storm on a dead target) is the entry.
-+		 * The armed timer will run the reconnect in <= reconnect_delay_sec; there is
-+		 * nothing this failed disconnect must do that the timer will not redo. */
++		/* Evariops 0039: an already-armed delayed reconnect owns the continuation.
++		 * Falling through to "fail the reset sequence immediately" re-enters
++		 * bdev_nvme_reset_ctrlr_complete(false), which answers OP_DELAYED_RECONNECT,
++		 * which calls back here and fails again with the timer still armed —
++		 * unbounded mutual recursion, nothing between the frames yields, and the
++		 * reactor stack overflows. With the timer armed, return: it re-runs the
++		 * reconnect within reconnect_delay_sec, and there is nothing this failed
++		 * disconnect must do that the timer will not redo. */
 +		if (cb_fn == bdev_nvme_start_reconnect_delay_timer &&
 +		    nvme_ctrlr->reconnect_is_delayed) {
 +			NVME_CTRLR_NOTICELOG(nvme_ctrlr,

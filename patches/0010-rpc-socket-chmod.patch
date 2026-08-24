@@ -1,12 +1,12 @@
 diff --git a/lib/rpc/rpc.c b/lib/rpc/rpc.c
-index ead7c66..7af1f9c 100644
+index ead7c66..46446e2 100644
 --- a/lib/rpc/rpc.c
 +++ b/lib/rpc/rpc.c
 @@ -5,6 +5,7 @@
   */
  
  #include <sys/file.h>
-+#include <sys/stat.h>	/* Evariops R14: umask() / mode_t for atomic owner-only socket */
++#include <sys/stat.h>	/* Evariops 0010: umask() / mode_t for the owner-only socket */
  
  #include "spdk/stdinc.h"
  
@@ -18,16 +18,17 @@ index ead7c66..7af1f9c 100644
  	int rc;
  
  	server = calloc(1, sizeof(struct spdk_rpc_server));
-@@ -194,10 +196,18 @@ spdk_rpc_server_listen(const char *listen_addr)
+@@ -194,10 +196,19 @@ spdk_rpc_server_listen(const char *listen_addr)
  	 */
  	unlink(server->listen_addr_unix.sun_path);
  
-+	/* Evariops R14 (TOCTOU): bind() (inside spdk_jsonrpc_server_listen) creates the
-+	 * socket file with the process umask — often 0755/0775 in a shared /var/tmp — and
-+	 * the socket is CONNECTABLE the instant it is bound+listening. A chmod done AFTER
-+	 * leaves a window in which a local unprivileged process can connect() and issue
-+	 * destructive RPCs. Force umask 077 across the bind so the socket is created
-+	 * owner-only (0600 = 0666 & ~077) ATOMICALLY; restore the umask right after. */
++	/* Evariops 0010: the RPC socket must be owner-only from the instant it exists.
++	 * bind(), inside spdk_jsonrpc_server_listen(), creates the socket file with the
++	 * process umask, and the socket is connectable as soon as it is bound - so a
++	 * chmod performed afterwards leaves a window in which any local process can
++	 * connect and issue destructive RPCs. Wrapping the listen in umask 077 makes the
++	 * file 0600 (0666 & ~077) at creation time, closing that window. Restore the
++	 * previous umask immediately after, since it is process-wide. */
 +	saved_umask = umask(077);
  	server->jsonrpc_server = spdk_jsonrpc_server_listen(AF_UNIX, 0,
  				 (struct sockaddr *) & server->listen_addr_unix,
@@ -37,13 +38,12 @@ index ead7c66..7af1f9c 100644
  	if (server->jsonrpc_server == NULL) {
  		SPDK_ERRLOG("spdk_jsonrpc_server_listen() failed\n");
  		close(server->lock_fd);
-@@ -205,6 +215,19 @@ spdk_rpc_server_listen(const char *listen_addr)
+@@ -205,6 +216,18 @@ spdk_rpc_server_listen(const char *listen_addr)
  		goto ret;
  	}
  
-+	/* Evariops S-2 / R14 (belt-and-braces): the umask above already created the
-+	 * socket 0600; re-assert it in case the platform's bind() ignores umask for
-+	 * AF_UNIX. This chmod is no longer the primary control (it closed a TOCTOU). */
++	/* Backstop, not the primary control: re-assert 0600 in case a platform's bind()
++	 * ignores the umask for AF_UNIX. */
 +	if (chmod(server->listen_addr_unix.sun_path, 0600) != 0) {
 +		SPDK_ERRLOG("Cannot chmod 0600 RPC socket %s: %s\n",
 +			    server->listen_addr_unix.sun_path, spdk_strerror(errno));

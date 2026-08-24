@@ -29,10 +29,9 @@ struct vbdev_cbt {
 	uint32_t                     chunk_shift;    /* log2(chunk_size_blocks) for fast path */
 	uint64_t                     total_blocks;
 
-	/* D3: bitmap clearing is RESET-DRIVEN (bdev_cbt_reset, refused while an
-	 * epoch is active). The automatic healthy-clear poller and its
-	 * backends_healthy / dirty_history_valid signals were dead code (no
-	 * caller ever set them) and were removed. */
+	/* No backend-health field on purpose: the bitmap is cleared only by
+	 * bdev_cbt_reset, refused while any epoch is active. Nothing inside the
+	 * target can know that every distributed backend is in sync. */
 
 	/* ── Epoch management ── */
 	TAILQ_HEAD(, cbt_epoch)      epochs;

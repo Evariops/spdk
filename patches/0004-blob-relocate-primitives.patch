@@ -1,5 +1,5 @@
 diff --git a/include/spdk/bit_pool.h b/include/spdk/bit_pool.h
-index 316c66a..81297f1 100644
+index 316c66a..c89e57d 100644
 --- a/include/spdk/bit_pool.h
 +++ b/include/spdk/bit_pool.h
 @@ -94,6 +94,22 @@ int spdk_bit_pool_resize(struct spdk_bit_pool **pool, uint32_t num_bits);
@@ -9,10 +9,10 @@ index 316c66a..81297f1 100644
 +/**
 + * Find the index of the first free (clear) bit at or after start_bit_index,
 + * scanning word-wise (fully-allocated 64-bit words are skipped in one step).
-+ * Read-only: does NOT allocate — a windowed/resumable caller claims the returned
-+ * index itself via spdk_bit_pool_set_bit_allocated so the pool's free-count
-+ * invariant is maintained. Unlike spdk_bit_pool_allocate_bit (global lowest free
-+ * bit), this scans from an arbitrary start so a caller can bound it to a window.
++ * This does not allocate: the caller must claim the returned index itself with
++ * spdk_bit_pool_set_bit_allocated(), or the pool's free count goes stale. Unlike
++ * spdk_bit_pool_allocate_bit(), which returns the globally lowest free bit, this
++ * scans from an arbitrary start so a caller can bound it to a window.
 + *
 + * \param pool Bit pool to search.
 + * \param start_bit_index Index to start searching from.
@@ -26,79 +26,112 @@ index 316c66a..81297f1 100644
   * Allocate a bit from the bit pool.
   *
 diff --git a/include/spdk/blob.h b/include/spdk/blob.h
-index fe98215..9cebfc8 100644
+index fe98215..357bf31 100644
 --- a/include/spdk/blob.h
 +++ b/include/spdk/blob.h
-@@ -544,6 +544,75 @@ uint64_t spdk_blob_get_num_allocated_clusters(struct spdk_blob *blob);
+@@ -544,6 +544,108 @@ uint64_t spdk_blob_get_num_allocated_clusters(struct spdk_blob *blob);
   */
  uint64_t spdk_blob_get_next_allocated_io_unit(struct spdk_blob *blob, uint64_t offset);
  
 +/**
-+ * SPEC-73 M2a: physical LBA of a cluster on the bs_dev (bdev_tier composite),
-+ * so the control-plane can map clusters to bands/tiers.
-+ * \return physical LBA, or 0 if unallocated / out of range.
++ * Get the physical LBA of a cluster on the underlying bs_dev.
++ *
++ * \param blob Blob struct to query.
++ * \param cluster_num Cluster index within the blob.
++ *
++ * \return physical LBA, or 0 if the cluster is unallocated or out of range.
 + */
 +uint64_t spdk_blob_get_cluster_lba(struct spdk_blob *blob, uint64_t cluster_num);
 +
 +/**
-+ * SPEC-73 M2b: claim a free cluster whose physical LBA falls within
-+ * [lba_start, lba_start+lba_count) (a band's range). The destination of a
-+ * relocate. Returns the new physical LBA via new_lba. Caller must copy the data
-+ * to new_lba then call spdk_blob_relocate_commit().
-+ * \return 0 on success, -ENOSPC if the band has no free cluster.
++ * Claim a free cluster whose physical LBA falls within [lba_start, lba_start +
++ * lba_count) - the destination of a relocation. The caller must copy the data to
++ * the returned LBA and then call spdk_blob_relocate_commit().
++ *
++ * \param blob Blob that will own the cluster.
++ * \param lba_start Start of the destination LBA window.
++ * \param lba_count Length of the destination LBA window.
++ * \param new_lba Filled with the physical LBA of the claimed cluster.
++ *
++ * \return 0 on success, -ENOSPC if the window holds no free cluster.
 + */
 +int spdk_blob_claim_cluster_in_range(struct spdk_blob *blob, uint64_t lba_start,
 +				     uint64_t lba_count, uint64_t *new_lba);
 +
 +/**
-+ * SPEC-73 (deferred #4): resumable variant of spdk_blob_claim_cluster_in_range for
-+ * a campaign that claims MANY clusters into the same band window (batch relocate/
-+ * remap). cursor is an in/out CLUSTER-index hint: the scan starts at
-+ * max(window_start, *cursor) and, on success, *cursor is set to claimed+1 so the
-+ * next call skips the just-claimed prefix — turning an N-claim campaign into one
-+ * band from O(N^2) into O(bandsize + N). cursor == NULL behaves exactly like the
-+ * legacy entry point (start at the window start). PERF ONLY: the cursor is a hint;
-+ * the scan always honors [window_start, window_end) and never returns an
-+ * already-allocated or out-of-window cluster, so a stale cursor is always safe.
-+ * \return 0 on success, -ENOSPC if no free cluster at/after the hint in the window.
++ * Resumable variant of spdk_blob_claim_cluster_in_range() for a batch that claims
++ * many clusters into the same window. The scan starts at max(window start,
++ * *cursor) and, on success, *cursor is set past the claimed cluster so the next
++ * call skips the prefix it already filled. The cursor is a performance hint only:
++ * the scan always stays inside the window and never returns an already-allocated
++ * cluster, so a stale cursor remains safe. A NULL cursor scans from the window
++ * start.
++ *
++ * \param blob Blob that will own the cluster.
++ * \param lba_start Start of the destination LBA window.
++ * \param lba_count Length of the destination LBA window.
++ * \param cursor In/out cluster-index hint, or NULL.
++ * \param new_lba Filled with the physical LBA of the claimed cluster.
++ *
++ * \return 0 on success, -ENOSPC if no free cluster remains at or after the hint.
 + */
 +int spdk_blob_claim_cluster_in_range_from(struct spdk_blob *blob, uint64_t lba_start,
 +		uint64_t lba_count, uint32_t *cursor, uint64_t *new_lba);
 +
 +/**
-+ * SPEC-73 M2b: atomically re-point a cluster to new_lba (swap in-place, no count
-+ * change), persist the extent page, and release the old cluster ONLY after the
-+ * extent is durable (crash-safe; native replay reclaims any orphan). Runs on the
-+ * metadata thread. The caller must have copied the data to new_lba first.
++ * Re-point a cluster at new_lba and persist the extent page. The caller must have
++ * copied the data to new_lba first; the old cluster is released only once the new
++ * extent is durable, so a crash leaves at most an orphan cluster that load-time
++ * replay reclaims. Runs on the metadata thread. Fails with -EBUSY on a snapshot,
++ * whose clusters are shared copy-on-write with its clones.
 + *
-+ * release_old (R11): true for a normal relocate (old cluster on a healthy band,
-+ * return it to the pool). false for a REMAP (old cluster on a DEGRADED/dead band) —
-+ * the old cluster is QUARANTINED (kept marked-allocated) so the thin allocator
-+ * never re-serves that bit into the dead band (which would -EIO). Refuses -EBUSY on
-+ * a snapshot blob (F2 made intrinsic, deferred #5).
++ * \param blob Blob owning the cluster.
++ * \param cluster_num Cluster index within the blob.
++ * \param new_lba Physical LBA the cluster now maps to.
++ * \param release_old True returns the old cluster to the pool. False quarantines
++ * it - keeps it marked allocated - so the allocator cannot hand out a range that
++ * sits on storage known to be unhealthy.
++ * \param cb_fn Called on completion.
++ * \param cb_arg Argument passed to cb_fn.
++ *
++ * \return 0 if the commit was dispatched, negative errno otherwise.
 + */
 +int spdk_blob_relocate_commit(struct spdk_blob *blob, uint64_t cluster_num, uint64_t new_lba,
 +			      bool release_old, spdk_blob_op_complete cb_fn, void *cb_arg);
 +
 +/**
-+ * SPEC-73 M2b: release a cluster claimed via spdk_blob_claim_cluster_in_range that
-+ * was not committed (relocate abort), avoiding a leak until reboot.
++ * Release a cluster claimed by spdk_blob_claim_cluster_in_range() that was never
++ * committed, for example when a relocation is aborted. Without this the cluster
++ * stays allocated until the next blobstore load.
++ *
++ * \param blob Blob that claimed the cluster.
++ * \param lba Physical LBA returned by the claim.
 + */
 +void spdk_blob_release_cluster_lba(struct spdk_blob *blob, uint64_t lba);
 +
 +/**
-+ * SPEC-73 C1: hold (freeze) all I/O submitted to this blob. Queued I/O resumes
-+ * on unfreeze and RE-EXECUTES the blob→LBA translation, so a cluster relocated
-+ * meanwhile is reached at its NEW physical location (the property a bdev-level
-+ * quiesce cannot give — it replays the pre-translation LBA). Refcounted; may be
-+ * called from any thread (internally dispatched to the blobstore md thread);
-+ * cb_fn fires on the calling thread.
++ * Hold all I/O submitted to this blob. I/O released by the matching unfreeze
++ * re-executes the blob-to-LBA translation, so a cluster relocated meanwhile is
++ * reached at its new physical location - which a bdev-level quiesce cannot do,
++ * since it replays the pre-translation LBA. Refcounted, and callable from any
++ * thread; cb_fn fires on the calling thread.
++ *
++ * \param blob Blob to freeze.
++ * \param cb_fn Called once the freeze is in effect.
++ * \param cb_arg Argument passed to cb_fn.
++ *
 + * \return 0 if dispatched, -ENOMEM otherwise.
 + */
 +int spdk_blob_freeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
 +
 +/**
-+ * SPEC-73 C1: release one freeze reference and replay the held I/O.
++ * Release one freeze reference and replay the held I/O.
++ *
++ * \param blob Blob to unfreeze.
++ * \param cb_fn Called once the I/O has been replayed.
++ * \param cb_arg Argument passed to cb_fn.
++ *
++ * \return 0 if dispatched, -ENOMEM otherwise.
 + */
 +int spdk_blob_unfreeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
 +
@@ -106,16 +139,15 @@ index fe98215..9cebfc8 100644
   * Get next unallocated io_unit
   *
 diff --git a/lib/blob/blobstore.c b/lib/blob/blobstore.c
-index 7ae791c..d6d632c 100644
+index 7ae791c..e1daf9c 100644
 --- a/lib/blob/blobstore.c
 +++ b/lib/blob/blobstore.c
-@@ -6246,6 +6246,20 @@ spdk_blob_get_next_unallocated_io_unit(struct spdk_blob *blob, uint64_t offset)
+@@ -6246,6 +6246,19 @@ spdk_blob_get_next_unallocated_io_unit(struct spdk_blob *blob, uint64_t offset)
  	return blob_find_io_unit(blob, offset, false);
  }
  
-+/* SPEC-73 M2a: physical LBA of a cluster on the underlying bs_dev (the bdev_tier
-+ * composite). Returns 0 if the cluster is unallocated or out of range. Lets the
-+ * control-plane map each cluster to a band/tier (LBA -> band) for placement. */
++/* Evariops 0004: physical LBA of a cluster on the underlying bs_dev, so a caller
++ * can map clusters onto the device's own layout. 0 means unallocated. */
 +uint64_t
 +spdk_blob_get_cluster_lba(struct spdk_blob *blob, uint64_t cluster_num)
 +{
@@ -130,32 +162,24 @@ index 7ae791c..d6d632c 100644
  /* START spdk_bs_create_blob */
  
  static void
-@@ -9030,6 +9044,322 @@ blob_insert_cluster_on_md_thread(struct spdk_blob *blob, uint32_t cluster_num,
+@@ -9030,6 +9043,304 @@ blob_insert_cluster_on_md_thread(struct spdk_blob *blob, uint32_t cluster_num,
  	spdk_thread_send_msg(blob->bs->md_thread, blob_insert_cluster_msg, ctx);
  }
  
-+/* ===== SPEC-73 M2b: cluster relocation primitives =====================
-+ * The relocate orchestration lives in the data-plane (bdev_tier control):
-+ *   1. old_lba = spdk_blob_get_cluster_lba(blob, cn)
-+ *   2. spdk_blob_claim_cluster_in_range(blob, band_lba_start, band_lba_count, &new_lba)
-+ *   3. copy old_lba -> new_lba (accel) ; quiesce old range ; reconcile (CRC)
-+ *   4. spdk_blob_relocate_commit(blob, cn, new_lba, cb)  [swap + persist + release old]
-+ *   5. unquiesce
-+ * Crash-safety (invariants A/B): data is written to new BEFORE the extent is
-+ * re-pointed (step 3 precedes step 4); old is released ONLY after the extent is
-+ * durable (below). A crash in any window leaves an orphan auto-reclaimed by the
-+ * native replay (used_clusters rebuilt from extents). */
++/* Evariops 0004: cluster relocation primitives. The caller drives the sequence:
++ * claim a free cluster inside the destination LBA window, copy the data there,
++ * then spdk_blob_relocate_commit() to re-point the extent and free the old
++ * cluster. Two crash-safety rules make every window recoverable: the data reaches
++ * the new cluster BEFORE the extent is re-pointed, and the old cluster is freed
++ * ONLY after the new extent is durable. A crash therefore leaves at most an
++ * orphan cluster, which load-time replay reclaims when it rebuilds used_clusters
++ * from the extents. */
 +
-+/* Deferred #4: word-wise + resume-cursor cluster claim. The old body probed the
-+ * used_clusters bit-pool one BIT at a time from c_start on every call, so a
-+ * campaign filling one band re-scanned its allocated prefix each time -> O(N^2).
-+ * Now: (1) spdk_bit_pool_find_first_free_from skips fully-allocated 64-bit words
-+ * in one step, and (2) an optional in/out `cursor` lets a campaign resume past the
-+ * last claimed bit instead of restarting at c_start -> O(bandsize + N). Semantics
-+ * are unchanged: first free cluster at/after the start hint within the window,
-+ * under used_lock, -ENOSPC when none. The cursor is a HINT only — the live scan
-+ * still bounds to [c_start, c_end) and set_bit_allocated re-checks the bit, so a
-+ * stale/over-shot cursor can never yield an allocated or out-of-window cluster. */
++/* Evariops 0004: claim the first free cluster at or after the start hint inside
++ * [lba_start, lba_start + lba_count), under used_lock; -ENOSPC when the window
++ * holds none. The optional cursor is a performance hint only: the scan still
++ * bounds itself to the window and re-checks the bit under the lock, so a stale
++ * or over-shot cursor can never yield an allocated or out-of-window cluster. */
 +static int
 +blob_claim_cluster_in_range(struct spdk_blob *blob, uint64_t lba_start, uint64_t lba_count,
 +			    uint32_t *cursor, uint64_t *new_lba)
@@ -173,8 +197,8 @@ index 7ae791c..d6d632c 100644
 +		c_end = cap;
 +	}
 +
-+	/* Resume hint: start at the cursor if it points past c_start (never before,
-+	 * so the window's lower bound is always honored). */
++	/* Use the cursor only when it points past c_start, so the window's lower bound
++	 * always wins. */
 +	start = c_start;
 +	if (cursor != NULL && *cursor > start) {
 +		start = *cursor;
@@ -186,14 +210,14 @@ index 7ae791c..d6d632c 100644
 +		if (idx != UINT32_MAX && idx < c_end) {
 +			int claim_rc = spdk_bit_pool_set_bit_allocated(bs->used_clusters, idx);
 +
-+			/* m8: cannot fail — idx < capacity and the bit is free, both under
-+			 * used_lock. Assert the invariant instead of ignoring it. */
++			/* Cannot fail: idx is below capacity and its bit is free, both
++			 * established under used_lock. */
 +			assert(claim_rc == 0);
 +			(void)claim_rc;
 +			bs->num_free_clusters--;
 +			*new_lba = bs_cluster_to_lba(bs, idx);
 +			if (cursor != NULL) {
-+				*cursor = idx + 1;	/* next candidate; skip the claimed prefix */
++				*cursor = idx + 1;	/* next candidate */
 +			}
 +			rc = 0;
 +		}
@@ -216,8 +240,8 @@ index 7ae791c..d6d632c 100644
 +	return blob_claim_cluster_in_range(blob, lba_start, lba_count, cursor, new_lba);
 +}
 +
-+/* SPEC-73 M2b: release a cluster claimed by spdk_blob_claim_cluster_in_range that
-+ * was NOT committed (relocate abort), so it is not leaked until the next reboot. */
++/* Evariops 0004: give back a cluster that was claimed but never committed (an
++ * aborted relocation); otherwise it stays allocated until the next blobstore load. */
 +void
 +spdk_blob_release_cluster_lba(struct spdk_blob *blob, uint64_t lba)
 +{
@@ -244,7 +268,7 @@ index 7ae791c..d6d632c 100644
 +	struct spdk_thread		*orig_thread;
 +	spdk_blob_op_complete		cb_fn;
 +	void				*cb_arg;
-+	bool				release_old;	/* R11: false = quarantine old (remap) */
++	bool				release_old;	/* false = quarantine the old cluster */
 +	int				rc;
 +};
 +
@@ -265,32 +289,25 @@ index 7ae791c..d6d632c 100644
 +
 +	if (bserrno == 0) {
 +		if (ctx->old_lba != 0 && ctx->release_old) {
-+			/* Invariant B: release old ONLY after the extent is durable. */
++			/* Release the old cluster ONLY once the new extent is durable. */
 +			spdk_spin_lock(&bs->used_lock);
 +			bs_release_cluster(bs, (uint32_t)bs_lba_to_cluster(bs, ctx->old_lba));
 +			spdk_spin_unlock(&bs->used_lock);
 +		}
-+		/* R11 (remap): release_old == false QUARANTINES the old cluster instead of
-+		 * returning it to the pool. A remap re-homes a cluster whose OLD copy sits on
-+		 * a DEGRADED/dead band; releasing that bit would let the thin allocator
-+		 * re-serve it to a normal host write → routed into the dead band → -EIO on an
-+		 * otherwise-healthy volume. Leaving it marked-allocated is a bounded, in-RAM
-+		 * leak for THIS instance only: a reboot rebuilds used_clusters from the blob
-+		 * extents (which now point at new_lba), and the control-plane reassembles the
-+		 * dead band DEGRADED/RETIRED so its range is not re-served. */
++		/* release_old == false quarantines the old cluster instead of returning it
++		 * to the pool: it is used when the old copy sits on unhealthy storage, and
++		 * freeing that bit would let the allocator hand the same range back to a
++		 * normal write. The quarantine is an in-RAM leak for this instance only:
++		 * the next load rebuilds used_clusters from the extents, which now point at
++		 * new_lba. */
 +	} else {
-+		/* Persist failed: roll the in-memory swap back to old_lba (commit_msg
-+		 * already overwrote active.clusters[cluster_num] with new_lba).
-+		 * H4 — CALLER CONTRACT: the new cluster must be QUARANTINED, not
-+		 * released. An error completion is ambiguous — the extent-page write
-+		 * may still have reached media (timeout/abort/reset), leaving the
-+		 * DURABLE extent pointing at new_lba. Releasing it would let a later
-+		 * thin allocation durably commit the same cluster in another blob →
-+		 * two owners after restart, with no double-reference detection at
-+		 * replay. Keeping the in-RAM claim is a bounded single-boot leak:
-+		 * replay either reclaims new_lba as an orphan (extent never landed)
-+		 * or the extent legitimately owns it (its content was fully copied
-+		 * before the commit was dispatched). */
++		/* The persist failed: undo the in-memory swap. CALLER CONTRACT: the new
++		 * cluster must now be quarantined, never released. A failed completion is
++		 * ambiguous: the extent-page write may still have reached the media, so the
++		 * durable extent can already point at new_lba. Releasing it would let a
++		 * later allocation durably commit the same cluster to another blob, giving
++		 * two owners across a restart, and replay has no double-reference detection.
++		 * Holding the claim costs at most one cluster until the next load. */
 +		ctx->blob->active.clusters[ctx->cluster_num] = ctx->old_lba;
 +	}
 +	ctx->rc = bserrno;
@@ -326,8 +343,8 @@ index 7ae791c..d6d632c 100644
 +		spdk_thread_send_msg(ctx->orig_thread, blob_relocate_done, ctx);
 +		return;
 +	}
-+	/* Invariant A holds (caller copied data to new before this). Swap in-place
-+	 * (overwrite map entry; cluster count unchanged) then persist the extent. */
++	/* The caller has already copied the data to new_lba. Overwrite the map entry
++	 * in place (the cluster count is unchanged), then persist the extent page. */
 +	blob->active.clusters[ctx->cluster_num] = ctx->new_lba;
 +	blob_write_extent_page(blob, *extent_page, ctx->cluster_num, ctx->page,
 +			       blob_relocate_extent_written, ctx);
@@ -339,10 +356,9 @@ index 7ae791c..d6d632c 100644
 +{
 +	struct blob_relocate_ctx *ctx;
 +
-+	/* Deferred #5 (F2 made intrinsic): refuse to relocate/remap a snapshot's cluster
-+	 * from ANY caller, not only the RPC handler. A snapshot's clusters are shared
-+	 * copy-on-write with its clones; re-pointing one would corrupt the clone that
-+	 * reads it. Same -EBUSY the RPC layer already returns (errno contract preserved). */
++	/* A snapshot shares its clusters copy-on-write with its clones, so re-pointing
++	 * one would corrupt every clone that reads it. Refuse here rather than in the
++	 * RPC handler, so no caller can bypass the rule. */
 +	if (spdk_blob_is_snapshot(blob)) {
 +		return -EBUSY;
 +	}
@@ -371,14 +387,12 @@ index 7ae791c..d6d632c 100644
 +	return 0;
 +}
 +
-+/* ===== SPEC-73 C1: public blob-level I/O freeze ========================
-+ * Exposes the internal blob_freeze_io/blob_unfreeze_io (the primitive the
-+ * snapshot/resize/delete paths already rely on) so the relocate orchestration
-+ * can hold host I/O ABOVE the blob→LBA translation. This is what closes the
-+ * C1 lost-write: I/O held by a freeze re-executes the translation on release
-+ * (landing on the post-swap cluster), whereas I/O held by a composite-level
-+ * quiesce replays a stale pre-swap LBA. Dispatches to the md thread (the
-+ * internal primitives assert it); the callback returns on the caller thread. */
++/* Evariops 0004: public wrapper over the internal blob_freeze_io/blob_unfreeze_io.
++ * A freeze holds host I/O ABOVE the blob-to-LBA translation, so I/O replayed at
++ * unfreeze re-runs that translation and reaches a cluster relocated meanwhile at
++ * its new location; a bdev-level quiesce would instead replay the pre-swap LBA and
++ * lose the write. Calls are dispatched to the md thread because the internal
++ * primitives assert it; cb_fn runs on the caller's thread. */
 +
 +struct blob_freeze_pub_ctx {
 +	struct spdk_blob	*blob;

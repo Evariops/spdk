@@ -1,8 +1,8 @@
 diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
-index a88a237..ae78a08 100644
+index a8e6165..6c2d6b4 100644
 --- a/module/bdev/raid/bdev_raid.c
 +++ b/module/bdev/raid/bdev_raid.c
-@@ -2203,12 +2203,32 @@ raid_bdev_remove_base_bdev_on_quiesced(void *ctx, int status)
+@@ -2202,12 +2202,31 @@ raid_bdev_remove_base_bdev_on_quiesced(void *ctx, int status)
  
  			if (sb_base_bdev->state == RAID_SB_BASE_BDEV_CONFIGURED &&
  			    sb_base_bdev->slot == slot) {
@@ -14,12 +14,11 @@ index a88a237..ae78a08 100644
  					sb_base_bdev->state = RAID_SB_BASE_BDEV_MISSING;
  				}
  
-+				/* Evariops 0014.7 (V-2, RecordDivergence): the
-+				 * survivors advance their content generation in the
-+				 * SAME superblock transaction that records the
-+				 * ejection — from here on, writes land on a content
-+				 * the ejected member provably does not have. The
-+				 * ejected slot keeps its (now lagging) generation. */
++				/* Evariops 0016: survivors must advance their content
++				 * generation in the SAME superblock transaction that
++				 * records the ejection, so that no write can land on
++				 * content the ejected member is still credited with.
++				 * The ejected slot keeps its now-lagging generation. */
 +				for (j = 0; j < sb->base_bdevs_size; j++) {
 +					struct raid_bdev_sb_base_bdev *survivor = &sb->base_bdevs[j];
 +
@@ -35,13 +34,13 @@ index a88a237..ae78a08 100644
  				raid_bdev_write_superblock(raid_bdev, raid_bdev_remove_base_bdev_write_sb_cb, base_info);
  				return;
  			}
-@@ -2621,6 +2641,27 @@ raid_bdev_process_finish_write_sb_cb(int status, struct raid_bdev *raid_bdev, vo
+@@ -2620,6 +2639,27 @@ raid_bdev_process_finish_write_sb_cb(int status, struct raid_bdev *raid_bdev, vo
  	}
  }
  
-+/* Evariops 0014.7 (V-2): the generation the survivors carry — a member joining
++/* Evariops 0016: the content generation the survivors carry. A member joining
 + * the array adopts it in the same superblock transaction as its CONFIGURED
-+ * flip (its content is now provably that of the survivors). */
++ * flip, which is the point at which its content matches the survivors'. */
 +static uint64_t
 +raid_bdev_sb_max_content_generation(const struct raid_bdev_superblock *sb)
 +{
@@ -63,7 +62,7 @@ index a88a237..ae78a08 100644
  static void
  raid_bdev_process_finish_write_sb(void *ctx)
  {
-@@ -2628,6 +2669,7 @@ raid_bdev_process_finish_write_sb(void *ctx)
+@@ -2627,6 +2667,7 @@ raid_bdev_process_finish_write_sb(void *ctx)
  	struct raid_bdev_superblock *sb = raid_bdev->sb;
  	struct raid_bdev_sb_base_bdev *sb_base_bdev;
  	struct raid_base_bdev_info *base_info;
@@ -71,25 +70,57 @@ index a88a237..ae78a08 100644
  	uint8_t i;
  
  	for (i = 0; i < sb->base_bdevs_size; i++) {
-@@ -2645,6 +2687,10 @@ raid_bdev_process_finish_write_sb(void *ctx)
+@@ -2635,15 +2676,18 @@ raid_bdev_process_finish_write_sb(void *ctx)
+ 		if (sb_base_bdev->state != RAID_SB_BASE_BDEV_CONFIGURED &&
+ 		    sb_base_bdev->slot < raid_bdev->num_base_bdevs) {
+ 			base_info = &raid_bdev->base_bdev_info[sb_base_bdev->slot];
+-			/* SPEC-74 M6: a write_only member whose seeded rebuild has not
+-			 * completed must NOT be promoted by another process's completion —
+-			 * its data region may still be stale (SEEDED-REBUILD-DESIGN.md:
+-			 * the SB flip is deferred to seeded-rebuild completion, which
+-			 * clears write_only_pending first). */
++			/* A write_only member whose seeded rebuild has not completed must
++			 * NOT be promoted by another process's completion: its data region
++			 * may still be stale. Its own completion clears write_only_pending
++			 * first, and only then may the superblock slot flip. */
+ 			if (base_info->is_configured && !base_info->write_only_pending) {
  				sb_base_bdev->state = RAID_SB_BASE_BDEV_CONFIGURED;
  				sb_base_bdev->data_offset = base_info->data_offset;
  				spdk_uuid_copy(&sb_base_bdev->uuid, &base_info->uuid);
-+				/* Evariops 0014.7: adopt the survivors' generation in
++				/* Evariops 0016: adopt the survivors' generation in
 +				 * the SAME transaction as the CONFIGURED flip. */
 +				sb_base_bdev->content_generation = adopted_gen;
 +				base_info->content_generation = adopted_gen;
  			}
  		}
  	}
-@@ -3533,9 +3579,17 @@ raid_bdev_skip_rebuild_unquiesced(void *ctx, int status)
+@@ -3510,23 +3554,30 @@ raid_bdev_skip_rebuild_unquiesced(void *ctx, int status)
+ 			    spdk_strerror(-status));
+ 	}
+ 
+-	/* SPEC-74 M6: for a write_only attach the SB flip is deferred to
+-	 * seeded-rebuild completion (the data region is still stale) — the slot
+-	 * stays un-promoted exactly like an ordinary rebuild target's. */
++	/* For a write_only attach the superblock flip is deferred to seeded-rebuild
++	 * completion: the data region is still stale, so the slot stays un-promoted
++	 * exactly like an ordinary rebuild target's. */
+ 	if (raid_bdev->superblock_enabled && !base_info->write_only_pending) {
+ 		struct raid_bdev_superblock *sb = raid_bdev->sb;
+ 		struct raid_bdev_sb_base_bdev *sb_base_bdev;
+ 		uint8_t i;
+ 
+-		/* CBT-7 (documented): the SB flips to CONFIGURED only after the
+-		 * unquiesce. A crash between the two costs a full rebuild at reboot —
+-		 * conservative and safe (never CONFIGURED without live channels). */
++		/* Ordering: the superblock flips to CONFIGURED only after the
++		 * unquiesce, never before. A crash between the two costs a full
++		 * rebuild at reboot, which is the safe side of the trade. */
  		for (i = 0; i < sb->base_bdevs_size; i++) {
  			sb_base_bdev = &sb->base_bdevs[i];
  			if (sb_base_bdev->slot == raid_bdev_base_bdev_slot(base_info)) {
-+				/* Evariops 0014.7: compute the adopted generation BEFORE
-+				 * flipping this slot (a stale slot generation must not
-+				 * win the max). Same-transaction adoption, like the
-+				 * rebuild-completion path. */
++				/* Evariops 0016: compute the adopted generation BEFORE
++				 * flipping this slot, or this slot's stale generation
++				 * could win the max. */
 +				uint64_t adopted_gen = raid_bdev_sb_max_content_generation(sb);
 +
  				sb_base_bdev->state = RAID_SB_BASE_BDEV_CONFIGURED;
@@ -100,21 +131,21 @@ index a88a237..ae78a08 100644
  				break;
  			}
  		}
-@@ -4114,6 +4168,12 @@ raid_bdev_create_from_sb(const struct raid_bdev_superblock *sb, struct raid_bdev
+@@ -4103,6 +4154,12 @@ raid_bdev_create_from_sb(const struct raid_bdev_superblock *sb, struct raid_bdev
  
  		base_info->data_offset = sb_base_bdev->data_offset;
  		base_info->data_size = sb_base_bdev->data_size;
-+		/* Evariops 0014.7 (V-2): extended reassembly — restore the
-+		 * per-member generation facts for ALL slots (a FAILED/MISSING
-+		 * member keeps its stale generation: that lag is exactly what
-+		 * the control-plane's cold-recovery pass reads). */
++		/* Evariops 0016: restore the generation facts for ALL slots, not
++		 * only configured ones. A FAILED or MISSING member keeps its stale
++		 * generation, and that lag is what the control plane's cold-recovery
++		 * pass reads. */
 +		base_info->content_generation = sb_base_bdev->content_generation;
 +		base_info->view_epoch = sb_base_bdev->view_epoch;
  	}
  
  	*raid_bdev_out = raid_bdev;
 diff --git a/module/bdev/raid/bdev_raid.h b/module/bdev/raid/bdev_raid.h
-index 43d76da..7e7351a 100644
+index 681aeec..43841bc 100644
 --- a/module/bdev/raid/bdev_raid.h
 +++ b/module/bdev/raid/bdev_raid.h
 @@ -134,6 +134,12 @@ struct raid_base_bdev_info {
@@ -130,34 +161,34 @@ index 43d76da..7e7351a 100644
  };
  
  struct raid_bdev_io;
-@@ -525,7 +531,10 @@ raid_bdev_flush_blocks(struct raid_base_bdev_info *base_info, struct spdk_io_cha
+@@ -527,7 +533,10 @@ raid_bdev_flush_blocks(struct raid_base_bdev_info *base_info, struct spdk_io_cha
   */
  
  #define RAID_BDEV_SB_VERSION_MAJOR	1
 -#define RAID_BDEV_SB_VERSION_MINOR	0
-+/* Evariops 0014.7 (spdk-csi RPC-CONTRACT §8, V-2): minor 1 adds per-member
-+ * content_generation + view_epoch (carved out of reserved bytes — a minor-0
-+ * superblock reads back as generation 0 / epoch 0). */
++/* Evariops 0016: minor 1 adds the per-member content_generation and view_epoch,
++ * carved out of reserved bytes, so a minor-0 superblock reads back as
++ * generation 0 / epoch 0. */
 +#define RAID_BDEV_SB_VERSION_MINOR	1
  
  #define RAID_BDEV_SB_NAME_SIZE		64
  
-@@ -550,7 +559,18 @@ struct raid_bdev_sb_base_bdev {
+@@ -552,7 +561,18 @@ struct raid_bdev_sb_base_bdev {
  	/* slot number of this base bdev in the raid */
  	uint8_t			slot;
  
 -	uint8_t			reserved[23];
 +	uint8_t			reserved0[7];
 +
-+	/* Evariops 0014.7 (V-2): survivors increment this in the SAME superblock
-+	 * transaction that records a member's ejection (RecordDivergence); a
-+	 * completing rebuild target adopts the survivors' generation in the same
-+	 * transaction as its CONFIGURED flip. A member whose generation lags is
-+	 * provably stale — the cold-recovery pass reads exactly this. */
++	/* Evariops 0016: survivors must increment this in the same superblock
++	 * transaction that records a member's ejection, and a completing rebuild
++	 * target must adopt the survivors' generation in the same transaction as
++	 * its CONFIGURED flip. A member whose generation lags is provably stale;
++	 * cold recovery reads exactly this. */
 +	uint64_t		content_generation;
 +
-+	/* Evariops 0014.7 (V-2): view epoch this member last participated in.
-+	 * Persisted/reassembled here; mutated by the view protocol (W3). */
++	/* Evariops 0016: view epoch this member last participated in. Stored and
++	 * reassembled here; owned by the control plane's view protocol. */
 +	uint64_t		view_epoch;
  };
  SPDK_STATIC_ASSERT(sizeof(struct raid_bdev_sb_base_bdev) == 64, "incorrect size");
