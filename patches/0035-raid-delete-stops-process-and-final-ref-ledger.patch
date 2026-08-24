@@ -1,15 +1,14 @@
 diff --git a/module/bdev/nvme/bdev_nvme.c b/module/bdev/nvme/bdev_nvme.c
-index 2f8fe10..7e021b1 100644
+index c79cdcc..fa7fc4f 100644
 --- a/module/bdev/nvme/bdev_nvme.c
 +++ b/module/bdev/nvme/bdev_nvme.c
-@@ -916,6 +916,13 @@ nvme_ctrlr_put_ref_ext(struct nvme_ctrlr *nvme_ctrlr, enum nvme_ctrlr_ref_holder
+@@ -914,6 +914,12 @@ nvme_ctrlr_put_ref_ext(struct nvme_ctrlr *nvme_ctrlr, enum nvme_ctrlr_ref_holder
  		return;
  	}
  
-+	/* Evariops 0035: the FINAL release was the only silent exit of this ledger —
-+	 * a reader saw "ref 1 holders[qpair:1]" then nothing, and the silence was
-+	 * read as an immortal ctrlr (it carried a full misdiagnosis on 2026-08-13).
-+	 * The last put speaks like every deferred one does. */
++	/* Evariops 0035: the final release is the other exit of this ledger, and it
++	 * speaks like the deferred ones do — otherwise silence after a "destruct
++	 * deferred" line is indistinguishable from a ctrlr that never goes away. */
 +	NVME_CTRLR_NOTICELOG(nvme_ctrlr,
 +			     "final ref released (by %s): destruct proceeds (Evariops 0035)\n",
 +			     g_nvme_ctrlr_ref_holder_names[holder]);
@@ -17,10 +16,10 @@ index 2f8fe10..7e021b1 100644
  	spdk_thread_send_msg(spdk_thread_get_app_thread(), nvme_ctrlr_unregister, nvme_ctrlr);
  }
 diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
-index a3146b8..a4d26b7 100644
+index 56ac873..d448bbe 100644
 --- a/module/bdev/raid/bdev_raid.c
 +++ b/module/bdev/raid/bdev_raid.c
-@@ -2700,6 +2700,8 @@ raid_bdev_event_base_bdev(enum spdk_bdev_event_type type, struct spdk_bdev *bdev
+@@ -2761,6 +2761,8 @@ raid_bdev_event_base_bdev(enum spdk_bdev_event_type type, struct spdk_bdev *bdev
   * cb_fn - callback function
   * cb_arg - argument to callback function
   */
@@ -29,16 +28,14 @@ index a3146b8..a4d26b7 100644
  void
  raid_bdev_delete(struct raid_bdev *raid_bdev, raid_bdev_destruct_cb cb_fn, void *cb_arg)
  {
-@@ -2718,6 +2720,20 @@ raid_bdev_delete(struct raid_bdev *raid_bdev, raid_bdev_destruct_cb cb_fn, void
+@@ -2779,6 +2781,18 @@ raid_bdev_delete(struct raid_bdev *raid_bdev, raid_bdev_destruct_cb cb_fn, void
  
  	raid_bdev->destroy_started = true;
  
-+	/* Evariops 0035: a delete stops an active background process ITSELF. The
-+	 * unregister event only covers ONLINE raids — without this edge a raid's
-+	 * rebuild ran its full course while the delete (and every base-bdev
-+	 * removal queued behind it) waited on it, measured at 30 s+ per delete
-+	 * on 2026-08-13. Idempotent: raid_bdev_process_finish is a no-op on an
-+	 * already-STOPPING process. */
++	/* Evariops 0035: a delete must stop an active background process itself. The
++	 * unregister event only covers ONLINE raids, so without this edge the delete
++	 * — and every base-bdev removal queued behind it — waits for the rebuild to
++	 * run its full course. Idempotent on an already-STOPPING process. */
 +	if (raid_bdev->process != NULL) {
 +		SPDK_NOTICELOG("raid bdev '%s': delete requested with %s in progress — stopping it (Evariops 0035)\n",
 +			       raid_bdev->bdev.name,
@@ -50,7 +47,7 @@ index a3146b8..a4d26b7 100644
  	RAID_FOR_EACH_BASE_BDEV(raid_bdev, base_info) {
  		base_info->remove_scheduled = true;
  
-@@ -3033,6 +3049,14 @@ raid_bdev_process_finish(struct raid_bdev_process *process, int status)
+@@ -3102,6 +3116,14 @@ raid_bdev_process_finish(struct raid_bdev_process *process, int status)
  	assert(process->state == RAID_PROCESS_STATE_RUNNING);
  	process->state = RAID_PROCESS_STATE_STOPPING;
  
@@ -65,7 +62,7 @@ index a3146b8..a4d26b7 100644
  	if (process->window_range_locked) {
  		raid_bdev_process_unlock_window_range(process);
  	} else {
-@@ -3040,6 +3064,17 @@ raid_bdev_process_finish(struct raid_bdev_process *process, int status)
+@@ -3109,6 +3131,17 @@ raid_bdev_process_finish(struct raid_bdev_process *process, int status)
  	}
  }
  
@@ -83,17 +80,22 @@ index a3146b8..a4d26b7 100644
  static void
  raid_bdev_process_window_range_unlocked(void *ctx, int status)
  {
-@@ -3283,6 +3318,13 @@ raid_bdev_process_lock_window_range(struct raid_bdev_process *process)
- 			 * the QoS token so the fast-skip is not paced at copy bandwidth
- 			 * (SEEDED-REBUILD-DESIGN.md "fast-advance"). */
- 			spdk_poller_pause(process->qos.process_continue_poller);
+@@ -3344,9 +3377,15 @@ raid_bdev_process_lock_window_range(struct raid_bdev_process *process)
+ 	if (process->qos.enable_qos) {
+ 		if (spdk_unlikely(process->seeded) &&
+ 		    raid_bdev_process_window_seeded_clean(process)) {
+-			/* SPEC-74 M6: a clean window does no copy I/O — exempt it from
+-			 * the QoS token so the fast-skip is not paced at copy bandwidth
+-			 * (SEEDED-REBUILD-DESIGN.md "fast-advance"). */
++			/* A clean window does no copy I/O, so it must not consume a QoS
++			 * token: the fast-skip is not paced at copy bandwidth. */
++			spdk_poller_pause(process->qos.process_continue_poller);
 +		} else if (process->state >= RAID_PROCESS_STATE_STOPPING ||
 +			   raid_bdev->destroy_started) {
-+			/* Evariops 0035: an abort is never paced. A STOPPING process (or
-+			 * one whose raid is being deleted) must reach its finish path
-+			 * NOW — waiting for bandwidth tokens here kept a doomed rebuild
-+			 * alive while every removal and delete queued behind it. */
-+			spdk_poller_pause(process->qos.process_continue_poller);
++			/* Evariops 0035: an abort is never paced. A STOPPING process, or
++			 * one whose raid is being deleted, must reach its finish path now;
++			 * waiting for bandwidth tokens here holds up every removal and
++			 * delete queued behind it. */
+ 			spdk_poller_pause(process->qos.process_continue_poller);
  		} else if (raid_bdev_process_consume_token(process)) {
  			spdk_poller_pause(process->qos.process_continue_poller);
- 		} else {

@@ -1,15 +1,14 @@
 diff --git a/lib/nvmf/nvmf_rpc.c b/lib/nvmf/nvmf_rpc.c
+index d3b1e36..bdd05fe 100644
 --- a/lib/nvmf/nvmf_rpc.c
 +++ b/lib/nvmf/nvmf_rpc.c
-@@ -3176,9 +3176,14 @@ _rpc_nvmf_subsystem_query(struct spdk_jsonrpc_request *request,
+@@ -3176,9 +3176,12 @@ _rpc_nvmf_subsystem_query(struct spdk_jsonrpc_request *request,
  
  	subsystem = spdk_nvmf_tgt_find_subsystem(tgt, ctx->nqn);
  	if (!subsystem) {
-+		/* Evariops 0036: a missing subsystem is a FACT (-ENODEV), not a caller
-+		 * mistake. INVALID_PARAMS made "absent" indistinguishable from a bad
-+		 * request, so every absent-tolerant caller misclassified it as fatal —
-+		 * measured 2026-08-14: a teardown died because the subsystem was
-+		 * already gone, and the recreate loop behind it ran for 7 hours. */
++		/* Evariops 0036: report absence as -ENODEV, not INVALID_PARAMS. Callers
++		 * that tolerate an already-gone subsystem (teardown, for one) need to
++		 * distinguish "not there" from "you asked wrongly". */
  		SPDK_ERRLOG("Unable to find subsystem with NQN %s\n", ctx->nqn);
 -		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 -						 "Invalid parameters");

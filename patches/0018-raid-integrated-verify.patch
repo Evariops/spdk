@@ -1,15 +1,36 @@
 diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
-index de4ec92..a523787 100644
+index fe71954..f2611d8 100644
 --- a/module/bdev/raid/bdev_raid.c
 +++ b/module/bdev/raid/bdev_raid.c
-@@ -102,6 +102,14 @@ struct raid_bdev_process {
- 	 * NULL when the registry could not allocate — the rebuild still runs,
- 	 * it is just unobservable there. Sealed exactly once at finish. */
+@@ -88,20 +88,28 @@ struct raid_bdev_process {
+ 	int				status;
+ 	TAILQ_HEAD(, raid_process_finish_action) finish_actions;
+ 	struct raid_process_qos		qos;
+-	/* SPEC-74 M6 seeded rebuild (docs/SEEDED-REBUILD-DESIGN.md): sorted,
+-	 * non-overlapping dirty ranges (owned by the process, freed with it).
+-	 * Windows intersecting no range complete without copying — the target
+-	 * was attached write_only, so unlisted blocks are already current. */
++	/* Seeded rebuild: sorted, non-overlapping dirty ranges, owned by the
++	 * process and freed with it. A window intersecting no range completes
++	 * without copying — the target is attached write_only, so blocks outside
++	 * the ranges are already current on it. */
+ 	bool				seeded;
+ 	struct raid_bdev_seed_range	*seed_ranges;
+ 	uint32_t			num_seed_ranges;
+ 	/* Cursor into seed_ranges — windows only ever advance, so passed
+ 	 * ranges never need re-scanning. */
+ 	uint32_t			seed_range_idx;
+-	/* Evariops 0014.5 (RPC-CONTRACT §2): registry entry for this attempt.
+-	 * NULL when the registry could not allocate — the rebuild still runs,
+-	 * it is just unobservable there. Sealed exactly once at finish. */
++	/* Evariops 0015: registry entry for this attempt. NULL when the registry
++	 * could not allocate — the rebuild still runs, it is just unobservable
++	 * there. Sealed exactly once, at finish. */
  	struct raid_rebuild_outcome	*outcome;
-+	/* Evariops 0014.8 (RPC-CONTRACT §10a): integrated verify phase state.
-+	 * verify_done guards re-entry; verified feeds the registry seal (and
-+	 * thereby gates bdev_cbt_epoch_close(consumed)); outcome_divergent
-+	 * routes the seal to DIVERGENT instead of FAILED. */
++	/* Evariops 0018: integrated verify phase state. verify_done guards
++	 * re-entry; verified feeds the registry seal, which in turn gates
++	 * bdev_cbt_epoch_close(consumed); outcome_divergent routes the seal to
++	 * DIVERGENT instead of FAILED. */
 +	struct raid_process_verify	*verify;
 +	bool				verify_done;
 +	bool				verified;
@@ -17,13 +38,22 @@ index de4ec92..a523787 100644
  };
  
  struct raid_process_finish_action {
-@@ -2843,18 +2851,21 @@ raid_bdev_process_finish_done(void *ctx)
- 	 * broke, its subject went away. All process writes have ceased at this
- 	 * point, so a bdev_raid_delete reply (which is gated behind this
- 	 * process stopping) honors "no writes after the RPC returns" (T-D5).
+@@ -2835,24 +2843,24 @@ raid_bdev_process_finish_done(void *ctx)
+ 
+ 	process->state = RAID_PROCESS_STATE_STOPPED;
+ 
+-	/* Evariops 0014.5 (RPC-CONTRACT §2): seal the registry entry. The two
+-	 * cancellation causes — raid destroy (-ECANCELED) and member removal
+-	 * (-ENODEV) — are CANCELED, not FAILED: the copy process itself never
+-	 * broke, its subject went away. All process writes have ceased at this
+-	 * point, so a bdev_raid_delete reply (which is gated behind this
+-	 * process stopping) honors "no writes after the RPC returns" (T-D5).
 -	 * verified stays false until 0014.8 delivers the integrated verify. */
-+	 * Evariops 0014.8: verified comes from the integrated verify phase;
-+	 * a verify double-mismatch seals DIVERGENT, not FAILED. */
++	/* Evariops 0015: seal the registry entry, exactly once. Raid destroy
++	 * (-ECANCELED) and member removal (-ENODEV) seal CANCELED, not FAILED: the
++	 * copy never broke, its subject went away. All process writes have ceased
++	 * here, which is what lets a bdev_raid_delete reply gated on this stop
++	 * promise "no writes after the RPC returns". */
  	if (process->outcome != NULL) {
  		enum raid_rebuild_outcome_state terminal;
  
@@ -41,23 +71,18 @@ index de4ec92..a523787 100644
  		process->outcome = NULL;
  	}
  
-@@ -3248,6 +3259,442 @@ raid_bdev_process_lock_window_range(struct raid_bdev_process *process)
+@@ -3239,6 +3247,437 @@ raid_bdev_process_lock_window_range(struct raid_bdev_process *process)
  	return true;
  }
  
-+/* ── Evariops 0014.8 (RPC-CONTRACT §10a): integrated verify phase ──────────
-+ *
-+ * After the copy completes (window_offset == blockcnt) and before the process
-+ * concludes, sample RAID_PROCESS_VERIFY_WINDOWS windows across the copied
-+ * extent (the seed ranges for a seeded rebuild, the whole raid otherwise) and
-+ * compare the two legs under quiesce_range. A mismatch is re-copied from the
-+ * arbiter (the source leg) and re-verified once; a second mismatch under the
-+ * same lock proves the copy process itself is broken → DIVERGENT. Honest
-+ * scope (T-C12): ~64 MiB of a multi-TiB extent — a PROBABILISTIC process-bug
-+ * detector, not an exhaustive one (that is bdev_raid_verify_ranges, §10b).
-+ * Success seals the registry entry verified=true, which is exactly what
-+ * bdev_cbt_epoch_close(mode=consumed) demands before discarding a delta.
-+ * The CONFIGURED flip happens at finish — promotion is gated on this phase. */
++/* Evariops 0018: integrated verify phase. After the copy completes and before
++ * the process concludes, sample RAID_PROCESS_VERIFY_WINDOWS windows across the
++ * copied extent and compare both legs under quiesce_range. A mismatch is
++ * re-copied from the arbiter (the source leg) and re-verified once; a second
++ * mismatch under the SAME lock means the copy process itself is broken, and
++ * seals DIVERGENT. This is a probabilistic detector, not an exhaustive scan.
++ * Success seals verified=true, which bdev_cbt_epoch_close(mode=consumed)
++ * requires before discarding a delta, and gates the CONFIGURED flip at finish. */
 +
 +#define RAID_PROCESS_VERIFY_WINDOWS	64
 +
@@ -384,9 +409,9 @@ index de4ec92..a523787 100644
 +
 +	process->verify_done = true;	/* re-entry guard, whatever path exits */
 +
-+	/* Scope: raid1 nexus with plain data. Anything else completes
-+	 * UNVERIFIED — the registry entry stays verified=false, and
-+	 * bdev_cbt_epoch_close(consumed) stays locked for its token. */
++	/* Scope: raid1 with plain data. Anything else completes UNVERIFIED — the
++	 * registry entry stays verified=false and bdev_cbt_epoch_close(consumed)
++	 * stays locked for its token. */
 +	if (raid_bdev->level != RAID1 ||
 +	    spdk_bdev_get_dif_type(&raid_bdev->bdev) != SPDK_DIF_DISABLE) {
 +		raid_bdev_process_finish(process, 0);
@@ -445,8 +470,8 @@ index de4ec92..a523787 100644
 +		total_blocks = raid_bdev->bdev.blockcnt;
 +	}
 +
-+	/* Uniform-stride sampling: honest, reproducible, no RNG needed. Windows
-+	 * never overlap (monotonic physical offsets enforced below). */
++	/* Uniform-stride sampling, so the choice is reproducible without an RNG.
++	 * Windows never overlap: the loop below enforces monotonic offsets. */
 +	step = spdk_max(total_blocks / RAID_PROCESS_VERIFY_WINDOWS, verify->window_size);
 +	for (k = 0; k < RAID_PROCESS_VERIFY_WINDOWS; k++) {
 +		uint64_t logical = (uint64_t)k * step;
@@ -484,13 +509,13 @@ index de4ec92..a523787 100644
  static int
  raid_bdev_process_continue_poll(void *arg)
  {
-@@ -3275,6 +3722,14 @@ raid_bdev_process_thread_run(struct raid_bdev_process *process)
+@@ -3266,6 +3705,14 @@ raid_bdev_process_thread_run(struct raid_bdev_process *process)
  
  	if (process->window_offset == raid_bdev->bdev.blockcnt) {
  		SPDK_DEBUGLOG(bdev_raid, "process completed on %s\n", raid_bdev->bdev.name);
-+		/* Evariops 0014.8: the copy is complete — run the integrated verify
-+		 * phase before concluding. Both the registry seal and the SB
-+		 * CONFIGURED flip happen at finish, so promotion is gated on it. */
++		/* Evariops 0018: run the verify phase before concluding. The
++		 * registry seal and the superblock CONFIGURED flip both happen at
++		 * finish, so promotion is gated on this. */
 +		if (process->type == RAID_PROCESS_REBUILD && !process->verify_done &&
 +		    process->status == 0 && process->window_status == 0) {
 +			raid_bdev_process_verify_start(process);
@@ -499,12 +524,26 @@ index de4ec92..a523787 100644
  		raid_bdev_process_finish(process, 0);
  		return;
  	}
-@@ -3460,6 +3915,12 @@ raid_bdev_process_free(struct raid_bdev_process *process)
+@@ -3441,16 +3888,21 @@ raid_bdev_process_free(struct raid_bdev_process *process)
+ 		raid_bdev_process_request_free(process_req);
+ 	}
+ 
+-	/* SPEC-74 M6: the seeded process owns its ranges — every teardown path
+-	 * (finish or aborted start) goes through here. */
++	/* The seeded process owns its ranges, and every teardown path lands here. */
+ 	free(process->seed_ranges);
+-	/* Evariops 0014.5: safety net for teardown paths that bypass
+-	 * raid_bdev_process_finish_done (aborted channel start) — a RUNNING
+-	 * entry with no owner would otherwise never seal nor expire. */
++	/* Evariops 0015: safety net for teardown paths that bypass
++	 * raid_bdev_process_finish_done, such as an aborted channel start. A
++	 * RUNNING entry with no owner would otherwise never seal nor expire. */
+ 	if (process->outcome != NULL) {
  		raid_rebuild_outcome_finish(process->outcome, RAID_REBUILD_OUTCOME_FAILED, false);
  		process->outcome = NULL;
  	}
-+	/* Evariops 0014.8: same defensive discipline for the verify state —
-+	 * conclude() frees it on every live path. */
++	/* Evariops 0018: same safety net for the verify state; conclude() frees
++	 * it on every live path. */
 +	if (process->verify != NULL) {
 +		raid_bdev_process_verify_free(process->verify);
 +		process->verify = NULL;

@@ -1,26 +1,19 @@
 /*   SPDX-License-Identifier: BSD-3-Clause
  *   Copyright (c) 2026 Evariops.
  *
- *   T1: host-compilable unit tests of the PRODUCTION tier code (not a copy):
- *   this translation unit #includes vbdev_tier_sb.c directly, compiled against
- *   the minimal mock SPDK headers in mock/. Covers the v2 on-disk format:
- *     - ABI (sizeof/offsetof, doubling the SPDK_STATIC_ASSERTs at runtime)
- *     - tier_sb_serialize / tier_sb_valid roundtrip + corruption + version +
- *       byte-swapped-magic (F-4) rejection
- *     - F-5 A/B slot selection (tier_sb_select): highest valid seq wins,
- *       torn/invalid slot tolerated
- *     - F-2 generation_uuid + created_epoch_sec + u64 cluster_blocks (F-3)
- *     - band table serialization content, geometry inlines
- *     - a binary GOLDEN vector: the serialized header bytes are pinned so an
- *       accidental field reorder is caught even if sizeof stays equal
+ *   Host-compilable unit tests of the PRODUCTION tier code (not a copy): this
+ *   translation unit #includes vbdev_tier_sb.c directly, compiled against the
+ *   minimal mock SPDK headers in mock/. Covers the v2 on-disk format: ABI,
+ *   serialize/validate roundtrip and rejections, A/B slot selection, the
+ *   geometry inlines, and a binary golden vector of the header bytes.
  *
- *   NOT covered here (needs the full bdev runtime — see docs/audits T3 bench):
- *   I/O routing, fan-out, hot-remove, resync, write_all channel plumbing.
+ *   NOT covered here (needs the full bdev runtime): I/O routing, fan-out,
+ *   hot-remove, resync, write_all channel plumbing.
  */
 
-/* M2 framing: countdown-armed calloc fault injection for the production code
- * compiled below (-1 = pass-through). test_calloc's own call binds to the real
- * libc calloc (resolved before the macro exists). */
+/* Countdown-armed calloc fault injection for the production code compiled below
+ * (-1 = pass-through). test_calloc's own call binds to the real libc calloc,
+ * resolved before the macro exists. */
 #include <stdlib.h>
 static int g_calloc_fail_countdown = -1;
 static void *
@@ -70,7 +63,7 @@ bool
 spdk_bdev_io_type_supported(struct spdk_bdev *bdev, enum spdk_bdev_io_type io_type)
 {
 	(void)bdev; (void)io_type;
-	return false;	/* mirrors the -ENOTSUP flush stub: no-FLUSH base (bdev_uring) */
+	return false;	/* mirrors the -ENOTSUP flush stub: a base without FLUSH support */
 }
 
 int
@@ -105,9 +98,9 @@ spdk_bdev_get_io_channel(struct spdk_bdev_desc *desc)
 	return NULL;
 }
 
-/* T-4b: lives in vbdev_tier.c (not host-compilable). A no-op that reports
- * "nothing deferred" (false) satisfies the link; the M2 framing test counts
- * invocations to pin "every fan-out termination resolves deferred teardown". */
+/* Lives in vbdev_tier.c, which is not host-compilable. A no-op reporting "nothing
+ * deferred" satisfies the link; the tests count invocations to pin the rule that
+ * every fan-out termination resolves deferred teardown. */
 static int g_fanout_idle_calls;
 bool
 vbdev_tier_sb_fanout_idle(struct vbdev_tier *t)
@@ -171,8 +164,7 @@ make_composite(struct vbdev_tier *t)
 	t->total_num_blocks = 4096 + 100352 + 50176 + 25088;
 }
 
-/* Free the bands make_composite/add_band allocated (the composite `t` itself is
- * stack-owned; only the band nodes are heap). Keeps the ASAN+LSAN build clean. */
+/* Free the heap band nodes; the composite `t` itself is stack-owned. */
 static void
 free_composite(struct vbdev_tier *t)
 {
@@ -187,10 +179,10 @@ free_composite(struct vbdev_tier *t)
 
 /* ---- tests ------------------------------------------------------------------- */
 
+/* The on-disk ABI (field offsets, struct sizes, format constants) has not drifted. */
 static void
 test_abi(void)
 {
-	/* F-1: runtime double-check of the compile-time asserts. */
 	CHECK(sizeof(struct tier_sb_band) == 192);
 	CHECK(offsetof(struct tier_superblock, bands) == 256);
 	CHECK(sizeof(struct tier_superblock) == 12544);
@@ -201,7 +193,6 @@ test_abi(void)
 	CHECK(offsetof(struct tier_superblock, created_epoch_sec) == 24);
 	CHECK(offsetof(struct tier_superblock, generation_uuid) == 32);
 	CHECK(offsetof(struct tier_superblock, composite_name) == 48);
-	/* v2 constants. */
 	CHECK(TIER_SB_MAGIC == 0x5449455253423032ULL);
 	CHECK(TIER_SB_VERSION == 2u);
 	CHECK(TIER_SB_SLOT_BYTES * 2 == TIER_SB_RESERVE_BYTES);
@@ -209,6 +200,7 @@ test_abi(void)
 	CHECK(sizeof(struct tier_superblock) <= TIER_SB_SLOT_BYTES);
 }
 
+/* Serializing a composite reproduces every header and band field, and validates. */
 static void
 test_serialize_roundtrip(void)
 {
@@ -240,7 +232,7 @@ test_serialize_roundtrip(void)
 	CHECK(strcmp(sb.bands[2].serial, "serial-2") == 0);
 	CHECK(sb.bands[3].band_id == 0 && sb.bands[3].num_blocks == 0);
 
-	/* u64 cluster_blocks must survive a value > UINT32_MAX (F-3). */
+	/* cluster_blocks must survive a value > UINT32_MAX. */
 	t.cluster_blocks = 0x100000001ULL;
 	tier_sb_serialize(&t, self, 42, 0, &sb);
 	CHECK(sb.cluster_blocks == 0x100000001ULL);
@@ -253,6 +245,7 @@ test_serialize_roundtrip(void)
 	free_composite(&t);
 }
 
+/* Any bit flip, wrong version or byte-swapped magic makes a superblock invalid. */
 static void
 test_reject_corruption(void)
 {
@@ -272,15 +265,14 @@ test_reject_corruption(void)
 	sb.seq--;
 	CHECK(tier_sb_valid(&sb));
 
-	/* A tampered generation_uuid must invalidate the CRC (fencing integrity). */
 	sb.generation_uuid[7] ^= 0x55;
 	CHECK(!tier_sb_valid(&sb));
 	sb.generation_uuid[7] ^= 0x55;
 	CHECK(tier_sb_valid(&sb));
 
-	sb.version = TIER_SB_VERSION + 1;	/* v1/v3 not accepted (clean break) */
+	sb.version = TIER_SB_VERSION + 1;	/* only the current version reads */
 	CHECK(!tier_sb_valid(&sb));
-	sb.version = 1u;			/* the abandoned v1 must NOT read */
+	sb.version = 1u;
 	CHECK(!tier_sb_valid(&sb));
 	sb.version = TIER_SB_VERSION;
 
@@ -288,12 +280,12 @@ test_reject_corruption(void)
 	CHECK(!tier_sb_valid(&sb));
 	sb.magic ^= 1;
 
-	sb.magic = __builtin_bswap64(TIER_SB_MAGIC);	/* F-4 big-endian writer */
+	sb.magic = __builtin_bswap64(TIER_SB_MAGIC);	/* big-endian writer */
 	CHECK(!tier_sb_valid(&sb));
 	free_composite(&t);
 }
 
-/* F-5: two-slot selection. */
+/* Slot selection takes the valid slot with the highest seq, tolerating a torn one. */
 static void
 test_slot_select(void)
 {
@@ -307,28 +299,24 @@ test_slot_select(void)
 	a = (struct tier_superblock *)reserve;
 	b = (struct tier_superblock *)(reserve + TIER_SB_SLOT_BYTES);
 
-	/* slot layout matches the writer: seq N -> slot N%2. */
 	CHECK(tier_sb_slot_for_seq(42) == 0);
 	CHECK(tier_sb_slot_for_seq(43) == 1);
 
-	/* Both valid: higher seq wins regardless of which slot holds it. */
-	tier_sb_serialize(&t, NULL, 44, 0, a);	/* slot A: even seq */
-	tier_sb_serialize(&t, NULL, 45, 0, b);	/* slot B: odd seq  */
+	tier_sb_serialize(&t, NULL, 44, 0, a);
+	tier_sb_serialize(&t, NULL, 45, 0, b);
 	CHECK(tier_sb_select(reserve, TIER_SB_RESERVE_BYTES) == b);
-	tier_sb_serialize(&t, NULL, 46, 0, a);	/* now A newer */
+	tier_sb_serialize(&t, NULL, 46, 0, a);
 	CHECK(tier_sb_select(reserve, TIER_SB_RESERVE_BYTES) == a);
 
-	/* Torn newer slot (B) -> fall back to the older valid slot (A). */
 	tier_sb_serialize(&t, NULL, 100, 0, a);
 	tier_sb_serialize(&t, NULL, 101, 0, b);
-	((uint8_t *)b)[64] ^= 0xFF;		/* corrupt B's CRC-covered bytes */
+	((uint8_t *)b)[64] ^= 0xFF;		/* corrupt CRC-covered bytes of a slot */
 	CHECK(tier_sb_select(reserve, TIER_SB_RESERVE_BYTES) == a);
 
-	/* Both torn -> NULL. */
 	((uint8_t *)a)[64] ^= 0xFF;
 	CHECK(tier_sb_select(reserve, TIER_SB_RESERVE_BYTES) == NULL);
 
-	/* Short buffer -> NULL (no OOB read). */
+	/* A short buffer yields NULL rather than reading out of bounds. */
 	tier_sb_serialize(&t, NULL, 1, 0, a);
 	CHECK(tier_sb_select(reserve, TIER_SB_RESERVE_BYTES - 1) == NULL);
 	CHECK(tier_sb_select(NULL, TIER_SB_RESERVE_BYTES) == NULL);
@@ -337,6 +325,7 @@ test_slot_select(void)
 	free_composite(&t);
 }
 
+/* The alignment and md-range inlines agree with the composite geometry. */
 static void
 test_geometry_inlines(void)
 {
@@ -361,9 +350,8 @@ test_geometry_inlines(void)
 	free_composite(&t);
 }
 
-/* Binary golden vector: pin the serialized header bytes so a field reorder that
- * preserves sizeof is still caught. Only deterministic header fields are pinned
- * (crc/created_epoch excluded — crc is derived, epoch is wall-clock). */
+/* The pinned header bytes catch a field reorder that preserves sizeof. Only
+ * deterministic fields are pinned: crc is derived and the epoch is wall-clock. */
 static void
 test_golden_header(void)
 {
@@ -388,7 +376,7 @@ test_golden_header(void)
 	free_composite(&t);
 }
 
-/* ---- audit findings framing (M2/M3) ----------------------------------------- */
+/* ---- durability and fan-out termination contracts --------------------------- */
 
 static void
 persist_rc_cb(void *cb_arg, int rc)
@@ -396,10 +384,8 @@ persist_rc_cb(void *cb_arg, int rc)
 	*(int *)cb_arg = rc;
 }
 
-/* M3: a fan-out where EVERY band is skipped (DEGRADED / RETIRED / desc-less)
- * writes zero superblock copies and must NOT complete rc == 0 — the callers'
- * MJ6 contract reads rc == 0 as "durably persisted", and a retire acked on a
- * zero-copy persist resurrects after reboot from the old highest-seq SBs. */
+/* A fan-out that writes zero superblock copies must not report rc == 0, which
+ * callers read as "durably persisted". */
 static void
 test_m3_zero_copy_persist_not_durable(void)
 {
@@ -408,21 +394,17 @@ test_m3_zero_copy_persist_not_durable(void)
 	int rc = 12345;
 
 	make_composite(&t);
-	/* All bands non-ACTIVE (fixture descs are NULL anyway — both skip legs). */
 	TAILQ_FOREACH(b, &t.bands, link) {
 		b->state = TIER_BAND_DEGRADED;
 	}
 	CHECK(tier_sb_write_all(&t, persist_rc_cb, &rc) == 0);
-	/* Zero writes launch → the fan-out completes synchronously. */
 	CHECK(rc == -ENODEV);
 	CHECK(t.sb_write_inflight == false);
 	free_composite(&t);
 }
 
-/* M2: the ctx-calloc ENOMEM path is a fan-out TERMINATION — it must resolve
- * teardown deferred behind the fan-out (vbdev_tier_sb_fanout_idle), or a
- * delete_pending composite whose drained callbacks hold no async_inflight
- * reference leaks forever (bands, claims, -EEXIST on re-create). */
+/* The ctx-calloc ENOMEM path is a fan-out termination, so it must still resolve
+ * teardown deferred behind the fan-out. */
 static void
 test_m2_enomem_termination_resolves_deferred_teardown(void)
 {
@@ -436,9 +418,9 @@ test_m2_enomem_termination_resolves_deferred_teardown(void)
 	g_calloc_fail_countdown = 1;
 	CHECK(tier_sb_write_all(&t, persist_rc_cb, &rc) == 0);
 	g_calloc_fail_countdown = -1;
-	CHECK(rc == -ENOMEM);			/* queued cb drained with the error */
+	CHECK(rc == -ENOMEM);
 	CHECK(t.sb_write_inflight == false);
-	CHECK(g_fanout_idle_calls == 1);	/* the fix: termination → idle hook */
+	CHECK(g_fanout_idle_calls == 1);
 	free_composite(&t);
 }
 

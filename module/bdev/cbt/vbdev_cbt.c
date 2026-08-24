@@ -6,26 +6,21 @@
 /*
  * SPDK CBT (Change Block Tracking) vbdev module.
  *
- * A passthrough bdev that maintains a cumulative dirty bitmap for every
- * write/unmap/write_zeroes that flows through it.  The bitmap is used to
- * drive incremental (partial) RAID rebuilds after backend outages.
+ * A passthrough bdev that records in an in-RAM bitmap which chunks were
+ * written, so a backend returning from an outage re-copies only the delta
+ * instead of the whole surface.
  *
- * Bitmap lifecycle is RESET-DRIVEN (D3): the bitmap only shrinks when the
- * orchestrator explicitly calls bdev_cbt_reset after certifying all backends
- * are healthy and in-sync. There is NO automatic healthy-clear poller — an
- * in-target timer cannot know distributed backend health, and a wrong clear
- * silently destroys the delta needed for partial rebuild.
- *
- * Design reference: SPEC-52 §2.
+ * The bitmap only shrinks on an explicit bdev_cbt_reset, refused while any
+ * epoch is active: nothing inside the target can know that every distributed
+ * backend is in sync, and a wrong clear silently destroys the delta.
  */
 
 #include "spdk/stdinc.h"
 
 #include "vbdev_cbt_internal.h"
-#include "vbdev_cbt_query.h"	/* Evariops 0014.6: raid-facing epoch facts */
-/* Evariops 0014.5: the rebuild outcome registry lives in the raid module (the
- * nexus process hosts both); patch 0015 materializes this header at image
- * build. Linked via --whole-archive, so the cross-module symbol resolves. */
+#include "vbdev_cbt_query.h"	/* raid-facing epoch facts */
+/* The rebuild outcome registry lives in the raid module; the same process hosts
+ * both and the link uses --whole-archive, so the cross-module symbol resolves. */
 #include "../raid/bdev_raid_outcomes.h"
 #include "spdk/rpc.h"
 #include "spdk/env.h"
@@ -90,9 +85,8 @@ struct cbt_bdev_io {
 /* Helpers                                                            */
 /* ================================================================== */
 
-/* Lazy popcount — compute dirty_chunks on demand (called from poller/RPCs,
- * not from the IO hot path). Uses 64-bit popcount for speed on large bitmaps.
- */
+/* Dirty-chunk count is computed on demand (pollers, RPCs), never on the IO hot
+ * path — no per-chunk counter is maintained. */
 uint64_t
 cbt_popcount_bitmap(const struct vbdev_cbt *cbt)
 {
@@ -106,7 +100,6 @@ cbt_popcount_bitmap(const struct vbdev_cbt *cbt)
 		memcpy(&word, src + i * 8, sizeof(word));
 		count += (uint64_t)__builtin_popcountll(word);
 	}
-	/* Handle tail bytes. */
 	if (tail > 0) {
 		const uint8_t *rest = src + n * 8;
 		for (uint64_t i = 0; i < tail; i++) {
@@ -175,18 +168,13 @@ cbt_has_other_active_epoch(struct vbdev_cbt *cbt, struct cbt_epoch *self)
 	return false;
 }
 
-/* H1: OR an unconsumed frozen delta back into the live bitmap before its
- * buffer is discarded (re-freeze, close, evict). Bits exchanged out of the
- * live bitmap at freeze exist ONLY in bitmap_frozen until a rebuild COMPLETES;
- * freeing that buffer without this merge-back permanently loses the chunks —
- * a later "successful" delta rebuild then promotes a silently divergent
- * member under skip_rebuild.
- *
- * Pessimistic by design: chunks the aborted rebuild DID copy are re-marked
- * too and get re-copied on the next iteration — wasted bandwidth, never lost
- * data. Lock-free: per-byte atomic OR, same discipline as the IO-thread
- * markers; caller is the app thread and all call sites are guarded against a
- * concurrently RUNNING rebuild, so bitmap_frozen has no concurrent reader. */
+/* OR an unconsumed frozen delta back into the live bitmap before its buffer is
+ * discarded (re-freeze, close, evict): bits exchanged out at freeze exist ONLY
+ * in bitmap_frozen until a rebuild COMPLETES, and freeing that buffer without
+ * this merge-back loses the chunks for good. Pessimistic by design — chunks the
+ * aborted rebuild did copy are re-marked and re-copied, costing bandwidth, never
+ * data. Lock-free per-byte atomic OR; the caller is the app thread and every call
+ * site is guarded against a RUNNING rebuild, so bitmap_frozen has no reader. */
 static void
 cbt_epoch_restore_unconsumed_delta(struct vbdev_cbt *cbt, struct cbt_epoch *ep)
 {
@@ -209,17 +197,12 @@ cbt_epoch_restore_unconsumed_delta(struct vbdev_cbt *cbt, struct cbt_epoch *ep)
 
 /* ================================================================== */
 /* Bitmap operations (hot path — may run on any reactor thread)       */
-/* Uses atomic OR so concurrent IO threads cannot lose bits.          */
-/*                                                                    */
-/* Performance design:                                                */
-/*   - chunk_shift replaces division (chunk_size guaranteed P2)       */
-/*   - No atomic counter increment per chunk (dirty_chunks is         */
-/*     recomputed lazily via popcount when needed by RPCs/poller)     */
-/*   - total_writes_tracked uses relaxed add (stats only)            */
+/* Atomic OR so concurrent IO threads cannot lose bits; chunk_shift   */
+/* replaces division (chunk size is rounded up to a power of two).    */
 /* ================================================================== */
 
 /* Core bit-setter, shared by the submit-time mark and the completion-time
- * re-mark (H2). No statistics side effect. */
+ * re-mark. No statistics side effect. */
 static inline void
 cbt_mark_dirty_bits(struct vbdev_cbt *cbt, uint64_t offset_blocks, uint64_t num_blocks)
 {
@@ -233,37 +216,31 @@ cbt_mark_dirty_bits(struct vbdev_cbt *cbt, uint64_t offset_blocks, uint64_t num_
 	chunk_start = offset_blocks >> cbt->chunk_shift;
 	chunk_end   = (offset_blocks + num_blocks - 1) >> cbt->chunk_shift;
 
-	/* Clamp to bitmap bounds. */
 	if (chunk_end >= cbt->bitmap_size_bits) {
 		chunk_end = cbt->bitmap_size_bits - 1;
 	}
 
-	/* Fast path: set full bytes for large ranges. */
 	uint64_t byte_start = chunk_start >> 3;
 	uint64_t byte_end   = chunk_end >> 3;
 
 	if (byte_start == byte_end) {
-		/* All bits in a single byte. */
 		uint8_t mask = 0;
 		for (uint64_t i = chunk_start; i <= chunk_end; i++) {
 			mask |= (uint8_t)(1u << (i & 7));
 		}
 		__atomic_fetch_or(&cbt->bitmap[byte_start], mask, __ATOMIC_RELAXED);
 	} else {
-		/* First partial byte. */
 		uint8_t first_mask = (uint8_t)(0xFF << (chunk_start & 7));
 		__atomic_fetch_or(&cbt->bitmap[byte_start], first_mask, __ATOMIC_RELAXED);
 
-		/* Full bytes in between — use memset for large spans. */
 		uint64_t full_start = byte_start + 1;
 		uint64_t full_end   = byte_end;  /* exclusive */
 		if (full_end > full_start) {
-			/* For full bytes, 0xFF is idempotent with OR, so direct set is safe.
-			 * Concurrent atomic ORs on the same byte can only add bits. */
+			/* A plain 0xFF store is safe here even against concurrent atomic
+			 * ORs on the same byte: those can only add bits. */
 			memset(&cbt->bitmap[full_start], 0xFF, full_end - full_start);
 		}
 
-		/* Last partial byte. */
 		uint8_t last_mask = (uint8_t)(0xFF >> (7 - (chunk_end & 7)));
 		__atomic_fetch_or(&cbt->bitmap[byte_end], last_mask, __ATOMIC_RELAXED);
 	}
@@ -276,13 +253,7 @@ cbt_mark_dirty(struct vbdev_cbt *cbt, uint64_t offset_blocks, uint64_t num_block
 	__atomic_fetch_add(&cbt->total_writes_tracked, 1, __ATOMIC_RELAXED);
 }
 
-/* D3: the healthy-clear poller was removed — it required an explicit
- * bdev_cbt_set_backends_healthy() signal that no caller ever sent (dead code),
- * so the bitmap only tended towards 100% dirty. Clearing is reset-driven:
- * the orchestrator calls bdev_cbt_reset (refused while any epoch is active). */
-
-/* Forward declaration (rebuild registry, defined below) — used by the epoch
- * state guards CBT-1/CBT-2/c5. */
+/* Rebuild registry lookup, defined below — used by the epoch state guards. */
 struct cbt_rebuild_ctx;
 static struct cbt_rebuild_ctx *cbt_rebuild_find_active_for_epoch(const struct vbdev_cbt *cbt,
 								 const char *epoch_id);
@@ -310,22 +281,12 @@ _cbt_complete_io(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
 	struct spdk_bdev_io *orig_io = cb_arg;
 
-	/* H2: RE-mark the dirty bit at completion, BEFORE acking the host.
-	 *
-	 * The submit-time mark alone is not enough under snapshot-and-clear
-	 * freeze: a freeze can exchange-and-consume the bit while this write is
-	 * still in flight to the base. The rebuild may then read the chunk
-	 * before the write lands, and the bit exists in no bitmap afterwards —
-	 * the chunk silently diverges forever. Re-marking here closes that
-	 * window without any drain or freeze of host I/O:
-	 *   - write landed before the rebuild read  → the consumed bit is fine,
-	 *     the rebuild copies the new data;
-	 *   - write lands after                     → this re-mark puts the bit
-	 *     in the (new) live bitmap → captured by the next delta.
-	 * Re-mark also on FAILURE: a failed write may have partially reached
-	 * media. The submit-time mark stays for crash conservatism.
-	 * Cost: one relaxed atomic OR on a byte whose cacheline the submit-time
-	 * mark touched moments ago. */
+	/* Re-mark the dirty bit at completion, BEFORE acking the host: a freeze may
+	 * exchange the submit-time bit out of the live bitmap while this write is
+	 * still in flight, and this second mark puts the chunk back in the live
+	 * bitmap so the next delta captures it. No drain or freeze of host I/O is
+	 * needed. Re-mark on FAILURE too — a failed write may have partially reached
+	 * media; the submit-time mark stays for crash conservatism. */
 	switch (orig_io->type) {
 	case SPDK_BDEV_IO_TYPE_WRITE:
 	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
@@ -479,9 +440,8 @@ vbdev_cbt_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_i
 		break;
 
 	default:
-		/* Forward unknown IO types without tracking (zcopy, compare,
-		 * zone ops, seek, etc.) — they don't modify data.
-		 */
+		/* Anything not handled above is not advertised as supported
+		 * (see vbdev_cbt_io_type_supported), so reaching here is a bug. */
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 		return;
 	}
@@ -529,7 +489,7 @@ vbdev_cbt_get_io_channel(void *ctx)
 	return spdk_get_io_channel(cbt_node);
 }
 
-/* 0014.6 (cbt part): stable state names for get_bdevs consumers. */
+/* Stable state names for get_bdevs consumers. */
 static const char *
 cbt_epoch_state_name(enum cbt_epoch_state state)
 {
@@ -543,12 +503,10 @@ cbt_epoch_state_name(enum cbt_epoch_state state)
 	}
 }
 
-/* 0014.10 (RPC-CONTRACT §12): epoch-at-ejection — see vbdev_cbt_query.h.
- * Refuses (-EEXIST) when an OPEN epoch already bounds the round: the CP's own
- * round (or a previous auto-open) suffices, and an implicit takeover would
- * steal the nonce from under the controller. FROZEN/REBUILDING epochs do not
- * block: those are prior rounds being digested, while the live bitmap keeps
- * tracking — the new epoch bounds the NEW ejection. */
+/* Epoch-at-ejection — see vbdev_cbt_query.h. Refuses (-EEXIST) when an OPEN
+ * epoch already bounds the round: an implicit takeover would steal the nonce
+ * from under the controller. FROZEN/REBUILDING epochs do not block — those are
+ * prior rounds being digested while the live bitmap keeps tracking. */
 int
 vbdev_cbt_auto_epoch_open(const char *bdev_name, const char *stale_backend_id)
 {
@@ -585,10 +543,9 @@ vbdev_cbt_auto_epoch_open(const char *bdev_name, const char *stale_backend_id)
 				   max_gen + 1, nonce);
 }
 
-/* 0014.6 (RPC-CONTRACT §3): cross-module query — the raid module publishes
- * these facts per member in ITS get_bdevs output (see vbdev_cbt_query.h).
- * Epochs are appended at open, so the last list entry is the most recently
- * opened one; closed epochs leave the list, so everything here is live. */
+/* Cross-module query — the raid module publishes these facts per member in ITS
+ * get_bdevs output (see vbdev_cbt_query.h). Epochs are appended at open and
+ * leave the list at close, so the last entry is the most recently opened one. */
 int
 vbdev_cbt_query_latest_epoch(const char *bdev_name, struct vbdev_cbt_epoch_facts *out)
 {
@@ -632,9 +589,8 @@ vbdev_cbt_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 	spdk_json_write_named_uint64(w, "dirty_chunks", cbt_popcount_bitmap(cbt_node));
 	spdk_json_write_named_uint64(w, "total_chunks", cbt_node->bitmap_size_bits);
 
-	/* 0014.1/0014.2/0014.6 (RPC-CONTRACT §3/§5): the observation source — the
-	 * control-plane's EpochObservation is built from get_bdevs, never from a
-	 * dedicated poll. Per epoch: {epoch_id, nonce, state, generation, truncated}. */
+	/* The control-plane observes epochs through get_bdevs, never through a
+	 * dedicated poll. */
 	spdk_json_write_named_array_begin(w, "epochs");
 	TAILQ_FOREACH(ep, &cbt_node->epochs, link) {
 		spdk_json_write_object_begin(w);
@@ -675,7 +631,6 @@ _cbt_device_unregister_cb(void *io_device)
 	free(cbt_node->bitmap);
 	free(cbt_node->cbt_bdev.name);
 
-	/* Free any remaining epochs and their frozen bitmaps. */
 	struct cbt_epoch *ep;
 	while ((ep = TAILQ_FIRST(&cbt_node->epochs)) != NULL) {
 		TAILQ_REMOVE(&cbt_node->epochs, ep, link);
@@ -757,10 +712,9 @@ vbdev_cbt_base_bdev_event_cb(enum spdk_bdev_event_type type,
 			     struct spdk_bdev *bdev, void *event_ctx)
 {
 	if (type == SPDK_BDEV_EVENT_RESIZE) {
-		/* 0014.2 (RPC-CONTRACT §5, T-D6): the live bitmap was sized at create —
-		 * a grown base leaves the growth zone tracked by NOTHING. Every live
-		 * epoch becomes a lie: mark it truncated so the control-plane routes to
-		 * a FULL rebuild (D14) instead of trusting a partial delta. */
+		/* The live bitmap was sized at create, so a grown base leaves the growth
+		 * zone tracked by nothing. Mark every live epoch truncated: its delta is
+		 * incomplete and only a full rebuild is safe. */
 		struct vbdev_cbt *rnode;
 		struct cbt_epoch *rep;
 
@@ -787,11 +741,10 @@ vbdev_cbt_base_bdev_event_cb(enum spdk_bdev_event_type type,
 
 		TAILQ_FOREACH_SAFE(node, &g_cbt_nodes, link, tmp) {
 			if (bdev == node->base_bdev) {
-				/* c4: drop the deferred-create entry too — otherwise a
-				 * reappearing base bdev silently recreates the cbt vbdev
-				 * with a VIRGIN bitmap that masquerades as continuous
-				 * tracking history. Recreation must be an explicit
-				 * bdev_cbt_create from the orchestrator. */
+				/* Drop the deferred-create entry too: a reappearing base
+				 * bdev would otherwise silently recreate the cbt vbdev with
+				 * a VIRGIN bitmap masquerading as continuous tracking
+				 * history. Recreation must be an explicit bdev_cbt_create. */
 				TAILQ_FOREACH_SAFE(name, &g_bdev_names, link, ntmp) {
 					if (strcmp(name->vbdev_name,
 						   spdk_bdev_get_name(&node->cbt_bdev)) == 0) {
@@ -863,7 +816,6 @@ vbdev_cbt_register(const char *bdev_name)
 
 		/* Ensure chunk_size_blocks is a power of 2 for fast-path shift. */
 		if ((cbt_node->chunk_size_blocks & (cbt_node->chunk_size_blocks - 1)) != 0) {
-			/* Round up to next power of 2. */
 			uint64_t v = cbt_node->chunk_size_blocks;
 			v--;
 			v |= v >> 1; v |= v >> 2; v |= v >> 4;
@@ -1051,9 +1003,8 @@ bdev_cbt_delete_disk(const char *cbt_name,
 			}
 		}
 	} else if (rc == -ENODEV) {
-		/* The bdev doesn't exist (deferred create never completed).
-		 * Clean up the deferred entry from g_bdev_names.
-		 */
+		/* Deferred create never completed: dropping the pending name entry
+		 * is the whole deletion, and it succeeds. */
 		TAILQ_FOREACH(name, &g_bdev_names, link) {
 			if (strcmp(name->vbdev_name, cbt_name) == 0) {
 				TAILQ_REMOVE(&g_bdev_names, name, link);
@@ -1074,6 +1025,16 @@ bdev_cbt_delete_disk(const char *cbt_name,
 /* Public API: epoch operations                                       */
 /* ================================================================== */
 
+/* An epoch marks one backend outage. Protocol: open (the backend is stale, the
+ * live bitmap accumulates) → freeze (the accumulated bits move into the epoch's
+ * frozen bitmap) → get_dirty_ranges and rebuild (copy that frozen delta) →
+ * close, PRESERVE or CONSUMED. Delta preservation rule: a frozen delta that was
+ * exchanged out of the live bitmap and never proven copied by a COMPLETED
+ * rebuild is OR-ed back into the live bitmap before its buffer is discarded —
+ * those chunks exist nowhere else. CONSUMED is the only exception and demands a
+ * verified rebuild token. At most CBT_MAX_EPOCHS epochs coexist; opening past
+ * that evicts only a COMPLETED or INVALID one. */
+
 int
 bdev_cbt_epoch_open(const char *cbt_name, const char *epoch_id,
 		    const char *stale_backend_id, uint64_t generation,
@@ -1089,38 +1050,33 @@ bdev_cbt_epoch_open(const char *cbt_name, const char *epoch_id,
 		return -ENODEV;
 	}
 
-	/* Validate epoch_id length. */
 	if (strlen(epoch_id) >= CBT_EPOCH_ID_MAX) {
 		return -ENAMETOOLONG;
 	}
 	if (strlen(stale_backend_id) >= CBT_BACKEND_ID_MAX) {
 		return -ENAMETOOLONG;
 	}
-	/* 0014.1: the nonce is opaque and optional (pre-0014 callers pass NULL). */
+	/* The nonce is opaque and optional. */
 	if (nonce != NULL && strlen(nonce) >= CBT_NONCE_MAX) {
 		return -ENAMETOOLONG;
 	}
 
-	/* Check if epoch already exists. */
 	ep = cbt_find_epoch(cbt, epoch_id);
 	if (ep) {
 		if (generation > ep->generation) {
-			/* c5 (requalified): a higher-generation takeover must NOT rip the
-			 * epoch away from a rebuild that is scanning/writing its frozen
-			 * bitmap — that corrupts the state machine and opens the CBT-1 UAF.
-			 * Gate on an ACTUALLY-RUNNING rebuild, not on ep->state: a COMPLETED
-			 * rebuild deliberately leaves the epoch in REBUILDING (finalize keeps
-			 * it there), so keying on the state would refuse every later takeover
-			 * forever (cancel_rebuild returns -EINVAL — no running rebuild — so
-			 * the flow would deadlock). */
+			/* A higher-generation takeover must NOT rip the epoch away from a
+			 * rebuild that is scanning or writing its frozen bitmap. Gate on an
+			 * ACTUALLY-RUNNING rebuild, not on ep->state: a completed rebuild
+			 * deliberately leaves the epoch in REBUILDING, so keying on the state
+			 * would refuse every later takeover forever. */
 			if (cbt_rebuild_find_active_for_epoch(cbt, epoch_id) != NULL) {
 				SPDK_ERRLOG("CBT: epoch_open gen=%lu refused: epoch '%s' has an "
 					    "active rebuild\n", (unsigned long)generation, epoch_id);
 				return -EBUSY;
 			}
-			/* Replace with higher generation. 0014.1: the takeover carries the
-			 * NEW round's nonce; 0014.2: `truncated` deliberately survives —
-			 * the bitmap still does not cover a growth zone from a resize. */
+			/* The takeover carries the new round's nonce; truncated deliberately
+			 * survives, since the bitmap still does not cover the growth zone
+			 * left by a resize. */
 			ep->generation = generation;
 			snprintf(ep->stale_backend_id, sizeof(ep->stale_backend_id),
 				 "%s", stale_backend_id);
@@ -1139,11 +1095,10 @@ bdev_cbt_epoch_open(const char *cbt_name, const char *epoch_id,
 		if (!oldest || oldest->state == CBT_EPOCH_FROZEN ||
 		    oldest->state == CBT_EPOCH_REBUILDING ||
 		    oldest->state == CBT_EPOCH_OPEN) {
-			/* Diagnostic (§4.5): a FROZEN/REBUILDING oldest is legitimately in flight.
-			 * But the OLDEST epoch being stuck OPEN means it was opened and then NEVER
-			 * frozen/consumed — the tell-tale of an orchestrator that opened it under a
-			 * stale_backend_id the observer never matches (CP node-id vs observer lvol-id),
-			 * so D7/D8/D9 never engage and the epoch leaks until it wedges opens here. */
+			/* A FROZEN or REBUILDING oldest is legitimately in flight. An oldest
+			 * stuck OPEN was opened and never frozen or consumed — usually an
+			 * orchestrator keying stale_backend_id differently from the observer,
+			 * which leaks the epoch and wedges every later open. */
 			if (oldest && oldest->state == CBT_EPOCH_OPEN) {
 				SPDK_ERRLOG("CBT: max epochs reached, OLDEST epoch '%s' stuck OPEN "
 					    "(stale_backend='%s', never frozen/consumed) — likely an "
@@ -1158,10 +1113,9 @@ bdev_cbt_epoch_open(const char *cbt_name, const char *epoch_id,
 			}
 			return -ENOSPC;
 		}
-		/* C3 (defense-in-depth): with the epoch_invalidate rebuild guard an
-		 * INVALID epoch cannot have a RUNNING rebuild (rebuild_start requires
-		 * FROZEN/REBUILDING), but never free an epoch a rebuild ctx still
-		 * points at — that is a UAF read (ctx->bitmap) AND write (finalize). */
+		/* Never free an epoch a rebuild context still points at: that is a
+		 * use-after-free read of its bitmap and a use-after-free write at
+		 * finalize. */
 		if (cbt_rebuild_find_active_for_epoch(cbt, oldest->epoch_id) != NULL) {
 			SPDK_ERRLOG("CBT: max epochs reached, epoch '%s' has an active "
 				    "rebuild — refusing eviction\n", oldest->epoch_id);
@@ -1170,7 +1124,7 @@ bdev_cbt_epoch_open(const char *cbt_name, const char *epoch_id,
 		/* Safe to evict: COMPLETED or INVALID. */
 		SPDK_WARNLOG("CBT: max epochs reached, evicting '%s'\n",
 			     oldest->epoch_id);
-		/* H1: an INVALID epoch may still hold an unconsumed exchanged delta. */
+		/* An INVALID epoch may still hold an unconsumed exchanged delta. */
 		cbt_epoch_restore_unconsumed_delta(cbt, oldest);
 		TAILQ_REMOVE(&cbt->epochs, oldest, link);
 		cbt->epoch_count--;
@@ -1219,66 +1173,47 @@ bdev_cbt_epoch_freeze(const char *cbt_name, const char *epoch_id)
 	    ep->state != CBT_EPOCH_REBUILDING) {
 		return -EINVAL;
 	}
-	/* CBT-1: a RUNNING rebuild holds ctx->bitmap = ep->bitmap_frozen and scans it
-	 * asynchronously — freeing/reallocating it here is a use-after-free read.
-	 * Same guard start_rebuild already applies, made symmetric. */
+	/* A RUNNING rebuild scans ep->bitmap_frozen asynchronously: freeing or
+	 * reallocating it here is a use-after-free read. */
 	if (cbt_rebuild_find_active_for_epoch(cbt, epoch_id) != NULL) {
 		SPDK_ERRLOG("CBT: epoch_freeze '%s' refused: rebuild in progress\n", epoch_id);
 		return -EBUSY;
 	}
 
-	/* H1: allocate the new snapshot BEFORE touching the old one — an ENOMEM
-	 * must leave the epoch exactly as it was (the old code freed the only
-	 * copy of the previous delta first, so a failed malloc bricked the epoch
-	 * AND lost the un-copied chunks). */
+	/* Allocate the new snapshot BEFORE touching the old one: an ENOMEM must
+	 * leave the epoch exactly as it was, previous delta included. */
 	uint8_t *new_frozen = malloc(cbt->bitmap_size_bytes);
 	if (!new_frozen) {
 		return -ENOMEM;
 	}
 
-	/* H1: re-freeze after a FAILED/ABORTED rebuild — the previous delta was
-	 * exchanged out of the live bitmap and its un-copied chunks exist only in
-	 * the old bitmap_frozen. Merge it back first: the exchange below then
-	 * re-captures (old unconsumed delta ∪ writes since last freeze), which is
-	 * exactly the correct retry set. */
+	/* Re-freeze after a failed or aborted rebuild: merge the previous delta back
+	 * first, so the exchange below re-captures the old unconsumed delta together
+	 * with the writes since the last freeze — exactly the retry set. */
 	if (ep->bitmap_frozen != NULL) {
 		cbt_epoch_restore_unconsumed_delta(cbt, ep);
 		free(ep->bitmap_frozen);
 	}
 	ep->bitmap_frozen = new_frozen;
 
-	/* Snapshot the current bitmap into this epoch.
-	 *
-	 * Thread safety: IO threads write individual bits with atomic OR.
-	 * We read the bitmap here on the app thread. On x86/arm64, each byte
-	 * read is atomic, so we never see a torn byte. Any write that completed
-	 * its IO callback before this function was called is guaranteed to be
-	 * in the snapshot. A write still in flight may have its submit-time bit
-	 * consumed by the exchange below, but that is harmless (H2): the
-	 * completion path RE-marks the bit before acking the host, so the chunk
-	 * either was copied with the new data (write landed before the rebuild
-	 * read) or lands in the next delta (bit re-set in the live bitmap). No
-	 * host-I/O drain is required around freeze. */
+	/* IO threads set bits with atomic OR; this snapshot runs on the app thread
+	 * and a byte read is atomic, so no byte is ever torn. A write still in flight
+	 * may lose its submit-time bit to the exchange below — harmless, the
+	 * completion path re-marks it before acking the host. No host-I/O drain is
+	 * required around freeze. */
 	__atomic_thread_fence(__ATOMIC_ACQUIRE);
 
 	if (!cbt_has_other_active_epoch(cbt, ep)) {
-		/* Snapshot-AND-CLEAR (atomic per-byte exchange): each freeze captures the
-		 * DELTA since the previous freeze, so iterative partial rebuilds converge
-		 * geometrically once copy_rate > dirty_rate. The previous accumulate-only
-		 * semantics recopied the union of everything dirtied since epoch open on
-		 * every iteration — residual was monotonically non-decreasing and the
-		 * convergence loop could not terminate by design.
-		 *
-		 * Exchange (not memcpy+memset): a bit OR'd by an IO thread between the
-		 * copy and the clear would be LOST — a missed chunk under skip_rebuild
-		 * is silent data divergence. The exchange makes each concurrent OR land
-		 * either before (captured in this snapshot) or after (tracked for the
-		 * next delta). */
+		/* Snapshot-AND-CLEAR: each freeze captures the DELTA since the previous
+		 * freeze, so iterative partial rebuilds converge once the copy rate
+		 * exceeds the dirty rate. Per-byte exchange, not memcpy+memset: a bit
+		 * OR-ed by an IO thread between a copy and a clear would be lost, and a
+		 * missed chunk is silent data divergence. */
 		for (uint64_t i = 0; i < cbt->bitmap_size_bytes; i++) {
 			ep->bitmap_frozen[i] =
 				__atomic_exchange_n(&cbt->bitmap[i], 0, __ATOMIC_ACQ_REL);
 		}
-		/* H1: these bits now exist ONLY here until a rebuild COMPLETES. */
+		/* These bits now exist ONLY here until a rebuild COMPLETES. */
 		ep->frozen_live_consumed = true;
 	} else {
 		/* Another epoch still consumes the accumulated live view — snapshot only.
@@ -1323,20 +1258,17 @@ bdev_cbt_epoch_close(const char *cbt_name, const char *epoch_id,
 	if (ep->state == CBT_EPOCH_OPEN) {
 		return -EINVAL;
 	}
-	/* CBT-2: a RUNNING rebuild writes ctx->epoch->bitmap_frozen and
-	 * ctx->epoch->state at completion — freeing the epoch under it is a
-	 * use-after-free WRITE. Cancel the rebuild first. */
+	/* A RUNNING rebuild writes the epoch's frozen bitmap and state at completion:
+	 * freeing the epoch under it is a use-after-free write. Cancel it first. */
 	if (cbt_rebuild_find_active_for_epoch(cbt, epoch_id) != NULL) {
 		SPDK_ERRLOG("CBT: epoch_close '%s' refused: rebuild in progress\n", epoch_id);
 		return -EBUSY;
 	}
 
-	/* 0014.3 (RPC-CONTRACT §4): CONSUMED deliberately discards the frozen delta —
-	 * the caller certifies it was copied by a verified-successful rebuild. The
-	 * certification is the outcome-registry token (0014.5): it must name a LOCAL
-	 * registry entry in state succeeded+verified — `verified` is set by the
-	 * integrated verify phase (0014.8, K sampled windows against the arbiter
-	 * leg). Without that proof: -EPERM, never a silent downgrade to PRESERVE. */
+	/* CONSUMED deliberately discards the frozen delta, so the caller must prove
+	 * the copy happened: the token must name a local rebuild outcome in state
+	 * succeeded and verified. Without that proof, -EPERM — never a silent
+	 * downgrade to PRESERVE. */
 	if (mode == CBT_EPOCH_CLOSE_CONSUMED) {
 		if (rebuild_token == NULL || rebuild_token[0] == '\0') {
 			SPDK_ERRLOG("CBT: epoch_close '%s' mode=consumed refused: no "
@@ -1353,9 +1285,8 @@ bdev_cbt_epoch_close(const char *cbt_name, const char *epoch_id,
 			       "frozen delta discarded by certification\n",
 			       epoch_id, rebuild_token);
 	} else {
-		/* H1: closing an epoch must not lose dirty history. If the frozen delta
-		 * was exchanged out of the live bitmap and never proven copied (rebuild
-		 * aborted/failed/never run), merge it back before discarding. */
+		/* Closing must not lose dirty history: a delta exchanged out of the live
+		 * bitmap and never proven copied is merged back before it is freed. */
 		cbt_epoch_restore_unconsumed_delta(cbt, ep);
 	}
 
@@ -1388,10 +1319,9 @@ bdev_cbt_epoch_invalidate(const char *cbt_name, const char *epoch_id)
 		return -ENOENT;
 	}
 
-	/* C3: same guard as freeze (CBT-1) and close (CBT-2). Invalidating a
-	 * REBUILDING epoch makes it evictable by epoch_open's max-epochs path,
-	 * which would free ep->bitmap_frozen and ep under the RUNNING rebuild —
-	 * UAF read in the chunk scanner, UAF write in finalize. */
+	/* Invalidating a REBUILDING epoch would make it evictable by the max-epochs
+	 * path, freeing the epoch and its frozen bitmap under the RUNNING rebuild.
+	 * Cancel the rebuild first. */
 	if (cbt_rebuild_find_active_for_epoch(cbt, epoch_id) != NULL) {
 		SPDK_ERRLOG("CBT: epoch_invalidate '%s' refused: rebuild in progress "
 			    "(cancel it first)\n", epoch_id);
@@ -1544,12 +1474,9 @@ struct cbt_rebuild_ctx {
 	struct cbt_epoch         *epoch;
 	struct spdk_bdev_desc    *src_desc;
 	struct spdk_bdev_desc    *dst_desc;
-	/* Lifetime pin (UAF guard): `cbt` and `epoch`/`bitmap` are BARE pointers into
-	 * the cbt vbdev, but the rebuild reads its geometry/bitmap on every chunk. A
-	 * base hot-remove unregisters+frees the cbt vbdev; when the read source is the
-	 * cbt bdev itself (default) src_desc already pins it, but with a source_bdev_name
-	 * OVERRIDE nothing did, so the free raced the rebuild. This extra descriptor on
-	 * the cbt bdev makes SPDK defer the cbt destruct until the rebuild's cleanup
+	/* Lifetime pin: cbt, epoch and bitmap below are BARE pointers into the cbt
+	 * vbdev, dereferenced on every chunk, and a base hot-remove frees that vbdev.
+	 * This extra descriptor defers the cbt destruct until the rebuild's cleanup
 	 * closes it. NULL when src_desc already covers the cbt bdev. */
 	struct spdk_bdev_desc    *cbt_pin_desc;
 	struct spdk_io_channel   *src_ch;
@@ -1628,8 +1555,8 @@ cbt_rebuild_find_by_id(const char *rebuild_id)
 	return NULL;
 }
 
-/* New: discriminate by cbt node too — two cbt vbdevs may legitimately use the
- * same epoch_id (the old name-only match made them block each other). */
+/* Matches on the cbt node too: two cbt vbdevs may legitimately use the same
+ * epoch_id, and an id-only match would make them block each other. */
 static struct cbt_rebuild_ctx *
 cbt_rebuild_find_active_for_epoch(const struct vbdev_cbt *cbt, const char *epoch_id)
 {
@@ -1662,8 +1589,8 @@ cbt_rebuild_registry_cleanup(struct cbt_rebuild_ctx *ctx)
 		spdk_bdev_close(ctx->dst_desc);
 	}
 	if (ctx->cbt_pin_desc) {
-		/* Releasing the lifetime pin: lets a cbt destruct deferred by a hot-remove
-		 * finally proceed (see cbt_pin_desc). */
+		/* Releasing the lifetime pin lets a cbt destruct deferred by a hot-remove
+		 * proceed (see cbt_pin_desc). */
 		spdk_bdev_close(ctx->cbt_pin_desc);
 		ctx->cbt_pin_desc = NULL;
 	}
@@ -1745,12 +1672,10 @@ cbt_rebuild_base_event_cb(enum spdk_bdev_event_type type,
 {
 	struct cbt_rebuild_ctx *ctx = event_ctx;
 
-	/* A REMOVE of the source, target, OR the pinned cbt bdev aborts the rebuild.
-	 * Marking aborted stops it at the next chunk boundary; the in-flight I/O
-	 * drains and the terminal path closes every descriptor (including the cbt
-	 * lifetime pin) — only then does a hot-remove-driven cbt destruct proceed.
-	 * When the read source is the cbt bdev itself and no I/O is in flight the old
-	 * "let the I/O fail" heuristic could stall, so set the flag explicitly. */
+	/* A REMOVE of the source, the target or the pinned cbt bdev aborts the
+	 * rebuild: the flag stops it at the next chunk boundary, in-flight I/O drains,
+	 * and the terminal path closes every descriptor including the lifetime pin.
+	 * Set it explicitly — with no I/O in flight, waiting for one to fail stalls. */
 	if (type == SPDK_BDEV_EVENT_REMOVE && ctx != NULL &&
 	    ctx->state == CBT_REBUILD_RUNNING) {
 		SPDK_WARNLOG("CBT rebuild: bdev '%s' removed — aborting\n",
@@ -1759,9 +1684,8 @@ cbt_rebuild_base_event_cb(enum spdk_bdev_event_type type,
 	}
 }
 
-/* Maximum number of chunks to coalesce into a single I/O.
- * 16 chunks × 64KB = 1 MiB max I/O size — sweet spot for NVMe-oF TCP.
- */
+/* Maximum number of chunks coalesced into one I/O: with the default 64 KB chunk
+ * this caps a rebuild I/O at 1 MiB, which suits NVMe-oF TCP. */
 #define CBT_REBUILD_MAX_COALESCE_CHUNKS  16
 
 /* Find the next contiguous run of dirty bits starting from ctx->current_bit.
@@ -1776,7 +1700,6 @@ cbt_rebuild_find_next_dirty_run(struct cbt_rebuild_ctx *ctx,
 	uint64_t start;
 	uint64_t run;
 
-	/* Find first dirty bit. */
 	while (ctx->current_bit < total) {
 		uint64_t byte_idx = ctx->current_bit >> 3;
 		uint8_t byte_val = bmap[byte_idx];
@@ -1799,7 +1722,6 @@ found_start:
 	run = 1;
 	ctx->current_bit++;
 
-	/* Extend the run while consecutive bits are dirty, up to max coalesce. */
 	while (run < CBT_REBUILD_MAX_COALESCE_CHUNKS && ctx->current_bit < total) {
 		uint64_t byte_idx = ctx->current_bit >> 3;
 		uint8_t bit_pos = ctx->current_bit & 7;
@@ -1835,7 +1757,8 @@ cbt_rebuild_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	struct cbt_rebuild_ctx *ctx = cb_arg;
 	struct cbt_rebuild_io_slot *slot = NULL;
 
-	/* Find which slot this write belongs to by matching the buffer. */
+	/* The slot is identified by its DMA buffer — the bdev_io carries no back
+	 * pointer to it. */
 	for (int i = 0; i < ctx->num_slots; i++) {
 		if (ctx->slots[i].in_use && ctx->slots[i].buf == bdev_io->iov.iov_base) {
 			slot = &ctx->slots[i];
@@ -1850,7 +1773,6 @@ cbt_rebuild_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 		ctx->error = -EIO;
 		ctx->aborted = true;
 	} else if (slot) {
-		/* Instrumentation: write latency */
 		uint64_t write_tsc = spdk_get_ticks() - slot->write_start_tsc;
 		ctx->total_write_tsc += write_tsc;
 		if (write_tsc > ctx->max_write_tsc) {
@@ -1883,7 +1805,6 @@ cbt_rebuild_read_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	struct cbt_rebuild_io_slot *slot = NULL;
 	int rc;
 
-	/* Find the slot. */
 	for (int i = 0; i < ctx->num_slots; i++) {
 		if (ctx->slots[i].in_use && ctx->slots[i].buf == bdev_io->iov.iov_base) {
 			slot = &ctx->slots[i];
@@ -1906,14 +1827,12 @@ cbt_rebuild_read_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 		return;
 	}
 
-	/* Instrumentation: read latency */
 	uint64_t read_tsc = spdk_get_ticks() - slot->read_start_tsc;
 	ctx->total_read_tsc += read_tsc;
 	if (read_tsc > ctx->max_read_tsc) {
 		ctx->max_read_tsc = read_tsc;
 	}
 
-	/* Write the data to the target bdev. */
 	slot->write_start_tsc = spdk_get_ticks();
 	rc = spdk_bdev_write(ctx->dst_desc, ctx->dst_ch,
 			     slot->buf,
@@ -1938,18 +1857,15 @@ cbt_rebuild_throttle_poller_fn(void *arg)
 	uint64_t now = spdk_get_ticks();
 	uint64_t elapsed_us = (now - ctx->window_start_tsc) * 1000000 / cbt_get_tsc_hz();
 
-	/* Reset window every second. */
+	/* The bandwidth budget is per one-second window. */
 	if (elapsed_us >= 1000000) {
 		ctx->bytes_this_window = 0;
 		ctx->window_start_tsc = now;
 		if (ctx->throttled) {
 			ctx->throttled = false;
-			/* R10: on the legacy path cbt_rebuild_submit_next may drain the last
-			 * outstanding I/O and free(ctx) (submit_next → finish → finalize →
-			 * TAILQ_REMOVE + free). Do NOT dereference ctx afterward. We un-throttled
-			 * and drove work, so report BUSY without touching ctx; finalize already
-			 * unregistered this poller, so the return value is only ever consumed
-			 * while ctx is still alive. */
+			/* submit_next may drain the last outstanding I/O and free ctx, so do
+			 * NOT dereference ctx after this call. Returning BUSY is safe:
+			 * finalize has already unregistered this poller. */
 			cbt_rebuild_submit_next(ctx);
 			return SPDK_POLLER_BUSY;
 		}
@@ -1972,7 +1888,6 @@ cbt_rebuild_submit_next(struct cbt_rebuild_ctx *ctx)
 
 	while (!ctx->aborted && !ctx->cancelled &&
 	       ctx->outstanding_ios < ctx->max_outstanding) {
-		/* Bandwidth throttle check. */
 		if (ctx->max_bytes_per_sec > 0 &&
 		    ctx->bytes_this_window >= ctx->max_bytes_per_sec) {
 			ctx->throttled = true;
@@ -1986,7 +1901,6 @@ cbt_rebuild_submit_next(struct cbt_rebuild_ctx *ctx)
 			break;
 		}
 
-		/* Get next chunk(s) to copy. */
 		if (ctx->override_ranges) {
 			if (!cbt_rebuild_find_next_range(ctx, &offset_blocks, &length_blocks)) {
 				goto done_scanning;
@@ -2027,7 +1941,6 @@ cbt_rebuild_submit_next(struct cbt_rebuild_ctx *ctx)
 		}
 	}
 
-	/* If no outstanding IOs and we're done or aborted, finish. */
 	if (ctx->outstanding_ios == 0) {
 		cbt_rebuild_finish(ctx);
 	}
@@ -2056,17 +1969,15 @@ cbt_rebuild_flush_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	cbt_rebuild_finalize(ctx);
 }
 
-/* CBT-4: all chunk writes landed — FLUSH the target before declaring the rebuild
- * COMPLETED. Without it the copied chunks may sit in a volatile write cache; a
- * power cut then leaves a lacunary member that the control-plane believes synced. */
+/* Once every chunk write has landed, FLUSH the target before declaring the
+ * rebuild COMPLETED: otherwise the copied chunks may sit in a volatile write
+ * cache and a power cut leaves a member the control-plane believes synced. */
 static void
 cbt_rebuild_finish(struct cbt_rebuild_ctx *ctx)
 {
-	/* M1: !aborted — a hot-remove abort must reach finalize with error == 0
-	 * so R1 classifies it ABORTED (resumable), not FAILED. Flushing the
-	 * (possibly removed) target here would fail, overwrite the
-	 * classification, and durability of a partial copy is moot anyway: the
-	 * resume re-copies from the merged-back delta (H1). */
+	/* No flush on an aborted run: it must reach finalize with error == 0 so it
+	 * classifies ABORTED (resumable) rather than FAILED, and durability of a
+	 * partial copy is moot since the resume re-copies the merged-back delta. */
 	if (ctx->error == 0 && !ctx->cancelled && !ctx->aborted &&
 	    ctx->chunks_copied > 0 &&
 	    ctx->dst_desc != NULL && ctx->dst_ch != NULL) {
@@ -2101,9 +2012,9 @@ cbt_rebuild_finalize(struct cbt_rebuild_ctx *ctx)
 	result.bytes_copied = ctx->bytes_copied;
 	result.duration_ms = elapsed_tsc * 1000 / hz;
 	result.error = ctx->error;
-	/* R1: an ABORTED rebuild (hot-remove mid-flight) is neither a success nor a
-	 * plain I/O error. It must NOT report completed, or the control-plane marks the
-	 * member fully synced after a mid-rebuild abort → silent under-replication. */
+	/* An ABORTED rebuild is neither a success nor a plain I/O error: it must NOT
+	 * report completed, or the control-plane treats a partially copied member as
+	 * fully synced. */
 	result.completed = (ctx->error == 0 && !ctx->cancelled && !ctx->aborted);
 
 	/* ── Instrumentation report ── */
@@ -2134,12 +2045,10 @@ cbt_rebuild_finalize(struct cbt_rebuild_ctx *ctx)
 		       (unsigned long)(result.bytes_copied / 1024 / 1024 * 1000 /
 				       result.duration_ms) : 0);
 
-	/* Compute residual dirty ratio on successful completion. */
 	if (result.completed && ctx->cbt->bitmap_size_bits > 0) {
-		/* H1: every chunk of the exchanged delta is now proven copied — the
-		 * frozen buffer no longer holds the only copy of anything, and the
-		 * memcpy below repurposes it as a residual snapshot of the live
-		 * bitmap. It must NOT be merged back on a later discard. */
+		/* Every chunk of the exchanged delta is now proven copied. Clear the flag
+		 * before the memcpy below repurposes the buffer as a residual snapshot of
+		 * the live bitmap, so a later discard does not merge stale bits back. */
 		ctx->epoch->frozen_live_consumed = false;
 		__atomic_thread_fence(__ATOMIC_ACQUIRE);
 		memcpy(ctx->epoch->bitmap_frozen, ctx->cbt->bitmap,
@@ -2150,18 +2059,17 @@ cbt_rebuild_finalize(struct cbt_rebuild_ctx *ctx)
 					      (double)ctx->cbt->bitmap_size_bits;
 	}
 
-	/* Transition epoch to REBUILDING state (keep it there). */
+	/* A finished rebuild deliberately LEAVES the epoch in REBUILDING; only close
+	 * takes it out. The generation-takeover guard relies on this. */
 	if (ctx->epoch->state == CBT_EPOCH_FROZEN) {
 		ctx->epoch->state = CBT_EPOCH_REBUILDING;
 	}
 
-	/* Cleanup I/O resources. */
 	cbt_rebuild_registry_cleanup(ctx);
 
-	/* ── Finalize state for the registry ──
-	 * R1: order matters. An I/O failure sets BOTH error and aborted (read/write_cb),
-	 * so check error before aborted → it maps to FAILED. A hot-remove abort sets
-	 * ONLY aborted (error == 0) → ABORTED. Neither is COMPLETED. */
+	/* Order matters: an I/O failure sets BOTH error and aborted, so error is
+	 * tested first and maps to FAILED; a hot-remove abort sets only aborted and
+	 * maps to ABORTED. Neither is COMPLETED. */
 	if (ctx->cancelled) {
 		ctx->state = CBT_REBUILD_CANCELLED;
 	} else if (ctx->error != 0) {
@@ -2174,28 +2082,22 @@ cbt_rebuild_finalize(struct cbt_rebuild_ctx *ctx)
 	ctx->final_result = result;
 	ctx->completion_tsc = spdk_get_ticks();
 
-	/* Invoke completion callback (legacy fire-and-wait path). */
 	if (ctx->cb_fn) {
 		ctx->cb_fn(ctx->cb_arg, &result);
 	}
 
-	/* If this is the legacy path (has cb_fn, no rebuild_id), remove from
-	 * registry and free immediately. Async entries stay for get_status.
-	 */
+	/* Legacy path (no rebuild_id): free the context now. An async context stays
+	 * in the registry to answer get_status until the GC poller reclaims it. */
 	if (ctx->rebuild_id[0] == '\0') {
 		TAILQ_REMOVE(&g_rebuild_registry, ctx, registry_link);
 		free(ctx);
 	}
-	/* else: ctx stays in g_rebuild_registry for get_status queries.
-	 * GC poller will free it after CBT_REBUILD_GC_DELAY_US.
-	 */
 }
 
-/* Shared engine start for both the legacy (deferred-response) and async
- * (rebuild_id) paths. rebuild_id, when non-NULL, is stamped on the context
- * BEFORE the first I/O can complete — a zero-dirty bitmap finishes
- * SYNCHRONOUSLY, and the old tag-after-return dance freed the context before
- * the id was set (get_rebuild_status then returned -ENOENT forever). */
+/* Shared engine for the legacy (deferred-response) and async (rebuild_id) paths.
+ * rebuild_id is stamped on the context BEFORE the first I/O: a zero-dirty bitmap
+ * finishes synchronously, so a context tagged after return would already be gone
+ * and get_rebuild_status would answer -ENOENT forever. */
 static int
 cbt_rebuild_start(const char *cbt_name, const char *epoch_id,
 		  const char *target_bdev_name,
@@ -2229,13 +2131,12 @@ cbt_rebuild_start(const char *cbt_name, const char *epoch_id,
 	if (!ep->bitmap_frozen) {
 		return -EINVAL;
 	}
-	/* New: the legacy RPC path had NO anti-double-rebuild guard — two concurrent
-	 * rebuilds would share ep->bitmap_frozen. One rebuild per (cbt, epoch). */
+	/* One rebuild per (cbt, epoch): two concurrent rebuilds would share
+	 * ep->bitmap_frozen. */
 	if (cbt_rebuild_find_active_for_epoch(cbt, epoch_id) != NULL) {
 		return -EBUSY;
 	}
 
-	/* Validate queue_depth. */
 	if (queue_depth == 0) {
 		queue_depth = CBT_REBUILD_DEFAULT_QD;
 	}
@@ -2243,7 +2144,6 @@ cbt_rebuild_start(const char *cbt_name, const char *epoch_id,
 		queue_depth = CBT_REBUILD_MAX_QD;
 	}
 
-	/* Allocate rebuild context. */
 	ctx = calloc(1, sizeof(*ctx));
 	if (!ctx) {
 		return -ENOMEM;
@@ -2260,12 +2160,10 @@ cbt_rebuild_start(const char *cbt_name, const char *epoch_id,
 	ctx->window_start_tsc = ctx->start_tsc;
 	ctx->bitmap = ep->bitmap_frozen;
 	if (rebuild_id != NULL) {
-		/* Stamp the id NOW (see function comment): a synchronous finish must
-		 * already see it so the ctx survives in the registry for get_status. */
+		/* Stamp the id now: a synchronous finish must already see it. */
 		snprintf(ctx->rebuild_id, sizeof(ctx->rebuild_id), "%s", rebuild_id);
 	}
 
-	/* Copy override ranges if provided. */
 	if (override_ranges && num_ranges > 0) {
 		ctx->override_ranges = calloc(num_ranges, sizeof(*ctx->override_ranges));
 		if (!ctx->override_ranges) {
@@ -2277,9 +2175,7 @@ cbt_rebuild_start(const char *cbt_name, const char *epoch_id,
 		ctx->num_ranges = num_ranges;
 	}
 
-	/* Open source bdev. Use source_bdev_name override if provided,
-	 * otherwise default to the CBT bdev itself (reads go to base/RAID).
-	 */
+	/* Without a source override, reads go through the CBT bdev itself. */
 	src_name = source_bdev_name ? source_bdev_name :
 		   spdk_bdev_get_name(&cbt->cbt_bdev);
 	rc = spdk_bdev_open_ext(src_name, false,
@@ -2290,11 +2186,9 @@ cbt_rebuild_start(const char *cbt_name, const char *epoch_id,
 		return rc;
 	}
 
-	/* UAF guard: pin the cbt vbdev's lifetime for the whole rebuild. `ctx->cbt`
-	 * / `ctx->epoch` / `ctx->bitmap` are bare pointers into it, dereferenced on
-	 * every chunk; a base hot-remove would otherwise free the cbt vbdev underneath
-	 * a running rebuild. When the read source IS the cbt bdev, src_desc already
-	 * pins it — only a source override needs a dedicated pin descriptor. */
+	/* Pin the cbt vbdev for the whole rebuild (see cbt_pin_desc). When the read
+	 * source IS the cbt bdev, src_desc already pins it — only a source override
+	 * needs a dedicated descriptor. */
 	if (strcmp(src_name, spdk_bdev_get_name(&cbt->cbt_bdev)) != 0) {
 		rc = spdk_bdev_open_ext(spdk_bdev_get_name(&cbt->cbt_bdev), false,
 					cbt_rebuild_base_event_cb, ctx, &ctx->cbt_pin_desc);
@@ -2306,7 +2200,6 @@ cbt_rebuild_start(const char *cbt_name, const char *epoch_id,
 		}
 	}
 
-	/* Open target bdev. */
 	rc = spdk_bdev_open_ext(target_bdev_name, true,
 				cbt_rebuild_base_event_cb, ctx, &ctx->dst_desc);
 	if (rc != 0) {
@@ -2317,7 +2210,6 @@ cbt_rebuild_start(const char *cbt_name, const char *epoch_id,
 		return rc;
 	}
 
-	/* Get IO channels. */
 	ctx->src_ch = spdk_bdev_get_io_channel(ctx->src_desc);
 	ctx->dst_ch = spdk_bdev_get_io_channel(ctx->dst_desc);
 	if (!ctx->src_ch || !ctx->dst_ch) {
@@ -2331,10 +2223,8 @@ cbt_rebuild_start(const char *cbt_name, const char *epoch_id,
 		return -ENOMEM;
 	}
 
-	/* Allocate DMA buffer slots.
-	 * Each slot must hold up to CBT_REBUILD_MAX_COALESCE_CHUNKS chunks
-	 * to support I/O coalescing (e.g., 16 × 64KB = 1 MiB per slot).
-	 */
+	/* Each DMA slot must hold a fully coalesced I/O, so it is sized for
+	 * CBT_REBUILD_MAX_COALESCE_CHUNKS chunks. */
 	chunk_bytes = (uint64_t)cbt->chunk_size_blocks * cbt->cbt_bdev.blocklen *
 		      CBT_REBUILD_MAX_COALESCE_CHUNKS;
 	ctx->slots = calloc((size_t)ctx->num_slots, sizeof(*ctx->slots));
@@ -2352,7 +2242,6 @@ cbt_rebuild_start(const char *cbt_name, const char *epoch_id,
 	for (int i = 0; i < ctx->num_slots; i++) {
 		ctx->slots[i].buf = spdk_dma_malloc(chunk_bytes, 4096, NULL);
 		if (!ctx->slots[i].buf) {
-			/* Free already allocated. */
 			for (int j = 0; j < i; j++) {
 				spdk_dma_free(ctx->slots[j].buf);
 			}
@@ -2368,7 +2257,6 @@ cbt_rebuild_start(const char *cbt_name, const char *epoch_id,
 		}
 	}
 
-	/* Start bandwidth throttle poller if needed. */
 	if (ctx->max_bytes_per_sec > 0) {
 		ctx->throttle_poller = SPDK_POLLER_REGISTER(
 			cbt_rebuild_throttle_poller_fn, ctx, 100000); /* 100ms */
@@ -2378,7 +2266,6 @@ cbt_rebuild_start(const char *cbt_name, const char *epoch_id,
 	ctx->total_dirty_chunks = cbt_count_dirty_bits(ep->bitmap_frozen,
 						       cbt->bitmap_size_bytes);
 
-	/* Register in the rebuild registry. */
 	ctx->state = CBT_REBUILD_RUNNING;
 	TAILQ_INSERT_TAIL(&g_rebuild_registry, ctx, registry_link);
 
@@ -2396,7 +2283,6 @@ cbt_rebuild_start(const char *cbt_name, const char *epoch_id,
 		       (unsigned long)max_bw_mb_sec,
 		       CBT_REBUILD_MAX_COALESCE_CHUNKS);
 
-	/* Kick off the first batch. */
 	cbt_rebuild_submit_next(ctx);
 	return 0;
 }
@@ -2431,9 +2317,8 @@ bdev_cbt_start_rebuild(const char *cbt_name, const char *epoch_id,
 
 	assert(spdk_get_thread() == spdk_thread_get_app_thread());
 
-	/* Generate the rebuild_id FIRST: cbt_rebuild_start stamps it on the context
-	 * before any I/O, so even a synchronous finish (zero dirty chunks) leaves a
-	 * queryable registry entry (the old post-hoc tagging raced exactly that). */
+	/* Generate the id FIRST: the engine stamps it on the context before any I/O,
+	 * so even a synchronous finish (zero dirty chunks) leaves a queryable entry. */
 	id = ++g_rebuild_id_counter;
 	snprintf(out_rebuild_id, CBT_REBUILD_ID_MAX, "rebuild-%lu", (unsigned long)id);
 
@@ -2441,8 +2326,8 @@ bdev_cbt_start_rebuild(const char *cbt_name, const char *epoch_id,
 			       source_bdev_name, max_bw_mb_sec,
 			       queue_depth, NULL, 0, out_rebuild_id, NULL, NULL);
 	if (rc != 0) {
-		/* No rebuild was created — clear the pre-stamped id so a caller that
-		 * ignores rc cannot query/persist a phantom "rebuild-N". */
+		/* No rebuild was created: clear the pre-stamped id so a caller that
+		 * ignores rc cannot query or persist a phantom one. */
 		out_rebuild_id[0] = '\0';
 		return rc;
 	}
@@ -2502,17 +2387,13 @@ bdev_cbt_update_rebuild_options(const char *rebuild_id,
 		return -EINVAL;
 	}
 
-	/* Update bandwidth limit — takes effect at next window reset.
-	 * 0 = no change (field omitted in JSON). To set unlimited, use a
-	 * very large value. Non-zero = limit in MB/s.
-	 */
+	/* Limit in MB/s; 0 means "omitted", so no change — unlimited is expressed by
+	 * a very large value. Takes effect at the next window reset. */
 	if (max_bw_mb_sec > 0) {
 		ctx->max_bytes_per_sec = max_bw_mb_sec * 1024 * 1024;
 	}
 
-	/* Update queue depth — takes effect immediately in submit_next.
-	 * 0 = no change (field omitted in JSON).
-	 */
+	/* 0 means "omitted", so no change. Takes effect immediately in submit_next. */
 	if (queue_depth > 0 && queue_depth <= CBT_REBUILD_MAX_QD) {
 		ctx->max_outstanding = (int)queue_depth;
 	}
@@ -2538,10 +2419,8 @@ bdev_cbt_cancel_rebuild(const char *rebuild_id, uint64_t *out_chunks_copied)
 		return -EINVAL;
 	}
 
-	/* Set cancelled flag — submit_next will stop issuing new I/Os.
-	 * In-flight I/Os will complete normally, then cbt_rebuild_finish
-	 * will be called from write_cb when outstanding_ios reaches 0.
-	 */
+	/* submit_next stops issuing new I/Os; the in-flight ones complete normally
+	 * and the last completion runs the terminal path. */
 	ctx->cancelled = true;
 	*out_chunks_copied = ctx->chunks_copied;
 
@@ -2590,9 +2469,8 @@ bdev_cbt_reset(const char *cbt_name)
 		return -ENODEV;
 	}
 
-	/* Refuse reset while any epoch is active — it would destroy
-	 * the delta needed for partial rebuild.
-	 */
+	/* Refuse while any epoch is active: the reset would destroy the delta a
+	 * partial rebuild needs. */
 	if (cbt_any_epoch_open(cbt)) {
 		SPDK_ERRLOG("CBT: cannot reset '%s' — active epochs exist\n", cbt_name);
 		return -EBUSY;

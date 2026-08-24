@@ -13,39 +13,24 @@ index c90b4a2..d381b3b 100644
  C_SRCS += raid5f.c
 diff --git a/module/bdev/raid/bdev_raid_verify_ranges.c b/module/bdev/raid/bdev_raid_verify_ranges.c
 new file mode 100644
-index 0000000..cca7fc4
+index 0000000..bb8fb73
 --- /dev/null
 +++ b/module/bdev/raid/bdev_raid_verify_ranges.c
-@@ -0,0 +1,857 @@
+@@ -0,0 +1,830 @@
 +/*   SPDX-License-Identifier: BSD-3-Clause
 + *   Copyright (C) 2026 Evariops.
 + *   All rights reserved.
 + */
 +
-+/* Evariops 0014.12 + SPEC-75G F-b (spdk-csi RPC-CONTRACT §10b):
-+ * bdev_raid_verify_ranges — the EXHAUSTIVE divergence detector (the
-+ * integrated verify phase, §10a, is the probabilistic one). Two modes,
-+ * selected by the raid level:
-+ *
-+ *  - raid1 (copy-compare): compares the first configured leg (implicit
-+ *    arbiter) against every other configured leg, chunk by chunk.
-+ *  - raid5f (syndrome, SPEC-75G F-b): recomputes the RAID-5 consistency
-+ *    relation per stripe — the XOR of all k+1 members' strips must be
-+ *    zero (see the syndrome section below). Requires EVERY member
-+ *    readable (-EAGAIN otherwise: with m = 1 there is no redundancy left
-+ *    to check against — repair first, verify after).
-+ *
-+ * Each chunk runs under a channel-owned LBA lock (host writes overlapping
-+ * the chunk are held and replayed — patch 0008 discipline). It REPORTS
-+ * divergent ranges and never repairs: arbitration is the control plane's
-+ * (mirror: R >= 3 vote, or DivergenceUnarbitrated at R == 2 — T-D2;
-+ * raid5f: re-fold the stripe from its source, or EcContentDivergence).
-+ *
-+ * Pacing: the `verify` envelope class (0014.9), frozen at dispatch. The
-+ * caller drives bounded batches and re-drives the tail, exactly like
-+ * bdev_raid_rebuild_ranges. Progress and the terminal state are mirrored in
-+ * the rebuild-outcome registry under the request token (observability; a
-+ * zero-divergence completion seals succeeded+verified). */
++/* Evariops 0014: bdev_raid_verify_ranges — the exhaustive divergence detector,
++ * in two modes selected by the raid level. raid1 (copy-compare) compares the
++ * first configured leg, the implicit arbiter, against every other configured
++ * leg chunk by chunk; raid5f (syndrome) recomputes the RAID-5 consistency
++ * relation per stripe and needs EVERY member readable (-EAGAIN otherwise).
++ * Each chunk runs under a channel-owned LBA lock, so host writes overlapping
++ * it are held and replayed. It REPORTS divergent ranges and NEVER repairs:
++ * arbitration belongs to the control plane. Paced by the verify envelope; the
++ * caller drives bounded batches and re-drives the tail. */
 +
 +#include "bdev_raid.h"
 +#include "bdev_raid_outcomes.h"
@@ -58,8 +43,8 @@ index 0000000..cca7fc4
 +#include "spdk/string.h"
 +#include "spdk/thread.h"
 +#include "spdk/util.h"
-+/* spdk_bdev_lock_lba_range comes from spdk/bdev_module.h (patch 0008), which
-+ * bdev_raid.h already includes. */
++/* spdk_bdev_lock_lba_range comes from spdk/bdev_module.h, which bdev_raid.h
++ * already includes. */
 +
 +#define RAID_VERIFY_CHUNK_BLOCKS	2048u	/* 1 MiB @ 512B, like repair */
 +#define RAID_VERIFY_MAX_RANGES		4096u
@@ -162,8 +147,8 @@ index 0000000..cca7fc4
 +			spdk_json_write_object_end(w);
 +		}
 +		spdk_json_write_array_end(w);
-+		/* Silent-cap honesty: the caller must know when the report is
-+		 * truncated (the count is still exact). */
++		/* The range list is capped; the caller must know when it is truncated.
++		 * divergent_blocks stays exact either way. */
 +		spdk_json_write_named_bool(w, "divergent_ranges_truncated",
 +					   c->divergent_blocks > 0 &&
 +					   c->num_divergent == RAID_VERIFY_MAX_REPORTED);
@@ -346,26 +331,15 @@ index 0000000..cca7fc4
 +	}
 +}
 +
-+/* ── raid5f syndrome mode (SPEC-75G F-b) ─────────────────────────────────
-+ * Mirror legs are copies; raid5f members hold DISTINCT strips, so equality
-+ * is meaningless there. The checkable invariant is the RAID-5 consistency
-+ * relation itself: parity == XOR of the k data strips, i.e. the XOR of ALL
-+ * k+1 members' strips is zero for every stripe — whichever member holds
-+ * the rotating parity (the rotation is irrelevant to the check). Every
-+ * member stores stripe S's strip at member LBA S × strip_size
-+ * (raid5f_chunk_submit), so the walk needs only generic raid_bdev geometry
-+ * — no raid5f internals, no parity-position math.
-+ *
-+ * The strip is accumulated in bounded sub-reads (≤ RAID_VERIFY_CHUNK_BLOCKS)
-+ * so memory stays two buffers whatever the strip size: buf_arb is the XOR
-+ * accumulator, buf_leg the per-member read scratch. Strictly QD=1.
-+ *
-+ * All members must stay readable: a member read error or a membership
-+ * change mid-walk aborts with -EAGAIN — with m = 1 a stripe missing one
-+ * strip has nothing left to check against; the contract is repair first
-+ * (rebuild_ranges 0008 / process), verify after. Divergence is reported
-+ * per STRIPE in raid LBA space; like the mirror mode this REPORTS and
-+ * never repairs. */
++/* ── raid5f syndrome mode ────────────────────────────────────────────────
++ * raid5f members hold DISTINCT strips, so leg equality means nothing here.
++ * The checkable invariant is the RAID-5 relation: for every stripe the XOR
++ * of all k+1 member strips is zero, whichever member holds the rotating
++ * parity. Stripe S lives at member LBA S × strip_size, so the walk needs
++ * only generic raid geometry — no raid5f internals. A strip is accumulated
++ * in sub-reads of at most RAID_VERIFY_CHUNK_BLOCKS (buf_arb accumulates the
++ * XOR, buf_leg is the read scratch), QD=1. An unreadable member aborts with
++ * -EAGAIN: repair first, verify after. Divergence is reported per STRIPE. */
 +
 +static void raid_verify_syndrome_next_member(struct raid_verify_ctx *c);
 +
@@ -405,8 +379,7 @@ index 0000000..cca7fc4
 +	spdk_bdev_free_io(bdev_io);
 +	if (!success) {
 +		/* A present member failed to read: the stripe cannot be
-+		 * syndrome-checked and the raid needs REPAIR, not a retry
-+		 * here — same contract as degraded-at-entry. */
++		 * syndrome-checked and the raid needs REPAIR, not a retry here. */
 +		SPDK_ERRLOG("raid verify: '%s' member '%s' read failed in stripe %" PRIu64
 +			    " — repair first\n", c->raid_bdev->bdev.name,
 +			    c->raid_bdev->base_bdev_info[c->leg_slot].name,
@@ -707,8 +680,8 @@ index 0000000..cca7fc4
 +	syndrome = raid_bdev->level == RAID5F;
 +	if (syndrome &&
 +	    (raid_bdev->bdev.md_len != 0 || raid_bdev->bdev.blocklen % sizeof(uint64_t) != 0)) {
-+		/* EcImage chunks are plain lvols; interleaved metadata would
-+		 * need md-aware parity accounting — honest bound, not a TODO. */
++		/* Interleaved metadata would need md-aware parity accounting:
++		 * plain data bdevs only. */
 +		spdk_jsonrpc_send_error_response(request, -ENOTSUP,
 +						 "raid5f syndrome verify supports plain data bdevs only");
 +		goto cleanup;
@@ -729,8 +702,8 @@ index 0000000..cca7fc4
 +		}
 +	}
 +	if (syndrome) {
-+		/* m = 1: with any member unreadable there is no redundancy
-+		 * left to check against — repair first (0008), verify after. */
++		/* With any member unreadable there is no redundancy left to
++		 * check against — repair first, verify after. */
 +		if (configured != raid_bdev->num_base_bdevs) {
 +			spdk_jsonrpc_send_error_response_fmt(request, -EAGAIN,
 +							     "syndrome verify requires all %u members readable "
@@ -783,9 +756,9 @@ index 0000000..cca7fc4
 +							     "range %u is empty or exceeds the raid size", i);
 +			goto cleanup;
 +		}
-+		/* Syndrome walks whole stripes — 0008's alignment discipline,
-+		 * validated up front. (The whole-device default is aligned by
-+		 * construction: blockcnt = total_stripes × stripe_blocks.) */
++		/* Syndrome walks whole stripes, so ranges must be stripe-aligned.
++		 * (The whole-device default is aligned by construction:
++		 * blockcnt = total_stripes × stripe_blocks.) */
 +		if (syndrome && (range->start_lba % stripe_blocks != 0 ||
 +				 range->num_blocks % stripe_blocks != 0)) {
 +			spdk_jsonrpc_send_error_response_fmt(request,
@@ -835,7 +808,7 @@ index 0000000..cca7fc4
 +		goto cleanup;
 +	}
 +
-+	/* Pacing under the verify envelope, frozen now (0014.9 discipline). */
++	/* Freeze the verify envelope now: the rate does not change under the scan. */
 +	verify_mb_sec = raid_envelope_active_mb_sec(RAID_ENVELOPE_VERIFY);
 +	if (verify_mb_sec != 0) {
 +		c->bytes_per_tsc = verify_mb_sec * 1024 * 1024.0 / spdk_get_ticks_hz();
@@ -853,7 +826,7 @@ index 0000000..cca7fc4
 +	c->outcome = raid_rebuild_outcome_open(token, req.name, "(verify_ranges)");
 +	raid_rebuild_outcome_set_verifying(c->outcome);
 +
-+	/* SEC1 audit (0011 discipline): long-lived reader holding LBA locks. */
++	/* Audit trail: this is a long-lived reader holding LBA locks. */
 +	snprintf(detail, sizeof(detail), "raid=%s ranges=%zu mode=%s", req.name,
 +		 req.num_ranges, syndrome ? "syndrome" : "copy-compare");
 +	spdk_jsonrpc_request_audit(request, "bdev_raid_verify_ranges", detail);

@@ -1,59 +1,59 @@
 # Evariops SPDK patches
 
 Out-of-tree patches applied on top of upstream SPDK during the container build
-(`images/spdk/Dockerfile`). They add the primitives the SPEC-73 tiering
-data-plane and the SPEC-66 group-snapshot barrier need, and harden a few
-upstream paths. The two out-of-tree bdev **modules** (`module/bdev/cbt`,
-`module/bdev/tier`) are copied in whole, not patched.
+(`images/spdk/Dockerfile`). They add the primitives the tiering data plane and
+the group-snapshot barrier need, and harden a few upstream paths. The two
+out-of-tree bdev **modules** (`module/bdev/cbt`, `module/bdev/tier`) are copied
+in whole, not patched.
 
-## Application order (U-5/U-6)
+## Application order
 
-Patches are applied in **lexicographic order of filename** (`0001` … `0012`) —
+Patches are applied in **lexicographic order of filename** (`0001` … `0040`) —
 the Dockerfile globs `patches/*.patch` and `git apply`s each. The numeric prefix
 IS the contract; do not rely on any other ordering. Order matters:
 
 | # | Patch | Touches | Depends on |
 |--:|:------|:--------|:-----------|
-| 0001 | raid skip_rebuild | bdev_raid | — |
-| 0002 | lvol get_allocated_ranges | bdev_lvol | — |
-| 0003 | nvmf pause/resume | lib/nvmf | 0011 (audit hook) |
-| 0004 | blob relocate primitives + freeze_io | lib/blob | — |
-| 0005 | lvol placement/relocate/remap RPCs | bdev_lvol, module/bdev/tier | 0004, 0011, tier module |
-| 0006 | raid5f degraded-read | bdev_raid | — |
-| 0007 | raid nexus heat | bdev_raid | — |
-| 0008 | raid rebuild_ranges + full_stripe_blocks (C3) | bdev_raid, lib/bdev (lock_lba_range) | 0006, 0011 |
-| 0009 | ENOSPC → CAPACITY_EXCEEDED | bdev_lvol, bdev_raid | — |
-| 0010 | rpc socket chmod 0600 | lib/rpc | — |
-| 0011 | jsonrpc SO_PEERCRED audit hook (SEC1) | lib/jsonrpc | — |
-| 0012 | lvol shutdown-unload observability | bdev_lvol | — |
-| 0013 | raid1 seeded rebuild (write_only attach + range-seeded backfill) | bdev_raid | 0001, 0008, 0011 |
-| 0014 | raid incarnation identity + `expected_incarnation` ⇒ -ESTALE (GCCP 0014.4) | bdev_raid | 0013 |
-| 0015 | raid rebuild-outcome registry + CANCELED contract + `bdev_raid_get_rebuild_outcomes` (GCCP 0014.5) | bdev_raid (adds `bdev_raid_outcomes.{c,h}`); `module/bdev/cbt` consults it for `epoch_close(consumed)` | 0013, 0014 |
-| 0016 | raid extended superblock — per-member `content_generation`/`view_epoch`, same-transaction (GCCP 0014.7, V-2) | bdev_raid (SB minor 0→1, carved from reserved bytes) | 0013 |
-| 0017 | raid per-member observation — `state`/`since`/generations + cbt live-epoch facts in get_bdevs (GCCP 0014.6) | bdev_raid; `#include`s `../cbt/vbdev_cbt_query.h` (requires the cbt module, like 0005 requires tier) | 0013, 0016, cbt module |
-| 0018 | raid integrated verify — K=64 sampled windows post-copy under quiesce_range, re-copy before DIVERGENT, `verified` registry seal gating `epoch_close(consumed)` (GCCP 0014.8) | bdev_raid | 0013, 0015, 0016 |
-| 0019 | raid auto epoch at member ejection — survivors' cbt bounds the delta, nonce reported via get_bdevs (GCCP 0014.10) | bdev_raid; calls `vbdev_cbt_auto_epoch_open` (cbt module) | 0013, cbt module |
-| 0020 | nvmf explicit audited force-resume — fence path breaks a standing barrier by design, DÉC-11 (GCCP 0014.11) | lib/nvmf (nvmf_pause_rpc.c) | 0003, 0011 |
-| 0021 | raid envelopes — per-class caps ×(nominal, maintenance) + rebuild concurrency bound, `bdev_raid_set/get_envelopes` (GCCP 0014.9) | bdev_raid (adds `bdev_raid_envelopes.{c,h}`) | 0013 |
-| 0022 | raid verify_ranges — exhaustive divergence detector, LBA-locked chunks, verify-envelope paced, reports & never repairs (GCCP 0014.12). **Bi-mode** (SPEC-75G F-b): raid1 = copy-compare; raid5f = XOR-syndrome per stripe (all members required, -EAGAIN when degraded; ranges full-stripe-aligned) | bdev_raid (adds `bdev_raid_verify_ranges.c`) | 0008, 0014, 0015, 0021 |
-| 0023 | raid5f degraded-service observability (SPEC-75G F-d) — `reconstruct_reads_absent`/`reconstruct_reads_error`/`degraded_write_stripes`/`last_degraded_ts` in get_bdevs, relaxed-atomic counters on the I/O paths | bdev_raid (raid5f.c increments, bdev_raid.c emission) | 0006, 0008 |
-| 0024 | spdk_dd propagates bdev I/O errors — upstream ignores `success` in all three bdev completion callbacks, so dd exited 0 while every write was rejected (found by vec-smoke); a silently failed READ is worse (stale buffer written as data) | app/spdk_dd | — |
-| 0025 | `bdev_raid_clear_superblock` — CP-authorized clear of a stale raid SB on an UNCLAIMED base bdev (cross-node nexus republish: upstream delete never erases SBs, so a new-incarnation create over stamped legs is refused; found live by QA SurvivesPodCrash 2026-08-03). Write-open refuses claimed legs; no valid SB = idempotent no-op (never writes to a non-stamped bdev); zeroes the signature block only | bdev_raid (bdev_raid_rpc.c only) | 0011 (audit hook) |
-| 0026 | examine never auto-re-adds a returning member into a CLAIMED raid — re-admission belongs to the control plane (D7 write_only + seeded chain). The examine re-add + auto-rebuild raced the CP's own attach on a live raid with a flapping remote member and corrupted the heap (SIGSEGV, caught live 2026-08-03). Unclaimed (examine-assembled) raids keep upstream behavior — boot reassembly is the SB's purpose | bdev_raid (bdev_raid.c examine_sb) | 0014 (incarnation field) |
-| 0027 | a dead-socket DISCONNECTING qpair re-aborts its stragglers — the disconnect-time abort skips requests inside an accel op; when accel completes, the request can't complete alone (its send_ack died with the closed socket) and nothing re-runs the abort, so on a no-poll-group qpair (the admin qpair a reset/destruct drives) the flush-failure branch of process_completions returns 0 forever: DISCONNECTING never ends, the pending ctrlr destruct wedges, and the dead controller PINS its TRID against every re-attach (silent-death reintegration parked 8+ min, caught live turing runs 10-11, SPEC-77L Q-010-2 couche 3 / Q-009-1 family). Run 12 proved it necessary but NOT sufficient — see 0028 | lib/nvme (nvme_tcp.c process_completions) | — |
-| 0028 | a delete landing inside the reconnect-delay window completes its deferred destruct — `bdev_nvme_reconnect_delay_timer_expired`'s destruct branch returned without acting: no reconnect (right), but adminq poller left paused and NOBODY ever unregisters (wrong) — the leaked continuation kept the dead ctrlr (and its TRID) alive until ctrlr_loss_timeout (~10 min, the observed self-resolution ×3). Mirrors OP_COMPLETE_PENDING_DESTRUCT. Plus destruct-deferral observability (NOTICE at delete-request, put_ref deferral, timer expiry) so a residual wedge NAMES its holder (run 13 is a measurement, not a coin flip). Upstream master has the same hole | module/bdev/nvme (bdev_nvme.c) | 0027 (same incident family) |
-| 0029 | nvme_ctrlr refs ventilated by named holder — run 14 (powercycle) showed the other 0028 form: delete OUTSIDE the delay window, `ref 3 → destruct deferred: ref 2` held the WHOLE run with nothing naming the holders. Every get/put is tagged (`base/ns/qpair/disable/cache_clear/ana/keys`, per-category ledger in nvme_ctrlr, underflow self-reports), the three 0028 probes print the breakdown, a ref TAKEN on a destructing ctrlr logs its taker (the zombie-reconnect re-pin vector), and the `-EALREADY` re-delete path — which flattens to rc=0 so the CP's detach loop reads "Applied" ×308 while nothing changes — samples the breakdown on change + every 64th as heartbeat: the futile detach loop becomes a free periodic probe | module/bdev/nvme (bdev_nvme.c + bdev_nvme.h) | 0028 (extends its probes) |
-| 0030 | raid remove_base_bdev names the unaddressable slot — the RPC resolves the member with `spdk_bdev_open_ext(name)` FIRST, so a slot whose bdev died is unreachable: open fails, the agent reads "already removed", and the phantom slot squats the raid forever (run 14: DetachMember Applied ×308, slot "configuring", desc gone). On open failure, every slot still referencing the name is NOTICEd with its full state (raid state, slot idx, configured/failed/remove_scheduled/desc) — observability only, the remove-by-slot fix waits on the run 15 measurement | module/bdev/raid (bdev_raid_rpc.c only) | 0014 (incarnation plumbing in the same RPC) |
-| 0031 | a failed base-bdev configure releases what it took — the `default:` branch of `raid_bdev_configure_base_bdev_check_sb_cb` (SB read fails, e.g. -EIO against a member that just died) logged and broke while keeping desc + module claim + app-thread io channel, so the slot squatted "configuring" and the leak PINNED the dead member's nvme_ctrlr destruct for the whole run (turing run 15: `holders[ns:1 qpair:1]` for 9 min 05, released to the second when teardown destroyed the raid). Upstream has the same hole — exotic there, systematic under a power-cycled node | module/bdev/raid (bdev_raid.c) | 0029 (its named holders are what identified the leak) |
-| 0032 | the delayed-reconnect path YIELDS instead of spinning — `spdk_nvme_ctrlr_disconnect()` returns -EBUSY/-ENXIO (sticky), `nvme_ctrlr_disconnect` completes the reset as failed, `check_op_after_reset` answers OP_DELAYED_RECONNECT, whose action is that same disconnect: a hot loop with NOTHING that yields, since the pacing timer is armed by a callback that never runs. It ends only when `ctrlr_loss_timeout_sec` flips the answer to OP_DESTRUCT. Measured live (SPEC-77L runs 22-23, replica node power-cycled under load): **173 418 and 144 488 iterations**, ~8 000 spins/s, 28 s each, from the instant the raid failed the dead member. The nexus is single-core: its nvmf target stopped answering the CONSUMER's keep-alive within 5 s, the initiator kernel declared the path dead (opcode 0x18 QID 0 timeout → error recovery) and the volume froze **28 s where the failover itself costs 2 s**. Fix: arm the delay timer directly when that was the requested callback — one attempt per `reconnect_delay_sec`, the pacing upstream intended. Run 21, same code, never entered the loop (0 occurrences, stall 2,03 s): entry depends on the ctrlr state when the raid ejects it. Upstream master has the same hole | module/bdev/nvme (bdev_nvme.c) | 0028 (same reconnect-delay machinery) |
-| 0033 | member removal tells the truth — `-EALREADY` (a removal is in flight: wait and observe) is now distinct from `-ENODEV` (not a member: the end state IS reached), and a removal that FAILS no longer resurrects its member. Upstream answered ONE code for both realities, and answered a failed removal with `is_failed = false` + a WARNLOG: the control plane read "already removed", declared the detach done in 0 ms, and `spdk.raid.members{configured}=3` held before, during AND after (SPEC-77L Q-023-3, turing run 41 — the exact line the Q-021-8 guard was built to catch). The member now CARRIES the failure (`remove_error`, per-member in get_bdevs 0017), stays `failed` instead of silently returning to `configured`, and that same field — rather than a lie about the member's state — is what re-arms the local fail path. Service I/O is untouched: raid1 routes on the slot's channel, never on `is_failed`. Upstream master has both holes | module/bdev/raid (bdev_raid.c + bdev_raid.h) | 0014 (incarnation plumbing on the same RPC), 0017 (the per-member surface that carries `remove_error`), 0030 (same RPC, the unaddressable-slot half) |
-| 0039 | an armed delayed reconnect OWNS the continuation — when `spdk_nvme_ctrlr_disconnect()` fails (-EBUSY) on the OP_DELAYED_RECONNECT path while `reconnect_is_delayed` is ALREADY true, 0032's guard refused to re-arm (correct: the timer exists) and fell into upstream's "fail the reset sequence immediately": `bdev_nvme_reset_ctrlr_complete(false)` → `check_op_after_reset` = OP_DELAYED_RECONNECT → the same disconnect → the same failure — an unbounded MUTUAL RECURSION with nothing between the frames that yields, until the reactor stack overflows. Proven by core dump on turing (s39, SelfHealReplacement — failover storm on a dead target, 4 crashes per run): SIGSEGV in a log `snprintf`, thousands of alternating `reset_ctrlr_complete`/`nvme_ctrlr_disconnect` frames, and in the ctrlr: `reconnect_is_delayed=1`, `reconnect_delay_timer` armed, `resetting=0`, `destruct=0`, loss timeout 30 s not reached. Entry = a reset completion delivered during the armed window. Fix: with the timer armed, RETURN — the timer re-runs the reconnect within `reconnect_delay_sec`, and there is nothing the failed disconnect must do that the timer will not redo. This was the Q-032-84 data-plane SEGV (5× exit 139 on cp-2, session 38) | module/bdev/nvme (bdev_nvme.c) | 0032 (completes its yield: the guard paced the loop, this bounds the recursion the guard's refusal created) |
-| 0038 | a PREEMPT-ABORT from a non-registrant no longer kills the target — `ns->preempt_abort` is allocated at exactly ONE site (the `RESERVE_PREEMPT_ABORT` case of `nvmf_ns_reservation_acquire`), but the registrant check above it does `goto exit` FIRST, so a preempt-abort refused with "No registrant or current key doesn't match" returns having never allocated it. Both readers then test only `ns_reservation_req_is_preempt_abort(req)`, which reads the COMMAND bytes and cannot know: `_nvmf_ns_reservation_update_done` dereferences the NULL immediately (the crash), and `poll_group_reservation_preempt_abort_process` has the same hole on a narrower race. Measured live 2026-08-14 on turing: the refusal was the LAST line before every death — 18 target restarts on cp-3, 4 on cp-1, all exit 139. Pure upstream code — no Evariops patch touches `lib/nvmf/subsystem.c`, so the defect is upstream's and this patch carries it out-of-tree like the rest of the series | lib/nvmf (subsystem.c) | — |
-
-| 0040 | the delete-stop MARKS — the running cycle OWNS the continuation. 0035's delete-side stop called `raid_bdev_process_finish()` from an async thread message, and finish() DRIVES the window machinery (unlock / thread_run), which is only correct from the cycle's own continuation points — the message can land BETWEEN any two of them. Landing mid-window it unquiesced the LBA range UNDER the in-flight window requests and freed the process beneath their completions: caught on turing (s39, debug build, SelfHealReplacement) as `assert(process->window_remaining == 0)` in `raid_bdev_process_thread_run` right after "delete requested with rebuild in progress — stopping it"; in release builds this was the family-2 teardown SIGSEGV (s38 01:41, s39 14:49, exit 139 in a qpair completion print storm). Landing with a quiesce, channel update or unquiesce in flight, it double-drove that same machinery. Fix: the stop marks STOPPING + records -ECANCELED and RETURNS — every resting state of the cycle already carries a pending continuation that observes STOPPING (window_range_locked cb, the request drain, verify io_done/conclude, thread_run, and 0035's unpaced-abort branch of lock_window_range). Three cycle-internal callers that can now observe an externally-set STOPPING get guards: the request drain rides the normal channel-update/unlock path instead of a finish() that would no-op and leak the locked window; the quiesce/unquiesce failure paths conclude directly via do_finish. A defensive `window_remaining > 0` guard in finish() keeps the invariant stated, not assumed | module/bdev/raid (bdev_raid.c) | 0035 (the async delete-stop this disciplines), 0039 (the same principle on the nvme side: whoever is already armed owns the continuation) |
-
-⚠ **Dette de registre** : 0034 à 0037 n'ont **jamais** été inscrits dans ce tableau (le fichier
-existe, la ligne manque). Le tableau n'est donc plus l'inventaire qu'il annonce — à résorber.
+| 0001 | raid `skip_rebuild` — `bdev_raid_add_base_bdev` promotes a member without a full-surface rebuild when the copy was made externally | bdev_raid | — |
+| 0002 | lvol `get_allocated_ranges` — reports the allocated cluster ranges of an lvol so a caller copies only live data | bdev_lvol | — |
+| 0003 | nvmf pause/resume — RPCs that stop and restart subsystem admission to open a barrier window | lib/nvmf | 0011 (audit hook) |
+| 0004 | blob relocate primitives + `freeze_io` — blobstore support for moving clusters and freezing I/O around the move | lib/blob | — |
+| 0005 | lvol placement/relocate/remap RPCs — expose per-cluster placement and let the control plane move clusters between tier bands | bdev_lvol, module/bdev/tier | 0004, 0011, tier module |
+| 0006 | raid5f degraded-read — serves reads by reconstruction when a member is missing instead of failing them | bdev_raid | — |
+| 0007 | raid nexus heat — per-member access heat accounting, exported for placement decisions | bdev_raid | — |
+| 0008 | raid `rebuild_ranges` + `full_stripe_blocks` — rebuilds an explicit list of ranges under LBA locks instead of the whole surface | bdev_raid, lib/bdev (lock_lba_range) | 0006, 0011 |
+| 0009 | ENOSPC → CAPACITY_EXCEEDED — maps out-of-space to a distinct status so callers stop reading it as a generic I/O error | bdev_lvol, bdev_raid | — |
+| 0010 | rpc socket chmod 0600 — restricts the JSON-RPC unix socket to its owner | lib/rpc | — |
+| 0011 | jsonrpc SO_PEERCRED audit hook — exposes peer credentials and the audit entry point every destructive RPC calls | lib/jsonrpc | — |
+| 0012 | lvol shutdown-unload observability — logs what the lvolstore unload is still waiting on at shutdown | bdev_lvol | — |
+| 0013 | raid1 seeded rebuild — attaches a member write-only and backfills only the historical delta, with no pause window (`docs/SEEDED-REBUILD-DESIGN.md`) | bdev_raid | 0001, 0008, 0011 |
+| 0014 | raid incarnation identity — a raid carries a control-plane incarnation; RPCs passing `expected_incarnation` fail `-ESTALE` on mismatch | bdev_raid | 0013 |
+| 0015 | raid rebuild-outcome registry — records how each rebuild ended (including a CANCELED outcome) and exposes `bdev_raid_get_rebuild_outcomes` | bdev_raid (adds `bdev_raid_outcomes.{c,h}`); `module/bdev/cbt` consults it for `epoch_close(consumed)` | 0013, 0014 |
+| 0016 | raid extended superblock — per-member `content_generation`/`view_epoch` persisted in the same transaction | bdev_raid (SB minor 0→1, carved from reserved bytes) | 0013 |
+| 0017 | raid per-member observation — `state`/`since`/generations plus live cbt epoch facts in `get_bdevs` | bdev_raid; `#include`s `../cbt/vbdev_cbt_query.h` (requires the cbt module, like 0005 requires tier) | 0013, 0016, cbt module |
+| 0018 | raid integrated verify — sampled windows compared post-copy under `quiesce_range`, re-copied before declaring DIVERGENT, with a `verified` seal gating `epoch_close(consumed)` | bdev_raid | 0013, 0015, 0016 |
+| 0019 | raid auto epoch at member ejection — opens a cbt epoch on the survivors so their tracking bounds the later delta; the nonce is reported in `get_bdevs` | bdev_raid; calls `vbdev_cbt_auto_epoch_open` (cbt module) | 0013, cbt module |
+| 0020 | nvmf audited force-resume — lets the fence path break a standing pause barrier deliberately, leaving an audit record | lib/nvmf (nvmf_pause_rpc.c) | 0003, 0011 |
+| 0021 | raid envelopes — per-class bandwidth caps × (nominal, maintenance) and a rebuild concurrency bound, via `bdev_raid_set/get_envelopes` | bdev_raid (adds `bdev_raid_envelopes.{c,h}`) | 0013 |
+| 0022 | raid `verify_ranges` — exhaustive divergence detector, LBA-locked and envelope-paced, which reports and never repairs; raid1 compares copies, raid5f checks the XOR syndrome per stripe | bdev_raid (adds `bdev_raid_verify_ranges.c`) | 0008, 0014, 0015, 0021 |
+| 0023 | raid5f degraded-service observability — reconstruct-read and degraded-write counters plus a last-event timestamp in `get_bdevs` | bdev_raid (raid5f.c increments, bdev_raid.c emission) | 0006, 0008 |
+| 0024 | spdk_dd propagates bdev I/O errors — upstream ignores `success` in all three completion callbacks, so dd exits 0 while every I/O is rejected | app/spdk_dd | — |
+| 0025 | `bdev_raid_clear_superblock` — authorized clear of a stale raid superblock on an unclaimed base bdev, so a new incarnation can be created over already-stamped legs | bdev_raid (bdev_raid_rpc.c only) | 0011 (audit hook) |
+| 0026 | examine never auto-re-adds a returning member into a CLAIMED raid — re-admission belongs to the control plane; unclaimed raids keep upstream boot reassembly | bdev_raid (bdev_raid.c examine_sb) | 0014 (incarnation field) |
+| 0027 | a dead-socket DISCONNECTING qpair re-aborts its stragglers — a request parked in an accel op is otherwise never completed, so the disconnect never ends and the dead controller pins its TRID | lib/nvme (nvme_tcp.c process_completions) | — |
+| 0028 | a delete landing inside the reconnect-delay window completes its deferred destruct — upstream returns without unregistering, leaking the dead ctrlr and its TRID until the loss timeout | module/bdev/nvme (bdev_nvme.c) | 0027 |
+| 0029 | nvme_ctrlr refs named by holder — every get/put is tagged into a per-category ledger, so a deferred destruct says who is holding it | module/bdev/nvme (bdev_nvme.c + bdev_nvme.h) | 0028 |
+| 0030 | raid `remove_base_bdev` names the unaddressable slot — when a member's bdev is gone the open fails and the slot squats the raid, so every slot still referencing the name is logged with its full state | module/bdev/raid (bdev_raid_rpc.c only) | 0014 |
+| 0031 | a failed base-bdev configure releases what it took — the superblock-read failure path kept desc, module claim and io channel, pinning the dead member's controller destruct | module/bdev/raid (bdev_raid.c) | 0029 |
+| 0032 | the delayed-reconnect path yields instead of spinning — a sticky disconnect failure re-entered itself unpaced, so the delay timer is armed directly for one attempt per `reconnect_delay_sec` | module/bdev/nvme (bdev_nvme.c) | 0028 |
+| 0033 | member removal tells the truth — `-EALREADY` (removal in flight) is distinct from `-ENODEV` (not a member), and a failed removal carries `remove_error` instead of returning the member to `configured` | module/bdev/raid (bdev_raid.c + bdev_raid.h) | 0014, 0017, 0030 |
+| 0034 | raid verify is single-flight and bounded — one verify at a time per raid, named and dated in `get_bdevs`, resumable at `start_lba` under a `max_blocks` budget that answers `complete`/`next_lba` | module/bdev/raid (bdev_raid.{c,h}, bdev_raid_verify_ranges.c) | 0022 (the verify it disciplines) |
+| 0035 | a raid delete stops its running background process instead of waiting for it, the abort path skips QoS pacing, and the final nvme_ctrlr ref release is logged like every deferred one | module/bdev/raid, module/bdev/nvme | 0021 (the QoS pacing its abort bypasses), 0029 (the ref ledger it completes) |
+| 0036 | an absent nvmf subsystem is a fact — `nvmf_subsystem_query` answers `-ENODEV` rather than INVALID_PARAMS, so absent-tolerant callers stop reading "gone" as "bad request" | lib/nvmf (nvmf_rpc.c) | — |
+| 0037 | `bdev_raid_claim` — compare-and-set claim of an examine-reassembled raid for a control-plane incarnation; `-EEXIST` names the current owner | module/bdev/raid (bdev_raid_rpc.c) | 0014 |
+| 0038 | a PREEMPT-ABORT from a non-registrant no longer kills the target — the refusal path returns before allocating `ns->preempt_abort`, while both readers test only the command bytes and dereference the NULL | lib/nvmf (subsystem.c) | — |
+| 0039 | an armed delayed reconnect owns the continuation — the path returns instead of re-driving a failed disconnect, ending a mutual recursion that overflows the reactor stack | module/bdev/nvme (bdev_nvme.c) | 0032 |
+| 0040 | the delete-stop only MARKS — 0035's stop drove the window machinery from a foreign thread, unquiescing under in-flight requests; it now sets STOPPING with `-ECANCELED` and each resting state concludes | module/bdev/raid (bdev_raid.c) | 0035, 0039 |
 
 0005 `#include`s `vbdev_tier.h` and adds `-I module/bdev/tier` to the lvol module
 CFLAGS via its own Makefile hunk; the Dockerfile injects the module dirs before
@@ -80,16 +80,16 @@ nothing, unlike `git apply` which errors) — if a build ever links without
 - `mk/spdk.modules.mk`: `BLOCKDEV_MODULES_LIST += bdev_cbt` / `bdev_tier`
 - `mk/spdk.lib_deps.mk`: `DEPDIRS-bdev_cbt`/`bdev_tier` + `DEPDIRS-bdev_lvol … bdev_tier`
 
-## Upstream pin (W4)
+## Upstream pin
 
-The upstream commit is pinned in `images/spdk/Dockerfile`
-(`ARG SPDK_COMMIT_SHA`) and verified after clone — a moved tag fails the build.
-`scripts/patches.sh` reads the same ARG, so tooling and build never disagree.
+The upstream commit is pinned in `images/spdk/Dockerfile` (`ARG SPDK_COMMIT_SHA`)
+and verified after clone — a moved tag fails the build. `scripts/patches.sh`
+reads the same ARG, so tooling and build never disagree.
 
 ## Tooling — `scripts/patches.sh`
 
-Never hand-edit hunk offsets (the audit's U-3 finding: a `fix: correct patch
-hunk line count` commit is proof of manual editing gone wrong). Instead:
+Never hand-edit hunk offsets: a patch whose hunk line counts were corrected by
+hand is proof of manual editing gone wrong. Instead:
 
 ```sh
 # Apply the series into a local SPDK checkout that is at the pinned commit.
@@ -118,15 +118,14 @@ scripts/patches.sh regen   /path/to/spdk-worktree
 4. `scripts/patches.sh verify` (or `check` against a pinned clone) to confirm
    the whole series still applies.
 
-**Series format (homogenized 2026-07-16): RAW `git diff` output, no mail
-header.** `git apply` (Dockerfile + `check`/`apply`) is the only consumer;
-**`git am` is NOT part of the contract** (it chokes on raw diffs — the series
-was format-mixed mbox/raw until 2026-07-16, which is how that was learned).
-`regen` emits raw per-commit diffs with the commit subject as filename, so a
-regen of an untouched series is byte-stable. Never hand-edit hunks.
+**Series format: RAW `git diff` output, no mail header.** `git apply` (Dockerfile
++ `check`/`apply`) is the only consumer; **`git am` is NOT part of the contract**
+— it chokes on raw diffs. `regen` emits raw per-commit diffs with the commit
+subject as filename, so a regen of an untouched series is byte-stable. Never
+hand-edit hunks.
 
-## Upstreaming (UP4)
+## Upstreaming
 
 Candidates, easiest first: 0006 (degraded-read, small/general), 0003
 (pause/resume), 0002 (allocated_ranges). 0004 (blob relocate) needs an RFC. Each
-merged upstream removes rebase surface here.
+patch merged upstream removes rebase surface here.

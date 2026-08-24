@@ -1,61 +1,44 @@
 diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
+index dd3cb51..feebb76 100644
 --- a/module/bdev/raid/bdev_raid.c
 +++ b/module/bdev/raid/bdev_raid.c
-@@ -4873,22 +4873,30 @@
- 		}
- 		return;
- 	}
- out:
+@@ -4849,6 +4849,12 @@ out:
  	raid_bdev_examine_others_done(ctx, status);
  }
-+
-+/* Evariops 0026: forward-declared so raid_bdev_examine_sb can tell WHO called it — the
-+ * bdev-module examine chain (which passes this) or a control-plane requested add (which
-+ * passes the requester's configure_cb). The re-add guard applies to the former only. */
-+static void raid_bdev_examine_done(void *ctx, int status);
  
++/* Evariops 0026: forward-declared so raid_bdev_examine_sb can tell its two
++ * callers apart — the bdev-module examine chain passes this callback, a
++ * control-plane add passes the requester's. The re-add guard applies only to
++ * the examine chain. */
++static void raid_bdev_examine_done(void *ctx, int status);
++
  static void
  raid_bdev_examine_sb(const struct raid_bdev_superblock *sb, struct spdk_bdev *bdev,
  		     raid_base_bdev_cb cb_fn, void *cb_ctx)
- {
- 	const struct raid_bdev_sb_base_bdev *sb_base_bdev = NULL;
- 	struct raid_bdev *raid_bdev;
+@@ -4858,6 +4864,10 @@ raid_bdev_examine_sb(const struct raid_bdev_superblock *sb, struct spdk_bdev *bd
  	struct raid_base_bdev_info *iter, *base_info;
  	uint8_t i;
  	int rc;
-+	/* Evariops 0026: captured HERE, at entry — cb_fn is reassigned to raid_bdev_examine_others
-+	 * further down, so testing it at the guard would read the wrong caller. */
++	/* Evariops 0026: capture the caller HERE, at entry. cb_fn is reassigned to
++	 * raid_bdev_examine_others further down, so testing it at the guard below
++	 * would read the wrong caller. */
 +	const bool discovered = (cb_fn == raid_bdev_examine_done);
  
  	if (sb->block_size != spdk_bdev_get_data_block_size(bdev)) {
  		SPDK_WARNLOG("Bdev %s block size (%u) does not match the value in superblock (%u)\n",
- 			     bdev->name, sb->block_size, spdk_bdev_get_data_block_size(bdev));
- 		rc = -EINVAL;
- 		goto out;
-@@ -4973,12 +4981,36 @@
- 
- 		cb_fn = raid_bdev_examine_others;
- 		cb_ctx = ctx;
+@@ -4948,6 +4958,22 @@ raid_bdev_examine_sb(const struct raid_bdev_superblock *sb, struct spdk_bdev *bd
  	}
  
  	if (raid_bdev->state == RAID_BDEV_STATE_ONLINE) {
-+		/* Evariops 0026: NEVER auto re-add a returning member into a CLAIMED raid — the
-+		 * control plane owns re-admission (write_only attach + seeded rebuild, its D7
-+		 * chain). The examine-driven re-add + auto-rebuild raced the controller's own
-+		 * attach ('raid ... is in process') on a live raid whose remote member flapped,
-+		 * and the collision corrupted the heap (SIGSEGV, caught live 2026-08-03). An
-+		 * UNCLAIMED raid (examine-assembled, no controller yet) keeps the upstream
-+		 * behavior — reassembly-at-boot is the superblock's whole purpose.
++		/* Evariops 0026: never auto re-add a returning member into a CLAIMED
++		 * raid. Re-admission belongs to the control plane (write_only attach
++		 * plus seeded rebuild); an examine-driven re-add races the controller's
++		 * own attach on a live raid. An UNCLAIMED raid keeps upstream behaviour,
++		 * since reassembly at boot is the superblock's whole purpose.
 +		 *
-+		 * Evariops 0026b (turing run 97, 2026-08-16): `discovered` was MISSING, so this
-+		 * guard also refused the control plane — the very caller the comment above says
-+		 * owns re-admission. Its own AddNexusBaseBdev -> bdev_raid_add_base_bdev reaches
-+		 * here through raid_bdev_configure_base_bdev_check_sb_cb, and got -EPERM:
-+		 *   11:20:37.274  Adding base bdev nvme_..._0n1 to RAID raid1_nx-...
-+		 *   11:20:37.288  Not re-adding bdev nvme_..._0n1 to claimed raid bdev ...
-+		 * AttachFull then failed identically for THIRTEEN MINUTES and the member never
-+		 * rejoined the RAID. The two callers are distinguishable by the callback they
-+		 * pass, and now they are distinguished. */
++		 * The `discovered` test is load-bearing: without it the guard also
++		 * refuses the control plane, whose add reaches here through
++		 * raid_bdev_configure_base_bdev_check_sb_cb and would get -EPERM. */
 +		if (raid_bdev->incarnation != NULL && discovered) {
 +			SPDK_NOTICELOG("Not re-adding bdev %s to claimed raid bdev %s (incarnation '%s') — "
 +				       "member re-admission belongs to the control plane (Evariops 0026)\n",
@@ -66,6 +49,3 @@ diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
  		assert(sb_base_bdev->slot < raid_bdev->num_base_bdevs);
  		base_info = &raid_bdev->base_bdev_info[sb_base_bdev->slot];
  		assert(base_info->is_configured == false);
- 		assert(sb_base_bdev->state == RAID_SB_BASE_BDEV_MISSING ||
- 		       sb_base_bdev->state == RAID_SB_BASE_BDEV_FAILED);
- 		assert(spdk_uuid_is_null(&base_info->uuid));

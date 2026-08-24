@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # Copyright (c) 2026 Evariops.
 #
-# patches.sh — tooling for the Evariops SPDK patch series (UP2/U-3).
+# patches.sh — tooling for the Evariops SPDK patch series.
 #
-# The audit flagged manual hunk editing (`git apply` of by-hand-edited .patch
-# files) as a real risk: `sed`/hand edits silently corrupt offsets and only
-# surface at build time. This script makes the round trip mechanical:
+# Hand-editing a .patch file silently corrupts its hunk offsets, and the damage
+# only surfaces at build time. This script makes the round trip mechanical
+# instead — edit sources in a worktree, regenerate, verify:
 #
 #   patches.sh check   <spdk_src>     verify the whole series applies in order
 #                                      (non-destructive: checks against a scratch
@@ -20,7 +20,7 @@
 #                                      needed; requires network + git).
 #
 # The pinned upstream is read from images/spdk/Dockerfile (ARG SPDK_COMMIT_SHA),
-# so the script and the container build can never disagree (W4).
+# so the script and the container build can never disagree.
 
 set -euo pipefail
 

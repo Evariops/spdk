@@ -2,120 +2,91 @@
 
 ## What problem this solves
 
-SPDK RAID-1 has no dirty tracking. When a backend disconnects — whether for planned maintenance or unexpected failure — the only recovery path is a full surface rebuild: reading and rewriting every block on the volume. For a 2 TB volume, that takes over five hours.
+SPDK RAID-1 has no dirty tracking. When a backend disconnects — for planned
+maintenance or through failure — the only recovery path is a full surface
+rebuild: reading and rewriting every block of the volume. For a 2 TB volume that
+takes over five hours.
 
-This module eliminates that cost. It sits between the target and the RAID bdev as a transparent passthrough, recording which blocks have been modified. When the backend comes back, only the modified blocks are copied — turning hours into seconds.
+This module removes that cost. It sits between the target and the RAID bdev as a
+transparent passthrough, recording which blocks have been modified. When the
+backend comes back, only the modified blocks are copied — turning hours into
+seconds.
 
 ## How it works
 
-The CBT vbdev intercepts every write, unmap, and write_zeroes IO that flows through it. For each operation, it marks the corresponding bits in an in-memory bitmap. The bitmap is indexed by *chunks* — configurable regions of 4 KB to 64 MB (default 64 KB). This means the memory cost for a 2 TB volume at 64 KB granularity is 4 MB.
+The CBT vbdev intercepts every write, unmap and write_zeroes I/O flowing through
+it and marks the corresponding bits in an in-memory bitmap. The bitmap is
+indexed by *chunks* — configurable regions of 4 KB to 64 MB, 64 KB by default —
+so a 2 TB volume costs 4 MB of memory at the default granularity. Chunk size is
+forced to a power of two, so a chunk index is a shift rather than a division.
 
-The bitmap is never explicitly started or stopped. It accumulates from the moment the vbdev is created. This guarantees zero missed writes regardless of when a failure is detected — the orchestrator never needs to race against the first write.
+The bitmap is never explicitly started or stopped: it accumulates from the
+moment the vbdev is created. This guarantees no missed writes whenever a failure
+is detected, and the orchestrator never has to race the first write.
 
-Multiple IO threads set bits concurrently using atomic OR. There are no locks on the IO path. A per-chunk counter is not maintained — instead, the dirty count is computed lazily via popcount when requested by RPCs or the poller.
+Multiple I/O threads set bits concurrently with `__atomic_fetch_or` under
+relaxed ordering (and `memset(0xFF)` for full bytes in large ranges). There are
+no locks on the I/O path — setting a bit to 1 is idempotent, so concurrent ORs
+cannot lose information — and no per-chunk counter is maintained: the dirty
+count is computed lazily by popcount when an RPC or the poller asks for it.
+Epoch operations, by contrast, all run on the SPDK app thread and are not
+thread-safe against each other; `assert`s on the app thread enforce that.
 
-## Interface contract
+## The epoch protocol
 
-The module exposes its functionality through JSON-RPC. The orchestrator drives the lifecycle; the module never takes autonomous decisions about rebuild or recovery.
+An *epoch* represents a single backend outage and its recovery. Up to four
+epochs coexist, so backends failing at different times are tracked
+independently. Each holds its own frozen bitmap, so peak memory is
+`5 × bitmap_size` (live plus four frozen).
 
-### Creating and destroying the vbdev
+Per-RPC preconditions, error codes, idempotence and crash behaviour are
+specified in `docs/RPC-CONTRACT.md`; this section explains the shape of the
+protocol, not its contract.
 
-`bdev_cbt_create` wraps any existing bdev with a CBT tracking layer. The base bdev may not exist yet — in that case, the configuration is saved and applied when the bdev appears (deferred create). `bdev_cbt_delete` tears it down and cleans up the deferred entry if the base bdev never materialized.
+The shape is **open → freeze → get_dirty_ranges → close**:
 
-### The epoch protocol
+| Step | RPC | What it guarantees |
+|:-----|:----|:-------------------|
+| open | `bdev_cbt_epoch_open` | the stale backend's identity and generation are recorded; tracking is unaffected |
+| freeze | `bdev_cbt_epoch_freeze` | the delta since the previous freeze becomes an immutable snapshot; the live bitmap then accumulates only NEW writes |
+| get_dirty_ranges | `bdev_cbt_epoch_get_dirty_ranges` | that snapshot reads back as coalesced `{offset, length}` pairs — a FIXED set the copier can work through |
+| close | `bdev_cbt_epoch_close` | the epoch is released without losing history: an unconsumed delta is merged back into the live bitmap first |
 
-An *epoch* represents a single backend outage and its associated recovery. The orchestrator opens an epoch when it detects that a backend is stale, identifying which backend and at which generation. Up to four epochs may coexist simultaneously — allowing independent tracking when multiple backends fail at different times.
+`bdev_cbt_epoch_rebuild_start` and `bdev_cbt_epoch_invalidate` are state markers
+around that spine: a copy is under way, or this epoch is unrecoverable and the
+backend needs a full rebuild.
 
-**Opening** (`bdev_cbt_epoch_open`) records the stale backend identity. The bitmap continues accumulating all writes as before — the epoch is purely an administrative marker.
+Two invariants are worth understanding before calling anything:
 
-**Freezing** (`bdev_cbt_epoch_freeze`) captures the DELTA since the previous freeze: when no other epoch is active, the live bitmap is atomically exchanged (snapshot-AND-clear) into the epoch's frozen bitmap, so iterative partial rebuilds converge geometrically. An atomic fence ensures visibility of all prior relaxed stores from IO threads. After freeze, the live bitmap accumulates only NEW writes. Freeze is accepted from OPEN, FROZEN, or REBUILDING states (the latter enables the convergence loop: freeze → partial_rebuild → re-freeze → partial_rebuild → ...), and is refused with `-EBUSY` while a rebuild is RUNNING on the epoch (CBT-1).
+**A frozen delta is never dropped until a rebuild proves it copied.** Bits
+exchanged out of the live bitmap exist only in the frozen buffer. Any path that
+would discard that buffer without a completed rebuild — a re-freeze after a
+failed one, a close, an eviction — first ORs it back into the live bitmap, so
+the next snapshot is exactly (unconsumed delta ∪ new writes). A failed iteration
+therefore loses nothing; already-copied chunks are pessimistically re-copied.
 
-Delta-preservation invariant (H1): bits exchanged out of the live bitmap exist only in the frozen buffer until a rebuild COMPLETES. Any path that discards that buffer without a completed rebuild — re-freeze after an aborted/failed rebuild, close, eviction — first ORs it back into the live bitmap, so a retry snapshot is exactly (unconsumed delta ∪ new writes). A failed iteration loses nothing; already-copied chunks are pessimistically re-copied.
+**An aborted rebuild is not a completed one.** Only a rebuild answering
+`completed` licenses discarding the delta it consumed; anything that stops
+early, fails or is cancelled leaves the frozen bitmap in force and its delta is
+folded back. A freeze racing an in-flight write is harmless for the same reason:
+the dirty bit is set at submission AND re-set at completion before the host ack,
+so a chunk consumed at submit time lands in the next delta and no host-I/O drain
+is needed around freeze.
 
-In-flight writes (H2): a write's dirty bit is set at submission AND re-set at completion (before the host ack). A freeze that consumes the submit-time bit of a still-in-flight write is therefore harmless — the chunk lands in the next delta. No host-I/O drain is required around freeze.
+## Copying and converging
 
-**Reading ranges** (`bdev_cbt_epoch_get_dirty_ranges`) walks the frozen bitmap and coalesces contiguous dirty chunks into offset+length pairs. The result is capped to avoid unbounded allocations, and a `truncated` flag signals when the caller must paginate.
+`bdev_cbt_partial_rebuild` copies asynchronously inside the SPDK process,
+reading dirty chunks from the CBT bdev and writing them to a target bdev under
+an optional bandwidth cap and queue depth. It does not issue one I/O per chunk:
+it coalesces up to 16 consecutive dirty chunks into a single read+write pair
+(`CBT_REBUILD_MAX_COALESCE_CHUNKS = 16`), which at the default chunk size means
+I/Os of up to 1 MiB — the sweet spot for NVMe-oF TCP, where per-command
+overhead dominates at small sizes.
 
-**Rebuild start** (`bdev_cbt_epoch_rebuild_start`) transitions the epoch from FROZEN to REBUILDING. This is a state marker — the actual data copy happens externally. While REBUILDING, the epoch cannot be evicted, reset, or have the bitmap cleared underneath it.
-
-**Partial rebuild** (`bdev_cbt_partial_rebuild`) performs the actual data copy asynchronously within the SPDK process. It reads dirty chunks from the CBT bdev (which passes through to the RAID base) and writes them to a specified target bdev. The operation is fully async and callback-driven — the RPC response is deferred until the copy completes.
-
-Parameters:
-- `name`: the CBT bdev to read from
-- `epoch_id`: must be in FROZEN state (transitions to REBUILDING on completion)
-- `target_bdev_name`: the destination bdev (must exist in the same spdk_tgt process)
-- `max_bandwidth_mb_sec`: bandwidth throttle in MB/s (0 = unlimited)
-- `queue_depth`: concurrent I/Os (1–128, default 16)
-
-#### I/O coalescing
-
-The rebuild engine does not issue one I/O per dirty chunk. It scans the frozen bitmap for contiguous dirty runs and coalesces up to 16 consecutive chunks into a single read+write pair (`CBT_REBUILD_MAX_COALESCE_CHUNKS = 16`). With the default 64 KB chunk size, this produces I/Os of up to 1 MiB — the sweet spot for NVMe-oF TCP where per-command overhead (capsule framing, round-trip, completion polling) dominates at small sizes.
-
-For a volume that is 80% dirty (typical after a sustained workload), coalescing reduces the number of I/O operations from ~13000 to ~800–1000, yielding a 3–5× throughput improvement on 1 Gbps links.
-
-Each of the `queue_depth` DMA buffer slots is sized at `chunk_size × 16` (1 MiB by default) to accommodate the maximum coalesced I/O. Total DMA memory: `queue_depth × 1 MiB` (e.g., 16 MiB at default QD=16, 32 MiB at QD=32).
-
-#### Pipeline
-
-The state machine is: `submit_next` → read(src) → `read_cb` → write(dst) → `write_cb` → `submit_next`. Each slot is occupied for the full read+write round-trip. The `while (outstanding < max_outstanding)` loop in `submit_next` fills all available slots in a single call, maintaining the target queue depth. A per-second bandwidth window limits throughput when throttling is configured.
-
-#### Instrumentation
-
-At completion, the rebuild logs performance counters to SPDK NOTICELOG:
-
-```
-CBT rebuild stats: duration=5200ms chunks=13199 bytes=825 MiB
-  read_latency:  avg=180us max=3200us
-  write_latency: avg=520us max=4100us
-  pipeline: avg_qd=28 submit_calls=1043 no_slot=12 throttled=0
-  ios_coalesced=12156 throughput=158 MiB/s
-```
-
-- `avg_qd`: average outstanding I/Os at each `submit_next` call — confirms pipeline fill
-- `no_slot`: times all DMA slots were busy — indicates QD is the limiter
-- `submit_throttled`: times the bandwidth cap blocked submission
-- `ios_coalesced`: chunks that were merged into larger I/Os (vs issued individually)
-- `read_latency` / `write_latency`: per-I/O latency in microseconds (avg/max)
-
-On completion, the response includes:
-- `completed`: boolean success indicator
-- `chunks_copied`: number of dirty chunks copied
-- `bytes_copied`: total bytes transferred
-- `duration_ms`: wall-clock time for the operation
-- `residual_dirty_ratio`: fraction of the bitmap that is now dirty (writes that arrived during the copy). This ratio drives the orchestrator's convergence loop — when it drops below a threshold, a final quiesce+freeze+copy achieves zero delta.
-
-**Closing** (`bdev_cbt_epoch_close`) discards the epoch and its frozen bitmap — after merging an unconsumed delta back into the live bitmap (H1), so abandoning an epoch never loses dirty history. Refused with `-EBUSY` while a rebuild is RUNNING (CBT-2).
-
-**Invalidation** (`bdev_cbt_epoch_invalidate`) marks an epoch as unrecoverable. The orchestrator knows it must fall back to a full rebuild for that backend. Refused with `-EBUSY` while a rebuild is RUNNING (C3 — an INVALID epoch is evictable, and evicting it under a running rebuild would free the bitmap the rebuild is scanning).
-
-### Bitmap clearing is reset-driven
-
-There is no automatic clearing (the former healthy-clear poller and its `bdev_cbt_set_backends_healthy()` signal were dead code and have been REMOVED — D3). Once the orchestrator has confirmed all backends are synchronized (after `skip_rebuild` promotion), it MUST call `bdev_cbt_reset` explicitly; otherwise the bitmap grows monotonically and "partial" rebuilds degrade toward full-surface copies.
-
-### Reset
-
-`bdev_cbt_reset` zeroes the bitmap. It refuses with `-EBUSY` if any epoch is active — protecting the delta needed for in-progress rebuilds.
-
-## Convergence and quiesce
-
-The module provides both the tracking primitives and the async copy engine. The orchestrator drives the convergence loop but does not implement the data copy — that happens inside the SPDK process via `bdev_cbt_partial_rebuild`.
-
-A typical orchestrator sequence for partial rebuild under sustained write load:
-
-1. Open epoch. The bitmap accumulates all writes.
-2. Freeze. Snapshot the dirty state.
-3. Call `bdev_cbt_partial_rebuild` — copies dirty chunks to the stale backend.
-4. During the copy, new writes accumulate in the live bitmap.
-5. On completion, read `residual_dirty_ratio` from the response.
-6. Re-freeze. The new snapshot captures only what arrived since the last freeze.
-7. Repeat steps 3–6 until residual_dirty_ratio is below threshold.
-8. ANA drain (2s quiesce at the NVMe-oF target level). No more writes arrive.
-9. Final freeze. Delta is zero by construction.
-10. Final `bdev_cbt_partial_rebuild` (nothing or near-nothing). Close epoch.
-11. Re-add the backend with `skip_rebuild=true`. Then `bdev_cbt_reset` (explicit —
-    there is no automatic clear; see "Bitmap clearing is reset-driven").
-
-The state machine for a single epoch through the convergence loop:
+The orchestrator drives the loop: freeze, copy, read `residual_dirty_ratio` from
+the response — the fraction dirtied by writes that arrived during the copy —
+then re-freeze and copy again. Each pass is smaller than the last, so the loop
+converges geometrically:
 
 ```
 OPEN ──freeze──► FROZEN ──partial_rebuild──► REBUILDING
@@ -125,36 +96,29 @@ OPEN ──freeze──► FROZEN ──partial_rebuild──► REBUILDING
                    └──close──► (removed)
 ```
 
-The module cannot converge on its own when write rate approaches rebuild bandwidth. The ANA drain at step 8 is mandatory to guarantee termination. This quiesce happens above the module — at the target or multipath level — and is invisible to the CBT code.
+The module cannot converge on its own when the write rate approaches rebuild
+bandwidth. Termination comes from an ANA drain — a short quiesce at the NVMe-oF
+target level, above the module and invisible to it — before the final freeze,
+which makes the last delta zero by construction.
+
+Clearing is reset-driven: there is no automatic clear. Once the backend is
+re-added and all backends are synchronized, the orchestrator MUST call
+`bdev_cbt_reset`, or the bitmap grows monotonically and "partial" rebuilds
+degrade toward full-surface copies.
 
 ## RAID integration
 
-The companion patch (`patches/0001-raid-add-skip_rebuild-parameter.patch`) adds a `skip_rebuild` boolean to the `bdev_raid_add_base_bdev` RPC. When true, the RAID module skips its full surface rebuild process and instead:
+The companion patch (`patches/0001-raid-add-skip_rebuild-parameter.patch`) adds a
+`skip_rebuild` boolean to `bdev_raid_add_base_bdev`. When true, the RAID module
+skips its full surface rebuild and instead quiesces the raid, opens
+`base_channel[slot]` on every existing I/O channel for the re-added bdev —
+without this, existing channels would never write to the backend — then
+unquiesces and writes the superblock.
 
-Quiesces the RAID bdev to halt IO dispatch. Iterates all existing IO channels and opens `base_channel[slot]` for the re-added bdev — without this, existing channels would never write to the backend. Unquiesces to resume IO with the backend fully integrated. Writes the superblock to persist the configuration across reboots.
+## Build and tests
 
-This is modeled on SPDK's own `raid_bdev_process_finish` sequence (the normal rebuild completion path) but without the process infrastructure, since the data copy was already performed externally by the CBT-driven orchestrator.
-
-## Concurrency model
-
-All epoch operations run on the SPDK app thread. They are not thread-safe against each other — SPDK guarantees single-threaded execution on that thread. The `assert(spdk_get_thread() == spdk_thread_get_app_thread())` guards enforce this.
-
-IO submission (`cbt_mark_dirty`) runs on any reactor thread. It uses `__atomic_fetch_or` with relaxed ordering for individual bitmap bytes, and `memset(0xFF)` for full bytes in large ranges. The combination is safe because setting a bit to 1 is idempotent — concurrent ORs cannot lose information. Completions RE-mark the written range before acking the host (H2), so a snapshot-and-clear freeze racing an in-flight write never loses the chunk.
-
-The `total_writes_tracked` counter uses relaxed atomics. It is a statistical counter with no correctness semantics.
-
-## Memory layout
-
-The bitmap is a flat `uint8_t` array sized at `ceil(device_blocks / chunk_size_blocks) / 8` bytes. Chunk size is forced to a power of two so that the chunk index can be computed with a shift instead of a division.
-
-Each epoch holds its own `bitmap_frozen` — a `malloc`'d copy created at freeze time. At most 4 epochs coexist, so peak memory is `5 × bitmap_size` (live + 4 frozen).
-
-## Build
-
-The module compiles in two modes. As part of the SPDK tree (`make`), it produces a shared object linked into `spdk_tgt`. The Dockerfile handles this: it copies the module source into the cloned SPDK tree, registers it in the bdev Makefile via `sed`, applies the RAID patch, and builds everything together.
-
-For development and CI, `make -f Makefile.test` compiles standalone tests with AddressSanitizer, UndefinedBehaviorSanitizer, and `-Werror`. These tests simulate the CBT logic without any SPDK dependency — they can run on any machine with a C11 compiler and pthreads.
-
-## Testing strategy
-
-The test suite validates four concerns. `test_cbt_bitmap` exercises the fundamental bitmap operations: set, get, popcount, and boundary conditions at byte and bit granularity. `test_cbt_props` uses property-based random testing to verify invariants across thousands of randomized operation sequences. `test_cbt_resilience` simulates the full epoch lifecycle including edge cases like double-freeze, eviction under pressure, and invalid state transitions. `test_cbt_postfix` validates the specific behaviors introduced by the security and correctness audit: reset refusal during active epochs, truncation signaling, deferred cleanup, eviction safety, healthy-clear gating, and concurrent mark_dirty correctness under 8 threads.
+In the SPDK tree (`make`) the module builds into `spdk_tgt`; the Dockerfile
+copies the source in, registers it in the bdev Makefile via `sed`, applies the
+patch series and builds. `make -f Makefile.test` runs standalone ASAN/UBSAN
+tests with no SPDK dependency, covering the bitmap primitives, randomized
+property checks, the epoch lifecycle and concurrent marking across 8 threads.

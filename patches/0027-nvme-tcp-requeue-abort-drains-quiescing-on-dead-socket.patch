@@ -1,22 +1,19 @@
 diff --git a/lib/nvme/nvme_tcp.c b/lib/nvme/nvme_tcp.c
-index 7f093ec..f172762 100644
+index 7f093ec..e8eada7 100644
 --- a/lib/nvme/nvme_tcp.c
 +++ b/lib/nvme/nvme_tcp.c
-@@ -2165,6 +2165,18 @@ nvme_tcp_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_c
+@@ -2165,6 +2165,15 @@ nvme_tcp_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_c
  		if (rc < 0 && rc != -EAGAIN) {
  			NVME_TQPAIR_ERRLOG(tqpair, "spdk_sock_flush() failed, rc %d: %s\n", rc, spdk_strerror(-rc));
  			if (nvme_qpair_get_state(qpair) == NVME_QPAIR_DISCONNECTING) {
 +				/* Evariops 0027: re-abort before the emptiness check. The disconnect-time
-+				 * abort SKIPS requests with an accel operation in flight; when that accel
-+				 * completes later, the request still cannot complete on its own — its
-+				 * send_ack died with the socket (closed by disconnect_qpair, which is why
-+				 * this flush fails), and nobody ever re-runs the abort. outstanding_reqs
-+				 * then never empties, this branch returns 0 forever, the qpair never
-+				 * finishes DISCONNECTING and a pending ctrlr destruct wedges — pinning the
-+				 * TRID against every re-attach (caught live: silent-death reintegration
-+				 * parked 8+ min, turing runs 10-11). The socket is provably dead here, so
-+				 * force-completing acked-or-not requests is safe; requests still inside
-+				 * accel are skipped again and drained on a later poll. */
++				 * abort skips requests that have an accel operation in flight, and once
++				 * the socket is closed those requests can never complete on their own
++				 * (their send_ack died with it) and nothing re-runs the abort: outstanding_reqs
++				 * never empties and the qpair never leaves DISCONNECTING. A failed flush
++				 * here proves the socket is dead, so force-completing acked-or-not requests
++				 * is safe; requests still inside accel are skipped again and drained on a
++				 * later poll. */
 +				nvme_tcp_qpair_abort_reqs(qpair, qpair->abort_dnr);
  				if (TAILQ_EMPTY(&tqpair->outstanding_reqs)) {
  					nvme_transport_ctrlr_disconnect_qpair_done(qpair);

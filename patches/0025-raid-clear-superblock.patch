@@ -1,29 +1,18 @@
 diff --git a/module/bdev/raid/bdev_raid_rpc.c b/module/bdev/raid/bdev_raid_rpc.c
-index 92e33e5..7b7c697 100644
+index 5d9917f..720a6cb 100644
 --- a/module/bdev/raid/bdev_raid_rpc.c
 +++ b/module/bdev/raid/bdev_raid_rpc.c
-@@ -1104,3 +1104,179 @@ rpc_bdev_raid_set_options(struct spdk_jsonrpc_request *request, const struct spd
+@@ -1098,3 +1098,168 @@ rpc_bdev_raid_set_options(struct spdk_jsonrpc_request *request, const struct spd
  }
  SPDK_RPC_REGISTER("bdev_raid_set_options", rpc_bdev_raid_set_options,
  		  SPDK_RPC_STARTUP | SPDK_RPC_RUNTIME)
 +
-+/* Evariops 0025: clear a stale raid superblock from an UNCLAIMED base bdev.
-+ *
-+ * A clean raid teardown never erases the base bdevs' superblocks (upstream
-+ * raid_bdev_delete only frees resources — examine/reassembly feeds on the
-+ * surviving SB), so re-creating a raid under a NEW name/incarnation over
-+ * previously-stamped bases is refused by the configure-time superblock check
-+ * ("Superblock of a different raid bdev found"). The control plane authorizes
-+ * the clear per base bdev; this RPC:
-+ *   - opens the bdev for WRITE — a claimed bdev (live raid member) fails the
-+ *     open, so an in-use leg can never be cleared;
-+ *   - loads AND validates the superblock through the standard loader
-+ *     (signature + CRC): a bdev without a valid raid superblock is an
-+ *     idempotent no-op success ("cleared": false) — this RPC never writes to
-+ *     a bdev that does not carry one;
-+ *   - zeroes the superblock's first block (the signature block: parsing fails
-+ *     without it, examine ignores the base, a new create accepts it).
-+ */
++/* Evariops 0025: clear a stale raid superblock from an unclaimed base bdev.
++ * raid_bdev_delete leaves member superblocks in place (examine feeds on them),
++ * so creating a new raid over previously-stamped bases is otherwise refused at
++ * configure time. Opening for WRITE is the safety gate: a live member is
++ * claimed and cannot be opened. Zeroing the signature block alone is enough to
++ * make the superblock unparseable; a bdev without one is an idempotent no-op. */
 +struct rpc_bdev_raid_clear_superblock {
 +	char *base_bdev;
 +};

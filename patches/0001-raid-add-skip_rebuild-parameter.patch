@@ -1,8 +1,8 @@
 diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
-index 7ab1607..cc515bc 100644
+index 7ab1607..c86c748 100644
 --- a/module/bdev/raid/bdev_raid.c
 +++ b/module/bdev/raid/bdev_raid.c
-@@ -3201,10 +3201,199 @@ raid_bdev_ch_sync(struct spdk_io_channel_iter *i)
+@@ -3201,10 +3201,198 @@ raid_bdev_ch_sync(struct spdk_io_channel_iter *i)
  	spdk_for_each_channel_continue(i, 0);
  }
  
@@ -63,11 +63,10 @@ index 7ab1607..cc515bc 100644
 +	free(sr_ctx);
 +}
 +
-+/* ── CBT-6 unwind: a reactor failed to open the member's channel. Close every
-+ * channel we opened, unquiesce, revert the membership (the online remove path
-+ * also rolls back num_base_bdevs_operational) and report the error — the
-+ * member must NOT come up ONLINE with a NULL channel on any reactor (silent
-+ * divergence: writes skip it while the SB says CONFIGURED). ── */
++/* Unwind path for a reactor that failed to open the member's channel: close
++ * every channel opened so far, unquiesce, revert the membership, and report the
++ * error. A member must NOT come up ONLINE with a NULL channel on any reactor —
++ * writes would skip that reactor while the superblock says CONFIGURED. */
 +
 +static void
 +raid_bdev_skip_rebuild_fail_unquiesced(void *ctx, int status)
@@ -121,8 +120,8 @@ index 7ab1607..cc515bc 100644
 +	int rc;
 +
 +	if (status != 0) {
-+		/* CBT-6: at least one reactor could not open the channel — unwind
-+		 * instead of bringing the member up half-wired. */
++		/* At least one reactor could not open the channel: unwind rather than
++		 * bring the member up half-wired. */
 +		SPDK_ERRLOG("skip_rebuild: channel promotion failed (%s) — unwinding\n",
 +			    spdk_strerror(-status));
 +		sr_ctx->err = status;
@@ -148,17 +147,17 @@ index 7ab1607..cc515bc 100644
 +	uint8_t slot = raid_bdev_base_bdev_slot(base_info);
 +
 +	if (raid_ch->base_channel[slot] != NULL) {
-+		/* P-5: was an assert — NDEBUG builds dropped it and silently overwrote
-+		 * a live channel (leak + double channel). A populated slot is already
-+		 * what promotion wants: reuse it. */
++		/* A populated slot is already what promotion wants, so reuse it.
++		 * Overwriting it would leak the live channel — an assert here would
++		 * be dropped by NDEBUG builds and do exactly that. */
 +		spdk_for_each_channel_continue(i, 0);
 +		return;
 +	}
 +	raid_ch->base_channel[slot] = spdk_bdev_get_io_channel(base_info->desc);
 +	if (raid_ch->base_channel[slot] == NULL) {
 +		SPDK_ERRLOG("skip_rebuild: failed to get io channel for slot %u\n", slot);
-+		/* CBT-6: propagate — hardcoding 0 here brought the member ONLINE with a
-+		 * NULL channel on this reactor. */
++		/* Propagate the failure: continuing with 0 here brings the member
++		 * ONLINE with a NULL channel on this reactor. */
 +		spdk_for_each_channel_continue(i, -ENOMEM);
 +		return;
 +	}
@@ -202,7 +201,7 @@ index 7ab1607..cc515bc 100644
  	raid_base_bdev_cb configure_cb;
  	int rc;
  
-@@ -3243,7 +3432,30 @@ raid_bdev_configure_base_bdev_cont(struct raid_base_bdev_info *base_info)
+@@ -3243,7 +3431,30 @@ raid_bdev_configure_base_bdev_cont(struct raid_base_bdev_info *base_info)
  		}
  	} else if (base_info->is_process_target) {
  		raid_bdev->num_base_bdevs_operational++;
@@ -234,7 +233,7 @@ index 7ab1607..cc515bc 100644
  		if (rc != 0) {
  			SPDK_ERRLOG("Failed to start rebuild: %s\n", spdk_strerror(-rc));
  			_raid_bdev_remove_base_bdev(base_info, NULL, NULL);
-@@ -3488,6 +3700,7 @@ out:
+@@ -3488,6 +3699,7 @@ out:
  
  int
  raid_bdev_add_base_bdev(struct raid_bdev *raid_bdev, const char *name,
@@ -242,7 +241,7 @@ index 7ab1607..cc515bc 100644
  			raid_base_bdev_cb cb_fn, void *cb_ctx)
  {
  	struct raid_base_bdev_info *base_info = NULL, *iter;
-@@ -3543,6 +3756,8 @@ raid_bdev_add_base_bdev(struct raid_bdev *raid_bdev, const char *name,
+@@ -3543,6 +3755,8 @@ raid_bdev_add_base_bdev(struct raid_bdev *raid_bdev, const char *name,
  		return -ENOMEM;
  	}
  

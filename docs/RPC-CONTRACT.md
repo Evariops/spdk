@@ -1,441 +1,312 @@
-# Evariops fork — RPC contract (SPEC-73 / SPEC-66)
+# Evariops fork — JSON-RPC contract
 
-Contract sheet for the JSON-RPC surface the CSI control-plane drives (PR1). For
-each RPC: preconditions, idempotence, and crash behavior. The invariants P1–P5
-and the decisions D5/CBT-7 that the control-plane must honor are stated at the
-end. This is the fork-side half; the paired control-plane guards live in
-`spdk-csi/docs/reports/2026-07-04_remediations-appariees-fork-spdk.md`.
+Normative contract sheet for the JSON-RPC surface the CSI control-plane drives: per RPC, preconditions,
+idempotence, and behavior across a target crash.
 
-Probe support with `evariops_get_capabilities` (below) before assuming any of
-these exist — on vanilla SPDK they return JSON-RPC -32601.
+**Probe before you assume.** Call `evariops_get_capabilities` first. Everything here is fork-only; on vanilla
+SPDK these methods return JSON-RPC `-32601`.
+
+Terms. A **tier** is a composite bdev built from **bands**, fixed-geometry extents each carved out of one
+disk. An **epoch** is a bounded change-tracking (cbt) round: a bitmap of dirty chunks the control-plane
+freezes, reads and consumes. An **incarnation** identifies the control-plane process that created a raid. A
+**seeded rebuild** copies only the ranges the caller supplies. An **envelope** is a bandwidth cap on a class
+of background work.
 
 ## Global assumptions
 
-- **D5 — single reactor (`-m 0x1`).** The standing-pause registry (0003),
-  `g_relocate_inflight` (0005), `band->state`, and the heat counters assume all
-  RPC handlers run on one reactor, lock-free. `nvmf_subsystem_pause` logs an
-  error if it ever sees >1 reactor. Widening the CPU mask requires a concurrency
-  pass first. `evariops_get_capabilities` reports `single_reactor_assumed: true`.
-- **Volatile state dies with the process.** Standing pauses, in-flight
-  relocations, cbt epochs and rebuilds are RAM-only. A target restart loses them
-  all — detect it via `boot_id` (below) and reconcile.
-- **SEC1 — destructive RPCs are audited.** Every mutation handler
-  (`bdev_tier_delete`, `bdev_tier_retire_band`, `bdev_tier_resync_md`,
-  `bdev_lvol_relocate_cluster` / `_clusters` / `remap_cluster`,
-  `bdev_raid_rebuild_ranges`, `nvmf_subsystem_pause`) emits an
-  `audit rpc=<method> peer=pid:…,uid:…,gid:… <params>` NOTICELOG line, with the
-  caller's Unix-socket credentials (SO_PEERCRED, patch 0011). `peer=unknown` over
-  a TCP transport. This is an audit trail, **not** an authorization gate — access
-  control is still the socket mode (0600, patch 0010) + a NetworkPolicy (D4). The
-  socket is created owner-only **atomically** — `umask(077)` wraps the `bind()`
-  (R14), closing the TOCTOU window that a chmod-after-listen left open; the chmod
-  stays as belt-and-braces.
+- **Single reactor (`-m 0x1`).** The standing-pause registry (patch 0003), `g_relocate_inflight` (patch
+  0005), `band->state` and the heat counters assume all RPC handlers run on one reactor, lock-free;
+  `nvmf_subsystem_pause` logs an error if it sees more than one. Widening the CPU mask requires a
+  concurrency pass first. `evariops_get_capabilities` reports `single_reactor_assumed: true`.
+- **Volatile state dies with the process.** Standing pauses, in-flight relocations, cbt epochs and rebuilds
+  are RAM-only; a restart loses them all. Detect it via `boot_id` and reconcile.
+- **Destructive RPCs are audited.** Every mutation handler (`bdev_tier_delete`, `bdev_tier_retire_band`,
+  `bdev_tier_resync_md`, `bdev_lvol_relocate_cluster` / `_clusters` / `remap_cluster`,
+  `bdev_raid_rebuild_ranges`, `bdev_raid_start_seeded_rebuild`, `nvmf_subsystem_pause`) emits an
+  `audit rpc=<method> peer=pid:…,uid:…,gid:… <params>` NOTICELOG line with the caller's Unix-socket
+  credentials (SO_PEERCRED, patch 0011); `peer=unknown` over TCP. This is an audit trail, **not** an
+  authorization gate: access control is the socket mode (0600, patch 0010) plus a NetworkPolicy.
+  `umask(077)` wraps the `bind()`, so the socket is owner-only atomically with no TOCTOU window; the chmod
+  remains as belt-and-braces.
 
 ## evariops_get_capabilities
 
-- **Params**: none.
-- **Returns**: `boot_id` (per-process uuid), `tier_sb_version`,
-  `capabilities_schema`, `single_reactor_assumed`, `methods[]`.
-- **Use**: a changed `boot_id` across polls ⇒ the target restarted ⇒ treat all
-  volatile state as lost. `methods[]` membership is the capability probe.
-- `methods[]` is **filtered through the live RPC registry** (deferred #3): a fork
-  method left in the candidate list but not built into this binary is NOT emitted,
-  so `methods[]` never yields a false positive (a method reported present that then
-  fails -32601). A method built in but absent from the list is a harmless false
-  negative — the control-plane's per-call -32601 probe remains the ground truth.
-- Idempotent, read-only.
+No params, read-only, idempotent. Returns `boot_id` (per-process uuid), `tier_sb_version`,
+`capabilities_schema`, `single_reactor_assumed`, `methods[]`. A changed `boot_id` across polls means the
+target restarted: treat all volatile state as lost. `methods[]` is filtered through the live RPC registry, so
+it never reports a method that then fails `-32601`; a method built in but absent from the list is a harmless
+false negative, and the per-call `-32601` probe stays ground truth.
 
-## Lifecycle — tier
+## Tier lifecycle
 
 | RPC | Preconditions | Idempotence | Crash behavior |
 |:----|:--------------|:------------|:---------------|
-| `bdev_tier_create` | name free; `md_num_blocks>0`; `cluster_blocks` is 0 (legacy, no alignment) or ≥2 — **1 is rejected** (R13); `md_num_blocks` bounded (no align overflow, R17) | -EEXIST if name taken | in-RAM only until first SB write |
-| `bdev_tier_add_band` | tier exists, **not registered**; unique wwn; disk ≥ sb+md; blocklen divides the 128 KiB SB slot (R7 — T10-DIF 520/4160 rejected) | band_id auto-assigned; caller replays deterministically | — |
-| `bdev_tier_assemble_band` | **not registered (R8)**; band_id<64; state≤RETIRED; no overlap; fits disk; unique wwn; blocklen divides SB slot (R7) | -EEXIST on duplicate band_id; **-EBUSY after register (R8)** | places at stored geometry |
-| `bdev_tier_register` | ≥1 band, cluster-aligned geometry | **-EEXIST if already registered (W1)** | **rehydrates `t->seq` from the on-disk SBs (R2), then persists SB** on success |
-| `bdev_tier_retire_band` | not an md-mirror band (-EBUSY, T-7) | **idempotent**: re-run re-persists + re-closes | **async: acks only after SB durable (MJ6)**; rc≠0 ⇒ retry |
-| `bdev_tier_resync_md` | target is a DEGRADED md leg; healthy source leg exists | re-runnable (leg stays DEGRADED on failure) | copy under md-range quiesce; acks after activate+persist |
-| `bdev_tier_delete` | — | -ENODEV if absent | unregister → destruct |
-| `bdev_tier_get_bands` / `bdev_tier_read_sb` | — | read-only | read_sb returns highest-seq valid slot + `generation_uuid` |
+| `bdev_tier_create` | name free; `md_num_blocks > 0`, bounded so alignment cannot overflow; `cluster_blocks` is 0 (legacy, unaligned) or ≥ 2 — **1 is rejected** | `-EEXIST` if the name is taken | in-RAM until the first superblock write |
+| `bdev_tier_add_band` | tier exists, **not registered**; unique wwn; disk ≥ superblock + md; block length divides the 128 KiB superblock slot (T10-DIF 520/4160 rejected) | band_id auto-assigned; the caller replays deterministically | — |
+| `bdev_tier_assemble_band` | tier **not registered**; `band_id < 64`; state ≤ RETIRED; no range overlap; fits the disk; unique wwn; block length divides the slot | `-EEXIST` on duplicate band_id; **`-EBUSY` once registered** | places the band at its stored geometry |
+| `bdev_tier_register` | ≥ 1 band; cluster-aligned geometry | **`-EEXIST` if already registered** | rehydrates `t->seq` from the on-disk superblocks, then persists on success |
+| `bdev_tier_retire_band` | not an md-mirror band, else `-EBUSY` | idempotent: a re-run re-persists and re-closes | async; acks only once the superblock is durable. `rc ≠ 0` means retry |
+| `bdev_tier_resync_md` | target is a DEGRADED md leg; a healthy source leg exists | re-runnable; the leg stays DEGRADED on failure | copies under an md-range quiesce; acks after activate + persist |
+| `bdev_tier_delete` | — | `-ENODEV` if absent | unregister, then destruct |
+| `bdev_tier_get_bands`, `bdev_tier_read_sb` | — | read-only | `read_sb` returns the highest-seq valid slot plus `generation_uuid` |
 
-`bdev_tier_read_sb` exposes `version`, `seq`, `generation_uuid`,
-`created_epoch_sec`. **Assembly (control-plane) must**: read every candidate
-disk's SB, group by `generation_uuid` (fence stale disks from a previous
-instance), take the highest `seq` per band, and if the two md legs disagree on
-`seq`, assemble the higher one ACTIVE and the other DEGRADED then
-`bdev_tier_resync_md` (G-CSI-2). The fork persists DEGRADED but cannot arbitrate
-a split-brain across disks.
+**Assembly rules.** `bdev_tier_read_sb` exposes `version`, `seq`, `generation_uuid`, `created_epoch_sec`.
+Read every candidate disk's superblock, group by `generation_uuid` (this fences stale disks from a previous
+instance), take the highest `seq` per band, and when the two md legs disagree on `seq`, assemble the higher
+one ACTIVE and the other DEGRADED, then `bdev_tier_resync_md`. The fork persists DEGRADED but cannot
+arbitrate a split-brain across disks; that is the control-plane's.
 
-- **Seq monotonicity across a restart is fork-owned (R2).** The control-plane
-  does NOT thread `seq` back through `create`/`assemble`/`register` (it reads seq
-  only to pick the authoritative SB). So `bdev_tier_register` **re-reads the bands'
-  on-disk SBs and seeds `t->seq` above the highest seq found** before its first
-  persist. Without this the fresh instance would write `seq 1`, which a pre-restart
-  SB at a high seq out-votes forever (highest-seq-wins), reassembling the STALE
-  geometry and silently undoing every retire/relocate persisted at the high seq. No
-  CSI change is required; this is the behavior the contract already assumed.
+**Sequence monotonicity is fork-owned.** The control-plane never threads `seq` back through
+`create`/`assemble`/`register` — it reads `seq` only to pick the authoritative superblock. So
+`bdev_tier_register` re-reads the bands' on-disk superblocks and seeds `t->seq` above the highest value found
+before its first persist; otherwise a fresh instance would write `seq 1`, be out-voted forever under
+highest-seq-wins, and silently reassemble stale geometry.
 
-## Data-plane — relocate / remap (patch 0005)
+## Data plane — relocate and remap (patch 0005)
 
-- `bdev_lvol_relocate_cluster {name, tier_name, cluster_num, dst_lba_start, dst_lba_count}`
-  - **P-2**: the lvol must live on `tier_name`'s composite (-EINVAL else).
-  - **F2**: refuses snapshot blobs (-EBUSY).
-  - **F4**: one relocate/remap in flight per blob (-EBUSY else).
-  - **C1 + C1-DRAIN**: runs under an **lvol-bdev quiesce** (drains outstanding
-    host I/O, then holds new I/O above the L2P translation) plus an inner
-    **blob freeze**, for copy+commit; ALL of the lvol's I/O stalls
-    ~drain + 3× one cluster. The drain is what makes the copy's source stable —
-    the freeze alone never covered writes already in flight. **N-2**: the blob
-    is pinned by an own open-ref for the whole chain.
-  - Crash-safe (invariants A/B): a crash mid-op leaves an orphan cluster the
-    native blobstore replay reclaims; never a lost ACKed write.
-  - **H4**: an ambiguous commit failure (extent write dispatched, error
-    completion) QUARANTINES the destination cluster until restart instead of
-    releasing it — the durable extent may reference it; replay reconciles.
-- `bdev_lvol_relocate_clusters {…, clusters:[…], verify?}` — **PF3 batch**: one
-  quiesce+freeze amortized over N clusters (≤4096). Correctness identical to the
-  single form (same C1-DRAIN and H4 contracts). `verify` (**PF4**, default true)
-  forwards to each copy; false skips the C5 read-back on trusted media. Returns
-  `{relocated, requested, error}` — **partial success is a 200** (caller retries
-  the tail from `relocated`).
-- `bdev_lvol_remap_cluster {…}` — **N-7/W6**: source band must be DEGRADED,
-  destination band ACTIVE. Relaxes invariant A intentionally (the cluster is
-  already lost; the subsequent `bdev_raid_rebuild_ranges` fills the new one). The
-  control-plane MUST journal the remap durably BEFORE calling and re-drive the
-  range rebuild at restart until confirmed (**PR3**, remap-before-rebuild).
-  - **R11 — the old cluster is QUARANTINED, not freed.** A remap re-homes a cluster
-    whose old copy is on the DEGRADED band; the commit keeps that old cluster
-    marked-allocated (`release_old=false`) rather than returning it to the thin
-    pool. Otherwise the allocator could re-serve that LBA to a normal host write,
-    routing it back into the dead band → `-EIO` on a healthy volume. The quarantine
-    is in-RAM for the running instance; a reboot rebuilds `used_clusters` from the
-    blob extents (now pointing at the new cluster) and the control-plane reassembles
-    the dead band DEGRADED/RETIRED so its range is not re-served. Relocate (copy,
-    healthy source) still frees the old cluster normally (`release_old=true`).
-- `bdev_lvol_remap_clusters {name, tier_name, clusters:[{cluster_num, dst_lba_start, dst_lba_count}]}`
-  — **batch no-copy remap**: the no-copy analogue of `bdev_lvol_relocate_clusters`.
-  Re-homes N lost clusters (DEGRADED source → ACTIVE dst) under the **same per-item
-  guards** as the single `bdev_lvol_remap_cluster` (shared `remap_one_precheck`);
-  **no freeze, no copy, no `verify`** (the source is dead — nothing to drain or
-  read back). Sequential; **stops at the first per-item error** releasing that
-  item's un-committed claim, and returns `{remapped, requested, error}` —
-  **partial success is a 200** (caller retries the tail from `remapped`). Bounded
-  to 4096 items. Old clusters are QUARANTINED per item (`release_old=false`, R11).
-  Crash-safety per item is identical to the single remap (invariant B); the
-  control-plane journals the remap set and re-drives the tail + range rebuild at
-  restart (**PR3**). Re-issuing a partially-committed batch is safe: already-moved
-  clusters no longer sit on a DEGRADED band, so their per-item guard cleanly
-  `-EINVAL`s rather than double-moving.
-- **Cluster claim performance (deferred #4, patch 0004).** The claim under both
-  batch RPCs (`spdk_blob_claim_cluster_in_range`) is **word-wise** (skips
-  fully-allocated 64-bit words of the `used_clusters` bit-pool in one step) with an
-  optional **resume cursor** (`spdk_blob_claim_cluster_in_range_from`): a batch that
-  fills one band claims in **O(bandsize + N)** rather than O(N²), so a long
-  demotion/evac campaign shows flat per-cluster claim cost. Semantics are
-  **unchanged** (first free cluster in the window, `-ENOSPC` when full); the cursor
-  is a hint only — never a correctness input — so a stale/over-shot cursor is always
-  safe (the live windowed scan bounds every result). The batch threads one cursor
-  per dst band window and resets it when the window changes.
+| RPC | Preconditions | Execution | Result and crash behavior |
+|:----|:--------------|:----------|:--------------------------|
+| `bdev_lvol_relocate_cluster {name, tier_name, cluster_num, dst_lba_start, dst_lba_count}` | lvol lives on `tier_name`'s composite, else `-EINVAL`; not a snapshot blob, else `-EBUSY`; one relocate or remap in flight per blob, else `-EBUSY` | copy + commit under an **lvol-bdev quiesce** (drain outstanding host I/O, then hold new I/O above the L2P translation) plus an inner blob freeze; the drain is what makes the copy source stable. That lvol's I/O stalls ≈ drain + 3 cluster times. The blob is pinned by an own open-ref throughout | a crash mid-operation leaves an orphan cluster that native blobstore replay reclaims — never a lost ACKed write. An ambiguous commit failure (extent write dispatched, error completion) **quarantines** the destination cluster until restart instead of releasing it, since the durable extent may reference it |
+| `bdev_lvol_relocate_clusters {…, clusters:[…], verify?}` | same per item | same per item, but one quiesce + freeze amortized over N ≤ 4096 clusters; `verify` (default `true`) forwards to each copy, `false` skips the read-back on trusted media | `{relocated, requested, error}`; **partial success is a 200** — retry the tail from `relocated`. Per-item crash behavior identical |
+| `bdev_lvol_remap_cluster {…}` | source band DEGRADED, destination band ACTIVE | no copy: re-homes the cluster only. Intentionally relaxes the no-lost-write invariant (the cluster is already lost) — the subsequent `bdev_raid_rebuild_ranges` fills the new one | journal the remap durably **before** calling, and re-drive the range rebuild at restart until confirmed |
+| `bdev_lvol_remap_clusters {name, tier_name, clusters:[{cluster_num, dst_lba_start, dst_lba_count}]}` | same per item (shared `remap_one_precheck`) | **no freeze, no copy, no `verify`** — the source is dead, so there is nothing to drain or read back. Sequential, N ≤ 4096 | **stops at the first per-item error**, releasing that item's un-committed claim; returns `{remapped, requested, error}` with **partial success as a 200**. Journal the set and re-drive the tail plus the range rebuild at restart. Re-issuing a partially committed batch is safe: clusters already moved no longer sit on a DEGRADED band, so their guard returns `-EINVAL` instead of double-moving them |
 
-## Capacity / ENOSPC (patch 0009)
+**The old cluster is quarantined, not freed** (both remap forms). The commit keeps it marked-allocated
+(`release_old=false`); freeing it would let the allocator re-serve that LBA to a host write, routing it back
+into the dead band and returning `-EIO` on a healthy volume. The quarantine is in-RAM: after a reboot
+`used_clusters` is rebuilt from the blob extents, which now point at the new cluster, and the control-plane
+reassembles the dead band DEGRADED or RETIRED so its range is never re-served. Relocate, copying from a
+healthy source, still frees the old cluster (`release_old=true`).
 
-- A raid1 write to a **thin** member that is full returns NVMe
-  `CAPACITY_EXCEEDED` to the host **without** failing the member (**G3** — no
-  silent degradation). The write is NACKed.
-- **Divergence, by design.** Both legs stay ONLINE, but the leg whose write
-  failed and the leg whose write succeeded now **disagree on that block**. This
-  is correct block semantics (a NACKed write has indeterminate content) but the
-  fork does **NOT** auto-reconverge. The control-plane must treat that LBA's
-  content as undefined until it is rewritten, and must keep thin reservations
-  symmetric across legs (placement-side) so the case stays rare.
+**Cluster claim cost (patch 0004).** The claim behind both batch RPCs (`spdk_blob_claim_cluster_in_range`)
+scans the `used_clusters` bit-pool word-wise and takes an optional resume cursor
+(`spdk_blob_claim_cluster_in_range_from`), so a batch filling one band claims in O(bandsize + N) rather than
+O(N²). Semantics are unchanged — first free cluster in the window, `-ENOSPC` when full — and the cursor is a
+hint, never a correctness input: the live windowed scan bounds every result, so a stale or over-shot cursor
+is safe. The batch threads one cursor per destination band window and resets it when the window changes.
 
-## Repair / rebuild
+## Capacity and ENOSPC (patch 0009)
 
-- `bdev_raid_rebuild_ranges {name, ranges:[{start_lba,num_blocks}]}` — **C2**:
-  each chunk repaired under a channel-owned LBA lock (host writes held +
-  replayed). **P-3**: parity raids require **full-stripe-aligned** ranges
-  (-EINVAL else); the caller must align. **N-6**: a REMOVE aborts at the next
-  chunk (-ENODEV) — re-drive.
-  - **C3 — geometry is published, not guessed.** Read `full_stripe_blocks` from
-    the raid bdev's `bdev_get_bdevs` → `driver_specific.raid` (emitted for any
-    striped raid). It is EXACTLY the alignment `rebuild_ranges` validates:
-    `strip_size × min_base_bdevs_operational` (for raid5f, `min == num-1 == k`,
-    the data-chunk count). Align every range to it. Do **not** re-derive `k`
-    from `num_base_bdevs_operational` — for a healthy raid5f that field is `n`
-    (all members), not `k`; only `full_stripe_blocks` (or `min_base_bdevs_operational`)
-    gives the data-chunk count. `strip_size_kb`, `num_base_bdevs`,
-    `num_base_bdevs_operational` remain available for cross-checks.
-  - **EC reconstruct precondition (load-bearing).** The repair reconstructs a
-    lost chunk only because the degraded member returns **read errors** (present
-    band DEGRADED, patch 0006) or is **absent** (NULL channel, upstream) — either
-    triggers a parity reconstruct-read that the write-back then re-lays with fresh
-    parity. A member replaced by a **healthy, zeroed** disk reads its zeros
-    *successfully*, so no reconstruct fires and the repair would rewrite zeros.
-    The control-plane MUST therefore drive `rebuild_ranges` while the target
-    member is still **DEGRADED/absent** (the `remap → rebuild` order, PR3), NOT
-    after swapping in a fresh member. See
-    `docs/audits/2026-07-04_revue-ec-rebuild-ranges.md`.
-  - An unrecoverable stripe (>1 fault) fails the whole call with -EIO; the target
-    logs the offending chunk LBA/range (`raid repair: unrecoverable read at
-    chunk …`). Repair is idempotent — re-drive the tail after fixing redundancy.
-- `bdev_raid_add_base_bdev {…, skip_rebuild}` — **CBT-3/P5**: skip_rebuild is a
-  "trust me" primitive; the control-plane MUST prove the residual delta is zero
-  (garde résidu-nul + INV-37) before calling. **CBT-6**: a channel-promotion
-  failure now unwinds fully and returns an error (the member is not left
-  half-wired) — treat as retryable. **CBT-7**: the SB flips to CONFIGURED only
-  after the unquiesce; a crash between the two costs a full rebuild at reboot
-  (conservative, safe).
+A raid1 write to a **thin** member that is full returns NVMe `CAPACITY_EXCEEDED` to the host **without**
+failing the member: the write is NACKed and no leg is silently degraded away. **Divergence follows, by
+design**: both legs stay ONLINE but now disagree on that block. A NACKed write has indeterminate content, so
+this is correct block semantics, and the fork does **not** auto-reconverge. Treat that LBA as undefined until
+it is rewritten, and keep thin reservations symmetric across legs (placement-side) so the case stays rare.
 
-## Member observation & extended superblock (GCCP 0014.6/0014.7, patches 0016/0017)
+## Repair and rebuild
 
-- **0014.7 — extended superblock (V-2).** SB minor 0→1 (carved from reserved
-  bytes: a minor-0 SB reads back as generation 0 / epoch 0). Per member:
-  `content_generation` — survivors increment it in the SAME SB transaction
-  that records a member's ejection (RecordDivergence); a member completing a
-  rebuild (or skip_rebuild promotion) ADOPTS the survivors' max generation in
-  the same transaction as its CONFIGURED flip. A lagging generation is the
-  durable proof of staleness the cold-recovery pass reads. `view_epoch` is
-  persisted/reassembled here; the view protocol mutates it (W3, 0014b).
-  Reassembly restores both for ALL slots (a FAILED slot keeps its stale
-  generation — that lag is the point).
-- **0014.6 — per-member observation.** `get_bdevs` → `driver_specific.raid.
-  base_bdevs_list[]` gains: `state` (derived, precedence:
-  `failed > write_only > configured > configuring > absent`), `since` (unix
-  seconds of the last observable state flip — the CP's anti-flap input),
-  `content_generation`, `view_epoch`, and — when the member is a cbt bdev
-  tracking a live epoch — `epoch_nonce`/`epoch_state`/`truncated` (the
-  Decider's EpochObservation source; fields absent otherwise). The raid reads
-  the cbt facts via `vbdev_cbt_query_latest_epoch()` (most recently opened
-  live epoch; closed epochs leave the list).
+`bdev_raid_rebuild_ranges {name, ranges:[{start_lba, num_blocks}]}`
 
-## Envelopes, ejection epochs, fence-resume, verify_ranges (GCCP 0014.9-.12)
+- Each chunk is repaired under a channel-owned LBA lock; host writes are held and replayed.
+- Parity raids require **full-stripe-aligned** ranges, else `-EINVAL`. The caller aligns.
+- A member REMOVE aborts at the next chunk with `-ENODEV`; re-drive.
+- An unrecoverable stripe (more than one fault) fails the whole call `-EIO` and logs the offending chunk
+  range (`raid repair: unrecoverable read at chunk …`). Repair is idempotent: re-drive the tail once
+  redundancy is restored.
+- **Geometry is published, not guessed.** Read `full_stripe_blocks` from `bdev_get_bdevs` →
+  `driver_specific.raid` (emitted for any striped raid); it is exactly the alignment this RPC validates,
+  `strip_size × min_base_bdevs_operational` (for raid5f, `min == num - 1 == k`, the data-chunk count). Do
+  **not** re-derive `k` from `num_base_bdevs_operational`: on a healthy raid5f that field is `n`, all
+  members. Only `full_stripe_blocks` or `min_base_bdevs_operational` gives the data-chunk count;
+  `strip_size_kb`, `num_base_bdevs` and `num_base_bdevs_operational` remain for cross-checks.
+- **Order: remap, then rebuild.** Drive `rebuild_ranges` while the target member is still DEGRADED or
+  absent, never after swapping in a fresh member. The repair reconstructs a lost chunk only because the
+  member returns read errors (band present and DEGRADED, patch 0006) or is absent (NULL channel, upstream); a
+  healthy zeroed replacement reads its zeros *successfully*, no parity reconstruct fires, and the repair
+  rewrites zeros over live data.
 
-- **0014.9 — envelopes (patch 0021).** `bdev_raid_set_envelopes {rebuild|verify|
-  relocate}_{nominal|maintenance}_mb_sec, max_concurrent_rebuilds, regime?` +
-  `bdev_raid_get_envelopes`. CAPS, never shares; data-plane default 0 =
-  UNLIMITED (a failed set is a control-plane INCIDENT, never a silent
-  fallback); unknown regime = -EINVAL. The rebuild cap (under the current
-  regime) is FROZEN at process allocation and takes precedence over the legacy
-  `bdev_raid_set_options` bandwidth. Concurrency: an RPC-driven seeded rebuild
-  beyond the bound is refused -EAGAIN (retryable); the attach-triggered auto
-  rebuild is admitted LOUDLY (refusing would strand an attached member). The
-  relocate cap is stored for the tier module (wiring deferred, documented).
-- **0014.10 — epoch at ejection (patch 0019).** The raid opens an auto epoch
-  (`auto-<ticks>` / nonce `auto<hex>`) on EVERY surviving member's cbt in the
-  ejection path, stale_backend_id = the ejected member. -EEXIST when an OPEN
-  epoch already bounds the round (never an implicit takeover), -ENODEV when
-  the member is not cbt-wrapped — both fine. The auto nonce reaches the CP
-  through get_bdevs (0014.6): that is how the round is adopted.
-- **0014.11 — pause × rebuild (patch 0020).** Structural contract: a paused
-  subsystem QUEUES the rebuild's writes target-side; nothing in the process
-  path times out, so the outcome is never FAILED because of a pause.
-  Force-resume (DÉC-11): `nvmf_subsystem_resume {…, force: true}` breaks any
-  standing barrier — loud (WARNLOG) and audited; the barrier's own tokened
-  resume then reports `resumed:false/barrier_intact:false`, so the
-  group-snapshot saga fails cleanly and replays.
-- **0014.12 — verify_ranges (patch 0022).** `bdev_raid_verify_ranges {name,
-  ranges?:[{start_lba,num_blocks}], token?, expected_incarnation?}` — the
-  EXHAUSTIVE detector (§10a's integrated phase is the probabilistic one).
-  Two modes, selected by the raid LEVEL (reported back as `mode` in the
-  result): **raid1 = copy-compare** (below), **raid5f = syndrome** (see the
-  Erasure-coding section). raid1: first configured leg = implicit arbiter,
-  compared to every other readable leg, 1 MiB chunks each under a
-  channel-owned LBA lock (host writes held + replayed); paced by the verify
-  envelope (frozen at dispatch). REPORTS `{verified_blocks, divergent_blocks,
-  divergent_ranges (≤128, exact count + truncated flag), mode}` and never
-  repairs — arbitration is the CP's (R ≥ 3, T-D2). No ranges = the whole
-  raid; callers drive bounded batches and re-drive, like rebuild_ranges.
-  -EBUSY with a live background process (and aborts cleanly if one appears
-  mid-run); registry mirrors progress under the token (verifying →
-  succeeded+verified on zero divergence / divergent otherwise).
+`bdev_raid_add_base_bdev {…, skip_rebuild}` — `skip_rebuild` is a "trust me" primitive: prove the residual
+delta is zero before calling. A channel-promotion failure unwinds fully and returns an error, never leaving
+the member half-wired; treat it as retryable. The superblock flips to CONFIGURED only after the unquiesce, so
+a crash between the two costs a full rebuild at reboot.
 
-## Erasure coding — raid5f (SPEC-75G F-b/F-d, patches 0022/0023)
+## Seeded rebuild and write-only attach (patch 0013)
 
-The raid5f strate is CP-written only (DÉC-EC-0: no host ever writes a
-raid5f); these contracts serve the `EcImage` lifecycle (seal-verify, periodic
-verify, degraded-service observation).
+- `bdev_raid_add_base_bdev` accepts optional `"write_only": bool` — attach the member write-replicated and
+  read-excluded, with no rebuild process and no superblock CONFIGURED flip. Re-attaching the same bdev in the
+  same mode is an idempotent no-op.
+- `bdev_raid_start_seeded_rebuild {name, base_bdev, ranges:[{offset_blocks, length_blocks}], rebuild_token?,
+  expected_incarnation?}` starts the in-raid rebuild seeded with those dirty ranges, fast-advancing across
+  clean gaps; the per-window `quiesce_range` region lock is unchanged. Async: returns `{rebuild_id}`
+  immediately; completion promotes read-eligibility and flips the superblock to CONFIGURED. Refused `-EINVAL`
+  if the member is not write_only-attached, `-EAGAIN` beyond the concurrent-rebuild bound, `-ESTALE` on an
+  incarnation mismatch. Audited.
+- A failed seeded rebuild removes the member (the vanilla process-failure path) and leaves the epoch FROZEN
+  so the delta can be retried.
+- Seeded rebuild is **raid1-only**: on a raid5f it refuses `-EINVAL`.
 
-- **verify_ranges, syndrome mode (patch 0022, F-b).** On a raid5f, the same
-  RPC recomputes the RAID-5 consistency relation per stripe: the XOR of all
-  k+1 members' strips must be zero (the rotating parity position is
-  irrelevant to the check — no raid5f internals involved). Result field
-  `mode: "syndrome"`.
-  - **Preconditions**: ONLINE; no background process (-EBUSY); **every
-    member readable, else -EAGAIN** ("repair first") — with m = 1 a stripe
-    missing one strip has nothing left to check against. A member read
-    error or membership change mid-run also aborts -EAGAIN. Plain-data
-    bdevs only (interleaved md ⇒ -ENOTSUP).
-  - **Ranges** must be full-stripe aligned (`full_stripe_blocks` from
-    get_bdevs, 0008 discipline) — -EINVAL otherwise. No ranges = the whole
-    raid (aligned by construction).
-  - **Reporting** is per STRIPE in raid LBA space; report-only, never
-    repairs. Divergence handling is the CP's: re-fold the stripe from its
-    source, or raise `EcContentDivergence`.
-  - Same LBA-lock, verify-envelope pacing (charged on the k+1 strips
-    actually read), token/outcome-registry and incarnation semantics as the
-    raid1 mode.
-- **Verify-at-seal is EXPLICIT (0018 interplay).** The integrated verify
-  phase (0014.8) is raid1-only and completes a raid5f rebuild process
-  UNVERIFIED (clean no-op, registry `verified=false`). A raid5f is therefore
-  NEVER auto-sealed by a rebuild: the CP must run a syndrome verify_ranges
-  pass to seal (INV-EC-5) — including after `bdev_raid_rebuild_ranges` and
+## Member observation and the extended superblock (patches 0016/0017)
+
+- **Extended superblock**, minor version 0 → 1, carved from reserved bytes, so a minor-0 superblock reads
+  back as generation 0 and epoch 0. Per member, `content_generation`: survivors increment it in the **same**
+  superblock transaction that records a member's ejection, and a member completing a rebuild or a
+  `skip_rebuild` promotion adopts the survivors' maximum generation in the same transaction as its CONFIGURED
+  flip, so a lagging generation is durable proof of staleness for cold recovery. `view_epoch` is persisted
+  here too. Reassembly restores both fields for **all** slots: a FAILED slot keeps its stale generation.
+- **Per-member observation.** `bdev_get_bdevs` → `driver_specific.raid.base_bdevs_list[]` carries `state`
+  (derived, precedence `failed > write_only > configured > configuring > absent`), `since` (unix seconds of
+  the last observable state flip — the anti-flap input), `content_generation`, `view_epoch`, and, when the
+  member is a cbt bdev tracking a live epoch, `epoch_nonce`, `epoch_state` and `truncated` (absent
+  otherwise). Those cbt facts come from the most recently opened live epoch; closed epochs leave the list.
+
+## Envelopes (patch 0021)
+
+`bdev_raid_set_envelopes {rebuild|verify|relocate}_{nominal|maintenance}_mb_sec, max_concurrent_rebuilds,
+regime?` and `bdev_raid_get_envelopes`.
+
+- Envelopes are **caps, never shares**. The data-plane default 0 means UNLIMITED, so a failed `set` is a
+  control-plane incident, never a silent fallback. An unknown `regime` is `-EINVAL`.
+- The rebuild cap for the current regime is frozen at process allocation and takes precedence over the legacy
+  `bdev_raid_set_options` bandwidth setting.
+- An RPC-driven seeded rebuild beyond `max_concurrent_rebuilds` is refused `-EAGAIN` (retryable); the
+  attach-triggered automatic rebuild is admitted loudly, since refusing it would strand an attached member.
+- The relocate cap is stored for the tier module; that wiring is not yet in place.
+
+## Epoch opened at ejection (patch 0019)
+
+On the ejection path the raid opens an automatic epoch — id `auto-<ticks>`, nonce `auto<hex>` — on **every**
+surviving member's cbt, with `stale_backend_id` set to the ejected member. It returns `-EEXIST` when an OPEN
+epoch already bounds the round (never an implicit takeover) and `-ENODEV` when the member is not cbt-wrapped;
+both are benign. The automatic nonce reaches the control-plane through `bdev_get_bdevs`, and that is how the
+round is adopted. Raid1-only.
+
+## Pause barrier (patch 0003)
+
+- `nvmf_subsystem_pause {nqn, nsid?, ttl_ms?}` — a standing, drain-certified barrier: the 200 OK certifies
+  the drain. Returns an opaque `token` (`<instance>:<epoch>`) and the applied `ttl_ms`, clamped to 60 s and
+  logged when clamped. An idempotent re-pause refreshes the TTL; the TTL auto-resumes a leaked pause. The
+  registry entry is preallocated **before** the pause dispatch, so a Paused subsystem always has its entry
+  and TTL — no orphan pause on OOM.
+- `nvmf_subsystem_resume {nqn, token?}` reports `barrier_intact`. False means the freeze broke between pause
+  and resume (TTL, crash, another actor), so drop any snapshot taken under it. A stale `boot_id` implies the
+  token is dead.
+- `nvmf_subsystem_resume {…, force: true}` breaks any standing barrier, loudly (WARNLOG) and audited; the
+  barrier's own tokened resume then reports `resumed: false` / `barrier_intact: false`, so a group-snapshot
+  saga fails cleanly and replays.
+- **A pause never fails a rebuild.** A paused subsystem queues the rebuild's writes target-side and nothing
+  in the process path times out, so an outcome is never FAILED because of a pause.
+
+## verify_ranges — exhaustive divergence detection (patch 0022)
+
+`bdev_raid_verify_ranges {name, ranges?:[{start_lba, num_blocks}], token?, expected_incarnation?}` is the
+exhaustive detector; the verify phase integrated into rebuilds is the probabilistic one. The mode follows the
+raid level and is reported back as `mode`: raid1 copy-compare, raid5f syndrome.
+
+Both modes: `-EBUSY` when a background process is live, and a clean abort if one appears mid-run. Chunks are
+read under a channel-owned LBA lock with host writes held and replayed, paced by the verify envelope frozen
+at dispatch. It **never repairs** — arbitration belongs to the control-plane. No `ranges` means the whole
+raid; callers drive bounded batches and re-drive, as with `rebuild_ranges`. The outcome registry mirrors
+progress under `token` (`verifying`, then `succeeded` with `verified` on zero divergence, or `divergent`),
+and `expected_incarnation` carries the same `-ESTALE` semantics as elsewhere.
+
+| Mode | Extra preconditions | Check | Reporting |
+|:-----|:--------------------|:------|:----------|
+| **raid1** — copy-compare | plain-data raid1 | the first configured leg is the implicit arbiter, compared against every other readable leg in 1 MiB chunks | `{verified_blocks, divergent_blocks, divergent_ranges, mode}`; `divergent_ranges` holds ≤ 128 entries alongside the exact count and a truncated flag |
+| **raid5f** — syndrome | raid ONLINE; **every member readable, else `-EAGAIN`** ("repair first") — with one parity strip, a stripe already missing a strip has nothing to check against. A member read error or a membership change mid-run also aborts `-EAGAIN`. Plain-data bdevs only: interleaved metadata gives `-ENOTSUP`. Ranges must be full-stripe aligned (`full_stripe_blocks` from `bdev_get_bdevs`), else `-EINVAL`; no ranges = the whole raid, aligned by construction | recomputes the RAID-5 consistency relation per stripe: the XOR of all k+1 members' strips must be zero. The rotating parity position is irrelevant, so no raid5f internals are involved | per stripe in raid LBA space, `mode: "syndrome"`, report-only. Divergence handling is the control-plane's: re-fold the stripe from its source, or raise a content divergence. The verify envelope is charged on the k+1 strips actually read |
+
+## Erasure coding — raid5f (patches 0022/0023)
+
+The raid5f layer is control-plane-written only; no host ever writes to a raid5f. These contracts serve the
+erasure-coded image lifecycle: seal-verify, periodic verify, degraded-service observation.
+
+- **Sealing is explicit.** The verify phase integrated into rebuilds is raid1-only and completes a raid5f
+  rebuild UNVERIFIED (clean no-op, registry `verified=false`). A raid5f is therefore **never** auto-sealed by
+  a rebuild: run a syndrome `verify_ranges` pass to seal it, including after `bdev_raid_rebuild_ranges` and
   after a full rebuild process.
-- **Degraded-service counters (patch 0023, F-d).** get_bdevs
-  `driver_specific.raid` gains `reconstruct_reads_absent` (member missing —
-  vanilla reconstruct-read), `reconstruct_reads_error` (member
-  present-but-erroring — 0006 fallback), `degraded_write_stripes` (stripes
-  written at zero margin; F-e: the CP freezes folds on a degraded EcImage,
-  so nonzero here is a contract-violation gauge), `last_degraded_ts` (unix
-  seconds, 0 = never). Written on the I/O paths with relaxed atomics
-  (single reactor today — D5). These feed `EcRebuildDebt.since` and the
-  "serving degraded since T" incident escalation. The rebuild process's own
-  reconstruct reads are intentionally NOT counted (they are repair work,
-  not degraded host service).
-- **Seeded rebuild / auto-epoch stay raid1-only by design** (0013 refuses
-  -EINVAL; 0019 is gated): EC repair = re-provision the chunk +
-  `bdev_raid_rebuild_ranges` bounded to allocated ranges (thin-preserving,
-  INV-EC-9), or the native full process for a near-full image.
+- **Degraded-service counters (patch 0023).** `bdev_get_bdevs` → `driver_specific.raid` carries
+  `reconstruct_reads_absent` (member missing — the vanilla reconstruct-read), `reconstruct_reads_error`
+  (member present but erroring — the patch 0006 fallback), `degraded_write_stripes` (stripes written at zero
+  margin; the control-plane freezes folds on a degraded image, so a nonzero value is a contract-violation
+  gauge) and `last_degraded_ts` (unix seconds, 0 = never). Written on the I/O paths with relaxed atomics,
+  valid under the single-reactor assumption, they feed the "serving degraded since T" escalation. The
+  rebuild's own reconstruct reads are deliberately not counted: that is repair work, not degraded host
+  service.
+- **Repairing erasure-coded data** means re-provisioning the chunk and running `bdev_raid_rebuild_ranges`
+  bounded to the allocated ranges (thin-preserving), or the native full rebuild process for a near-full
+  image. Seeded rebuild and the ejection auto-epoch stay raid1-only.
 
-## Incarnation & rebuild outcomes (GCCP 0014.4/0014.5, patches 0014/0015)
+## Incarnation — ownership of a raid (patch 0014)
 
-- **0014.4 — identity.** `bdev_raid_create {…, incarnation}` (required, ≤63
-  chars): no creation without the creating control-plane incarnation's
-  identity. Engaging RPCs — `bdev_raid_delete`, `bdev_raid_add_base_bdev`,
-  `bdev_raid_remove_base_bdev`, `bdev_raid_start_seeded_rebuild` — accept
-  `expected_incarnation?` and refuse with **-ESTALE** on mismatch (never
-  best-effort execution). Omission is reserved for manual rescue tooling: the
-  control-plane client ALWAYS sends it. Superblock-reassembled raids are
-  *unclaimed* (`incarnation` absent from `get_bdevs`); any engaging RPC that
-  carries `expected_incarnation` against an unclaimed raid is -ESTALE.
-  `get_bdevs` → `driver_specific.raid.incarnation` exposes ownership.
-- **0014.5 — rebuild outcome registry.** Process-wide, survives the raid bdev,
-  terminal entries purged 15 min after finishing (lazy TTL).
-  `bdev_raid_start_seeded_rebuild {…, rebuild_token?}` records the attempt
-  under the CP token (deterministic per attempt — a retry re-opens the same
-  entry); full rebuilds feed the SAME registry under `auto:<raid>:<member>:<ticks>`
-  tokens. `bdev_raid_get_rebuild_outcomes {token?}` returns
-  `[{token, raid_bdev, base_bdev, state, bytes, verified, finished_at}]` with
-  `state ∈ running|verifying|succeeded|failed|divergent|canceled` (lowercase on
-  the wire), `bytes` = bytes actually copied (seeded fast-skip windows do not
-  count), `finished_at` = unix seconds (0 while non-terminal).
-  - **CANCELED contract (T-D5)**: `bdev_raid_delete` (or member removal) with a
-    rebuild in flight ⇒ the process is cancelled, the outcome is `canceled`,
-    and **no process write is emitted after the RPC returns** (the delete reply
-    is gated behind the process fully stopping). The CP deliberately has no
-    `Cancel` action — cleanliness is guaranteed here.
-  - `verified` is set by the integrated verify phase (0014.8, patch 0018):
-    after the copy completes and BEFORE the process concludes (the SB
-    CONFIGURED flip is gated on it), 64 uniform-stride windows across the
-    copied extent (seed ranges for seeded rebuilds, whole raid otherwise) are
-    compared two-legs under `quiesce_range`, arbiter = the source leg. A
-    mismatch is re-copied from the arbiter and re-verified once; a second
-    mismatch under the same lock seals the outcome **DIVERGENT** (-EILSEQ).
-    Success seals `verified=true` — unlocking `epoch_close(consumed)` for the
-    token. Honest scope (T-C12): a probabilistic process-bug detector
-    (~64 MiB sampled); the exhaustive one is `bdev_raid_verify_ranges` (§10b).
-    Raid1 plain-data only; anything else completes unverified. The registry
-    shows `verifying` while the phase runs; re-copied windows count in `bytes`.
+`bdev_raid_create {…, incarnation}` is required (≤ 63 characters): no creation without the creating
+control-plane incarnation's identity. The engaging RPCs — `bdev_raid_delete`, `bdev_raid_add_base_bdev`,
+`bdev_raid_remove_base_bdev`, `bdev_raid_start_seeded_rebuild` — accept `expected_incarnation?` and refuse
+**`-ESTALE`** on mismatch, never executing best-effort. Omitting it is reserved for manual rescue tooling;
+the control-plane client always sends it. Superblock-reassembled raids are *unclaimed*: `incarnation` is
+absent from `bdev_get_bdevs`, and any engaging RPC carrying `expected_incarnation` against an unclaimed raid
+is `-ESTALE`. `driver_specific.raid.incarnation` exposes ownership.
 
-## CBT epochs / rebuild
+## Rebuild outcome registry (patches 0015/0018)
 
-- `bdev_cbt_epoch_freeze` / `epoch_close` / `epoch_open` (higher generation):
-  return **-EBUSY** while a rebuild is RUNNING on the epoch (**CBT-1/2/c5**) —
-  the control-plane must `bdev_cbt_cancel_rebuild` first.
-- **0014.1** — `bdev_cbt_epoch_open {…, nonce?}`: opaque CP-generated nonce
-  (≤31 chars), stored on the epoch and echoed in `get_bdevs` — kills the
-  epoch-id ABA across maintenance rounds. A generation takeover re-stamps the
-  nonce of the NEW round.
-- **0014.2** — resize under a live epoch ⇒ `truncated: true` on that epoch
-  (get_bdevs): the live bitmap does not cover the growth zone — the delta is a
-  lie, the control-plane must route to a FULL rebuild (D14). Never cleared:
-  survives generation takeovers, dies with the epoch.
-- **0014.3** — `bdev_cbt_epoch_close {…, mode?: "preserve"|"consumed",
-  rebuild_token?}`: `preserve` (default) restores any unconsumed frozen delta
-  to the live bitmap (H1 discipline); `consumed` deliberately DISCARDS it under
-  caller certification and **requires a rebuild_token naming a LOCAL
-  succeeded+verified outcome-registry entry (-EPERM otherwise)** — validated
-  against the 0014.5 registry; `verified` is produced by the integrated verify
-  phase (0014.8, patch 0018). An unknown `mode` is -EINVAL, never a silent
-  preserve.
-- **0014.6 (cbt part)** — `get_bdevs` exposes `driver_specific.cbt.epochs[]`:
-  `{epoch_id, nonce, state: open|frozen|rebuilding|completed|invalid,
-  generation, truncated}` — the control-plane's `EpochObservation` source (no
-  dedicated poll).
-- `bdev_cbt_partial_rebuild` / `bdev_cbt_start_rebuild`: one rebuild per
-  (cbt, epoch); a second returns -EBUSY (interpret as "already running", not a
-  failure). **CBT-4**: the rebuild FLUSHes the target before COMPLETED.
-  - **R1 — an aborted rebuild is NOT `completed`.** A source/target/cbt hot-remove
-    mid-rebuild yields `bdev_cbt_get_rebuild_status` state **`aborted`** (distinct
-    from `failed` = an I/O error, and `completed`) with `completed: false`. The
-    delta was NOT fully copied, so the control-plane must **resume** the rebuild,
-    never treat the member as synced. (Previously a mid-rebuild abort with no failed
-    I/O reported `completed` → silent under-replication.)
-- `bdev_cbt_reset`: refused while any epoch is active. Bitmap clearing is
-  reset-driven (**D3** — no automatic healthy-clear).
-- **Breaking (D3)**: `bdev_cbt_epoch_list` no longer emits
-  `healthy_clear_suspended` nor `backends_healthy` — both fields' backing state
-  was removed with the dead healthy-clear poller (`backends_healthy` was
-  constant `false`: `bdev_cbt_set_backends_healthy` never had a caller). Strict
-  parsers must drop these keys.
-- **SPEC-77A A1**: `bdev_cbt_epoch_list` epochs[] now also carry `nonce` and
-  `truncated`, making the list the union of the two epoch views (it alone carries
-  `stale_backend_id`; `get_bdevs` alone carried `nonce`/`truncated`). The nonce is
-  the ABA-free identity the control-plane addresses freeze/close with: without it
-  in this reply, every resolution of a real nonce failed and the epoch could never
-  be frozen or consumed.
-- `bdev_cbt_epoch_invalidate`: refused with `-EBUSY` while a rebuild is RUNNING
-  on the epoch (**C3** — an INVALID epoch is evictable; evicting it under the
-  rebuild would free the frozen bitmap the rebuild is scanning). Cancel first.
-- **H1 (delta preservation)**: a frozen delta that was exchanged out of the
-  live bitmap and never proven copied (rebuild aborted/failed/never run) is
-  merged back into the live bitmap before its buffer is discarded (re-freeze,
-  close, evict). A freeze retry therefore captures (unconsumed delta ∪ new
-  writes) — a failed iteration never loses chunks under `skip_rebuild`.
-- After a base-bdev hot-remove the cbt vbdev is NOT silently recreated with a
-  virgin bitmap (**c4**); recreation is an explicit `bdev_cbt_create` and the
-  delta history is considered lost (epoch_invalidate → full rebuild if needed).
+Process-wide, survives the raid bdev; terminal entries are purged 15 minutes after finishing, on a lazy TTL.
 
-## Pause barrier (patch 0003, SPEC-66 H10)
+- `bdev_raid_start_seeded_rebuild {…, rebuild_token?}` records the attempt under the control-plane token,
+  deterministic per attempt: a retry re-opens the same entry. Full rebuilds feed the same registry under
+  `auto:<raid>:<member>:<ticks>` tokens.
+- `bdev_raid_get_rebuild_outcomes {token?}` returns `[{token, raid_bdev, base_bdev, state, bytes, verified,
+  finished_at}]`, `state ∈ running|verifying|succeeded|failed|divergent|canceled` (lowercase on the wire),
+  `bytes` the bytes actually copied (seeded fast-skip windows do not count), `finished_at` in unix seconds
+  and 0 while non-terminal.
+- **Cancellation.** A `bdev_raid_delete` or member removal with a rebuild in flight cancels the process,
+  seals the outcome `canceled`, and emits **no process write after the RPC returns** — the delete reply is
+  gated behind the process fully stopping. There is deliberately no `Cancel` RPC.
+- **`verified` and the integrated verify phase.** After the copy completes and before the process concludes
+  — the CONFIGURED flip is gated on it — 64 uniform-stride windows across the copied extent (the seed ranges
+  for a seeded rebuild, the whole raid otherwise) are compared across two legs under `quiesce_range`, arbiter
+  the source leg. A mismatch is re-copied from the arbiter and re-verified once; a second mismatch under the
+  same lock seals the outcome DIVERGENT (`-EILSEQ`). Success seals `verified=true`, which unlocks
+  `epoch_close(consumed)` for that token. The registry shows `verifying` while the phase runs, and re-copied
+  windows count in `bytes`. Scope: a probabilistic process-bug detector over roughly 64 MiB sampled — the
+  exhaustive check is `bdev_raid_verify_ranges`. Raid1 plain-data only; anything else completes unverified.
 
-- `nvmf_subsystem_pause {nqn, nsid?, ttl_ms?}` — a **standing, drain-certified**
-  barrier: the 200 OK certifies the drain. Returns an opaque `token`
-  (`<instance>:<epoch>`) and the applied `ttl_ms` (clamped to 60 s, logged if
-  clamped). Idempotent re-pause refreshes the TTL. TTL auto-resumes a leaked
-  pause. **The registry entry is preallocated before the pause dispatch** — a
-  Paused subsystem always gets its entry+TTL (no orphan pause on OOM).
-- `nvmf_subsystem_resume {nqn, token?}` — reports `barrier_intact`: false means
-  the freeze broke (TTL/crash/other) between pause and resume, so the controller
-  must drop any snapshot taken under it. A stale `boot_id` implies the token is
-  dead.
+## CBT epochs and rebuild
 
-## Invariants the control-plane owns (P1–P5b)
+Every `-EBUSY` below clears the same way: call `bdev_cbt_cancel_rebuild` on the epoch first.
 
-- **P1** geometry is SB-authoritative (highest seq); CRD is intent.
-- **P2** relocate/remap target the lvol's own composite (enforced fork-side).
-- **P3** remap journaled before the call; range rebuild re-driven at restart.
-- **P4** skip_rebuild only after a proven-zero residual delta.
-- **P5** the reintegration order is `pause → final freeze → copy delta →
-  add_base_bdev(skip_rebuild) → await callback → resume`; verify by conformance
-  test.
-- **P5b (seeded rebuild — SPEC-74 M6, see docs/SEEDED-REBUILD-DESIGN.md)** the
-  monotonic reintegration order is `add_base_bdev(write_only) →
-  cbt epoch_freeze → epoch_get_dirty_ranges → start_seeded_rebuild(ranges) →
-  completion → control-plane set-after`. No pause anywhere on this path.
-  Correctness rests on the write-only attach preceding the freeze: from the
-  attach instant every host write is replicated to the joiner, so the frozen
-  delta is FIXED and clean gaps may be skipped. The member stays read-excluded
-  until the seeded rebuild completes. P5 remains valid while both paths coexist;
-  deleting it is gated on the SPEC-74 C4 bench (p99-under-roll within policy).
+| RPC | Refused when | Contract |
+|:----|:-------------|:---------|
+| `bdev_cbt_epoch_open {…, nonce?}` | `-EBUSY` while a rebuild is RUNNING on the epoch (opening at a higher generation) | `nonce` is an opaque control-plane string (≤ 31 chars), stored on the epoch and echoed in `bdev_get_bdevs`; it kills the epoch-id ABA across maintenance rounds. A generation takeover re-stamps the nonce for the new round |
+| `bdev_cbt_epoch_freeze` | `-EBUSY` while a rebuild is RUNNING on the epoch | exchanges the live bitmap for a frozen delta |
+| `bdev_cbt_epoch_close {…, mode?: "preserve"\|"consumed", rebuild_token?}` | `-EBUSY` while a rebuild is RUNNING; `-EPERM` if `consumed` without a `rebuild_token` naming a **local, `succeeded` and `verified`** outcome-registry entry; `-EINVAL` on an unknown `mode` — never a silent preserve | `preserve` (default) restores any unconsumed frozen delta to the live bitmap; `consumed` deliberately discards it under caller certification |
+| `bdev_cbt_epoch_invalidate` | `-EBUSY` while a rebuild is RUNNING — an INVALID epoch is evictable, and eviction would free the frozen bitmap the rebuild is scanning | cancel the rebuild first |
+| `bdev_cbt_partial_rebuild`, `bdev_cbt_start_rebuild` | `-EBUSY` if one already runs for that (cbt, epoch) pair — read it as "already running", not a failure | one rebuild per (cbt, epoch); the rebuild FLUSHes the target before reporting COMPLETED |
+| `bdev_cbt_reset` | refused while **any** epoch is active | bitmap clearing is reset-driven; there is no automatic healthy-clear |
 
-### Planned RPC surface for P5b (this branch)
+- **An aborted rebuild is not `completed`.** A source, target or cbt hot-remove mid-rebuild yields
+  `bdev_cbt_get_rebuild_status` state **`aborted`** — distinct from `failed` (an I/O error) and from
+  `completed` — with `completed: false`. The delta was not fully copied: resume the rebuild, and never treat
+  the member as synced.
+- **Resize under a live epoch** sets `truncated: true` on that epoch: the live bitmap does not cover the
+  growth zone, so the delta is a lie and the control-plane must route to a FULL rebuild. Never cleared — it
+  survives generation takeovers and dies with the epoch.
+- **Delta preservation.** A frozen delta exchanged out of the live bitmap and never proven copied — rebuild
+  aborted, failed, or never run — is merged back into the live bitmap before its buffer is discarded, on
+  re-freeze, close and evict. A freeze retry therefore captures (unconsumed delta ∪ new writes), so a failed
+  iteration never loses chunks under `skip_rebuild`.
+- After a base-bdev hot-remove the cbt vbdev is **not** silently recreated with a virgin bitmap: recreation
+  is an explicit `bdev_cbt_create` and the delta history is then lost (`epoch_invalidate`, then a full
+  rebuild if needed).
 
-- `bdev_raid_add_base_bdev` gains optional `"write_only": bool` — attach the
-  member write-replicated/read-excluded; no rebuild process, no SB CONFIGURED
-  flip. Idempotent re-attach of the same bdev in the same mode is a no-op.
-- `bdev_raid_start_seeded_rebuild {name, base_bdev, ranges:[{offset_blocks,
-  length_blocks}]}` — starts the in-raid rebuild seeded with the given dirty
-  ranges (fast-advance across clean gaps; per-window quiesce_range region lock
-  unchanged). Async: immediate `{rebuild_id}`; completion promotes
-  read-eligibility + SB CONFIGURED. Refused `-EINVAL` if the member is not
-  write_only-attached; SEC1-audited. A failed seeded rebuild removes the member
-  (vanilla process-failure path) and leaves the epoch FROZEN (H1) for retry.
+**Observation surfaces.** `bdev_get_bdevs` → `driver_specific.cbt.epochs[]` gives `{epoch_id, nonce, state:
+open|frozen|rebuilding|completed|invalid, generation, truncated}`, the epoch-observation source, so no
+dedicated poll RPC is needed. `bdev_cbt_epoch_list` carries the same `nonce` and `truncated`, making the list
+the union of the two views; it alone carries `stale_backend_id`. The nonce is the ABA-free identity that
+`freeze` and `close` are addressed with: without it in this reply, no real nonce resolves and an epoch can
+never be frozen or consumed. **Breaking change**: `bdev_cbt_epoch_list` no longer emits
+`healthy_clear_suspended` nor `backends_healthy` — both fields' backing state went with the dead
+healthy-clear poller (`backends_healthy` was a constant `false`; `bdev_cbt_set_backends_healthy` never had a
+caller). Strict parsers must drop these keys.
+
+## Invariants the control-plane owns
+
+- **Geometry authority.** The superblock is authoritative, at the highest `seq`; the CRD is intent.
+- **Relocate and remap scope.** Both target the lvol's own composite; the fork enforces this.
+- **Remap durability.** Journal the remap before the call; re-drive the range rebuild at restart.
+- **skip_rebuild proof.** Attach with `skip_rebuild` only after proving the residual delta is zero.
+- **Reintegration order, paused path.** `pause → final freeze → copy delta → add_base_bdev(skip_rebuild) →
+  await callback → resume`. Verified by a conformance test.
+- **Reintegration order, seeded path** (see `docs/SEEDED-REBUILD-DESIGN.md`). The monotonic order is
+  `add_base_bdev(write_only) → cbt epoch_freeze → epoch_get_dirty_ranges → start_seeded_rebuild(ranges) →
+  completion → control-plane set-after`, with no pause anywhere. Correctness rests on the write-only attach
+  preceding the freeze: from the attach instant every host write is replicated to the joiner, so the frozen
+  delta is fixed and clean gaps may be skipped. The member stays read-excluded until the seeded rebuild
+  completes. The paused path remains valid while both paths coexist.

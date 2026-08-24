@@ -1,5 +1,5 @@
 diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
-index a523787..94e0b34 100644
+index f2611d8..0a1cdee 100644
 --- a/module/bdev/raid/bdev_raid.c
 +++ b/module/bdev/raid/bdev_raid.c
 @@ -2251,6 +2251,7 @@ raid_bdev_remove_base_bdev_on_quiesced(void *ctx, int status)
@@ -10,15 +10,14 @@ index a523787..94e0b34 100644
  
  	if (status != 0) {
  		SPDK_ERRLOG("Failed to quiesce raid bdev %s: %s\n",
-@@ -2259,6 +2260,30 @@ raid_bdev_remove_base_bdev_on_quiesced(void *ctx, int status)
+@@ -2259,6 +2260,29 @@ raid_bdev_remove_base_bdev_on_quiesced(void *ctx, int status)
  		return;
  	}
  
-+	/* Evariops 0014.10 (RPC-CONTRACT §12): bound the delta the moment the
-+	 * member leaves — open an auto epoch on every surviving member's cbt
-+	 * (each survivor sees every post-ejection write; the auto nonce is
-+	 * reported through get_bdevs). -EEXIST = a live round already bounds
-+	 * it; -ENODEV = the member is not cbt-wrapped. Both are fine. */
++	/* Evariops 0019: bound the delta the moment the member leaves, by opening
++	 * an auto epoch on every surviving member's cbt — each survivor then records
++	 * every post-ejection write. -EEXIST means a live round already bounds it,
++	 * -ENODEV that the member is not cbt-wrapped; both are expected. */
 +	if (raid_bdev->level == RAID1 && base_info->name != NULL) {
 +		RAID_FOR_EACH_BASE_BDEV(raid_bdev, survivor) {
 +			int rc;

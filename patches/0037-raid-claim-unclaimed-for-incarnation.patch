@@ -1,16 +1,15 @@
 diff --git a/module/bdev/raid/bdev_raid_rpc.c b/module/bdev/raid/bdev_raid_rpc.c
-index 772f6c4..4e20e05 100644
+index 85ac078..6ded0ca 100644
 --- a/module/bdev/raid/bdev_raid_rpc.c
 +++ b/module/bdev/raid/bdev_raid_rpc.c
-@@ -334,6 +334,72 @@ cleanup:
+@@ -334,6 +334,71 @@ cleanup:
  }
  SPDK_RPC_REGISTER("bdev_raid_create", rpc_bdev_raid_create, SPDK_RPC_RUNTIME)
  
-+/* Evariops 0037: CLAIM an examine-reassembled (unclaimed) raid for a control-plane
-+ * incarnation — CAS semantics: succeeds only when no incarnation is held, -EEXIST
-+ * names the current owner otherwise. Without it an ADOPTED raid stayed unclaimed
-+ * forever, every claimed-required reader called it a ghost (Faulted), and the
-+ * create/compensate loop destroyed what it had just built (2026-08-14). */
++/* Evariops 0037: claim a raid reassembled by examine, which comes back without
++ * an incarnation, for a control-plane incarnation. Compare-and-set semantics:
++ * it succeeds only while no incarnation is held, and otherwise returns -EEXIST
++ * naming the current owner. */
 +struct rpc_bdev_raid_claim {
 +	char *name;
 +	char *incarnation;

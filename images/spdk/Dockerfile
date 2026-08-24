@@ -36,7 +36,7 @@ FROM docker.io/library/fedora:43@sha256:762d73ba1c455232b0272c5d445a34f36c4b9f42
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 ARG SPDK_VERSION=v26.01
-# W4 (supply chain): a git TAG is mutable — pin the exact upstream commit and
+# Supply chain: a git TAG is mutable — pin the exact upstream commit and
 # verify it after clone, so a moved/replaced tag fails the build instead of
 # silently shipping different sources. Must match vendor/spdk (v26.01).
 ARG SPDK_COMMIT_SHA=2ef883e
@@ -59,7 +59,7 @@ RUN git clone --branch "${SPDK_VERSION}" --depth 1 --recurse-submodules \
 
 WORKDIR /build/spdk
 
-# ── Inject CBT + tier modules and patches (SPEC-73 M1-M5) ──
+# ── Inject CBT + tier modules and patches ──
 COPY module/bdev/cbt/ module/bdev/cbt/
 COPY module/bdev/tier/ module/bdev/tier/
 COPY patches/ /build/patches/
@@ -95,10 +95,10 @@ RUN dnf install -y --setopt=install_weak_deps=False --nodocs liburing-devel liba
 #
 # Modules KEPT (required by project features):
 #   bdev_lvol   — thin provisioning, snapshots, clones
-#   bdev_raid   — raid0, raid1 (Nexus), concat (real levels; no raid6/raid10
-#                 exists anywhere in SPDK — SPEC-75G)
-#   raid5f      — XOR single-parity full-stripe-write raid (m=1) — the
-#                 EcImage capacity strate (SPEC-75G; NOT Reed-Solomon)
+#   bdev_raid   — raid0, raid1 (Nexus), concat (the real levels; SPDK has no
+#                 raid6 or raid10)
+#   raid5f      — XOR single-parity full-stripe-write raid (one parity strip;
+#                 not Reed-Solomon) — the erasure-coded capacity tier
 #   bdev_nvme   — NVMe-oF initiator for remote replicas
 #   bdev_malloc — RAM disks for testing / fast scratch
 #   bdev_uring  — io_uring bdev for modern kernels (>= 5.1), SATA SSDs
@@ -224,9 +224,9 @@ RUN dnf install -y --setopt=install_weak_deps=False --nodocs \
 # Binary only (runtime .so provided by Fedora packages above)
 COPY --from=builder /build/spdk/build/bin/spdk_tgt /usr/local/bin/spdk_tgt
 
-# SPEC-75G G1: spdk_dd is the V-EC bench's full-stripe writer (raid5f only accepts
-# full-stripe writes — EC-3 — and remote initiators are MDTS-bounded, so the writer
-# must run INSIDE the target pod). Patch 0024 makes its exit code honest.
+# spdk_dd is the raid5f bench's full-stripe writer: raid5f only accepts full-stripe
+# writes, and remote initiators are MDTS-bounded, so the writer must run INSIDE the
+# target pod. Patch 0024 makes its exit code honest.
 COPY --from=builder /build/spdk/build/bin/spdk_dd /usr/local/bin/spdk_dd
 
 # SPDK RPC scripts (useful for live debugging: rpc.py, spdkcli, etc.)
@@ -258,7 +258,7 @@ CMD ["-r", "/var/tmp/spdk.sock", "-m", "0x1", "--wait-for-rpc"]
 FROM scratch
 
 LABEL org.opencontainers.image.title="SPDK Data Engine" \
-      org.opencontainers.image.description="Ultra-minimal hardened SPDK for NVMe-oF TCP (built without RDMA — SPEC-75G SF-11)" \
+      org.opencontainers.image.description="Ultra-minimal hardened SPDK for NVMe-oF TCP (built without RDMA)" \
       org.opencontainers.image.vendor="Evariops" \
       org.opencontainers.image.source="https://github.com/Evariops/containers" \
       org.opencontainers.image.licenses="Apache-2.0" \

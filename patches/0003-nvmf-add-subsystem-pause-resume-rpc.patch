@@ -13,14 +13,14 @@ index 3136f7a..0af5836 100644
  C_SRCS-$(CONFIG_HAVE_EVP_MAC) += auth.c
 diff --git a/lib/nvmf/nvmf_pause_rpc.c b/lib/nvmf/nvmf_pause_rpc.c
 new file mode 100644
-index 0000000..a162553
+index 0000000..db60709
 --- /dev/null
 +++ b/lib/nvmf/nvmf_pause_rpc.c
-@@ -0,0 +1,467 @@
+@@ -0,0 +1,466 @@
 +/* lib/nvmf/nvmf_pause_rpc.c — SPDX-License-Identifier: BSD-3-Clause
-+ * Evariops fork — companion of spdk-csi SPEC-66 (H10).
-+ * nvmf_subsystem_pause / nvmf_subsystem_resume: a STANDING, drain-certified,
-+ * TTL-guarded I/O barrier that holds a subsystem Paused across RPC calls. */
++ * Evariops 0003: nvmf_subsystem_pause / nvmf_subsystem_resume — a standing,
++ * drain-certified, TTL-guarded I/O barrier that holds a subsystem Paused across
++ * RPC calls, so a caller can take a consistent snapshot of its namespaces. */
 +#include "spdk/stdinc.h"
 +#include "spdk/rpc.h"
 +#include "spdk/nvmf.h"
@@ -31,10 +31,10 @@ index 0000000..a162553
 +#include "spdk/log.h"
 +#include "spdk/queue.h"
 +#include "spdk/env.h"           /* spdk_env_get_core_count */
-+#include "spdk/uuid.h"          /* P-6: random per-process nonce */
++#include "spdk/uuid.h"          /* random per-process nonce */
 +
 +#define PAUSE_TTL_DEFAULT_MS  30000u
-+#define PAUSE_TTL_MAX_MS      60000u    /* 60 s ceiling; keep below host io_timeout (R2) */
++#define PAUSE_TTL_MAX_MS      60000u    /* 60 s ceiling; keep below the host io_timeout */
 +
 +/* Standing-pause registry. SPDK control runs on a single reactor (-m 0x1):
 + * every access below is on the app thread. Add a lock if the CPU mask widens. */
@@ -58,11 +58,12 @@ index 0000000..a162553
 +};
 +static TAILQ_HEAD(, paused_subsystem) g_paused = TAILQ_HEAD_INITIALIZER(g_paused);
 +
-+/* Barrier-integrity token (RISK R1/R3, §8). g_instance is a per-process nonce so a
-+ * token minted before a crash never matches one after restart (registry is RAM-only,
-+ * §3.3); g_epoch bumps on every NEW standing pause so a TTL auto-resume + re-pause
-+ * mints a fresh token. `pause` returns the token; `resume` reports whether the freeze
-+ * was continuous, so the controller can drop a snapshot whose barrier silently broke. */
++/* Barrier-integrity token. The registry is RAM-only, so g_instance is a per-process
++ * nonce: a token minted before a crash never matches one minted after the restart.
++ * g_epoch bumps on every new standing pause, so a TTL auto-resume followed by a
++ * re-pause mints a fresh token. `pause` returns the token, `resume` reports whether
++ * the freeze was continuous — a caller can then drop a snapshot whose barrier
++ * silently broke. */
 +static uint64_t g_instance;
 +static uint64_t g_epoch;
 +
@@ -71,8 +72,8 @@ index 0000000..a162553
 +{
 +	static bool warned;
 +	if (g_instance == 0) {
-+		/* P-6: random nonce (the old ticks<<1 discarded the high bit and could
-+		 * collide across quick restarts). |1 keeps it provably nonzero. */
++		/* The nonce must not collide across quick restarts, so derive it from
++		 * random bits rather than the clock; |1 keeps it provably nonzero. */
 +		struct spdk_uuid u;
 +		uint64_t hi;
 +
@@ -80,7 +81,7 @@ index 0000000..a162553
 +		memcpy(&hi, &u, sizeof(hi));
 +		g_instance = hi | 1;
 +	}
-+	/* RISK R4: the lock-free registry assumes a single reactor (-m 0x1). */
++	/* The lock-free registry assumes a single reactor (-m 0x1). */
 +	if (!warned && spdk_env_get_core_count() > 1) {
 +		warned = true;
 +		SPDK_ERRLOG("nvmf pause: %u reactors active; the standing-pause registry is "
@@ -188,10 +189,9 @@ index 0000000..a162553
 +	uint32_t  ttl_ms;
 +	struct spdk_nvmf_tgt *tgt;
 +	struct spdk_nvmf_subsystem *subsystem;
-+	/* Registry entry PREALLOCATED before the pause dispatch: a post-drain alloc
-+	 * failure used to leave the subsystem Paused with no registry entry and no
-+	 * TTL (the exact leaked-pause state the design refuses), undone only by a
-+	 * best-effort resume that could itself fail silently. */
++	/* Registry entry preallocated before the pause is dispatched: a Paused
++	 * subsystem must always end up with an entry and a TTL, so the allocation
++	 * has to be able to fail before the drain, never after it. */
 +	struct paused_subsystem *prealloc;
 +};
 +
@@ -225,8 +225,8 @@ index 0000000..a162553
 +	/* Drain certified: in-flight I/O complete, new I/O now queued target-side. */
 +	p = paused_find(ss);
 +	if (p == NULL) {
-+		/* Entry was preallocated before dispatch — no OOM window exists here
-+		 * (a Paused subsystem always gets its registry entry + TTL). */
++		/* Preallocated before dispatch, so there is no allocation failure to
++		 * handle here. */
 +		p = ctx->prealloc;
 +		ctx->prealloc = NULL;
 +		assert(p != NULL);
@@ -287,8 +287,8 @@ index 0000000..a162553
 +	}
 +	if (ctx->ttl_ms == 0)             { ctx->ttl_ms = PAUSE_TTL_DEFAULT_MS; }
 +	if (ctx->ttl_ms > PAUSE_TTL_MAX_MS) {
-+		/* S-8 follow-up: clamp loudly — the caller must know its barrier is
-+		 * shorter than requested. */
++		/* Clamp loudly: the caller must learn that its barrier is shorter
++		 * than it asked for. */
 +		SPDK_WARNLOG("nvmf pause: ttl_ms %u clamped to %u (host io_timeout ceiling)\n",
 +			     ctx->ttl_ms, PAUSE_TTL_MAX_MS);
 +		ctx->ttl_ms = PAUSE_TTL_MAX_MS;
@@ -316,7 +316,7 @@ index 0000000..a162553
 +		return;
 +	}
 +
-+	/* SEC1: audit this drain barrier (pauses host I/O to a subsystem). */
++	/* Audit the call: this pauses host I/O to a whole subsystem. */
 +	{
 +		char detail[320];
 +
@@ -325,8 +325,7 @@ index 0000000..a162553
 +		spdk_jsonrpc_request_audit(request, "nvmf_subsystem_pause", detail);
 +	}
 +
-+	/* Preallocate the registry entry (see struct comment): fail BEFORE pausing,
-+	 * never after — a drained subsystem must always get its entry + TTL. */
++	/* Preallocate the registry entry so this can fail before the drain starts. */
 +	ctx->prealloc = calloc(1, sizeof(*ctx->prealloc));
 +	if (ctx->prealloc == NULL) {
 +		spdk_jsonrpc_send_error_response(request,
@@ -465,8 +464,8 @@ index 0000000..a162553
 +		return;
 +	}
 +	/* With a pinned token, only resume the *matching* standing pause: a mismatch means
-+	 * our barrier already ended (TTL/crash/other) and a different one may now be live —
-+	 * report it broken and leave that one untouched (RISK R1/R3). */
++	 * our barrier already ended (TTL, crash, someone else) and a different one may now
++	 * be live — report it broken and leave that one untouched. */
 +	intact = !have_token || (tok_inst == g_instance && tok_epoch == p->epoch);
 +	if (have_token && !intact) {
 +		resume_send_noop(request);

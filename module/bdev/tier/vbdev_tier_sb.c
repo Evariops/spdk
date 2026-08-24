@@ -1,10 +1,10 @@
 /*   SPDX-License-Identifier: BSD-3-Clause
  *   Copyright (c) 2026 Evariops. All rights reserved.
  *
- *   bdev_tier on-disk superblock (SPEC-73A INV-T1, à la bdev_raid_sb).
- *   One copy per band, in the reserved region [0, sb_blocks) of each base bdev
- *   (inside the RAID1-mirrored md range). Self-describes the whole composite so
- *   any present band can drive self-assembly + wwn validation.
+ *   bdev_tier on-disk superblock. One copy per band, in the reserved region
+ *   [0, sb_blocks) of each base bdev. Each copy self-describes the whole
+ *   composite, so any present band can drive assembly + wwn validation.
+ *   See vbdev_tier.h for the A/B slot layout and the highest-seq-wins rule.
  */
 
 #include "vbdev_tier.h"
@@ -27,7 +27,7 @@ tier_sb_serialize(struct vbdev_tier *t, struct tier_band *self, uint64_t seq,
 	memset(sb, 0, sizeof(*sb));
 	sb->magic = TIER_SB_MAGIC;
 	sb->version = TIER_SB_VERSION;
-	sb->seq = seq;		/* M5(a): generation RESERVED at write_all entry (t->seq already bumped) */
+	sb->seq = seq;		/* generation reserved at write_all entry (t->seq already bumped) */
 	sb->created_epoch_sec = created_epoch_sec;
 	memcpy(sb->generation_uuid, t->gen_uuid, sizeof(sb->generation_uuid));
 	snprintf(sb->composite_name, sizeof(sb->composite_name), "%s", t->bdev.name);
@@ -37,7 +37,7 @@ tier_sb_serialize(struct vbdev_tier *t, struct tier_band *self, uint64_t seq,
 	sb->num_bands = t->num_bands;
 	sb->this_band_id = self ? self->band_id : UINT32_MAX;
 	sb->blocklen = t->blocklen;
-	sb->cluster_blocks = t->cluster_blocks;	/* F1 grain; u64 on disk since v2 (F-3) */
+	sb->cluster_blocks = t->cluster_blocks;
 
 	TAILQ_FOREACH(b, &t->bands, link) {
 		if (i >= TIER_MAX_BANDS) {
@@ -63,9 +63,9 @@ tier_sb_valid(const struct tier_superblock *sb)
 	struct tier_superblock tmp;
 	uint32_t crc;
 
-	/* F-4: the format is declared little-endian only (amd64/arm64 targets). A
-	 * byte-swapped magic means the SB was written by a big-endian host — refuse
-	 * loudly instead of failing the CRC silently. */
+	/* The format is little-endian only. A byte-swapped magic means the SB was
+	 * written by a big-endian host — refuse loudly instead of failing the CRC
+	 * silently. */
 	if (sb->magic == __builtin_bswap64(TIER_SB_MAGIC)) {
 		SPDK_ERRLOG("tier sb: byte-swapped magic (big-endian writer?) — refusing\n");
 		return false;
@@ -79,7 +79,7 @@ tier_sb_valid(const struct tier_superblock *sb)
 	return crc == sb->crc;
 }
 
-/* F-5: pick the best (valid, highest-seq) of the two slots in a reserve buffer. */
+/* Pick the best (valid, highest-seq) of the two slots in a reserve buffer. */
 const struct tier_superblock *
 tier_sb_select(const void *reserve_buf, size_t reserve_len)
 {
@@ -106,18 +106,14 @@ tier_sb_select(const void *reserve_buf, size_t reserve_len)
 }
 
 /* ---- async write to all bands ----------------------------------------------
- *
- * M5(a): serialized. One fan-out in flight per composite; requests arriving
- * meanwhile queue their callback on t->sb_pending_cbs and are coalesced into
- * ONE follow-up fan-out of the latest in-memory state. The generation is
- * RESERVED (t->seq++) at fan-out start: a partially-failed fan-out can never
- * share a seq with a later, different table ("highest seq wins" stays sound —
- * gaps are harmless, duplicates are fatal).
- * M5(b): only ACTIVE bands are written. The old `!= RETIRED` filter included
- * DEGRADED bands whose write always fails → status stuck at -EIO → a
- * retirement was never observed as persisted once any band degraded.
- * F-6: each copy is FLUSHed after the write — a "committed" seq sitting in a
- * volatile write cache is not a commit. */
+ * Serialized: one fan-out in flight per composite; requests arriving meanwhile
+ * queue their callback on t->sb_pending_cbs and coalesce into ONE follow-up
+ * fan-out of the latest in-memory state. The generation is RESERVED (t->seq++)
+ * at fan-out start, so a partially-failed fan-out can never share a seq with a
+ * later, different table. Only ACTIVE bands are written (a DEGRADED band's write
+ * always fails, which would pin the fan-out status at -EIO forever), and each
+ * copy is FLUSHed: a "committed" seq sitting in a volatile write cache is not a
+ * commit. */
 
 struct tier_sb_write_ctx {
 	struct vbdev_tier	*t;
@@ -131,7 +127,7 @@ struct tier_sb_band_write {
 	struct spdk_bdev_desc	*desc;
 	struct spdk_io_channel	*ch;
 	void			*buf;
-	uint64_t		slot_off_blocks;	/* F-5: this generation's slot */
+	uint64_t		slot_off_blocks;	/* this generation's slot */
 	uint32_t		slot_blocks;
 };
 
@@ -145,8 +141,8 @@ tier_sb_fanout_complete(struct tier_sb_write_ctx *ctx)
 	int status = ctx->status;
 
 	/* Run the callbacks queued behind this fan-out. A callback may request a
-	 * teardown (bdev_tier_delete) — that is DEFERRED (delete_pending), never run
-	 * synchronously here, so `t` is guaranteed to survive this loop. */
+	 * teardown (bdev_tier_delete) — that is DEFERRED, never run synchronously
+	 * here, so `t` is guaranteed to survive this loop. */
 	while ((p = TAILQ_FIRST(&ctx->cbs)) != NULL) {
 		TAILQ_REMOVE(&ctx->cbs, p, link);
 		p->cb(p->cb_arg, status);
@@ -155,7 +151,7 @@ tier_sb_fanout_complete(struct tier_sb_write_ctx *ctx)
 	free(ctx);
 	t->sb_write_inflight = false;
 
-	/* T-4b: honor teardown deferred behind this fan-out (a pending delete, or a
+	/* Honor teardown deferred behind this fan-out (a pending delete, or a
 	 * hot-removed band's drain+close). If a deferred delete consumed the
 	 * composite, `t` is gone/unregistering — do not touch it. */
 	if (vbdev_tier_sb_fanout_idle(t)) {
@@ -201,11 +197,9 @@ tier_sb_write_band_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg
 		tier_sb_band_io_done(bw, false);
 		return;
 	}
-	/* F-6: flush before calling this copy durable. Same contract as the CBT
-	 * rebuild path: a base bdev without FLUSH support (bdev_uring) has no
-	 * volatile cache to drain — treat the completed write as durable instead
-	 * of failing the persist. This EIO'd EVERY superblock persist on uring
-	 * bases, so no tier SB was ever written on such nodes. */
+	/* Flush before calling this copy durable. A base bdev without FLUSH support
+	 * has no volatile cache to drain, so treat the completed write as durable
+	 * instead of failing the whole persist. */
 	if (!spdk_bdev_io_type_supported(spdk_bdev_desc_get_bdev(bw->desc),
 					 SPDK_BDEV_IO_TYPE_FLUSH)) {
 		tier_sb_band_io_done(bw, true);
@@ -223,7 +217,7 @@ tier_sb_write_start(struct vbdev_tier *t)
 {
 	struct tier_sb_write_ctx *ctx;
 	struct tier_band *b;
-	size_t bufsz = TIER_SB_SLOT_BYTES;	/* F-5: one slot per generation */
+	size_t bufsz = TIER_SB_SLOT_BYTES;	/* one slot per generation */
 	uint32_t slot_blocks = TIER_SB_SLOT_BYTES / t->blocklen;
 	uint64_t target_seq, slot_off_blocks, now_sec;
 
@@ -237,12 +231,10 @@ tier_sb_write_start(struct vbdev_tier *t)
 			p->cb(p->cb_arg, -ENOMEM);
 			free(p);
 		}
-		/* M2: this IS a fan-out termination. A bdev_tier_delete deferred
-		 * behind the queued follow-up (delete_pending), or a hot-removed
-		 * band's close_pending, was waiting on vbdev_tier_sb_fanout_idle —
-		 * returning without it stranded the composite (and its claimed base
-		 * descs) forever when the drained callbacks held no async_inflight
-		 * reference. Do not touch `t` if the teardown consumed it. */
+		/* This IS a fan-out termination: a deferred delete, or a hot-removed
+		 * band's close_pending, is waiting on vbdev_tier_sb_fanout_idle, and
+		 * returning without it would strand the composite (and its claimed
+		 * base descs) forever. Do not touch `t` if the teardown consumed it. */
 		vbdev_tier_sb_fanout_idle(t);
 		return;
 	}
@@ -261,10 +253,10 @@ tier_sb_write_start(struct vbdev_tier *t)
 	}
 	ctx->remaining = 1;	/* hold a ref while we launch, released at the end */
 
-	/* M5(a): reserve the generation up front (see block comment above). */
+	/* Reserve the generation up front (see the block comment above). */
 	t->seq++;
 	target_seq = t->seq;
-	/* F-5: generation N lands in slot N%2 — a torn write only hurts one slot. */
+	/* Generation N lands in slot N%2 — a torn write only hurts one slot. */
 	slot_off_blocks = (uint64_t)tier_sb_slot_for_seq(target_seq) * slot_blocks;
 	now_sec = (uint64_t)time(NULL);
 
@@ -274,7 +266,7 @@ tier_sb_write_start(struct vbdev_tier *t)
 		struct tier_sb_band_write *bw;
 		int rc;
 
-		/* M5(b): ACTIVE bands only. */
+		/* ACTIVE bands only. */
 		if (b->state != TIER_BAND_ACTIVE || b->desc == NULL) {
 			continue;
 		}
@@ -315,10 +307,9 @@ tier_sb_write_start(struct vbdev_tier *t)
 		launched++;
 	}
 
-	/* M3: zero copies written must NOT complete rc == 0 — the callers'
-	 * contract (rc != 0 ⇒ NOT durable, MJ6) treats 0 as "the state is on
-	 * disk". With every band skipped (all DEGRADED/RETIRED/desc-less), a
-	 * retire acked "durable" would silently resurrect after reboot from the
+	/* Zero copies written must NOT complete rc == 0: callers read rc == 0 as "the
+	 * state is on disk". With every band skipped (all DEGRADED/RETIRED/desc-less),
+	 * a retire acked as durable would silently resurrect after a reboot from the
 	 * old highest-seq superblocks. */
 	if (launched == 0 && ctx->status == 0) {
 		SPDK_ERRLOG("tier '%s': superblock persist wrote ZERO copies (no "
@@ -352,7 +343,7 @@ tier_sb_write_all(struct vbdev_tier *t, void (*cb)(void *cb_arg, int rc), void *
 		TAILQ_INSERT_TAIL(&t->sb_pending_cbs, p, link);
 	}
 	if (t->sb_write_inflight) {
-		/* M5(a): coalesce — one follow-up fan-out will persist the latest state. */
+		/* Coalesce — one follow-up fan-out will persist the latest state. */
 		t->sb_write_queued = true;
 		return 0;
 	}
@@ -384,7 +375,7 @@ tier_sb_read_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	if (!success) {
 		rc = -EIO;
 	} else {
-		/* F-5: both slots were read — take the valid one with the highest seq. */
+		/* Both slots were read — take the valid one with the highest seq. */
 		sb = tier_sb_select(rc_ctx->buf, (size_t)rc_ctx->sb_blocks * rc_ctx->blocklen);
 		if (sb == NULL) {
 			rc = -EILSEQ;	/* no / invalid superblock on this disk */

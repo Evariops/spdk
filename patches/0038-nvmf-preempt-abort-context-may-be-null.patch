@@ -1,34 +1,30 @@
 diff --git a/lib/nvmf/subsystem.c b/lib/nvmf/subsystem.c
-index 2fca2cc..13ffd1e 100644
+index 2fca2cc..356361f 100644
 --- a/lib/nvmf/subsystem.c
 +++ b/lib/nvmf/subsystem.c
-@@ -1819,8 +1819,13 @@ poll_group_reservation_preempt_abort_process(struct spdk_nvmf_poll_group *group,
+@@ -1819,8 +1819,12 @@ poll_group_reservation_preempt_abort_process(struct spdk_nvmf_poll_group *group,
  		return;
  	}
  	req = STAILQ_FIRST(&ns->reservations);
 -	/* Check if this is a preempt-and-abort cmd */
 -	if (!ns_reservation_req_is_preempt_abort(req)) {
 +	/* Check if this is a preempt-and-abort cmd that OWNS an abort context.
-+	 * Evariops 0038: `ns_reservation_req_is_preempt_abort` reads the COMMAND bytes,
-+	 * which say nothing about how far the acquire got. `ns->preempt_abort` is
-+	 * allocated at exactly one site, inside the RESERVE_PREEMPT_ABORT case of
-+	 * nvmf_ns_reservation_acquire — an acquire that fails its registrant check
-+	 * jumps to `exit` BEFORE that switch, so the pointer is still NULL here. */
++	 * Evariops 0038: the command bytes say nothing about how far the acquire got.
++	 * ns->preempt_abort is allocated only in the RESERVE_PREEMPT_ABORT case of
++	 * nvmf_ns_reservation_acquire, which an acquire that fails its registrant
++	 * check never reaches, so the pointer can still be NULL here. */
 +	if (!ns_reservation_req_is_preempt_abort(req) || !ns->preempt_abort) {
  		return;
  	}
  
-@@ -4045,7 +4050,14 @@ _nvmf_ns_reservation_update_done(struct spdk_nvmf_subsystem *subsystem,
+@@ -4045,7 +4049,11 @@ _nvmf_ns_reservation_update_done(struct spdk_nvmf_subsystem *subsystem,
  	assert(req->reservation_queued == true);
  	assert(req == STAILQ_FIRST(&ns->reservations));
  
 -	if (!status && ns_reservation_req_is_preempt_abort(req) && !ns->preempt_abort->io_waiting_done) {
-+	/* Evariops 0038: `ns->preempt_abort` may be NULL — see the note in
-+	 * poll_group_reservation_preempt_abort_process. This is the path a
-+	 * PREEMPT-ABORT from a NON-REGISTRANT takes: nvmf_ns_reservation_acquire
-+	 * logs "No registrant or current key doesn't match", returns false without
-+	 * ever allocating the context, and the caller lands straight here. Measured
-+	 * live 2026-08-14 on turing: SIGSEGV, 18 target restarts on one node. */
++	/* Evariops 0038: ns->preempt_abort may be NULL — see the note in
++	 * poll_group_reservation_preempt_abort_process. A PREEMPT-ABORT from a
++	 * non-registrant reaches here having never allocated the context. */
 +	if (!status && ns_reservation_req_is_preempt_abort(req) && ns->preempt_abort &&
 +	    !ns->preempt_abort->io_waiting_done) {
  		/* Check for io_waiting completion */

@@ -1,9 +1,9 @@
 /*   SPDX-License-Identifier: BSD-3-Clause
  *   Copyright (c) 2026 Evariops. All rights reserved.
  *
- *   bdev_tier JSON-RPC surface (SPEC-73A §9.1 / 73B C-OBS-2, C-MUT-2).
+ *   bdev_tier JSON-RPC surface.
  *
- *   The CSI control-plane (source of truth in CRD) replays, on agent startup:
+ *   The CSI control-plane (source of truth) replays, on agent startup:
  *     bdev_tier_create  -> bdev_tier_add_band (xN) -> bdev_tier_register
  *   reproducing the identical composite layout. Runtime ops: retire_band,
  *   get_bands, delete.
@@ -22,7 +22,7 @@
 struct rpc_tier_create {
 	char		*name;
 	uint64_t	md_num_blocks;
-	uint64_t	cluster_blocks;	/* F1: boundary alignment grain (blobstore cluster size in blocks) */
+	uint64_t	cluster_blocks;	/* boundary alignment grain (blobstore cluster size in blocks) */
 };
 
 static const struct spdk_json_object_decoder rpc_tier_create_decoders[] = {
@@ -41,7 +41,7 @@ rpc_bdev_tier_create(struct spdk_jsonrpc_request *request, const struct spdk_jso
 				    SPDK_COUNTOF(rpc_tier_create_decoders), &req)) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 "invalid parameters");
-		free(req.name);	/* R15: decode may have strdup'd name before a later field failed */
+		free(req.name);	/* decode may have strdup'd name before a later field failed */
 		return;
 	}
 	if (vbdev_tier_get_by_name(req.name) != NULL) {
@@ -49,38 +49,34 @@ rpc_bdev_tier_create(struct spdk_jsonrpc_request *request, const struct spdk_jso
 		free(req.name);
 		return;
 	}
-	/* A composite without an md region silently disables the mirrored-L2P design
-	 * (D1): vbdev_tier_is_md_range() would never match. Refuse it. */
+	/* A composite without an md region silently disables the mirrored-metadata
+	 * design: vbdev_tier_is_md_range() would never match. Refuse it. */
 	if (req.md_num_blocks == 0) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 "md_num_blocks must be > 0");
 		free(req.name);
 		return;
 	}
-	/* R13: cluster_blocks is the F1 alignment grain (blobstore cluster size in
-	 * blocks). 0 is the ONLY legacy value the control-plane replays verbatim for a
-	 * pre-F1 composite (alignment intentionally dormant); >= 2 is a real grain.
-	 * 1 is neither: it silently no-ops tier_align_* AND the register alignment guard
-	 * (t->cluster_blocks > 1), so an unaligned composite registers and later fails
-	 * -EIO on a straddling blobstore cluster. Fresh provisioning always passes the
-	 * real grain (>= 2, in practice >= 256). Reject the ambiguous 1. */
+	/* cluster_blocks is the alignment grain. 0 means alignment intentionally
+	 * dormant; >= 2 is a real grain. 1 is neither: it silently no-ops tier_align_*
+	 * AND the register alignment guard (t->cluster_blocks > 1), so an unaligned
+	 * composite registers and later fails -EIO on a straddling blobstore cluster. */
 	if (req.cluster_blocks == 1) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 "cluster_blocks must be 0 (legacy, no alignment) or >= 2");
 		free(req.name);
 		return;
 	}
-	/* R17: reject an md_num_blocks so large the cluster-align round-up
-	 * (tier_align_up: v + cluster_blocks - 1) would overflow u64 and wrap the md
-	 * region to a tiny value — silently disabling the mirrored L2P. A real md region
-	 * is a few GiB; anything near UINT64_MAX is a caller error. */
+	/* Reject an md_num_blocks so large that the cluster-align round-up
+	 * (tier_align_up: v + cluster_blocks - 1) overflows u64 and wraps the md region
+	 * to a tiny value, silently disabling the mirrored metadata. */
 	if (req.cluster_blocks > 1 && req.md_num_blocks > UINT64_MAX - (req.cluster_blocks - 1)) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 "md_num_blocks too large (cluster-align overflow)");
 		free(req.name);
 		return;
 	}
-	/* F-3: cluster_blocks is stored as u64 on disk since superblock v2 — no u32 cap. */
+	/* cluster_blocks is stored as u64 on disk — no u32 cap to enforce. */
 	t = vbdev_tier_create(req.name, req.md_num_blocks, req.cluster_blocks);
 	free(req.name);
 	if (t == NULL) {
@@ -173,7 +169,7 @@ rpc_bdev_tier_register(struct spdk_jsonrpc_request *request, const struct spdk_j
 				    SPDK_COUNTOF(rpc_tier_name_decoders), &req)) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 "invalid parameters");
-		free(req.name);	/* R15 */
+		free(req.name);	/* decode may have strdup'd name before a later field failed */
 		return;
 	}
 	t = vbdev_tier_get_by_name(req.name);
@@ -203,10 +199,10 @@ rpc_bdev_tier_delete(struct spdk_jsonrpc_request *request, const struct spdk_jso
 				    SPDK_COUNTOF(rpc_tier_name_decoders), &req)) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 "invalid parameters");
-		free(req.name);	/* R15 */
+		free(req.name);	/* decode may have strdup'd name before a later field failed */
 		return;
 	}
-	/* SEC1: audit this destructive op (tears down the whole composite). */
+	/* Audit this destructive op (tears down the whole composite). */
 	spdk_jsonrpc_request_audit(request, "bdev_tier_delete", req.name);
 	t = vbdev_tier_get_by_name(req.name);
 	free(req.name);
@@ -231,8 +227,8 @@ static const struct spdk_json_object_decoder rpc_tier_retire_decoders[] = {
 	{"band_id", offsetof(struct rpc_tier_retire, band_id), spdk_json_decode_uint32},
 };
 
-/* MJ6: the RPC acks only once the retirement is durably persisted to the
- * surviving bands' superblocks (rc != 0 ⇒ retry the idempotent retire). */
+/* The RPC acks only once the retirement is durably persisted to the surviving
+ * bands' superblocks; on rc != 0 the caller retries the idempotent retire. */
 static void
 rpc_tier_retire_done(void *cb_arg, int rc)
 {
@@ -258,10 +254,10 @@ rpc_bdev_tier_retire_band(struct spdk_jsonrpc_request *request, const struct spd
 				    SPDK_COUNTOF(rpc_tier_retire_decoders), &req)) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 "invalid parameters");
-		free(req.name);	/* R15 */
+		free(req.name);	/* decode may have strdup'd name before a later field failed */
 		return;
 	}
-	/* SEC1: audit this destructive op (evacuates + removes a band). */
+	/* Audit this destructive op (evacuates + removes a band). */
 	{
 		char detail[128];
 
@@ -298,7 +294,7 @@ rpc_bdev_tier_get_bands(struct spdk_jsonrpc_request *request, const struct spdk_
 				    SPDK_COUNTOF(rpc_tier_name_decoders), &req)) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 "invalid parameters");
-		free(req.name);	/* R15 */
+		free(req.name);	/* decode may have strdup'd name before a later field failed */
 		return;
 	}
 	t = vbdev_tier_get_by_name(req.name);
@@ -313,8 +309,8 @@ rpc_bdev_tier_get_bands(struct spdk_jsonrpc_request *request, const struct spdk_
 	spdk_json_write_named_array_begin(w, "bands");
 	TAILQ_FOREACH(b, &t->bands, link) {
 		/* Geometry + state only. Fill accounting (used/capacity) is logical and
-		 * lives in the blobstore; the CSI derives it from get_cluster_placement
-		 * (C-OBS-1), so the composite does not emit a duplicate/always-zero copy. */
+		 * lives in the blobstore, where the CSI derives it, so the composite does
+		 * not emit a duplicate/always-zero copy. */
 		spdk_json_write_object_begin(w);
 		spdk_json_write_named_uint32(w, "band_id", b->band_id);
 		spdk_json_write_named_uint32(w, "tier", b->tier);
@@ -332,7 +328,7 @@ rpc_bdev_tier_get_bands(struct spdk_jsonrpc_request *request, const struct spdk_
 }
 SPDK_RPC_REGISTER("bdev_tier_get_bands", rpc_bdev_tier_get_bands, SPDK_RPC_RUNTIME)
 
-/* ---- SPEC-73 A2: bdev_tier_assemble_band {name, base_bdev_name, band_id, tier, wwn?, serial?,
+/* ---- bdev_tier_assemble_band {name, base_bdev_name, band_id, tier, wwn?, serial?,
  *      lba_start, num_blocks, state, is_md} — place a band at explicit stored geometry ------------ */
 
 struct rpc_tier_assemble {
@@ -399,7 +395,7 @@ cleanup:
 }
 SPDK_RPC_REGISTER("bdev_tier_assemble_band", rpc_bdev_tier_assemble_band, SPDK_RPC_RUNTIME)
 
-/* ---- C3: bdev_tier_resync_md {name, band_id} — rebuild a DEGRADED md leg ---- */
+/* ---- bdev_tier_resync_md {name, band_id} — rebuild a DEGRADED md leg -------- */
 
 static void
 rpc_tier_resync_md_done(void *cb_arg, int rc)
@@ -425,10 +421,10 @@ rpc_bdev_tier_resync_md(struct spdk_jsonrpc_request *request, const struct spdk_
 				    SPDK_COUNTOF(rpc_tier_retire_decoders), &req)) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 "invalid parameters");
-		free(req.name);	/* R15 */
+		free(req.name);	/* decode may have strdup'd name before a later field failed */
 		return;
 	}
-	/* SEC1: audit this op (rewrites redundancy state of the mirrored md region). */
+	/* Audit this op (rewrites redundancy state of the mirrored md region). */
 	{
 		char detail[128];
 
@@ -451,7 +447,7 @@ rpc_bdev_tier_resync_md(struct spdk_jsonrpc_request *request, const struct spdk_
 }
 SPDK_RPC_REGISTER("bdev_tier_resync_md", rpc_bdev_tier_resync_md, SPDK_RPC_RUNTIME)
 
-/* ---- SPEC-73 A2: bdev_tier_read_sb {name=base_bdev} -> the on-disk superblock (swap detection) ---- */
+/* ---- bdev_tier_read_sb {name=base_bdev} -> the on-disk superblock ----------- */
 
 struct rpc_read_sb_ctx {
 	struct spdk_jsonrpc_request	*request;
@@ -461,9 +457,9 @@ struct rpc_read_sb_ctx {
 static void
 rpc_read_sb_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev, void *ctx)
 {
-	/* m7: the desc lives only for the duration of one async SB read and is closed
-	 * in rpc_read_sb_done. A REMOVE during that window just delays the base
-	 * bdev's unregister until the read completes (bounded); log it. */
+	/* The desc lives only for the duration of one async SB read and is closed in
+	 * rpc_read_sb_done. A REMOVE during that window just delays the base bdev's
+	 * unregister until the read completes (bounded); log it. */
 	if (type == SPDK_BDEV_EVENT_REMOVE) {
 		SPDK_WARNLOG("tier read_sb: '%s' removed mid-read; desc closes at read completion\n",
 			     bdev->name);
@@ -490,7 +486,7 @@ rpc_read_sb_done(void *cb_arg, const struct tier_superblock *sb, int rc)
 		spdk_json_write_named_uint64(w, "seq", sb->seq);
 		spdk_json_write_named_uint32(w, "version", sb->version);
 		spdk_json_write_named_uint64(w, "created_epoch_sec", sb->created_epoch_sec);
-		/* F-2: expose the generation uuid so the CSI can fence stale disks. */
+		/* Expose the generation uuid so the CSI can fence stale disks. */
 		spdk_uuid_fmt_lower(uuid_str, sizeof(uuid_str),
 				    (const struct spdk_uuid *)sb->generation_uuid);
 		spdk_json_write_named_string(w, "generation_uuid", uuid_str);
@@ -533,7 +529,7 @@ rpc_bdev_tier_read_sb(struct spdk_jsonrpc_request *request, const struct spdk_js
 	if (spdk_json_decode_object(params, rpc_tier_name_decoders,
 				    SPDK_COUNTOF(rpc_tier_name_decoders), &req)) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS, "invalid parameters");
-		free(req.name);	/* R15 */
+		free(req.name);	/* decode may have strdup'd name before a later field failed */
 		return;
 	}
 	rc = spdk_bdev_open_ext(req.name, false, rpc_read_sb_event_cb, NULL, &desc);
@@ -560,18 +556,15 @@ rpc_bdev_tier_read_sb(struct spdk_jsonrpc_request *request, const struct spdk_js
 }
 SPDK_RPC_REGISTER("bdev_tier_read_sb", rpc_bdev_tier_read_sb, SPDK_RPC_RUNTIME)
 
-/* ---- PR2: evariops_get_capabilities — boot_id + schema versions + methods --- */
+/* ---- evariops_get_capabilities — boot_id + schema versions + methods ------- */
 
 extern char g_tier_boot_id[];	/* minted at module init (vbdev_tier.c) */
 
-/* Candidate list of the Evariops-fork RPC surface the control-plane probes for.
- * Deferred #3: this is NOT emitted verbatim — each entry is filtered through the
- * LIVE RPC registry (spdk_rpc_get_method_state_mask) so `methods[]` reflects what
- * is actually registered in this binary, never a stale hand-maintained list. This
- * kills the false POSITIVE the CSI cannot tolerate (a method left here but not
- * built in → the CSI gates a path "present" that then fails -32601 at runtime).
- * The list scopes WHICH methods to report as fork-capabilities; the registry is
- * the source of truth for WHETHER each is present. */
+/* Candidate list of the fork RPC surface the control-plane probes for. It is NOT
+ * emitted verbatim: each entry is filtered through the LIVE RPC registry
+ * (spdk_rpc_get_method_state_mask), so methods[] reflects what this binary really
+ * registers. The list scopes WHICH methods to report as fork capabilities; the
+ * registry decides WHETHER each one is present. */
 static const char *g_evariops_methods[] = {
 	"bdev_tier_create", "bdev_tier_add_band", "bdev_tier_assemble_band",
 	"bdev_tier_register", "bdev_tier_delete", "bdev_tier_retire_band",
@@ -613,16 +606,14 @@ rpc_evariops_get_capabilities(struct spdk_jsonrpc_request *request,
 	spdk_json_write_named_string(w, "boot_id", g_tier_boot_id);
 	spdk_json_write_named_uint32(w, "tier_sb_version", TIER_SB_VERSION);
 	spdk_json_write_named_uint32(w, "capabilities_schema", 1);
-	spdk_json_write_named_bool(w, "single_reactor_assumed", true);	/* D5 (see RPC-CONTRACT) */
+	spdk_json_write_named_bool(w, "single_reactor_assumed", true);
 	spdk_json_write_named_array_begin(w, "methods");
 	for (i = 0; i < SPDK_COUNTOF(g_evariops_methods); i++) {
 		uint32_t state_mask;
 
-		/* Deferred #3: emit only methods present in the LIVE registry. A method
-		 * built in but forgotten from the candidate list is a false NEGATIVE —
-		 * harmless: the CSI falls back to its per-call -32601 probe. Fully removing
-		 * false negatives would need a public registry iterator, which upstream does
-		 * not expose; filtering the candidate list closes the dangerous direction. */
+		/* Emit only methods present in the LIVE registry. A method built in but
+		 * missing from the candidate list is a false NEGATIVE, and harmless: the
+		 * CSI falls back to its per-call -32601 probe. A false POSITIVE is not. */
 		if (spdk_rpc_get_method_state_mask(g_evariops_methods[i], &state_mask) == 0) {
 			spdk_json_write_string(w, g_evariops_methods[i]);
 		}
