@@ -1,0 +1,110 @@
+diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
+--- a/module/bdev/raid/bdev_raid.c
++++ b/module/bdev/raid/bdev_raid.c
+@@ -3056,6 +3056,17 @@
+ 		       process->raid_bdev->bdev.name,
+ 		       raid_bdev_process_to_str(process->type),
+ 		       spdk_strerror(-process->status));
++
++	/* Evariops 0040: with window requests in flight the DRAIN owns the
++	 * continuation — raid_bdev_process_request_complete() reaches zero and
++	 * rides the normal channel-update/unlock path, whose thread_run
++	 * observes STOPPING. Driving the unlock from here would unquiesce the
++	 * range UNDER the in-flight requests. No cycle-internal caller reaches
++	 * this with requests in flight; the guard keeps the invariant stated,
++	 * not assumed. */
++	if (process->window_remaining > 0) {
++		return;
++	}
+ 
+ 	if (process->window_range_locked) {
+ 		raid_bdev_process_unlock_window_range(process);
+@@ -3065,14 +3076,43 @@
+ }
+ 
+ /* Evariops 0035: the delete-side stop rides a thread message because the
+- * process state machine is single-threaded on process->thread; the finish
+- * path itself handles an already-STOPPING process as a no-op. */
++ * process state machine is single-threaded on process->thread.
++ *
++ * Evariops 0040: the stop MARKS, it never DRIVES. raid_bdev_process_finish()
++ * drives the window machinery (unlock / thread_run), which is only correct
++ * from the cycle's own continuation points — this message can land BETWEEN
++ * any two of them. With window requests in flight it unquiesced the range
++ * under them and freed the process beneath their completions (caught on
++ * turing as `assert(process->window_remaining == 0)` in
++ * raid_bdev_process_thread_run, a rebuild canceled mid-window — the s38/s39
++ * teardown SIGSEGV in release builds); with a quiesce, channel update or
++ * unquiesce in flight it double-drove the same machinery. Every resting
++ * state of the cycle has a pending continuation that observes STOPPING
++ * (window_range_locked cb, the request drain, verify io_done/conclude,
++ * thread_run, and the unpaced-abort branch of lock_window_range): the
++ * running cycle owns the continuation. */
+ static void
+ raid_bdev_delete_stop_process(void *ctx)
+ {
+ 	struct raid_bdev_process *process = ctx;
+ 
+-	raid_bdev_process_finish(process, -ECANCELED);
++	assert(spdk_get_thread() == process->thread);
++
++	if (process->status == 0) {
++		process->status = -ECANCELED;
++	}
++
++	if (process->state >= RAID_PROCESS_STATE_STOPPING) {
++		return;
++	}
++
++	assert(process->state == RAID_PROCESS_STATE_RUNNING);
++	process->state = RAID_PROCESS_STATE_STOPPING;
++
++	SPDK_NOTICELOG("raid bdev '%s': %s stopping (status: %s) — the running cycle owns the continuation (Evariops 0035/0040)\n",
++		       process->raid_bdev->bdev.name,
++		       raid_bdev_process_to_str(process->type),
++		       spdk_strerror(-process->status));
+ }
+ 
+ static void
+@@ -3082,6 +3122,13 @@
+ 
+ 	if (status != 0) {
+ 		SPDK_ERRLOG("Failed to unlock LBA range: %s\n", spdk_strerror(-status));
++		/* Evariops 0040: already STOPPING — finish() would no-op on its
++		 * early return and nothing else is pending: conclude directly. */
++		if (process->state >= RAID_PROCESS_STATE_STOPPING) {
++			process->window_range_locked = false;
++			raid_bdev_process_do_finish(process);
++			return;
++		}
+ 		raid_bdev_process_finish(process, status);
+ 		return;
+ 	}
+@@ -3149,7 +3196,12 @@
+ 
+ 	process->window_remaining -= process_req->num_blocks;
+ 	if (process->window_remaining == 0) {
+-		if (process->window_status != 0) {
++		/* Evariops 0040: stopped mid-window (async delete-stop) —
++		 * finish() would no-op on its >=STOPPING early return and the
++		 * locked window would leak. Ride the normal unlock path;
++		 * thread_run observes STOPPING. */
++		if (process->window_status != 0 &&
++		    process->state < RAID_PROCESS_STATE_STOPPING) {
+ 			raid_bdev_process_finish(process, process->window_status);
+ 			return;
+ 		}
+@@ -3272,6 +3324,13 @@
+ 
+ 	if (status != 0) {
+ 		SPDK_ERRLOG("Failed to lock LBA range: %s\n", spdk_strerror(-status));
++		/* Evariops 0040: already STOPPING (async delete-stop landed
++		 * while the quiesce was in flight) — finish() would no-op and
++		 * nothing else is pending: conclude directly (range unlocked). */
++		if (process->state >= RAID_PROCESS_STATE_STOPPING) {
++			raid_bdev_process_do_finish(process);
++			return;
++		}
+ 		raid_bdev_process_finish(process, status);
+ 		return;
+ 	}
