@@ -12,35 +12,20 @@
 
 ## 1. Motivation
 
-SPDK's blobstore tracks, per blob and in memory, exactly which clusters are allocated — this is
-the native changed-block-tracking for thin snapshots (each CoW layer's allocated clusters are
-precisely the blocks written since its parent). The public C API exposes this by offset:
+SPDK's blobstore tracks, per blob and in memory, exactly which clusters are allocated — this is the native changed-block-tracking for thin snapshots (each CoW layer's allocated clusters are precisely the blocks written since its parent). The public C API exposes this by offset:
 
-- `spdk_blob_get_next_allocated_io_unit` / `spdk_blob_get_next_unallocated_io_unit`
-  (`lib/blob/blobstore.c:6237-6247`, exported in `lib/blob/spdk_blob.map:25-26`) — a pure
-  in-memory walk (`blob_find_io_unit`, `:6221`) that steps by **cluster boundary**, issues no I/O,
-  and already powers `SEEK_DATA`/`SEEK_HOLE` on lvol bdevs (`module/bdev/lvol/vbdev_lvol.c:854-903`).
+- `spdk_blob_get_next_allocated_io_unit` / `spdk_blob_get_next_unallocated_io_unit` (`lib/blob/blobstore.c:6237-6247`, exported in `lib/blob/spdk_blob.map:25-26`) — a pure in-memory walk (`blob_find_io_unit`, `:6221`) that steps by **cluster boundary**, issues no I/O, and already powers `SEEK_DATA`/`SEEK_HOLE` on lvol bdevs (`module/bdev/lvol/vbdev_lvol.c:854-903`).
 
-**No JSON-RPC surfaces these offsets.** `bdev_get_bdevs` emits only the *count*
-(`num_allocated_clusters`, `vbdev_lvol.c:761`). Consumers behind the RPC socket (the spdk-csi
-target-agent) therefore cannot learn the allocation *layout*, which blocks:
+**No JSON-RPC surfaces these offsets.** `bdev_get_bdevs` emits only the *count* (`num_allocated_clusters`, `vbdev_lvol.c:761`). Consumers behind the RPC socket (the spdk-csi target-agent) therefore cannot learn the allocation *layout*, which blocks:
 
-- CSI `SnapshotMetadata` / KEP-3314 (`GetMetadataAllocated`: exact extents of a snapshot;
-  `GetMetadataDelta`: extents of the layers between two snapshots) → true incremental backups
-  via Velero/Kasten;
+- CSI `SnapshotMetadata` / KEP-3314 (`GetMetadataAllocated`: exact extents of a snapshot; `GetMetadataDelta`: extents of the layers between two snapshots) → true incremental backups via Velero/Kasten;
 - any future consumer needing sparse-aware copy (smarter rebuild seeding, migration pre-copy).
 
-**Prior art:** Longhorn's v2 data engine carries the equivalent out-of-tree
-(`bdev_lvol_get_fragmap` — a base64 *bitmap* per range; see longhorn/longhorn enhancement
-`20230809-support-backup-and-restore-for-volumes-with-v2-data-engine` and
-`longhorn-spdk-engine/pkg/spdk/client/basic.go`). We deliberately diverge on the wire format
-(§2.4): merged **extents** instead of a bitmap.
+**Prior art:** Longhorn's v2 data engine carries the equivalent out-of-tree (`bdev_lvol_get_fragmap` — a base64 *bitmap* per range; see longhorn/longhorn enhancement `20230809-support-backup-and-restore-for-volumes-with-v2-data-engine` and `longhorn-spdk-engine/pkg/spdk/client/basic.go`). We deliberately diverge on the wire format (§2.4): merged **extents** instead of a bitmap.
 
 ### Non-goals
 
-- **No ancestor/chain merging server-side.** The RPC reports **one blob layer**. Chain composition
-  (union over ancestors, delta between two snapshots) is the consumer's job (SPEC-60 §3.4) — it
-  keeps this C surface minimal, stateless, and per-call bounded.
+- **No ancestor/chain merging server-side.** The RPC reports **one blob layer**. Chain composition (union over ancestors, delta between two snapshots) is the consumer's job (SPEC-60 §3.4) — it keeps this C surface minimal, stateless, and per-call bounded.
 - **No `bdev_lvol_get_changed_ranges(base, target)`.** Same rationale: composition over primitives.
 - **No bitmap output / Longhorn API compatibility** (§2.4).
 - **No blobstore changes** — stock exported APIs only.
@@ -98,10 +83,7 @@ target-agent) therefore cannot learn the allocation *layout*, which blocks:
 | `ranges[]` | allocated extents of **this blob layer only**, ascending, non-overlapping, **adjacent runs merged**, cluster-aligned (offset and length are multiples of `cluster_size_bytes`, except a possible final extent truncated at `lvol_size_bytes`) |
 | `next_offset_bytes` | `0` ⇒ walk exhausted; non-zero ⇒ more extents exist, resume with `offset_bytes = next_offset_bytes` |
 
-**Invariants:** idempotent; read-only; for a **snapshot** (frozen, read-only blob) the result is
-immutable and bit-stable across calls. For a writable head lvol the map may change concurrently —
-the walk is still memory-safe, but the result is only a point-in-time approximation (documented;
-SPEC-60 only ever queries snapshot layers).
+**Invariants:** idempotent; read-only; for a **snapshot** (frozen, read-only blob) the result is immutable and bit-stable across calls. For a writable head lvol the map may change concurrently — the walk is still memory-safe, but the result is only a point-in-time approximation (documented; SPEC-60 only ever queries snapshot layers).
 
 ### 2.3 Errors
 
@@ -121,8 +103,7 @@ SPEC-60 only ever queries snapshot layers).
 | Pathological fragmentation | worst case = bitmap size, bounded by `max_ranges` pagination | constant |
 | JSON friendliness | native | binary-in-JSON |
 
-CSI `BlockMetadata` is extent-shaped (`byte_offset` + `size_bytes`); emitting extents end-to-end
-avoids two format conversions. Pagination (§2.1) bounds the fragmentation worst case.
+CSI `BlockMetadata` is extent-shaped (`byte_offset` + `size_bytes`); emitting extents end-to-end avoids two format conversions. Pagination (§2.1) bounds the fragmentation worst case.
 
 ---
 
@@ -130,17 +111,11 @@ avoids two format conversions. Pagination (§2.1) bounds the fragmentation worst
 
 ### 3.1 Placement & integration
 
-A **new source file** `module/bdev/lvol/vbdev_lvol_ranges_rpc.c`, added by the patch, plus a
-one-line hunk in `module/bdev/lvol/Makefile` (`C_SRCS += vbdev_lvol_ranges_rpc.c`).
+A **new source file** `module/bdev/lvol/vbdev_lvol_ranges_rpc.c`, added by the patch, plus a one-line hunk in `module/bdev/lvol/Makefile` (`C_SRCS += vbdev_lvol_ranges_rpc.c`).
 
 Why a new-file patch (vs the two alternatives):
-- *Appending to `vbdev_lvol_rpc.c`*: that file changes upstream every release → recurring
-  conflicts. A new file's only conflict surface is the one-line Makefile hunk.
-- *Out-of-tree module à la `module/bdev/cbt/`*: the cbt pattern (COPY + 3 `sed` registrations in
-  the Dockerfile) is justified for a full bdev module; an RPC-only addition needs
-  `module/bdev/lvol/vbdev_lvol.h` internals (`vbdev_lvol_get_from_bdev`) and gains nothing from
-  module isolation. RPC registration is constructor-based (`SPDK_RPC_REGISTER`) and works from any
-  linked object.
+- *Appending to `vbdev_lvol_rpc.c`*: that file changes upstream every release → recurring conflicts. A new file's only conflict surface is the one-line Makefile hunk.
+- *Out-of-tree module à la `module/bdev/cbt/`*: the cbt pattern (COPY + 3 `sed` registrations in the Dockerfile) is justified for a full bdev module; an RPC-only addition needs `module/bdev/lvol/vbdev_lvol.h` internals (`vbdev_lvol_get_from_bdev`) and gains nothing from module isolation. RPC registration is constructor-based (`SPDK_RPC_REGISTER`) and works from any linked object.
 
 ### 3.2 Reference implementation (~90 lines)
 
@@ -245,26 +220,15 @@ SPDK_RPC_REGISTER("bdev_lvol_get_allocated_ranges", rpc_bdev_lvol_get_allocated_
 ```
 
 Notes for the implementer:
-- **Extent merging is implicit**: `get_next_allocated` → `get_next_unallocated` yields maximal
-  runs directly; adjacent clusters never produce two extents.
-- **Cluster alignment**: `blob_find_io_unit` advances by cluster boundaries, so emitted extents
-  are cluster-aligned by construction (final extent clamped to `total_io_units`).
-- **`vbdev_lvol_get_from_bdev` guard** also rejects non-lvol bdevs (returns NULL on
-  module mismatch) — single check covers both error cases.
+- **Extent merging is implicit**: `get_next_allocated` → `get_next_unallocated` yields maximal runs directly; adjacent clusters never produce two extents.
+- **Cluster alignment**: `blob_find_io_unit` advances by cluster boundaries, so emitted extents are cluster-aligned by construction (final extent clamped to `total_io_units`).
+- **`vbdev_lvol_get_from_bdev` guard** also rejects non-lvol bdevs (returns NULL on module mismatch) — single check covers both error cases.
 
 ### 3.3 Threading & safety
 
-- Runs on the RPC/app thread, exactly like the existing read-only lvol RPCs
-  (`rpc_bdev_lvol_get_lvols` iterates lvol/blob state on the same thread,
-  `vbdev_lvol_rpc.c:1190-1257`). The walk reads only the in-memory cluster map — **no blobstore
-  md operation, no callback, no I/O submitted** → no completion context to manage, the RPC
-  responds synchronously.
-- Bounded time-on-thread: ≤ `max_ranges` extent emissions per call (hard cap 65536); a fully
-  fragmented 1 TiB / 1 MiB-cluster blob completes in ≤ 16 paginated calls.
-- Snapshot blobs are frozen → stable iteration. Writable head lvols: map may grow concurrently on
-  other threads; the cluster-map reads are word-sized loads on a stable array for the blob's
-  current size — same exposure as the existing `SEEK_DATA` path (`vbdev_lvol.c:892`), accepted
-  upstream. Documented as point-in-time for non-snapshots (§2.2).
+- Runs on the RPC/app thread, exactly like the existing read-only lvol RPCs (`rpc_bdev_lvol_get_lvols` iterates lvol/blob state on the same thread, `vbdev_lvol_rpc.c:1190-1257`). The walk reads only the in-memory cluster map — **no blobstore md operation, no callback, no I/O submitted** → no completion context to manage, the RPC responds synchronously.
+- Bounded time-on-thread: ≤ `max_ranges` extent emissions per call (hard cap 65536); a fully fragmented 1 TiB / 1 MiB-cluster blob completes in ≤ 16 paginated calls.
+- Snapshot blobs are frozen → stable iteration. Writable head lvols: map may grow concurrently on other threads; the cluster-map reads are word-sized loads on a stable array for the blob's current size — same exposure as the existing `SEEK_DATA` path (`vbdev_lvol.c:892`), accepted upstream. Documented as point-in-time for non-snapshots (§2.2).
 
 ### 3.4 Patch & build integration
 
@@ -274,10 +238,7 @@ patches/0002-bdev-lvol-add-get-allocated-ranges-rpc.patch
   └─ M module/bdev/lvol/Makefile                  (C_SRCS += vbdev_lvol_ranges_rpc.c)
 ```
 
-`images/spdk/Dockerfile`: extend the existing apply step (`:59`) —
-`git apply /build/patches/0001-*.patch /build/patches/0002-*.patch` (or a `for p in` loop so
-future patches need no Dockerfile edits). The `vendor/spdk` checkout in this repo is the
-development/test bed for the patch before image builds.
+`images/spdk/Dockerfile`: extend the existing apply step (`:59`) — `git apply /build/patches/0001-*.patch /build/patches/0002-*.patch` (or a `for p in` loop so future patches need no Dockerfile edits). The `vendor/spdk` checkout in this repo is the development/test bed for the patch before image builds.
 
 ---
 
@@ -295,32 +256,23 @@ development/test bed for the patch before image builds.
 
 ## 5. Versioning & release
 
-- Ships as a patch-level bump of the image: `v26.01.x` (scheme `v<upstream>.<patch>`, immutable
-  tags, cosign-signed, SBOM-attested — unchanged repo conventions).
-- **No lockstep with spdk-csi**: the consumer probes `rpc_get_methods` (SPEC-60 R4). Old image +
-  new CSI → graceful degradation (`FAILED_PRECONDITION` deltas); new image + old CSI → RPC simply
-  unused.
-- The RPC name is the API contract: never change semantics under the same name; additive fields
-  only (consumers must ignore unknown fields).
+- Ships as a patch-level bump of the image: `v26.01.x` (scheme `v<upstream>.<patch>`, immutable tags, cosign-signed, SBOM-attested — unchanged repo conventions).
+- **No lockstep with spdk-csi**: the consumer probes `rpc_get_methods` (SPEC-60 R4). Old image + new CSI → graceful degradation (`FAILED_PRECONDITION` deltas); new image + old CSI → RPC simply unused.
+- The RPC name is the API contract: never change semantics under the same name; additive fields only (consumers must ignore unknown fields).
 
 ---
 
 ## 6. Upstreaming plan (SPEC-60 §4, Option E)
 
-1. Open an spdk.io issue referencing the CSI SnapshotMetadata/KEP-3314 use case (SP-neutral
-   motivation; Longhorn's parallel out-of-tree `get_fragmap` as demand evidence).
-2. Submit to SPDK Gerrit: the §3.2 file + Makefile line + `scripts/rpc.py` plugin subcommand +
-   `doc/jsonrpc.md` entry + unit test (`test/unit/lib/blob` extension), per upstream conventions.
-3. Carry the patch locally regardless of review latency; on merge, drop `0002-*.patch` at the
-   next `SPDK_VERSION` bump — consumer-invisible thanks to the capability probe.
+1. Open an spdk.io issue referencing the CSI SnapshotMetadata/KEP-3314 use case (SP-neutral motivation; Longhorn's parallel out-of-tree `get_fragmap` as demand evidence).
+2. Submit to SPDK Gerrit: the §3.2 file + Makefile line + `scripts/rpc.py` plugin subcommand + `doc/jsonrpc.md` entry + unit test (`test/unit/lib/blob` extension), per upstream conventions.
+3. Carry the patch locally regardless of review latency; on merge, drop `0002-*.patch` at the next `SPDK_VERSION` bump — consumer-invisible thanks to the capability probe.
 
 ---
 
 ## 7. Definition of Done
 
-- Image `v26.01.x` exposes `bdev_lvol_get_allocated_ranges` per §2; smoke + pagination tests green
-  in CI.
+- Image `v26.01.x` exposes `bdev_lvol_get_allocated_ranges` per §2; smoke + pagination tests green in CI.
 - `spdk-csi` contract test green against the built image.
-- SPEC-60 QA (`QA_SMS_AllocatedMatchesWrittenLayout`, `QA_SMS_DeltaMatchesInterSnapshotWrites`)
-  green on a cluster running this image — the end-to-end proof that the extents are exact.
+- SPEC-60 QA (`QA_SMS_AllocatedMatchesWrittenLayout`, `QA_SMS_DeltaMatchesInterSnapshotWrites`) green on a cluster running this image — the end-to-end proof that the extents are exact.
 - Upstream submission opened (tracking issue linked in the repo README).

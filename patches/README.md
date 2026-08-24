@@ -1,16 +1,10 @@
 # Evariops SPDK patches
 
-Out-of-tree patches applied on top of upstream SPDK during the container build
-(`images/spdk/Dockerfile`). They add the primitives the tiering data plane and
-the group-snapshot barrier need, and harden a few upstream paths. The two
-out-of-tree bdev **modules** (`module/bdev/cbt`, `module/bdev/tier`) are copied
-in whole, not patched.
+Out-of-tree patches applied on top of upstream SPDK during the container build (`images/spdk/Dockerfile`). They add the primitives the tiering data plane and the group-snapshot barrier need, and harden a few upstream paths. The two out-of-tree bdev **modules** (`module/bdev/cbt`, `module/bdev/tier`) are copied in whole, not patched.
 
 ## Application order
 
-Patches are applied in **lexicographic order of filename** (`0001` … `0040`) —
-the Dockerfile globs `patches/*.patch` and `git apply`s each. The numeric prefix
-IS the contract; do not rely on any other ordering. Order matters:
+Patches are applied in **lexicographic order of filename** (`0001` … `0040`) — the Dockerfile globs `patches/*.patch` and `git apply`s each. The numeric prefix IS the contract; do not rely on any other ordering. Order matters:
 
 | # | Patch | Touches | Depends on |
 |--:|:------|:--------|:-----------|
@@ -55,26 +49,13 @@ IS the contract; do not rely on any other ordering. Order matters:
 | 0039 | an armed delayed reconnect owns the continuation — the path returns instead of re-driving a failed disconnect, ending a mutual recursion that overflows the reactor stack | module/bdev/nvme (bdev_nvme.c) | 0032 |
 | 0040 | the delete-stop only MARKS — 0035's stop drove the window machinery from a foreign thread, unquiescing under in-flight requests; it now sets STOPPING with `-ECANCELED` and each resting state concludes | module/bdev/raid (bdev_raid.c) | 0035, 0039 |
 
-0005 `#include`s `vbdev_tier.h` and adds `-I module/bdev/tier` to the lvol module
-CFLAGS via its own Makefile hunk; the Dockerfile injects the module dirs before
-applying patches (copy-before-apply ordering matters).
+0005 `#include`s `vbdev_tier.h` and adds `-I module/bdev/tier` to the lvol module CFLAGS via its own Makefile hunk; the Dockerfile injects the module dirs before applying patches (copy-before-apply ordering matters).
 
-**0011 is a shared substrate, not a leaf.** It adds `spdk_jsonrpc_request_audit()`
-+ `spdk_jsonrpc_request_get_peer_ucred()` to `lib/jsonrpc`, which the destructive
-handlers in 0003 (pause), 0005 (relocate/remap), and 0008 (rebuild_ranges) call —
-so those numerically-earlier patches reference a symbol added by 0011. This is
-sound because the series is applied **as a whole** before anything is compiled
-(the Dockerfile `git apply`s all of `patches/*.patch`, then builds once); the
-number is a *filename apply order*, not an incremental-compile order. It sits last
-to avoid renumbering the existing `Evariops 000X` labels baked into every commit.
+**0011 is a shared substrate, not a leaf.** It adds `spdk_jsonrpc_request_audit()` + `spdk_jsonrpc_request_get_peer_ucred()` to `lib/jsonrpc`, which the destructive handlers in 0003 (pause), 0005 (relocate/remap), and 0008 (rebuild_ranges) call — so those numerically-earlier patches reference a symbol added by 0011. This is sound because the series is applied **as a whole** before anything is compiled (the Dockerfile `git apply`s all of `patches/*.patch`, then builds once); the number is a *filename apply order*, not an incremental-compile order. It sits last to avoid renumbering the existing `Evariops 000X` labels baked into every commit.
 
 ## Makefile / build wiring (NOT patches)
 
-The module registration is done by four `sed -i` edits in the Dockerfile, not by
-patches, because they are one-line list insertions that would conflict on every
-upstream bump. They are **fragile** (a `sed` that finds no anchor silently does
-nothing, unlike `git apply` which errors) — if a build ever links without
-`bdev_tier`/`bdev_cbt`, check those `sed` anchors first:
+The module registration is done by four `sed -i` edits in the Dockerfile, not by patches, because they are one-line list insertions that would conflict on every upstream bump. They are **fragile** (a `sed` that finds no anchor silently does nothing, unlike `git apply` which errors) — if a build ever links without `bdev_tier`/`bdev_cbt`, check those `sed` anchors first:
 
 - `module/bdev/Makefile`: `DIRS-y += … cbt tier`
 - `mk/spdk.modules.mk`: `BLOCKDEV_MODULES_LIST += bdev_cbt` / `bdev_tier`
@@ -82,14 +63,11 @@ nothing, unlike `git apply` which errors) — if a build ever links without
 
 ## Upstream pin
 
-The upstream commit is pinned in `images/spdk/Dockerfile` (`ARG SPDK_COMMIT_SHA`)
-and verified after clone — a moved tag fails the build. `scripts/patches.sh`
-reads the same ARG, so tooling and build never disagree.
+The upstream commit is pinned in `images/spdk/Dockerfile` (`ARG SPDK_COMMIT_SHA`) and verified after clone — a moved tag fails the build. `scripts/patches.sh` reads the same ARG, so tooling and build never disagree.
 
 ## Tooling — `scripts/patches.sh`
 
-Never hand-edit hunk offsets: a patch whose hunk line counts were corrected by
-hand is proof of manual editing gone wrong. Instead:
+Never hand-edit hunk offsets: a patch whose hunk line counts were corrected by hand is proof of manual editing gone wrong. Instead:
 
 ```sh
 # Apply the series into a local SPDK checkout that is at the pinned commit.
@@ -108,24 +86,13 @@ scripts/patches.sh regen   /path/to/spdk-worktree
 
 ### To change a patch
 
-1. Build a worktree: clean SPDK checkout at the pinned commit (`vendor/spdk`
-   clones offline), apply the series **one commit per patch, in order**, with
-   `git apply` + `git commit -m "<patch filename stem>"` — the commit SUBJECT
-   must be the `NNNN-name` stem, it becomes the regenerated filename.
-2. Edit the source, `git commit --amend` (or a fixup) into the owning commit;
-   a NEW patch = a new commit with the next `NNNN-name` subject.
+1. Build a worktree: clean SPDK checkout at the pinned commit (`vendor/spdk` clones offline), apply the series **one commit per patch, in order**, with `git apply` + `git commit -m "<patch filename stem>"` — the commit SUBJECT must be the `NNNN-name` stem, it becomes the regenerated filename.
+2. Edit the source, `git commit --amend` (or a fixup) into the owning commit; a NEW patch = a new commit with the next `NNNN-name` subject.
 3. `scripts/patches.sh regen <worktree>` to rewrite `patches/*.patch`.
-4. `scripts/patches.sh verify` (or `check` against a pinned clone) to confirm
-   the whole series still applies.
+4. `scripts/patches.sh verify` (or `check` against a pinned clone) to confirm the whole series still applies.
 
-**Series format: RAW `git diff` output, no mail header.** `git apply` (Dockerfile
-+ `check`/`apply`) is the only consumer; **`git am` is NOT part of the contract**
-— it chokes on raw diffs. `regen` emits raw per-commit diffs with the commit
-subject as filename, so a regen of an untouched series is byte-stable. Never
-hand-edit hunks.
+**Series format: RAW `git diff` output, no mail header.** `git apply` (Dockerfile + `check`/`apply`) is the only consumer; **`git am` is NOT part of the contract** — it chokes on raw diffs. `regen` emits raw per-commit diffs with the commit subject as filename, so a regen of an untouched series is byte-stable. Never hand-edit hunks.
 
 ## Upstreaming
 
-Candidates, easiest first: 0006 (degraded-read, small/general), 0003
-(pause/resume), 0002 (allocated_ranges). 0004 (blob relocate) needs an RFC. Each
-patch merged upstream removes rebase surface here.
+Candidates, easiest first: 0006 (degraded-read, small/general), 0003 (pause/resume), 0002 (allocated_ranges). 0004 (blob relocate) needs an RFC. Each patch merged upstream removes rebase surface here.
