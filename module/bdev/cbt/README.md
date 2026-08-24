@@ -29,7 +29,7 @@ The shape is **open → freeze → get_dirty_ranges → close**:
 | get_dirty_ranges | `bdev_cbt_epoch_get_dirty_ranges` | that snapshot reads back as coalesced `{offset, length}` pairs — a FIXED set the copier can work through |
 | close | `bdev_cbt_epoch_close` | the epoch is released without losing history: an unconsumed delta is merged back into the live bitmap first |
 
-`bdev_cbt_epoch_rebuild_start` and `bdev_cbt_epoch_invalidate` are state markers around that spine: a copy is under way, or this epoch is unrecoverable and the backend needs a full rebuild.
+`bdev_cbt_epoch_invalidate` sits beside that spine as a state marker: this epoch is unrecoverable and the backend needs a full rebuild. The FROZEN → REBUILDING transition is not a separate call — the rebuild RPCs make it themselves. (`bdev_cbt_epoch_rebuild_start` is declared in `vbdev_cbt.h` and defined in `vbdev_cbt.c`, but it is bound to no RPC and has no caller: dead surface, to expose or remove.)
 
 Two invariants are worth understanding before calling anything:
 
