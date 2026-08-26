@@ -50,6 +50,9 @@ tier_sb_serialize(struct vbdev_tier *t, struct tier_band *self, uint64_t seq,
 		sb->bands[i].num_blocks = b->num_blocks;
 		snprintf(sb->bands[i].wwn, sizeof(sb->bands[i].wwn), "%s", b->wwn);
 		snprintf(sb->bands[i].serial, sizeof(sb->bands[i].serial), "%s", b->serial);
+		memcpy(sb->bands[i].part_uuid, b->part_uuid, sizeof(sb->bands[i].part_uuid));
+		sb->bands[i].part_start_lba = b->part_start_lba;
+		sb->bands[i].part_size_blocks = b->part_size_blocks;
 		i++;
 	}
 

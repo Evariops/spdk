@@ -110,6 +110,36 @@ vbdev_tier_band_of_lba(struct vbdev_tier *t, uint64_t lba, uint64_t *band_offset
 }
 
 /* --------------------------------------------------------------------------
+ * Fill-accounting provider (registered by the lvol layer; see vbdev_tier.h)
+ * -------------------------------------------------------------------------- */
+
+void
+vbdev_tier_set_usage_provider(const char *tier_name, vbdev_tier_usage_fn fn, void *ctx)
+{
+	struct vbdev_tier *t = vbdev_tier_get_by_name(tier_name);
+
+	if (t == NULL) {
+		SPDK_WARNLOG("tier '%s': usage provider registered for an unknown composite\n",
+			     tier_name);
+		return;
+	}
+	t->usage_fn = fn;
+	t->usage_ctx = ctx;
+}
+
+void
+vbdev_tier_clear_usage_provider(const char *tier_name)
+{
+	struct vbdev_tier *t = vbdev_tier_get_by_name(tier_name);
+
+	if (t == NULL) {
+		return;		/* composite already torn down — nothing to clear */
+	}
+	t->usage_fn = NULL;
+	t->usage_ctx = NULL;
+}
+
+/* --------------------------------------------------------------------------
  * I/O completion
  * -------------------------------------------------------------------------- */
 
@@ -1223,11 +1253,12 @@ vbdev_tier_create(const char *name, uint64_t md_num_blocks, uint64_t cluster_blo
 
 int
 vbdev_tier_add_band(struct vbdev_tier *t, const char *base_bdev_name, enum tier_class tier,
-		    const char *wwn, const char *serial, uint32_t *out_band_id)
+		    const char *wwn, const char *serial, const uint8_t *part_uuid,
+		    uint64_t part_start_lba, uint64_t part_size_blocks, uint32_t *out_band_id)
 {
-	struct tier_band *band;
+	struct tier_band *band, *existing;
 	struct spdk_bdev *base_bdev;
-	uint64_t usable_blocks;
+	uint64_t usable_blocks, lba_start, num_blocks, phys_offset;
 	int rc;
 
 	/* Geometry is frozen at register (blockcnt, per-reactor base channels): a band
@@ -1237,6 +1268,20 @@ vbdev_tier_add_band(struct vbdev_tier *t, const char *base_bdev_name, enum tier_
 	if (t->registered) {
 		SPDK_ERRLOG("tier '%s': add_band after register is not allowed\n", t->bdev.name);
 		return -EBUSY;
+	}
+	/* After assembly the md legs are either both reoccupied at their stored slots
+	 * or their disks are ABSENT. The auto-layout below would promote this NEW
+	 * device into the missing slot — a blank ACTIVE mirror leg with no resync —
+	 * and the leg-A branch would additionally reset total_num_blocks, laying this
+	 * band over the assembled bands' address space. A post-assembly append may
+	 * only be a plain concat, so an incomplete md mirror refuses the add. */
+	if (t->assembled &&
+	    (t->md_mirror_a == UINT32_MAX || t->md_mirror_b == UINT32_MAX)) {
+		SPDK_ERRLOG("tier '%s': refusing add_band after assembly with incomplete md "
+			    "mirror (a=%u b=%u): the composite is degraded, a new device must "
+			    "never be promoted to an md leg\n",
+			    t->bdev.name, t->md_mirror_a, t->md_mirror_b);
+		return -EPROTO;
 	}
 	/* Bound the slot BEFORE it is assigned: band_id indexes the fixed-size
 	 * base_ch[TIER_MAX_BANDS] and is stored in a 64-slot superblock. An
@@ -1251,7 +1296,6 @@ vbdev_tier_add_band(struct vbdev_tier *t, const char *base_bdev_name, enum tier_
 	 * the same physical disk was enumerated into two bands, which would silently
 	 * double-count capacity and corrupt the concat geometry. */
 	if (wwn != NULL && wwn[0] != '\0') {
-		struct tier_band *existing;
 		TAILQ_FOREACH(existing, &t->bands, link) {
 			if (strncmp(existing->wwn, wwn, sizeof(existing->wwn)) == 0) {
 				SPDK_ERRLOG("tier: band wwn '%s' already present (duplicate disk '%s')\n",
@@ -1320,11 +1364,18 @@ vbdev_tier_add_band(struct vbdev_tier *t, const char *base_bdev_name, enum tier_
 	if (serial) {
 		snprintf(band->serial, sizeof(band->serial), "%s", serial);
 	}
+	if (part_uuid) {
+		memcpy(band->part_uuid, part_uuid, sizeof(band->part_uuid));
+	}
+	band->part_start_lba = part_start_lba;
+	band->part_size_blocks = part_size_blocks;
 
 	/* Geometry. Each disk reserves [0, sb_blocks) for the superblock; usable =
 	 * blockcnt - sb_blocks. The first two bands additionally host the mirrored md
 	 * region [0, md_num_blocks) of the composite at base-physical
-	 * [sb_blocks, sb_blocks+md_num_blocks); their DATA contribution follows. */
+	 * [sb_blocks, sb_blocks+md_num_blocks); their DATA contribution follows.
+	 * Computed into locals and committed to `t` only after every check, so a
+	 * refused band leaves the composite untouched. */
 	if (base_bdev->blockcnt <= t->sb_blocks) {
 		SPDK_ERRLOG("tier: band '%s' too small for superblock reserve\n", base_bdev_name);
 		spdk_bdev_module_release_bdev(base_bdev);
@@ -1343,14 +1394,11 @@ vbdev_tier_add_band(struct vbdev_tier *t, const char *base_bdev_name, enum tier_
 			free(band);
 			return -ENOSPC;
 		}
-		t->md_mirror_a = band->band_id;
-		t->total_num_blocks = t->md_num_blocks;		/* md region occupies [0, md), cluster-aligned */
-		band->lba_start = t->md_num_blocks;		/* this band's data tail follows md (aligned) */
+		lba_start = t->md_num_blocks;			/* this band's data tail follows md (aligned) */
 		/* Round the data contribution DOWN to the cluster grain (the trailing remainder is an
 		 * unusable hole) so the NEXT band starts cluster-aligned and no cluster straddles. */
-		band->num_blocks = tier_align_down(t, usable_blocks - t->md_num_blocks);
-		band->phys_offset = t->sb_blocks + t->md_num_blocks;
-		t->total_num_blocks += band->num_blocks;
+		num_blocks = tier_align_down(t, usable_blocks - t->md_num_blocks);
+		phys_offset = t->sb_blocks + t->md_num_blocks;
 	} else if (t->md_mirror_b == UINT32_MAX) {
 		/* Band B: hosts the md MIRROR (not re-counted) + a data tail. */
 		if (usable_blocks <= t->md_num_blocks) {
@@ -1360,20 +1408,17 @@ vbdev_tier_add_band(struct vbdev_tier *t, const char *base_bdev_name, enum tier_
 			free(band);
 			return -ENOSPC;
 		}
-		t->md_mirror_b = band->band_id;
-		band->lba_start = t->total_num_blocks;		/* aligned (prior boundaries aligned) */
-		band->num_blocks = tier_align_down(t, usable_blocks - t->md_num_blocks);
-		band->phys_offset = t->sb_blocks + t->md_num_blocks;
-		t->total_num_blocks += band->num_blocks;
+		lba_start = t->total_num_blocks;		/* aligned (prior boundaries aligned) */
+		num_blocks = tier_align_down(t, usable_blocks - t->md_num_blocks);
+		phys_offset = t->sb_blocks + t->md_num_blocks;
 	} else {
 		/* Plain concat band. */
-		band->lba_start = t->total_num_blocks;		/* aligned */
-		band->num_blocks = tier_align_down(t, usable_blocks);
-		band->phys_offset = t->sb_blocks;
-		t->total_num_blocks += band->num_blocks;
+		lba_start = t->total_num_blocks;		/* aligned */
+		num_blocks = tier_align_down(t, usable_blocks);
+		phys_offset = t->sb_blocks;
 	}
 
-	if (band->num_blocks == 0) {
+	if (num_blocks == 0) {
 		SPDK_ERRLOG("tier: band '%s' has no cluster-aligned capacity (cluster_blocks=%" PRIu64 ")\n",
 			    base_bdev_name, t->cluster_blocks);
 		spdk_bdev_module_release_bdev(base_bdev);
@@ -1381,6 +1426,36 @@ vbdev_tier_add_band(struct vbdev_tier *t, const char *base_bdev_name, enum tier_
 		free(band);
 		return -ENOSPC;
 	}
+
+	/* Same guard as assemble_band: no two bands may overlap in the composite
+	 * address space. The auto-layout above cannot produce one on its own, but
+	 * placement must never rest solely on total_num_blocks being the high-water
+	 * mark of the bands actually present. */
+	TAILQ_FOREACH(existing, &t->bands, link) {
+		if (lba_start < existing->lba_start + existing->num_blocks &&
+		    existing->lba_start < lba_start + num_blocks) {
+			SPDK_ERRLOG("tier: add band '%s' [%" PRIu64 ", +%" PRIu64
+				    ") overlaps band %u\n", base_bdev_name, lba_start,
+				    num_blocks, existing->band_id);
+			spdk_bdev_module_release_bdev(base_bdev);
+			spdk_bdev_close(band->desc);
+			free(band);
+			return -EEXIST;
+		}
+	}
+
+	/* Commit — nothing below can fail. */
+	if (t->md_mirror_a == UINT32_MAX) {
+		t->md_mirror_a = band->band_id;
+		t->total_num_blocks = t->md_num_blocks;		/* md region occupies [0, md), cluster-aligned;
+								 * fresh provisioning only (assembled refuses above) */
+	} else if (t->md_mirror_b == UINT32_MAX) {
+		t->md_mirror_b = band->band_id;
+	}
+	band->lba_start = lba_start;
+	band->num_blocks = num_blocks;
+	band->phys_offset = phys_offset;
+	t->total_num_blocks += num_blocks;
 
 	TAILQ_INSERT_TAIL(&t->bands, band, link);
 	t->num_bands++;
@@ -1401,8 +1476,11 @@ vbdev_tier_add_band(struct vbdev_tier *t, const char *base_bdev_name, enum tier_
 int
 vbdev_tier_assemble_band(struct vbdev_tier *t, const char *base_bdev_name, uint32_t band_id,
 			 enum tier_class tier, const char *wwn, const char *serial,
-			 uint64_t lba_start, uint64_t num_blocks, enum tier_band_state state, bool is_md)
+			 const uint8_t *part_uuid, uint64_t part_start_lba,
+			 uint64_t part_size_blocks, uint64_t lba_start, uint64_t num_blocks,
+			 enum tier_band_state state, bool is_md)
 {
+	static const uint8_t zero_uuid[TIER_PART_UUID_LEN];
 	struct tier_band *band, *existing;
 	struct spdk_bdev *base_bdev;
 	uint64_t phys_offset;
@@ -1472,6 +1550,19 @@ vbdev_tier_assemble_band(struct vbdev_tier *t, const char *base_bdev_name, uint3
 			SPDK_ERRLOG("tier: assemble band wwn '%s' already present\n", wwn);
 			return -EEXIST;
 		}
+		/* Mirror of the duplicate-wwn rule for the unit identity: one partition
+		 * enumerated into two bands is the same double-count corruption. An
+		 * all-zero part_uuid carries no identity and is never compared. */
+		if (part_uuid != NULL &&
+		    memcmp(part_uuid, zero_uuid, TIER_PART_UUID_LEN) != 0 &&
+		    memcmp(existing->part_uuid, part_uuid, TIER_PART_UUID_LEN) == 0) {
+			char uuid_hex[2 * TIER_PART_UUID_LEN + 1];
+
+			SPDK_ERRLOG("tier: assemble band %u part_uuid '%s' already present "
+				    "on band %u\n", band_id,
+				    tier_part_uuid_hex(part_uuid, uuid_hex), existing->band_id);
+			return -EEXIST;
+		}
 	}
 	band = calloc(1, sizeof(*band));
 	if (band == NULL) {
@@ -1537,6 +1628,11 @@ vbdev_tier_assemble_band(struct vbdev_tier *t, const char *base_bdev_name, uint3
 	if (serial) {
 		snprintf(band->serial, sizeof(band->serial), "%s", serial);
 	}
+	if (part_uuid) {
+		memcpy(band->part_uuid, part_uuid, sizeof(band->part_uuid));
+	}
+	band->part_start_lba = part_start_lba;
+	band->part_size_blocks = part_size_blocks;
 	band->lba_start = lba_start;
 	band->num_blocks = num_blocks;
 	/* md-hosting bands carry the mirrored md region at base-physical [sb_blocks, sb_blocks+md); their
@@ -1557,6 +1653,7 @@ vbdev_tier_assemble_band(struct vbdev_tier *t, const char *base_bdev_name, uint3
 	}
 	TAILQ_INSERT_TAIL(&t->bands, band, link);
 	t->num_bands++;
+	t->assembled = true;	/* from now on add_band may only append a plain concat band */
 	SPDK_NOTICELOG("tier '%s': assembled band %u ('%s', tier=%d, state=%d) lba_start=%" PRIu64
 		       " num_blocks=%" PRIu64 " is_md=%d\n", t->bdev.name, band_id, base_bdev_name,
 		       tier, state, lba_start, num_blocks, is_md);

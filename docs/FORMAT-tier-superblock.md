@@ -60,7 +60,11 @@ Total = 256 + 64 × 192 = **12544 bytes**, which fits one 128 KiB slot with room
 | 24  | 8  | `num_blocks` |
 | 32  | 64 | `wwn` |
 | 96  | 64 | `serial` |
-| 160 | 32 | `reserved[32]` |
+| 160 | 16 | `part_uuid` — opaque unit identity supplied by the control plane (a partition's PARTUUID). **All-zero = whole disk / no partition identity** |
+| 176 | 8  | `part_start_lba` — the unit's start LBA on its **parent** device (0 for a whole disk) |
+| 184 | 8  | `part_size_blocks` — the unit's size on its parent device (0 for a whole disk) |
+
+The three unit-identity fields consumed the former `reserved[32]` **exactly** (offsets pinned by `SPDK_STATIC_ASSERT`s): the struct size and every prior offset are unchanged, and there is **no version bump and no migration** — the previously-zero bytes are precisely the "whole disk" encoding, so every superblock written before the fields existed reads back as a composite of whole-disk bands, which is what it was. The module stores and reports these fields verbatim; it never probes a partition table. The live-vs-stored comparison (identity match, geometry **equality**) belongs to the control plane's reassembly, which reads them via `bdev_tier_read_sb`.
 
 ## Invariants
 
@@ -71,8 +75,8 @@ Total = 256 + 64 × 192 = **12544 bytes**, which fits one 128 KiB slot with room
 - **DEGRADED exclusion**: only `ACTIVE` bands are written; a DEGRADED disk's stale copy is out-voted by `seq` at reassembly.
 - **Fencing**: `generation_uuid` is minted once at `bdev_tier_create` and copied into every superblock. A re-created composite gets a fresh uuid, so disks left over from a previous instance cannot be silently cross-assembled. The CSI agent compares uuids across a candidate disk set before assembling.
 
-- **Reserved space**: the 104 header bytes and 32 bytes per band are zero-filled and CRC-covered. A new field is added by shrinking a `reserved` array while keeping the surrounding offsets fixed — the meaning of previously-zero bytes changes, the struct size does not, so a reader predating the field sees zero (a safe default) and the static asserts still pass. Any field that changes size, or any reordering of existing fields, is a v3 break.
+- **Reserved space**: the 104 header bytes are zero-filled and CRC-covered. A new field is added by shrinking a `reserved` array while keeping the surrounding offsets fixed — the meaning of previously-zero bytes changes, the struct size does not, so a reader predating the field sees zero (a safe default) and the static asserts still pass. Any field that changes size, or any reordering of existing fields, is a v3 break. The per-band `reserved[32]` was consumed this way by `part_uuid`/`part_start_lba`/`part_size_blocks` (all-zero = whole disk).
 
 ## Test coverage
 
-`module/bdev/tier/test/test_tier_sb.c` (host-compiled, ASAN+UBSAN, linking the PRODUCTION `vbdev_tier_sb.c`) covers ABI offsets and sizes, serialize/validate roundtrip, CRC/version/byte-swapped-magic rejection, u64 `cluster_blocks`, A/B slot selection (highest-seq, torn-slot fallback, short-buffer safety), and a binary golden header vector that catches a field reorder even when `sizeof` is unchanged.
+`module/bdev/tier/test/test_tier_sb.c` (host-compiled, ASAN+UBSAN, linking the PRODUCTION `vbdev_tier_sb.c`) covers ABI offsets and sizes (including the pinned `part_uuid`/`part_start_lba`/`part_size_blocks` offsets), serialize/validate roundtrip (including the unit-identity fields), CRC/version/byte-swapped-magic rejection, u64 `cluster_blocks`, A/B slot selection (highest-seq, torn-slot fallback, short-buffer safety), a binary golden header vector that catches a field reorder even when `sizeof` is unchanged, and the backward-compat vector: a band without partition identity serializes bytes 160–191 as zero, byte-identical to the pre-identity format.

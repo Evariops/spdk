@@ -1,0 +1,194 @@
+diff --git a/include/spdk/blob.h b/include/spdk/blob.h
+index 357bf31..3e3fcfd 100644
+--- a/include/spdk/blob.h
++++ b/include/spdk/blob.h
+@@ -620,6 +620,21 @@ int spdk_blob_relocate_commit(struct spdk_blob *blob, uint64_t cluster_num, uint
+  */
+ void spdk_blob_release_cluster_lba(struct spdk_blob *blob, uint64_t lba);
+ 
++/**
++ * Count the allocated clusters whose physical extent intersects
++ * [lba_start, lba_start + lba_count) on the underlying bs_dev. Fill accounting
++ * for a device that carves its address space into fixed regions (bands): the
++ * region's used bytes are count * cluster size, clipped to the region.
++ *
++ * \param bs Blobstore to query.
++ * \param lba_start Start of the LBA range.
++ * \param lba_count Length of the LBA range.
++ *
++ * \return number of allocated clusters intersecting the range.
++ */
++uint64_t spdk_bs_count_allocated_clusters_in_lba_range(struct spdk_blob_store *bs,
++		uint64_t lba_start, uint64_t lba_count);
++
+ /**
+  * Hold all I/O submitted to this blob. I/O released by the matching unfreeze
+  * re-executes the blob-to-LBA translation, so a cluster relocated meanwhile is
+diff --git a/lib/blob/blobstore.c b/lib/blob/blobstore.c
+index e1daf9c..42bef8d 100644
+--- a/lib/blob/blobstore.c
++++ b/lib/blob/blobstore.c
+@@ -9136,6 +9136,41 @@ spdk_blob_release_cluster_lba(struct spdk_blob *blob, uint64_t lba)
+ 	spdk_spin_unlock(&bs->used_lock);
+ }
+ 
++/* Evariops 0041: fill accounting over a fixed LBA region — count the allocated
++ * clusters whose extent intersects [lba_start, lba_start + lba_count). The scan
++ * walks used_clusters under used_lock, so the answer is a consistent snapshot;
++ * it is bounded by the region's cluster count, which a caller sizing bands
++ * already keeps modest. */
++uint64_t
++spdk_bs_count_allocated_clusters_in_lba_range(struct spdk_blob_store *bs, uint64_t lba_start,
++					      uint64_t lba_count)
++{
++	uint32_t c_start, c_end, cap, i;
++	uint64_t count = 0;
++
++	if (lba_count == 0) {
++		return 0;
++	}
++	c_start = (uint32_t)bs_lba_to_cluster(bs, lba_start);
++	/* Last LBA of the range, avoiding overflow on an end-of-space range. */
++	if (lba_start > UINT64_MAX - lba_count) {
++		lba_count = UINT64_MAX - lba_start;
++	}
++	c_end = (uint32_t)bs_lba_to_cluster(bs, lba_start + lba_count - 1) + 1;
++	cap = spdk_bit_pool_capacity(bs->used_clusters);
++	if (c_end > cap) {
++		c_end = cap;
++	}
++	spdk_spin_lock(&bs->used_lock);
++	for (i = c_start; i < c_end; i++) {
++		if (spdk_bit_pool_is_allocated(bs->used_clusters, i)) {
++			count++;
++		}
++	}
++	spdk_spin_unlock(&bs->used_lock);
++	return count;
++}
++
+ struct blob_relocate_ctx {
+ 	struct spdk_blob		*blob;
+ 	uint64_t			cluster_num;
+diff --git a/lib/blob/spdk_blob.map b/lib/blob/spdk_blob.map
+index 5a03b76..79487e5 100644
+--- a/lib/blob/spdk_blob.map
++++ b/lib/blob/spdk_blob.map
+@@ -29,6 +29,7 @@
+ 	spdk_blob_claim_cluster_in_range_from;
+ 	spdk_blob_relocate_commit;
+ 	spdk_blob_release_cluster_lba;
++	spdk_bs_count_allocated_clusters_in_lba_range;
+ 	spdk_blob_freeze_io;
+ 	spdk_blob_unfreeze_io;
+ 	spdk_blob_opts_init;
+diff --git a/module/bdev/lvol/vbdev_lvol.c b/module/bdev/lvol/vbdev_lvol.c
+index 3673b97..7af5d77 100644
+--- a/module/bdev/lvol/vbdev_lvol.c
++++ b/module/bdev/lvol/vbdev_lvol.c
+@@ -13,6 +13,7 @@
+ #include "spdk/blob.h"
+ 
+ #include "vbdev_lvol.h"
++#include "vbdev_tier.h"	/* Evariops 0041: per-band usage provider */
+ 
+ struct vbdev_lvol_io {
+ 	struct spdk_blob_ext_io_opts ext_io_opts;
+@@ -43,6 +44,57 @@ SPDK_BDEV_MODULE_REGISTER(lvol, &g_lvol_if)
+ 
+ static void _vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg);
+ 
++/* Evariops 0041: fill-accounting bridge to bdev_tier. The composite knows only
++ * geometry; which blocks are LIVE is the blobstore's. When an lvolstore sits on
++ * a tier composite, this provider answers bdev_tier_get_bands' per-band
++ * used_blocks by counting the allocated clusters intersecting the band's LBA
++ * range. Synchronous, called on the app/RPC thread. */
++static int
++vbdev_lvs_tier_band_usage(void *ctx, uint64_t lba_start, uint64_t num_blocks,
++			  uint64_t *used_blocks_out)
++{
++	struct lvol_store_bdev *lvs_bdev = ctx;
++	struct spdk_blob_store *bs = lvs_bdev->lvs->blobstore;
++	uint32_t blocklen = spdk_bdev_get_block_size(lvs_bdev->bdev);
++	uint64_t cluster_blocks, used_blocks;
++
++	if (blocklen == 0 || spdk_bs_get_cluster_size(bs) < blocklen) {
++		return -EINVAL;
++	}
++	cluster_blocks = spdk_bs_get_cluster_size(bs) / blocklen;
++	used_blocks = spdk_bs_count_allocated_clusters_in_lba_range(bs, lba_start, num_blocks) *
++		      cluster_blocks;
++	/* Band boundaries are cluster-aligned by the tier module's construction; the
++	 * clip keeps the answer bounded by the band even if they were not. */
++	if (used_blocks > num_blocks) {
++		used_blocks = num_blocks;
++	}
++	*used_blocks_out = used_blocks;
++	return 0;
++}
++
++static void
++vbdev_lvs_tier_usage_register(struct lvol_store_bdev *lvs_bdev)
++{
++	struct vbdev_tier *tier = vbdev_tier_get_by_name(spdk_bdev_get_name(lvs_bdev->bdev));
++
++	if (tier == NULL || lvs_bdev->bdev != &tier->bdev) {
++		return;		/* this lvolstore does not sit on a tier composite */
++	}
++	vbdev_tier_set_usage_provider(tier->bdev.name, vbdev_lvs_tier_band_usage, lvs_bdev);
++}
++
++static void
++vbdev_lvs_tier_usage_unregister(struct lvol_store_bdev *lvs_bdev)
++{
++	struct vbdev_tier *tier = vbdev_tier_get_by_name(spdk_bdev_get_name(lvs_bdev->bdev));
++
++	if (tier == NULL || lvs_bdev->bdev != &tier->bdev || tier->usage_ctx != lvs_bdev) {
++		return;
++	}
++	vbdev_tier_clear_usage_provider(tier->bdev.name);
++}
++
+ struct lvol_store_bdev *
+ vbdev_get_lvs_bdev_by_lvs(struct spdk_lvol_store *lvs_orig)
+ {
+@@ -201,6 +253,7 @@ _vbdev_lvs_create_cb(void *cb_arg, struct spdk_lvol_store *lvs, int lvserrno)
+ 	lvs_bdev->req = NULL;
+ 
+ 	TAILQ_INSERT_TAIL(&g_spdk_lvol_pairs, lvs_bdev, lvol_stores);
++	vbdev_lvs_tier_usage_register(lvs_bdev);
+ 	SPDK_INFOLOG(vbdev_lvol, "Lvol store bdev inserted\n");
+ 
+ end:
+@@ -366,6 +419,7 @@ _vbdev_lvs_remove_cb(void *cb_arg, int lvserrno)
+ 		SPDK_INFOLOG(vbdev_lvol, "Lvol store removed with error: %d.\n", lvserrno);
+ 	}
+ 
++	vbdev_lvs_tier_usage_unregister(lvs_bdev);
+ 	TAILQ_REMOVE(&g_spdk_lvol_pairs, lvs_bdev, lvol_stores);
+ 	free(lvs_bdev);
+ 
+@@ -596,6 +650,7 @@ _vbdev_lvol_unregister_unload_lvs(void *cb_arg, int lvserrno)
+ 		SPDK_NOTICELOG("shutdown: lvolstore unloaded clean (unregister path)\n");
+ 	}
+ 
++	vbdev_lvs_tier_usage_unregister(lvs_bdev);
+ 	TAILQ_REMOVE(&g_spdk_lvol_pairs, lvs_bdev, lvol_stores);
+ 	free(lvs_bdev);
+ 
+@@ -1518,6 +1573,7 @@ vbdev_lvs_fini_start_unload_cb(void *cb_arg, int lvserrno)
+ 		SPDK_NOTICELOG("shutdown: lvolstore unloaded clean (fini_start path)\n");
+ 	}
+ 
++	vbdev_lvs_tier_usage_unregister(lvs_bdev);
+ 	TAILQ_REMOVE(&g_spdk_lvol_pairs, lvs_bdev, lvol_stores);
+ 	free(lvs_bdev);
+ 
+@@ -1703,6 +1759,7 @@ _vbdev_lvs_examine_cb(void *arg, struct spdk_lvol_store *lvol_store, int lvserrn
+ 	lvs_bdev->bdev = req->base_bdev;
+ 
+ 	TAILQ_INSERT_TAIL(&g_spdk_lvol_pairs, lvs_bdev, lvol_stores);
++	vbdev_lvs_tier_usage_register(lvs_bdev);
+ 
+ 	SPDK_INFOLOG(vbdev_lvol, "Lvol store found on %s - begin parsing\n",
+ 		     req->base_bdev->name);
