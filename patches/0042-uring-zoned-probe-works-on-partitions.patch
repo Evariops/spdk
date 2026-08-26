@@ -1,0 +1,60 @@
+diff --git a/module/bdev/uring/bdev_uring.c b/module/bdev/uring/bdev_uring.c
+index b7e27cc..717e260 100644
+--- a/module/bdev/uring/bdev_uring.c
++++ b/module/bdev/uring/bdev_uring.c
+@@ -607,6 +607,7 @@ bdev_uring_check_zoned_support(struct bdev_uring *uring, const char *name, const
+ 	struct stat sb;
+ 	char resolved_path[PATH_MAX], *rp;
+ 	char *sysfs_path = NULL;
++	char *queue_dir = NULL;
+ 
+ 	uring->bdev.zoned = false;
+ 
+@@ -628,8 +629,21 @@ bdev_uring_check_zoned_support(struct bdev_uring *uring, const char *name, const
+ 	}
+ 
+ 	base = basename(filename_dup);
+-	sysfs_path = spdk_sprintf_alloc("/sys/block/%s/queue/zoned", base);
++	queue_dir = spdk_sprintf_alloc("/sys/block/%s/queue", base);
++	sysfs_path = spdk_sprintf_alloc("%s/zoned", queue_dir);
+ 	retval = spdk_read_sysfs_attribute(&str, "%s", sysfs_path);
++	if (retval < 0) {
++		/* A PARTITION has no /sys/block/<name> entry: its queue belongs to the parent
++		 * disk, so the probe above fails with -ENOENT for every partition and the
++		 * create was refused outright. /sys/class/block/<name> is a symlink into the
++		 * parent's device directory for any naming scheme (nvme0n1p2, sda1,
++		 * mmcblk0p1), so ../queue there IS the parent's queue. */
++		free(sysfs_path);
++		free(queue_dir);
++		queue_dir = spdk_sprintf_alloc("/sys/class/block/%s/../queue", base);
++		sysfs_path = spdk_sprintf_alloc("%s/zoned", queue_dir);
++		retval = spdk_read_sysfs_attribute(&str, "%s", sysfs_path);
++	}
+ 	/* Check if this is a zoned block device */
+ 	if (retval < 0) {
+ 		URING_ERRLOG(uring, "Unable to open file %s. errno: %d\n", sysfs_path, retval);
+@@ -652,14 +666,14 @@ bdev_uring_check_zoned_support(struct bdev_uring *uring, const char *name, const
+ 		uring->bdev.zone_size = (zinfo >> uring->zd.lba_shift);
+ 		uring->zd.zone_shift = spdk_u32log2(zinfo >> uring->zd.lba_shift);
+ 
+-		retval = spdk_read_sysfs_attribute_uint32(&val, "/sys/block/%s/queue/max_open_zones", base);
++		retval = spdk_read_sysfs_attribute_uint32(&val, "%s/max_open_zones", queue_dir);
+ 		if (retval < 0) {
+ 			URING_ERRLOG(uring, "Failed to get max open zones %d (%s)\n", retval, strerror(-retval));
+ 			goto err_ret;
+ 		}
+ 		uring->bdev.max_open_zones = uring->bdev.optimal_open_zones = val;
+ 
+-		retval = spdk_read_sysfs_attribute_uint32(&val, "/sys/block/%s/queue/max_active_zones", base);
++		retval = spdk_read_sysfs_attribute_uint32(&val, "%s/max_active_zones", queue_dir);
+ 		if (retval < 0) {
+ 			URING_ERRLOG(uring, "Failed to get max active zones %d (%s)\n", retval, strerror(-retval));
+ 			goto err_ret;
+@@ -672,6 +686,7 @@ bdev_uring_check_zoned_support(struct bdev_uring *uring, const char *name, const
+ err_ret:
+ 	free(str);
+ 	free(sysfs_path);
++	free(queue_dir);
+ 	free(filename_dup);
+ 	return retval;
+ }

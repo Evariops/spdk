@@ -184,6 +184,12 @@ static void
 test_abi(void)
 {
 	CHECK(sizeof(struct tier_sb_band) == 192);
+	CHECK(offsetof(struct tier_sb_band, wwn) == 32);
+	CHECK(offsetof(struct tier_sb_band, serial) == 96);
+	/* The unit-identity fields consume the former reserved[32] exactly. */
+	CHECK(offsetof(struct tier_sb_band, part_uuid) == 160);
+	CHECK(offsetof(struct tier_sb_band, part_start_lba) == 176);
+	CHECK(offsetof(struct tier_sb_band, part_size_blocks) == 184);
 	CHECK(offsetof(struct tier_superblock, bands) == 256);
 	CHECK(sizeof(struct tier_superblock) == 12544);
 	CHECK(offsetof(struct tier_superblock, magic) == 0);
@@ -231,6 +237,28 @@ test_serialize_roundtrip(void)
 	CHECK(sb.bands[2].state == TIER_BAND_DEGRADED);
 	CHECK(strcmp(sb.bands[2].serial, "serial-2") == 0);
 	CHECK(sb.bands[3].band_id == 0 && sb.bands[3].num_blocks == 0);
+
+	/* The unit-identity fields roundtrip; bands without one serialize as zeros. */
+	{
+		struct tier_band *b1 = TAILQ_NEXT(self, link);
+		uint32_t i;
+
+		for (i = 0; i < TIER_PART_UUID_LEN; i++) {
+			b1->part_uuid[i] = (uint8_t)(0x10 + i);
+		}
+		b1->part_start_lba = 264192;
+		b1->part_size_blocks = 50176 + 64;
+		tier_sb_serialize(&t, self, 42, 0, &sb);
+		CHECK(tier_sb_valid(&sb));
+		CHECK(sb.bands[1].part_uuid[0] == 0x10 && sb.bands[1].part_uuid[15] == 0x1F);
+		CHECK(sb.bands[1].part_start_lba == 264192);
+		CHECK(sb.bands[1].part_size_blocks == 50176 + 64);
+		for (i = 0; i < TIER_PART_UUID_LEN; i++) {
+			CHECK(sb.bands[0].part_uuid[i] == 0);
+			CHECK(sb.bands[2].part_uuid[i] == 0);
+		}
+		CHECK(sb.bands[0].part_start_lba == 0 && sb.bands[0].part_size_blocks == 0);
+	}
 
 	/* cluster_blocks must survive a value > UINT32_MAX. */
 	t.cluster_blocks = 0x100000001ULL;
@@ -376,6 +404,61 @@ test_golden_header(void)
 	free_composite(&t);
 }
 
+/* A band without partition identity serializes its former reserved[32] region as
+ * all-zero bytes — byte-identical to the pre-identity format — so superblocks
+ * written before the fields existed validate and read back unchanged (all-zero
+ * part_uuid = whole disk, no version bump). With an identity, the bytes land at
+ * the pinned offsets, little-endian. */
+static void
+test_part_identity_compat(void)
+{
+	struct vbdev_tier t;
+	struct tier_superblock sb;
+	const uint8_t *p = (const uint8_t *)&sb;
+	char hex[2 * TIER_PART_UUID_LEN + 1];
+	uint32_t band, i;
+
+	make_composite(&t);
+	tier_sb_serialize(&t, TAILQ_FIRST(&t.bands), 42, 0, &sb);
+	CHECK(tier_sb_valid(&sb));
+	for (band = 0; band < 3; band++) {
+		uint32_t off = 256 + band * 192 + 160;
+
+		for (i = 0; i < 32; i++) {
+			CHECK(p[off + i] == 0);
+		}
+	}
+
+	{
+		struct tier_band *b0 = TAILQ_FIRST(&t.bands);
+
+		for (i = 0; i < TIER_PART_UUID_LEN; i++) {
+			b0->part_uuid[i] = (uint8_t)(0xC0 + i);
+		}
+		b0->part_start_lba = 0x0123456789ABCDEFULL;
+		b0->part_size_blocks = 0x1122334455667788ULL;
+		tier_sb_serialize(&t, b0, 43, 0, &sb);
+		CHECK(tier_sb_valid(&sb));
+		CHECK(p[256 + 160] == 0xC0 && p[256 + 175] == 0xCF);
+		CHECK(p[256 + 176] == 0xEF && p[256 + 183] == 0x01);	/* LE u64 */
+		CHECK(p[256 + 184] == 0x88 && p[256 + 191] == 0x11);	/* LE u64 */
+	}
+
+	/* The hex renderer: empty for no identity, 32 lowercase chars otherwise. */
+	{
+		uint8_t zero[TIER_PART_UUID_LEN] = {0};
+		uint8_t u[TIER_PART_UUID_LEN];
+
+		CHECK(strcmp(tier_part_uuid_hex(zero, hex), "") == 0);
+		for (i = 0; i < TIER_PART_UUID_LEN; i++) {
+			u[i] = (uint8_t)(i * 0x11);
+		}
+		CHECK(strcmp(tier_part_uuid_hex(u, hex),
+			     "00112233445566778899aabbccddeeff") == 0);
+	}
+	free_composite(&t);
+}
+
 /* ---- durability and fan-out termination contracts --------------------------- */
 
 static void
@@ -433,6 +516,7 @@ main(void)
 	test_slot_select();
 	test_geometry_inlines();
 	test_golden_header();
+	test_part_identity_compat();
 	test_m3_zero_copy_persist_not_durable();
 	test_m2_enomem_termination_resolves_deferred_teardown();
 

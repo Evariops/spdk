@@ -87,7 +87,11 @@ rpc_bdev_tier_create(struct spdk_jsonrpc_request *request, const struct spdk_jso
 }
 SPDK_RPC_REGISTER("bdev_tier_create", rpc_bdev_tier_create, SPDK_RPC_RUNTIME)
 
-/* ---- bdev_tier_add_band {name, base_bdev_name, tier, wwn?, serial?} ---------- */
+/* part_uuid wire decoding: tier_part_uuid_parse (vbdev_tier.h) — the strict
+ * 32-lowercase-hex mirror of tier_part_uuid_hex, unit-tested host-side. */
+
+/* ---- bdev_tier_add_band {name, base_bdev_name, tier, wwn?, serial?, part_uuid?,
+ *      part_start_lba?, part_size_blocks?} --------------------------------------- */
 
 struct rpc_tier_add_band {
 	char		*name;
@@ -95,6 +99,9 @@ struct rpc_tier_add_band {
 	uint32_t	tier;
 	char		*wwn;
 	char		*serial;
+	char		*part_uuid;
+	uint64_t	part_start_lba;
+	uint64_t	part_size_blocks;
 };
 
 static const struct spdk_json_object_decoder rpc_tier_add_band_decoders[] = {
@@ -103,6 +110,9 @@ static const struct spdk_json_object_decoder rpc_tier_add_band_decoders[] = {
 	{"tier", offsetof(struct rpc_tier_add_band, tier), spdk_json_decode_uint32},
 	{"wwn", offsetof(struct rpc_tier_add_band, wwn), spdk_json_decode_string, true},
 	{"serial", offsetof(struct rpc_tier_add_band, serial), spdk_json_decode_string, true},
+	{"part_uuid", offsetof(struct rpc_tier_add_band, part_uuid), spdk_json_decode_string, true},
+	{"part_start_lba", offsetof(struct rpc_tier_add_band, part_start_lba), spdk_json_decode_uint64, true},
+	{"part_size_blocks", offsetof(struct rpc_tier_add_band, part_size_blocks), spdk_json_decode_uint64, true},
 };
 
 static void
@@ -110,6 +120,7 @@ rpc_bdev_tier_add_band(struct spdk_jsonrpc_request *request, const struct spdk_j
 {
 	struct rpc_tier_add_band req = {};
 	struct vbdev_tier *t;
+	uint8_t part_uuid[TIER_PART_UUID_LEN];
 	uint32_t band_id = 0;
 	int rc;
 
@@ -123,13 +134,18 @@ rpc_bdev_tier_add_band(struct spdk_jsonrpc_request *request, const struct spdk_j
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS, "invalid tier");
 		goto cleanup;
 	}
+	if (tier_part_uuid_parse(req.part_uuid, part_uuid) != 0) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "invalid part_uuid (expect 32 lowercase hex chars)");
+		goto cleanup;
+	}
 	t = vbdev_tier_get_by_name(req.name);
 	if (t == NULL) {
 		spdk_jsonrpc_send_error_response_fmt(request, -ENODEV, "tier '%s' not found", req.name);
 		goto cleanup;
 	}
 	rc = vbdev_tier_add_band(t, req.base_bdev_name, (enum tier_class)req.tier, req.wwn, req.serial,
-				 &band_id);
+				 part_uuid, req.part_start_lba, req.part_size_blocks, &band_id);
 	if (rc != 0) {
 		spdk_jsonrpc_send_error_response_fmt(request, rc, "add_band failed: %s", spdk_strerror(-rc));
 		goto cleanup;
@@ -145,6 +161,7 @@ cleanup:
 	free(req.base_bdev_name);
 	free(req.wwn);
 	free(req.serial);
+	free(req.part_uuid);
 }
 SPDK_RPC_REGISTER("bdev_tier_add_band", rpc_bdev_tier_add_band, SPDK_RPC_RUNTIME)
 
@@ -308,9 +325,21 @@ rpc_bdev_tier_get_bands(struct spdk_jsonrpc_request *request, const struct spdk_
 	spdk_json_write_object_begin(w);
 	spdk_json_write_named_array_begin(w, "bands");
 	TAILQ_FOREACH(b, &t->bands, link) {
-		/* Geometry + state only. Fill accounting (used/capacity) is logical and
-		 * lives in the blobstore, where the CSI derives it, so the composite does
-		 * not emit a duplicate/always-zero copy. */
+		char uuid_hex[2 * TIER_PART_UUID_LEN + 1];
+		uint64_t used_blocks = 0;
+		bool usage_valid = false;
+
+		/* Fill accounting is logical state owned by the blobstore on top; the
+		 * registered usage provider bridges it per band. usage_valid carries
+		 * "was this measured" ON THE WIRE: no provider (lvolstore not loaded
+		 * yet) and a provider error both report 0 + usage_valid=false, so a
+		 * consumer never has to guess whether 0 means empty or unknown. */
+		if (t->usage_fn != NULL &&
+		    t->usage_fn(t->usage_ctx, b->lba_start, b->num_blocks, &used_blocks) == 0) {
+			usage_valid = true;
+		} else {
+			used_blocks = 0;
+		}
 		spdk_json_write_object_begin(w);
 		spdk_json_write_named_uint32(w, "band_id", b->band_id);
 		spdk_json_write_named_uint32(w, "tier", b->tier);
@@ -318,8 +347,15 @@ rpc_bdev_tier_get_bands(struct spdk_jsonrpc_request *request, const struct spdk_
 		spdk_json_write_named_string(w, "base_bdev_name", b->base_bdev_name);
 		spdk_json_write_named_string(w, "wwn", b->wwn);
 		spdk_json_write_named_string(w, "serial", b->serial);
+		spdk_json_write_named_string(w, "part_uuid",
+					     tier_part_uuid_hex(b->part_uuid, uuid_hex));
+		spdk_json_write_named_uint64(w, "part_start_lba", b->part_start_lba);
+		spdk_json_write_named_uint64(w, "part_size_blocks", b->part_size_blocks);
 		spdk_json_write_named_uint64(w, "lba_start", b->lba_start);
 		spdk_json_write_named_uint64(w, "num_blocks", b->num_blocks);
+		spdk_json_write_named_uint64(w, "capacity_blocks", b->num_blocks);
+		spdk_json_write_named_uint64(w, "used_blocks", used_blocks);
+		spdk_json_write_named_bool(w, "usage_valid", usage_valid);
 		spdk_json_write_object_end(w);
 	}
 	spdk_json_write_array_end(w);
@@ -329,7 +365,8 @@ rpc_bdev_tier_get_bands(struct spdk_jsonrpc_request *request, const struct spdk_
 SPDK_RPC_REGISTER("bdev_tier_get_bands", rpc_bdev_tier_get_bands, SPDK_RPC_RUNTIME)
 
 /* ---- bdev_tier_assemble_band {name, base_bdev_name, band_id, tier, wwn?, serial?,
- *      lba_start, num_blocks, state, is_md} — place a band at explicit stored geometry ------------ */
+ *      part_uuid?, part_start_lba?, part_size_blocks?, lba_start, num_blocks, state,
+ *      is_md} — place a band at explicit stored geometry ------------------------- */
 
 struct rpc_tier_assemble {
 	char		*name;
@@ -338,6 +375,9 @@ struct rpc_tier_assemble {
 	uint32_t	tier;
 	char		*wwn;
 	char		*serial;
+	char		*part_uuid;
+	uint64_t	part_start_lba;
+	uint64_t	part_size_blocks;
 	uint64_t	lba_start;
 	uint64_t	num_blocks;
 	uint32_t	state;
@@ -351,6 +391,9 @@ static const struct spdk_json_object_decoder rpc_tier_assemble_decoders[] = {
 	{"tier", offsetof(struct rpc_tier_assemble, tier), spdk_json_decode_uint32},
 	{"wwn", offsetof(struct rpc_tier_assemble, wwn), spdk_json_decode_string, true},
 	{"serial", offsetof(struct rpc_tier_assemble, serial), spdk_json_decode_string, true},
+	{"part_uuid", offsetof(struct rpc_tier_assemble, part_uuid), spdk_json_decode_string, true},
+	{"part_start_lba", offsetof(struct rpc_tier_assemble, part_start_lba), spdk_json_decode_uint64, true},
+	{"part_size_blocks", offsetof(struct rpc_tier_assemble, part_size_blocks), spdk_json_decode_uint64, true},
 	{"lba_start", offsetof(struct rpc_tier_assemble, lba_start), spdk_json_decode_uint64},
 	{"num_blocks", offsetof(struct rpc_tier_assemble, num_blocks), spdk_json_decode_uint64},
 	{"state", offsetof(struct rpc_tier_assemble, state), spdk_json_decode_uint32, true},
@@ -362,6 +405,7 @@ rpc_bdev_tier_assemble_band(struct spdk_jsonrpc_request *request, const struct s
 {
 	struct rpc_tier_assemble req = {};
 	struct vbdev_tier *t;
+	uint8_t part_uuid[TIER_PART_UUID_LEN];
 	int rc;
 
 	if (spdk_json_decode_object(params, rpc_tier_assemble_decoders,
@@ -373,13 +417,19 @@ rpc_bdev_tier_assemble_band(struct spdk_jsonrpc_request *request, const struct s
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS, "invalid tier");
 		goto cleanup;
 	}
+	if (tier_part_uuid_parse(req.part_uuid, part_uuid) != 0) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "invalid part_uuid (expect 32 lowercase hex chars)");
+		goto cleanup;
+	}
 	t = vbdev_tier_get_by_name(req.name);
 	if (t == NULL) {
 		spdk_jsonrpc_send_error_response_fmt(request, -ENODEV, "tier '%s' not found", req.name);
 		goto cleanup;
 	}
 	rc = vbdev_tier_assemble_band(t, req.base_bdev_name, req.band_id, (enum tier_class)req.tier,
-				      req.wwn, req.serial, req.lba_start, req.num_blocks,
+				      req.wwn, req.serial, part_uuid, req.part_start_lba,
+				      req.part_size_blocks, req.lba_start, req.num_blocks,
 				      (enum tier_band_state)req.state, req.is_md);
 	if (rc != 0) {
 		spdk_jsonrpc_send_error_response_fmt(request, rc, "assemble_band failed: %s", spdk_strerror(-rc));
@@ -392,6 +442,7 @@ cleanup:
 	free(req.base_bdev_name);
 	free(req.wwn);
 	free(req.serial);
+	free(req.part_uuid);
 }
 SPDK_RPC_REGISTER("bdev_tier_assemble_band", rpc_bdev_tier_assemble_band, SPDK_RPC_RUNTIME)
 
@@ -498,6 +549,8 @@ rpc_read_sb_done(void *cb_arg, const struct tier_superblock *sb, int rc)
 		spdk_json_write_named_uint32(w, "this_band_id", sb->this_band_id);
 		spdk_json_write_named_array_begin(w, "bands");
 		for (i = 0; i < sb->num_bands && i < TIER_MAX_BANDS; i++) {
+			char part_uuid_hex[2 * TIER_PART_UUID_LEN + 1];
+
 			spdk_json_write_object_begin(w);
 			spdk_json_write_named_uint32(w, "band_id", sb->bands[i].band_id);
 			spdk_json_write_named_uint32(w, "tier", sb->bands[i].tier);
@@ -506,6 +559,11 @@ rpc_read_sb_done(void *cb_arg, const struct tier_superblock *sb, int rc)
 			spdk_json_write_named_uint64(w, "num_blocks", sb->bands[i].num_blocks);
 			spdk_json_write_named_string(w, "wwn", sb->bands[i].wwn);
 			spdk_json_write_named_string(w, "serial", sb->bands[i].serial);
+			spdk_json_write_named_string(w, "part_uuid",
+						     tier_part_uuid_hex(sb->bands[i].part_uuid,
+									part_uuid_hex));
+			spdk_json_write_named_uint64(w, "part_start_lba", sb->bands[i].part_start_lba);
+			spdk_json_write_named_uint64(w, "part_size_blocks", sb->bands[i].part_size_blocks);
 			spdk_json_write_object_end(w);
 		}
 		spdk_json_write_array_end(w);
