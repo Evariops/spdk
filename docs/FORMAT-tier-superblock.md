@@ -66,6 +66,8 @@ Total = 256 + 64 × 192 = **12544 bytes**, which fits one 128 KiB slot with room
 
 The three unit-identity fields consumed the former `reserved[32]` **exactly** (offsets pinned by `SPDK_STATIC_ASSERT`s): the struct size and every prior offset are unchanged, and there is **no version bump and no migration** — the previously-zero bytes are precisely the "whole disk" encoding, so every superblock written before the fields existed reads back as a composite of whole-disk bands, which is what it was. The module stores and reports these fields verbatim; it never probes a partition table. The live-vs-stored comparison (identity match, geometry **equality**) belongs to the control plane's reassembly, which reads them via `bdev_tier_read_sb`.
 
+**Rollback caveat — the compatibility is one-way.** An OLDER image accepts a superblock carrying identities (`tier_sb_valid` checks magic + version + CRC, not reserved-must-be-zero), but its serializer rebuilds the superblock from a zeroed struct where these 32 bytes are reserved-zero: the **first persist** after a rollback (retire, resync, any `tier_sb_write_all`) rewrites every band with an all-zero identity, at a HIGHER `seq` — so under highest-seq-wins the erasure is definitive, and on the next upgrade the control plane finds whole-disk encodings where partitions exist. **Do not roll the image back under a composite with partition bands without reprovisioning it**; whole-disk-only composites roll back freely (their identity bytes are zero on both sides).
+
 ## Invariants
 
 - **Endianness**: little-endian only (amd64/arm64). `tier_sb_valid` rejects a byte-swapped magic explicitly — a big-endian writer is named rather than failing the CRC silently.

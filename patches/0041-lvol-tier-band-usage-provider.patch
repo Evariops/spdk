@@ -1,22 +1,76 @@
+diff --git a/include/spdk/bit_array.h b/include/spdk/bit_array.h
+index b0fed89..526ed69 100644
+--- a/include/spdk/bit_array.h
++++ b/include/spdk/bit_array.h
+@@ -136,6 +136,20 @@ uint32_t spdk_bit_array_find_first_clear(const struct spdk_bit_array *ba, uint32
+  */
+ uint32_t spdk_bit_array_count_set(const struct spdk_bit_array *ba);
+ 
++/**
++ * Count the number of set bits in [start_bit_index, start_bit_index + count),
++ * scanning word-wise (one popcount per 64 bits, first/last words masked) instead
++ * of bit-by-bit. The range is clamped to the array capacity.
++ *
++ * \param ba The bit array to search.
++ * \param start_bit_index First bit of the range.
++ * \param count Number of bits in the range.
++ *
++ * \return the number of bits set in the range.
++ */
++uint32_t spdk_bit_array_count_set_in_range(const struct spdk_bit_array *ba,
++		uint32_t start_bit_index, uint32_t count);
++
+ /**
+  * Count the number of cleared bits in the array.
+  *
+diff --git a/include/spdk/bit_pool.h b/include/spdk/bit_pool.h
+index c89e57d..fe09d70 100644
+--- a/include/spdk/bit_pool.h
++++ b/include/spdk/bit_pool.h
+@@ -94,6 +94,20 @@ int spdk_bit_pool_resize(struct spdk_bit_pool **pool, uint32_t num_bits);
+  */
+ bool spdk_bit_pool_is_allocated(const struct spdk_bit_pool *pool, uint32_t bit_index);
+ 
++/**
++ * Count the allocated bits in [start_bit_index, start_bit_index + count),
++ * word-wise (one popcount per 64 bits) — never bit-by-bit, so a range spanning
++ * millions of bits stays microseconds. The range is clamped to the pool capacity.
++ *
++ * \param pool Bit pool to query.
++ * \param start_bit_index First bit of the range.
++ * \param count Number of bits in the range.
++ *
++ * \return the number of allocated bits in the range.
++ */
++uint32_t spdk_bit_pool_count_allocated_in_range(const struct spdk_bit_pool *pool,
++		uint32_t start_bit_index, uint32_t count);
++
+ /**
+  * Find the index of the first free (clear) bit at or after start_bit_index,
+  * scanning word-wise (fully-allocated 64-bit words are skipped in one step).
 diff --git a/include/spdk/blob.h b/include/spdk/blob.h
-index 357bf31..3e3fcfd 100644
+index 357bf31..ea69301 100644
 --- a/include/spdk/blob.h
 +++ b/include/spdk/blob.h
-@@ -620,6 +620,21 @@ int spdk_blob_relocate_commit(struct spdk_blob *blob, uint64_t cluster_num, uint
+@@ -620,6 +620,25 @@ int spdk_blob_relocate_commit(struct spdk_blob *blob, uint64_t cluster_num, uint
   */
  void spdk_blob_release_cluster_lba(struct spdk_blob *blob, uint64_t lba);
  
 +/**
-+ * Count the allocated clusters whose physical extent intersects
-+ * [lba_start, lba_start + lba_count) on the underlying bs_dev. Fill accounting
-+ * for a device that carves its address space into fixed regions (bands): the
-+ * region's used bytes are count * cluster size, clipped to the region.
++ * Count the allocated clusters in [lba_start, lba_start + lba_count) on the
++ * underlying bs_dev. Fill accounting for a device that carves its address space
++ * into fixed regions (bands): the region's used bytes are count * cluster size.
++ *
++ * PRECONDITIONS: lba_start and lba_start + lba_count are both cluster-aligned
++ * (asserted), and the end does not wrap u64. The registering layer enforces
++ * both by refusing a provider whose region grain is not a multiple of the
++ * blobstore cluster, and by refusing overflowing ranges at band assembly.
 + *
 + * \param bs Blobstore to query.
-+ * \param lba_start Start of the LBA range.
-+ * \param lba_count Length of the LBA range.
++ * \param lba_start Start of the LBA range (cluster-aligned).
++ * \param lba_count Length of the LBA range (cluster-aligned).
 + *
-+ * \return number of allocated clusters intersecting the range.
++ * \return number of allocated clusters in the range.
 + */
 +uint64_t spdk_bs_count_allocated_clusters_in_lba_range(struct spdk_blob_store *bs,
 +		uint64_t lba_start, uint64_t lba_count);
@@ -25,44 +79,45 @@ index 357bf31..3e3fcfd 100644
   * Hold all I/O submitted to this blob. I/O released by the matching unfreeze
   * re-executes the blob-to-LBA translation, so a cluster relocated meanwhile is
 diff --git a/lib/blob/blobstore.c b/lib/blob/blobstore.c
-index e1daf9c..42bef8d 100644
+index e1daf9c..f774f99 100644
 --- a/lib/blob/blobstore.c
 +++ b/lib/blob/blobstore.c
-@@ -9136,6 +9136,41 @@ spdk_blob_release_cluster_lba(struct spdk_blob *blob, uint64_t lba)
+@@ -9136,6 +9136,42 @@ spdk_blob_release_cluster_lba(struct spdk_blob *blob, uint64_t lba)
  	spdk_spin_unlock(&bs->used_lock);
  }
  
 +/* Evariops 0041: fill accounting over a fixed LBA region — count the allocated
-+ * clusters whose extent intersects [lba_start, lba_start + lba_count). The scan
-+ * walks used_clusters under used_lock, so the answer is a consistent snapshot;
-+ * it is bounded by the region's cluster count, which a caller sizing bands
-+ * already keeps modest. */
++ * clusters in [lba_start, lba_start + lba_count). Both bounds must be
++ * cluster-aligned and the end must not wrap u64 (the tier caller aligns band
++ * boundaries to the blobstore cluster and refuses overflowing ranges at
++ * assembly): bs_lba_to_cluster asserts alignment, and the EXCLUSIVE end form is
++ * the only one whose argument stays aligned — the inclusive last LBA never is,
++ * and aborts every assert-enabled build (same convention as patch 0004).
++ * The count is one masked popcount per 64 clusters under used_lock — a
++ * whole-disk band stays microseconds; a bit-by-bit walk here would monopolize
++ * the single reactor for milliseconds per band at every poll (this series
++ * already paid that bug once, see 0004's word-wise rewrite). */
 +uint64_t
 +spdk_bs_count_allocated_clusters_in_lba_range(struct spdk_blob_store *bs, uint64_t lba_start,
 +					      uint64_t lba_count)
 +{
-+	uint32_t c_start, c_end, cap, i;
-+	uint64_t count = 0;
++	uint32_t c_start, c_end, cap;
++	uint64_t count;
 +
 +	if (lba_count == 0) {
 +		return 0;
 +	}
 +	c_start = (uint32_t)bs_lba_to_cluster(bs, lba_start);
-+	/* Last LBA of the range, avoiding overflow on an end-of-space range. */
-+	if (lba_start > UINT64_MAX - lba_count) {
-+		lba_count = UINT64_MAX - lba_start;
-+	}
-+	c_end = (uint32_t)bs_lba_to_cluster(bs, lba_start + lba_count - 1) + 1;
++	c_end = (uint32_t)bs_lba_to_cluster(bs, lba_start + lba_count);
 +	cap = spdk_bit_pool_capacity(bs->used_clusters);
 +	if (c_end > cap) {
 +		c_end = cap;
 +	}
-+	spdk_spin_lock(&bs->used_lock);
-+	for (i = c_start; i < c_end; i++) {
-+		if (spdk_bit_pool_is_allocated(bs->used_clusters, i)) {
-+			count++;
-+		}
++	if (c_start >= c_end) {
++		return 0;
 +	}
++	spdk_spin_lock(&bs->used_lock);
++	count = spdk_bit_pool_count_allocated_in_range(bs->used_clusters, c_start, c_end - c_start);
 +	spdk_spin_unlock(&bs->used_lock);
 +	return count;
 +}
@@ -82,8 +137,94 @@ index 5a03b76..79487e5 100644
  	spdk_blob_freeze_io;
  	spdk_blob_unfreeze_io;
  	spdk_blob_opts_init;
+diff --git a/lib/util/bit_array.c b/lib/util/bit_array.c
+index 067b25a..b8425bd 100644
+--- a/lib/util/bit_array.c
++++ b/lib/util/bit_array.c
+@@ -279,6 +279,45 @@ spdk_bit_array_count_set(const struct spdk_bit_array *ba)
+ 	return set_count;
+ }
+ 
++uint32_t
++spdk_bit_array_count_set_in_range(const struct spdk_bit_array *ba, uint32_t start_bit_index,
++				  uint32_t count)
++{
++	uint32_t end, first_word, last_word, w;
++	uint32_t set_count = 0;
++	spdk_bit_array_word word;
++
++	/* Clamp to capacity (bits past bit_count are guaranteed clear by resize, but
++	 * the WORDS past the last one are not readable). */
++	if (start_bit_index >= ba->bit_count || count == 0) {
++		return 0;
++	}
++	if (count > ba->bit_count - start_bit_index) {
++		count = ba->bit_count - start_bit_index;
++	}
++	end = start_bit_index + count;	/* exclusive; <= bit_count so no overflow */
++
++	first_word = start_bit_index >> SPDK_BIT_ARRAY_WORD_INDEX_SHIFT;
++	last_word = (end - 1) >> SPDK_BIT_ARRAY_WORD_INDEX_SHIFT;
++
++	for (w = first_word; w <= last_word; w++) {
++		word = ba->words[w];
++		if (w == first_word) {
++			/* Drop the bits below start (their count in low positions). */
++			word &= ~((SPDK_BIT_ARRAY_WORD_C(1) <<
++				   (start_bit_index & SPDK_BIT_ARRAY_WORD_INDEX_MASK)) - 1);
++		}
++		if (w == last_word && (end & SPDK_BIT_ARRAY_WORD_INDEX_MASK) != 0) {
++			/* Keep only the bits below end. */
++			word &= (SPDK_BIT_ARRAY_WORD_C(1) <<
++				 (end & SPDK_BIT_ARRAY_WORD_INDEX_MASK)) - 1;
++		}
++		set_count += SPDK_BIT_ARRAY_WORD_POPCNT(word);
++	}
++
++	return set_count;
++}
++
+ uint32_t
+ spdk_bit_array_count_clear(const struct spdk_bit_array *ba)
+ {
+@@ -431,6 +470,15 @@ spdk_bit_pool_is_allocated(const struct spdk_bit_pool *pool, uint32_t bit_index)
+ 	return spdk_bit_array_get(pool->array, bit_index);
+ }
+ 
++uint32_t
++spdk_bit_pool_count_allocated_in_range(const struct spdk_bit_pool *pool, uint32_t start_bit_index,
++				       uint32_t count)
++{
++	/* An allocated pool entry is a SET bit in the backing array (see
++	 * spdk_bit_pool_is_allocated). */
++	return spdk_bit_array_count_set_in_range(pool->array, start_bit_index, count);
++}
++
+ uint32_t
+ spdk_bit_pool_find_first_free_from(const struct spdk_bit_pool *pool, uint32_t start_bit_index)
+ {
+diff --git a/lib/util/spdk_util.map b/lib/util/spdk_util.map
+index 40ee55b..422ca4b 100644
+--- a/lib/util/spdk_util.map
++++ b/lib/util/spdk_util.map
+@@ -18,6 +18,7 @@
+ 	spdk_bit_array_find_first_set;
+ 	spdk_bit_array_find_first_clear;
+ 	spdk_bit_array_count_set;
++	spdk_bit_array_count_set_in_range;
+ 	spdk_bit_array_count_clear;
+ 	spdk_bit_array_store_mask;
+ 	spdk_bit_array_load_mask;
+@@ -30,6 +31,7 @@
+ 	spdk_bit_pool_free;
+ 	spdk_bit_pool_resize;
+ 	spdk_bit_pool_is_allocated;
++	spdk_bit_pool_count_allocated_in_range;
+ 	spdk_bit_pool_find_first_free_from;
+ 	spdk_bit_pool_allocate_bit;
+ 	spdk_bit_pool_set_bit_allocated;
 diff --git a/module/bdev/lvol/vbdev_lvol.c b/module/bdev/lvol/vbdev_lvol.c
-index 3673b97..7af5d77 100644
+index 3673b97..bb9e82a 100644
 --- a/module/bdev/lvol/vbdev_lvol.c
 +++ b/module/bdev/lvol/vbdev_lvol.c
 @@ -13,6 +13,7 @@
@@ -94,15 +235,15 @@ index 3673b97..7af5d77 100644
  
  struct vbdev_lvol_io {
  	struct spdk_blob_ext_io_opts ext_io_opts;
-@@ -43,6 +44,57 @@ SPDK_BDEV_MODULE_REGISTER(lvol, &g_lvol_if)
+@@ -43,6 +44,95 @@ SPDK_BDEV_MODULE_REGISTER(lvol, &g_lvol_if)
  
  static void _vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg);
  
 +/* Evariops 0041: fill-accounting bridge to bdev_tier. The composite knows only
 + * geometry; which blocks are LIVE is the blobstore's. When an lvolstore sits on
 + * a tier composite, this provider answers bdev_tier_get_bands' per-band
-+ * used_blocks by counting the allocated clusters intersecting the band's LBA
-+ * range. Synchronous, called on the app/RPC thread. */
++ * used_blocks by counting the allocated clusters in the band's LBA range.
++ * Synchronous, called on the app/RPC thread. */
 +static int
 +vbdev_lvs_tier_band_usage(void *ctx, uint64_t lba_start, uint64_t num_blocks,
 +			  uint64_t *used_blocks_out)
@@ -118,8 +259,10 @@ index 3673b97..7af5d77 100644
 +	cluster_blocks = spdk_bs_get_cluster_size(bs) / blocklen;
 +	used_blocks = spdk_bs_count_allocated_clusters_in_lba_range(bs, lba_start, num_blocks) *
 +		      cluster_blocks;
-+	/* Band boundaries are cluster-aligned by the tier module's construction; the
-+	 * clip keeps the answer bounded by the band even if they were not. */
++	/* Registration proved the band grain is a multiple of the blobstore cluster,
++	 * so no cluster straddles a band boundary and the sum over bands cannot
++	 * exceed the composite. The clip is therefore an invariant assert in
++	 * disguise, kept cheap. */
 +	if (used_blocks > num_blocks) {
 +		used_blocks = num_blocks;
 +	}
@@ -131,28 +274,64 @@ index 3673b97..7af5d77 100644
 +vbdev_lvs_tier_usage_register(struct lvol_store_bdev *lvs_bdev)
 +{
 +	struct vbdev_tier *tier = vbdev_tier_get_by_name(spdk_bdev_get_name(lvs_bdev->bdev));
++	struct spdk_blob_store *bs;
++	uint32_t blocklen;
++	uint64_t lvs_cluster_blocks;
 +
 +	if (tier == NULL || lvs_bdev->bdev != &tier->bdev) {
 +		return;		/* this lvolstore does not sit on a tier composite */
 +	}
-+	vbdev_tier_set_usage_provider(tier->bdev.name, vbdev_lvs_tier_band_usage, lvs_bdev);
++	/* The counting helper requires band boundaries to be blobstore-cluster
++	 * aligned. Band boundaries are aligned to the TIER grain (cluster_blocks),
++	 * so the requirement is: a real grain (>= 2 — the legacy 0 grain guarantees
++	 * no alignment at all) that is a whole multiple of the lvolstore cluster.
++	 * Nothing couples the two at lvs creation, so enforce it HERE, the first
++	 * point where both are known: a composite failing it gets NO provider and
++	 * reports used_blocks=0 + usage_valid=false (honest unknown) instead of
++	 * tripping the alignment assert or splitting a cluster across two bands. */
++	bs = lvs_bdev->lvs->blobstore;
++	blocklen = spdk_bdev_get_block_size(lvs_bdev->bdev);
++	if (blocklen == 0 || spdk_bs_get_cluster_size(bs) % blocklen != 0) {
++		SPDK_ERRLOG("lvol on tier '%s': blobstore cluster %" PRIu64 " not a multiple "
++			    "of blocklen %u — no usage provider\n", tier->bdev.name,
++			    spdk_bs_get_cluster_size(bs), blocklen);
++		return;
++	}
++	lvs_cluster_blocks = spdk_bs_get_cluster_size(bs) / blocklen;
++	if (tier->cluster_blocks < 2 || tier->cluster_blocks % lvs_cluster_blocks != 0) {
++		SPDK_ERRLOG("lvol on tier '%s': tier grain %" PRIu64 " blocks is not a "
++			    "multiple of the lvolstore cluster %" PRIu64 " blocks — band "
++			    "usage cannot be counted, no usage provider (used_blocks will "
++			    "report as unknown)\n", tier->bdev.name, tier->cluster_blocks,
++			    lvs_cluster_blocks);
++		return;
++	}
++	vbdev_tier_set_usage_provider(tier, vbdev_lvs_tier_band_usage, lvs_bdev);
 +}
 +
++/* Called at teardown INITIATION (remove/destroy entry, shutdown unload starts),
++ * BEFORE spdk_lvs_unload/spdk_lvs_destroy: those free the lvol store
++ * synchronously while the blobstore teardown is still an async I/O chain, and a
++ * bdev_tier_get_bands poll landing in that window would drive the provider into
++ * the freed store. Unregistering here closes the window; the completion
++ * callbacks free lvs_bdev only after this already ran. */
 +static void
 +vbdev_lvs_tier_usage_unregister(struct lvol_store_bdev *lvs_bdev)
 +{
 +	struct vbdev_tier *tier = vbdev_tier_get_by_name(spdk_bdev_get_name(lvs_bdev->bdev));
 +
-+	if (tier == NULL || lvs_bdev->bdev != &tier->bdev || tier->usage_ctx != lvs_bdev) {
++	/* usage_ctx != lvs_bdev subsumes any bdev-pointer comparison: only the
++	 * register path above can have stored this ctx, and it proved the bdev. */
++	if (tier == NULL || tier->usage_ctx != lvs_bdev) {
 +		return;
 +	}
-+	vbdev_tier_clear_usage_provider(tier->bdev.name);
++	vbdev_tier_clear_usage_provider(tier);
 +}
 +
  struct lvol_store_bdev *
  vbdev_get_lvs_bdev_by_lvs(struct spdk_lvol_store *lvs_orig)
  {
-@@ -201,6 +253,7 @@ _vbdev_lvs_create_cb(void *cb_arg, struct spdk_lvol_store *lvs, int lvserrno)
+@@ -201,6 +291,7 @@ _vbdev_lvs_create_cb(void *cb_arg, struct spdk_lvol_store *lvs, int lvserrno)
  	lvs_bdev->req = NULL;
  
  	TAILQ_INSERT_TAIL(&g_spdk_lvol_pairs, lvs_bdev, lvol_stores);
@@ -160,31 +339,62 @@ index 3673b97..7af5d77 100644
  	SPDK_INFOLOG(vbdev_lvol, "Lvol store bdev inserted\n");
  
  end:
-@@ -366,6 +419,7 @@ _vbdev_lvs_remove_cb(void *cb_arg, int lvserrno)
+@@ -366,6 +457,9 @@ _vbdev_lvs_remove_cb(void *cb_arg, int lvserrno)
  		SPDK_INFOLOG(vbdev_lvol, "Lvol store removed with error: %d.\n", lvserrno);
  	}
  
-+	vbdev_lvs_tier_usage_unregister(lvs_bdev);
++	/* The usage provider was unregistered at removal INITIATION (see
++	 * vbdev_lvs_tier_usage_unregister) — by this completion the store is long
++	 * freed and any unregister here would be too late. */
  	TAILQ_REMOVE(&g_spdk_lvol_pairs, lvs_bdev, lvol_stores);
  	free(lvs_bdev);
  
-@@ -596,6 +650,7 @@ _vbdev_lvol_unregister_unload_lvs(void *cb_arg, int lvserrno)
+@@ -461,6 +555,10 @@ _vbdev_lvs_remove(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn, void
+ 	}
+ 
+ 	lvs_bdev->removal_in_progress = true;
++	/* Teardown initiation: stop the tier usage provider BEFORE any
++	 * unload/destroy below frees the store under the still-async blobstore
++	 * teardown (see vbdev_lvs_tier_usage_unregister). */
++	vbdev_lvs_tier_usage_unregister(lvs_bdev);
+ 
+ 	req->cb_fn = cb_fn;
+ 	req->cb_arg = cb_arg;
+@@ -596,6 +694,7 @@ _vbdev_lvol_unregister_unload_lvs(void *cb_arg, int lvserrno)
  		SPDK_NOTICELOG("shutdown: lvolstore unloaded clean (unregister path)\n");
  	}
  
-+	vbdev_lvs_tier_usage_unregister(lvs_bdev);
++	/* Provider already unregistered at the unload INITIATION below. */
  	TAILQ_REMOVE(&g_spdk_lvol_pairs, lvs_bdev, lvol_stores);
  	free(lvs_bdev);
  
-@@ -1518,6 +1573,7 @@ vbdev_lvs_fini_start_unload_cb(void *cb_arg, int lvserrno)
+@@ -610,6 +709,8 @@ _vbdev_lvol_unregister_cb(void *ctx, int lvolerrno)
+ 	struct lvol_store_bdev *lvs_bdev = lvol_bdev->lvs_bdev;
+ 
+ 	if (g_shutdown_started && _vbdev_lvs_are_lvols_closed(lvs_bdev->lvs)) {
++		/* Teardown initiation (see vbdev_lvs_tier_usage_unregister). */
++		vbdev_lvs_tier_usage_unregister(lvs_bdev);
+ 		spdk_lvs_unload(lvs_bdev->lvs, _vbdev_lvol_unregister_unload_lvs, lvol_bdev);
+ 		return;
+ 	}
+@@ -1518,6 +1619,7 @@ vbdev_lvs_fini_start_unload_cb(void *cb_arg, int lvserrno)
  		SPDK_NOTICELOG("shutdown: lvolstore unloaded clean (fini_start path)\n");
  	}
  
-+	vbdev_lvs_tier_usage_unregister(lvs_bdev);
++	/* Provider already unregistered at the unload INITIATION below. */
  	TAILQ_REMOVE(&g_spdk_lvol_pairs, lvs_bdev, lvol_stores);
  	free(lvs_bdev);
  
-@@ -1703,6 +1759,7 @@ _vbdev_lvs_examine_cb(void *arg, struct spdk_lvol_store *lvol_store, int lvserrn
+@@ -1533,6 +1635,8 @@ vbdev_lvs_fini_start_iter(struct lvol_store_bdev *lvs_bdev)
+ 		lvs = lvs_bdev->lvs;
+ 
+ 		if (_vbdev_lvs_are_lvols_closed(lvs)) {
++			/* Teardown initiation (see vbdev_lvs_tier_usage_unregister). */
++			vbdev_lvs_tier_usage_unregister(lvs_bdev);
+ 			spdk_lvs_unload(lvs, vbdev_lvs_fini_start_unload_cb, lvs_bdev);
+ 			return;
+ 		}
+@@ -1703,6 +1807,7 @@ _vbdev_lvs_examine_cb(void *arg, struct spdk_lvol_store *lvol_store, int lvserrn
  	lvs_bdev->bdev = req->base_bdev;
  
  	TAILQ_INSERT_TAIL(&g_spdk_lvol_pairs, lvs_bdev, lvol_stores);

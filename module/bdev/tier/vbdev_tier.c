@@ -114,27 +114,15 @@ vbdev_tier_band_of_lba(struct vbdev_tier *t, uint64_t lba, uint64_t *band_offset
  * -------------------------------------------------------------------------- */
 
 void
-vbdev_tier_set_usage_provider(const char *tier_name, vbdev_tier_usage_fn fn, void *ctx)
+vbdev_tier_set_usage_provider(struct vbdev_tier *t, vbdev_tier_usage_fn fn, void *ctx)
 {
-	struct vbdev_tier *t = vbdev_tier_get_by_name(tier_name);
-
-	if (t == NULL) {
-		SPDK_WARNLOG("tier '%s': usage provider registered for an unknown composite\n",
-			     tier_name);
-		return;
-	}
 	t->usage_fn = fn;
 	t->usage_ctx = ctx;
 }
 
 void
-vbdev_tier_clear_usage_provider(const char *tier_name)
+vbdev_tier_clear_usage_provider(struct vbdev_tier *t)
 {
-	struct vbdev_tier *t = vbdev_tier_get_by_name(tier_name);
-
-	if (t == NULL) {
-		return;		/* composite already torn down — nothing to clear */
-	}
 	t->usage_fn = NULL;
 	t->usage_ctx = NULL;
 }
@@ -953,6 +941,12 @@ vbdev_tier_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 	spdk_json_write_named_uint32(w, "md_mirror_b", t->md_mirror_b);
 	spdk_json_write_named_array_begin(w, "bands");
 	TAILQ_FOREACH(b, &t->bands, link) {
+		char uuid_hex[2 * TIER_PART_UUID_LEN + 1];
+
+		/* Same identity/geometry surface as bdev_tier_get_bands. used_blocks is
+		 * deliberately NOT here: fill accounting has ONE surface (get_bands),
+		 * where usage_valid qualifies it — a second, unqualified copy in a
+		 * diagnostic dump would be the "0 means empty or unknown" trap again. */
 		spdk_json_write_object_begin(w);
 		spdk_json_write_named_uint32(w, "band_id", b->band_id);
 		spdk_json_write_named_string(w, "base_bdev_name", b->base_bdev_name);
@@ -960,8 +954,13 @@ vbdev_tier_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 		spdk_json_write_named_uint32(w, "state", b->state);
 		spdk_json_write_named_uint64(w, "lba_start", b->lba_start);
 		spdk_json_write_named_uint64(w, "num_blocks", b->num_blocks);
+		spdk_json_write_named_uint64(w, "capacity_blocks", b->num_blocks);
 		spdk_json_write_named_string(w, "wwn", b->wwn);
 		spdk_json_write_named_string(w, "serial", b->serial);
+		spdk_json_write_named_string(w, "part_uuid",
+					     tier_part_uuid_hex(b->part_uuid, uuid_hex));
+		spdk_json_write_named_uint64(w, "part_start_lba", b->part_start_lba);
+		spdk_json_write_named_uint64(w, "part_size_blocks", b->part_size_blocks);
 		spdk_json_write_object_end(w);
 	}
 	spdk_json_write_array_end(w);
@@ -1259,7 +1258,11 @@ vbdev_tier_add_band(struct vbdev_tier *t, const char *base_bdev_name, enum tier_
 	struct tier_band *band, *existing;
 	struct spdk_bdev *base_bdev;
 	uint64_t usable_blocks, lba_start, num_blocks, phys_offset;
+	uint32_t blocklen, sb_blocks;
+	enum { TIER_PLACE_MD_A, TIER_PLACE_MD_B, TIER_PLACE_CONCAT } placement;
 	int rc;
+
+	assert(part_uuid != NULL);
 
 	/* Geometry is frozen at register (blockcnt, per-reactor base channels): a band
 	 * added afterwards would not be addressable yet would be persisted to the SB,
@@ -1269,18 +1272,21 @@ vbdev_tier_add_band(struct vbdev_tier *t, const char *base_bdev_name, enum tier_
 		SPDK_ERRLOG("tier '%s': add_band after register is not allowed\n", t->bdev.name);
 		return -EBUSY;
 	}
-	/* After assembly the md legs are either both reoccupied at their stored slots
-	 * or their disks are ABSENT. The auto-layout below would promote this NEW
-	 * device into the missing slot — a blank ACTIVE mirror leg with no resync —
-	 * and the leg-A branch would additionally reset total_num_blocks, laying this
-	 * band over the assembled bands' address space. A post-assembly append may
-	 * only be a plain concat, so an incomplete md mirror refuses the add. */
-	if (t->assembled &&
-	    (t->md_mirror_a == UINT32_MAX || t->md_mirror_b == UINT32_MAX)) {
-		SPDK_ERRLOG("tier '%s': refusing add_band after assembly with incomplete md "
-			    "mirror (a=%u b=%u): the composite is degraded, a new device must "
-			    "never be promoted to an md leg\n",
-			    t->bdev.name, t->md_mirror_a, t->md_mirror_b);
+	/* An assembled composite refuses add_band entirely. The on-disk superblock may
+	 * list bands whose disks are ABSENT at boot — assembly leaves them NO in-memory
+	 * placeholder — so total_num_blocks is the high-water mark of the bands
+	 * actually present, the auto-placement below could lay this band exactly over
+	 * an absent band's persisted range, next_band_id could re-issue its slot, and
+	 * the next register would persist a generation (highest seq wins) that expels
+	 * the absent band: silent aliasing of live data. The md-promotion branches are
+	 * a second instance of the same class (a blank ACTIVE mirror leg, no resync).
+	 * Growth of an assembled composite goes through assemble_band at explicit
+	 * geometry, or through reprovisioning. */
+	if (t->assembled) {
+		SPDK_ERRLOG("tier '%s': add_band on an assembled composite is not allowed "
+			    "(the SB may list absent bands whose range/slot auto-placement "
+			    "would reuse); grow with assemble_band at explicit geometry\n",
+			    t->bdev.name);
 		return -EPROTO;
 	}
 	/* Bound the slot BEFORE it is assigned: band_id indexes the fixed-size
@@ -1292,17 +1298,29 @@ vbdev_tier_add_band(struct vbdev_tier *t, const char *base_bdev_name, enum tier_
 		return -ENOSPC;
 	}
 
-	/* Reject a disk identity already present in this composite: a duplicate wwn means
-	 * the same physical disk was enumerated into two bands, which would silently
-	 * double-count capacity and corrupt the concat geometry. */
-	if (wwn != NULL && wwn[0] != '\0') {
-		TAILQ_FOREACH(existing, &t->bands, link) {
-			if (strncmp(existing->wwn, wwn, sizeof(existing->wwn)) == 0) {
-				SPDK_ERRLOG("tier: band wwn '%s' already present (duplicate disk '%s')\n",
-					    wwn, base_bdev_name);
-				return -EEXIST;
-			}
-		}
+	rc = tier_unit_identity_validate(part_uuid, part_start_lba, part_size_blocks);
+	if (rc != 0) {
+		SPDK_ERRLOG("tier: band '%s' identity tuple is incoherent (uuid %s geometry "
+			    "start=%" PRIu64 " size=%" PRIu64 "): whole disk is all-zero uuid + "
+			    "0/0, a partition is a non-zero uuid + its real geometry\n",
+			    base_bdev_name,
+			    spdk_mem_all_zero(part_uuid, TIER_PART_UUID_LEN) ? "absent" : "present",
+			    part_start_lba, part_size_blocks);
+		return rc;
+	}
+
+	/* One unit, one band (see tier_band_identity_conflict). -ENOTUNIQ, never
+	 * -EEXIST: -EEXIST is reserved for assemble_band's idempotent same-slot
+	 * replay, and a caller treating it as "already placed — success" must never
+	 * absorb an identity-corruption refusal. */
+	existing = tier_band_identity_conflict(t, wwn, part_uuid);
+	if (existing != NULL) {
+		char uuid_hex[2 * TIER_PART_UUID_LEN + 1];
+
+		SPDK_ERRLOG("tier: band '%s' identity (wwn '%s' part_uuid '%s') already present "
+			    "on band %u\n", base_bdev_name, wwn != NULL ? wwn : "",
+			    tier_part_uuid_hex(part_uuid, uuid_hex), existing->band_id);
+		return -ENOTUNIQ;
 	}
 
 	band = calloc(1, sizeof(*band));
@@ -1319,32 +1337,37 @@ vbdev_tier_add_band(struct vbdev_tier *t, const char *base_bdev_name, enum tier_
 	}
 	base_bdev = spdk_bdev_desc_get_bdev(band->desc);
 
-	/* All bands must share the block size (mixing 512/4096 corrupts geometry). */
-	if (t->blocklen == 0) {
-		t->blocklen = base_bdev->blocklen;
+	/* All bands must share the block size (mixing 512/4096 corrupts geometry).
+	 * Validated in a LOCAL and committed with the rest: assigning t->blocklen
+	 * before the slot-divisibility check would let a refused first disk poison
+	 * the composite (every later disk of a different blocklen refused as a
+	 * mismatch — or worse, a second disk of the SAME bad blocklen skips this
+	 * first-band check and fails the SB persist at register). */
+	blocklen = t->blocklen;
+	if (blocklen == 0) {
+		blocklen = base_bdev->blocklen;
 		/* The superblock is written as whole TIER_SB_SLOT_BYTES slots, so the slot
 		 * must be an integral number of blocks. A blocklen that does not divide it
 		 * makes the FIRST SB write fail -EINVAL at register, leaving a registered
 		 * composite no reassembly can find. Reject the incompatible base here. */
-		if (TIER_SB_SLOT_BYTES % t->blocklen != 0) {
+		if (TIER_SB_SLOT_BYTES % blocklen != 0) {
 			SPDK_ERRLOG("tier: band '%s' blocklen %u cannot host the superblock slot "
-				    "(%d not a multiple)\n", base_bdev_name, t->blocklen,
+				    "(%d not a multiple)\n", base_bdev_name, blocklen,
 				    TIER_SB_SLOT_BYTES);
 			spdk_bdev_close(band->desc);
 			free(band);
 			return -EINVAL;
 		}
-	} else if (base_bdev->blocklen != t->blocklen) {
+	} else if (base_bdev->blocklen != blocklen) {
 		SPDK_ERRLOG("tier: band '%s' blocklen %u != composite %u\n",
-			    base_bdev_name, base_bdev->blocklen, t->blocklen);
+			    base_bdev_name, base_bdev->blocklen, blocklen);
 		spdk_bdev_close(band->desc);
 		free(band);
 		return -EINVAL;
 	}
 	/* Reserve a superblock region at the start of EACH base bdev. */
-	if (t->sb_blocks == 0) {
-		t->sb_blocks = spdk_divide_round_up(TIER_SB_RESERVE_BYTES, t->blocklen);
-	}
+	sb_blocks = t->sb_blocks != 0 ? t->sb_blocks
+		    : (uint32_t)spdk_divide_round_up(TIER_SB_RESERVE_BYTES, blocklen);
 
 	rc = spdk_bdev_module_claim_bdev(base_bdev, band->desc, &tier_if);
 	if (rc != 0) {
@@ -1354,7 +1377,7 @@ vbdev_tier_add_band(struct vbdev_tier *t, const char *base_bdev_name, enum tier_
 		return rc;
 	}
 
-	band->band_id = t->next_band_id++;
+	band->band_id = t->next_band_id;	/* consumed (incremented) only at commit */
 	band->tier = tier;
 	band->state = TIER_BAND_ACTIVE;
 	snprintf(band->base_bdev_name, sizeof(band->base_bdev_name), "%s", base_bdev_name);
@@ -1364,9 +1387,7 @@ vbdev_tier_add_band(struct vbdev_tier *t, const char *base_bdev_name, enum tier_
 	if (serial) {
 		snprintf(band->serial, sizeof(band->serial), "%s", serial);
 	}
-	if (part_uuid) {
-		memcpy(band->part_uuid, part_uuid, sizeof(band->part_uuid));
-	}
+	memcpy(band->part_uuid, part_uuid, sizeof(band->part_uuid));
 	band->part_start_lba = part_start_lba;
 	band->part_size_blocks = part_size_blocks;
 
@@ -1374,48 +1395,46 @@ vbdev_tier_add_band(struct vbdev_tier *t, const char *base_bdev_name, enum tier_
 	 * blockcnt - sb_blocks. The first two bands additionally host the mirrored md
 	 * region [0, md_num_blocks) of the composite at base-physical
 	 * [sb_blocks, sb_blocks+md_num_blocks); their DATA contribution follows.
-	 * Computed into locals and committed to `t` only after every check, so a
-	 * refused band leaves the composite untouched. */
-	if (base_bdev->blockcnt <= t->sb_blocks) {
+	 * The placement decision is bound ONCE here and read back at commit — two
+	 * re-derivations of "which md slot is free" is how compute and commit drift.
+	 * Everything (geometry, blocklen, sb_blocks, the slot) lives in locals and is
+	 * committed to `t` only after every check, so a refused band leaves the
+	 * composite untouched. */
+	placement = (t->md_mirror_a == UINT32_MAX) ? TIER_PLACE_MD_A :
+		    (t->md_mirror_b == UINT32_MAX) ? TIER_PLACE_MD_B : TIER_PLACE_CONCAT;
+
+	if (base_bdev->blockcnt <= sb_blocks) {
 		SPDK_ERRLOG("tier: band '%s' too small for superblock reserve\n", base_bdev_name);
 		spdk_bdev_module_release_bdev(base_bdev);
 		spdk_bdev_close(band->desc);
 		free(band);
 		return -ENOSPC;
 	}
-	usable_blocks = base_bdev->blockcnt - t->sb_blocks;
+	usable_blocks = base_bdev->blockcnt - sb_blocks;
 
-	if (t->md_mirror_a == UINT32_MAX) {
-		/* Band A: hosts the md region (counted ONCE in the composite) + a data tail. */
+	if (placement != TIER_PLACE_CONCAT) {
+		/* Bands A and B host the md region/mirror (counted ONCE, at slot A) + a
+		 * data tail. */
 		if (usable_blocks <= t->md_num_blocks) {
-			SPDK_ERRLOG("tier: band '%s' too small for md region\n", base_bdev_name);
+			SPDK_ERRLOG("tier: band '%s' too small for md %s\n", base_bdev_name,
+				    placement == TIER_PLACE_MD_A ? "region" : "mirror");
 			spdk_bdev_module_release_bdev(base_bdev);
 			spdk_bdev_close(band->desc);
 			free(band);
 			return -ENOSPC;
 		}
-		lba_start = t->md_num_blocks;			/* this band's data tail follows md (aligned) */
-		/* Round the data contribution DOWN to the cluster grain (the trailing remainder is an
-		 * unusable hole) so the NEXT band starts cluster-aligned and no cluster straddles. */
+		/* Slot A defines the data start right after md; slot B appends at the
+		 * high-water mark. Round the data contribution DOWN to the cluster grain
+		 * (the trailing remainder is an unusable hole) so the NEXT band starts
+		 * cluster-aligned and no cluster straddles. */
+		lba_start = placement == TIER_PLACE_MD_A ? t->md_num_blocks : t->total_num_blocks;
 		num_blocks = tier_align_down(t, usable_blocks - t->md_num_blocks);
-		phys_offset = t->sb_blocks + t->md_num_blocks;
-	} else if (t->md_mirror_b == UINT32_MAX) {
-		/* Band B: hosts the md MIRROR (not re-counted) + a data tail. */
-		if (usable_blocks <= t->md_num_blocks) {
-			SPDK_ERRLOG("tier: band '%s' too small for md mirror\n", base_bdev_name);
-			spdk_bdev_module_release_bdev(base_bdev);
-			spdk_bdev_close(band->desc);
-			free(band);
-			return -ENOSPC;
-		}
-		lba_start = t->total_num_blocks;		/* aligned (prior boundaries aligned) */
-		num_blocks = tier_align_down(t, usable_blocks - t->md_num_blocks);
-		phys_offset = t->sb_blocks + t->md_num_blocks;
+		phys_offset = (uint64_t)sb_blocks + t->md_num_blocks;
 	} else {
 		/* Plain concat band. */
 		lba_start = t->total_num_blocks;		/* aligned */
 		num_blocks = tier_align_down(t, usable_blocks);
-		phys_offset = t->sb_blocks;
+		phys_offset = sb_blocks;
 	}
 
 	if (num_blocks == 0) {
@@ -1430,26 +1449,30 @@ vbdev_tier_add_band(struct vbdev_tier *t, const char *base_bdev_name, enum tier_
 	/* Same guard as assemble_band: no two bands may overlap in the composite
 	 * address space. The auto-layout above cannot produce one on its own, but
 	 * placement must never rest solely on total_num_blocks being the high-water
-	 * mark of the bands actually present. */
+	 * mark of the bands actually present. -EADDRINUSE, distinct from both the
+	 * identity refusal and assemble's idempotent-replay -EEXIST. */
 	TAILQ_FOREACH(existing, &t->bands, link) {
-		if (lba_start < existing->lba_start + existing->num_blocks &&
-		    existing->lba_start < lba_start + num_blocks) {
+		if (tier_ranges_overlap(lba_start, num_blocks,
+					existing->lba_start, existing->num_blocks)) {
 			SPDK_ERRLOG("tier: add band '%s' [%" PRIu64 ", +%" PRIu64
 				    ") overlaps band %u\n", base_bdev_name, lba_start,
 				    num_blocks, existing->band_id);
 			spdk_bdev_module_release_bdev(base_bdev);
 			spdk_bdev_close(band->desc);
 			free(band);
-			return -EEXIST;
+			return -EADDRINUSE;
 		}
 	}
 
 	/* Commit — nothing below can fail. */
-	if (t->md_mirror_a == UINT32_MAX) {
+	t->blocklen = blocklen;
+	t->sb_blocks = sb_blocks;
+	t->next_band_id++;
+	if (placement == TIER_PLACE_MD_A) {
 		t->md_mirror_a = band->band_id;
 		t->total_num_blocks = t->md_num_blocks;		/* md region occupies [0, md), cluster-aligned;
 								 * fresh provisioning only (assembled refuses above) */
-	} else if (t->md_mirror_b == UINT32_MAX) {
+	} else if (placement == TIER_PLACE_MD_B) {
 		t->md_mirror_b = band->band_id;
 	}
 	band->lba_start = lba_start;
@@ -1480,11 +1503,13 @@ vbdev_tier_assemble_band(struct vbdev_tier *t, const char *base_bdev_name, uint3
 			 uint64_t part_size_blocks, uint64_t lba_start, uint64_t num_blocks,
 			 enum tier_band_state state, bool is_md)
 {
-	static const uint8_t zero_uuid[TIER_PART_UUID_LEN];
 	struct tier_band *band, *existing;
 	struct spdk_bdev *base_bdev;
 	uint64_t phys_offset;
+	uint32_t blocklen, sb_blocks;
 	int rc;
+
+	assert(part_uuid != NULL);
 
 	/* The band table is FROZEN at register (blockcnt and per-reactor base channels
 	 * are fixed there). This RPC is SPDK_RPC_RUNTIME, so without the guard it could
@@ -1531,37 +1556,43 @@ vbdev_tier_assemble_band(struct vbdev_tier *t, const char *base_bdev_name, uint3
 		SPDK_ERRLOG("tier: assemble band %u — both md mirror slots already assigned\n", band_id);
 		return -EINVAL;
 	}
+	/* -EEXIST is RESERVED for this same-slot check: it is the idempotent-replay
+	 * signal of the assembly contract, and it must fire BEFORE the identity guard
+	 * below — a true replay carries the same wwn/part_uuid and would otherwise be
+	 * misreported as an identity conflict. */
 	if (vbdev_tier_band_by_id(t, band_id) != NULL) {
 		return -EEXIST;
+	}
+	rc = tier_unit_identity_validate(part_uuid, part_start_lba, part_size_blocks);
+	if (rc != 0) {
+		SPDK_ERRLOG("tier: assemble band %u identity tuple is incoherent (uuid %s "
+			    "geometry start=%" PRIu64 " size=%" PRIu64 "): whole disk is "
+			    "all-zero uuid + 0/0, a partition is a non-zero uuid + its real "
+			    "geometry\n", band_id,
+			    spdk_mem_all_zero(part_uuid, TIER_PART_UUID_LEN) ? "absent" : "present",
+			    part_start_lba, part_size_blocks);
+		return rc;
+	}
+	/* One unit, one band (see tier_band_identity_conflict) — the corruption guard
+	 * answers -ENOTUNIQ, never the replay signal. */
+	existing = tier_band_identity_conflict(t, wwn, part_uuid);
+	if (existing != NULL) {
+		char uuid_hex[2 * TIER_PART_UUID_LEN + 1];
+
+		SPDK_ERRLOG("tier: assemble band %u identity (wwn '%s' part_uuid '%s') already "
+			    "present on band %u\n", band_id, wwn != NULL ? wwn : "",
+			    tier_part_uuid_hex(part_uuid, uuid_hex), existing->band_id);
+		return -ENOTUNIQ;
 	}
 	/* No two bands may overlap in the composite address space; a retired slot keeps
 	 * its range as an unreclaimable hole, so it counts too. */
 	TAILQ_FOREACH(existing, &t->bands, link) {
-		if (lba_start < existing->lba_start + existing->num_blocks &&
-		    existing->lba_start < lba_start + num_blocks) {
+		if (tier_ranges_overlap(lba_start, num_blocks,
+					existing->lba_start, existing->num_blocks)) {
 			SPDK_ERRLOG("tier: assemble band %u [%" PRIu64 ", +%" PRIu64
 				    ") overlaps band %u\n", band_id, lba_start, num_blocks,
 				    existing->band_id);
-			return -EEXIST;
-		}
-		/* Same duplicate-disk guard as add_band. */
-		if (wwn != NULL && wwn[0] != '\0' &&
-		    strncmp(existing->wwn, wwn, sizeof(existing->wwn)) == 0) {
-			SPDK_ERRLOG("tier: assemble band wwn '%s' already present\n", wwn);
-			return -EEXIST;
-		}
-		/* Mirror of the duplicate-wwn rule for the unit identity: one partition
-		 * enumerated into two bands is the same double-count corruption. An
-		 * all-zero part_uuid carries no identity and is never compared. */
-		if (part_uuid != NULL &&
-		    memcmp(part_uuid, zero_uuid, TIER_PART_UUID_LEN) != 0 &&
-		    memcmp(existing->part_uuid, part_uuid, TIER_PART_UUID_LEN) == 0) {
-			char uuid_hex[2 * TIER_PART_UUID_LEN + 1];
-
-			SPDK_ERRLOG("tier: assemble band %u part_uuid '%s' already present "
-				    "on band %u\n", band_id,
-				    tier_part_uuid_hex(part_uuid, uuid_hex), existing->band_id);
-			return -EEXIST;
+			return -EADDRINUSE;
 		}
 	}
 	band = calloc(1, sizeof(*band));
@@ -1576,32 +1607,35 @@ vbdev_tier_assemble_band(struct vbdev_tier *t, const char *base_bdev_name, uint3
 		return rc;
 	}
 	base_bdev = spdk_bdev_desc_get_bdev(band->desc);
-	if (t->blocklen == 0) {
-		t->blocklen = base_bdev->blocklen;
+	/* Validated in a LOCAL and committed only after every check (see
+	 * vbdev_tier_add_band): a refused band must leave the composite untouched,
+	 * blocklen and sb_blocks included. */
+	blocklen = t->blocklen;
+	if (blocklen == 0) {
+		blocklen = base_bdev->blocklen;
 		/* Reject a blocklen that cannot host the fixed superblock slot (see
 		 * vbdev_tier_add_band) — else the first SB persist fails and the composite
 		 * is unrecoverable. */
-		if (TIER_SB_SLOT_BYTES % t->blocklen != 0) {
+		if (TIER_SB_SLOT_BYTES % blocklen != 0) {
 			SPDK_ERRLOG("tier: assemble band '%s' blocklen %u cannot host the superblock "
-				    "slot (%d not a multiple)\n", base_bdev_name, t->blocklen,
+				    "slot (%d not a multiple)\n", base_bdev_name, blocklen,
 				    TIER_SB_SLOT_BYTES);
 			spdk_bdev_close(band->desc);
 			free(band);
 			return -EINVAL;
 		}
-	} else if (base_bdev->blocklen != t->blocklen) {
+	} else if (base_bdev->blocklen != blocklen) {
 		SPDK_ERRLOG("tier: assemble band '%s' blocklen %u != composite %u\n",
-			    base_bdev_name, base_bdev->blocklen, t->blocklen);
+			    base_bdev_name, base_bdev->blocklen, blocklen);
 		spdk_bdev_close(band->desc);
 		free(band);
 		return -EINVAL;
 	}
-	if (t->sb_blocks == 0) {
-		t->sb_blocks = spdk_divide_round_up(TIER_SB_RESERVE_BYTES, t->blocklen);
-	}
+	sb_blocks = t->sb_blocks != 0 ? t->sb_blocks
+		    : (uint32_t)spdk_divide_round_up(TIER_SB_RESERVE_BYTES, blocklen);
 	/* The stored geometry must FIT the real disk (the register guard only checks
 	 * alignment) — otherwise the band's tail returns -EIO at runtime. */
-	phys_offset = is_md ? (t->sb_blocks + t->md_num_blocks) : t->sb_blocks;
+	phys_offset = is_md ? ((uint64_t)sb_blocks + t->md_num_blocks) : sb_blocks;
 	if (phys_offset >= base_bdev->blockcnt ||
 	    num_blocks > base_bdev->blockcnt - phys_offset) {
 		SPDK_ERRLOG("tier: assemble band %u geometry (phys_off=%" PRIu64 " num=%" PRIu64
@@ -1618,6 +1652,9 @@ vbdev_tier_assemble_band(struct vbdev_tier *t, const char *base_bdev_name, uint3
 		free(band);
 		return rc;
 	}
+	/* Commit — nothing below can fail. */
+	t->blocklen = blocklen;
+	t->sb_blocks = sb_blocks;
 	band->band_id = band_id;
 	band->tier = tier;
 	band->state = state;
@@ -1628,16 +1665,14 @@ vbdev_tier_assemble_band(struct vbdev_tier *t, const char *base_bdev_name, uint3
 	if (serial) {
 		snprintf(band->serial, sizeof(band->serial), "%s", serial);
 	}
-	if (part_uuid) {
-		memcpy(band->part_uuid, part_uuid, sizeof(band->part_uuid));
-	}
+	memcpy(band->part_uuid, part_uuid, sizeof(band->part_uuid));
 	band->part_start_lba = part_start_lba;
 	band->part_size_blocks = part_size_blocks;
 	band->lba_start = lba_start;
 	band->num_blocks = num_blocks;
 	/* md-hosting bands carry the mirrored md region at base-physical [sb_blocks, sb_blocks+md); their
 	 * data tail starts after it. Plain bands start at sb_blocks. (Matches vbdev_tier_add_band.) */
-	band->phys_offset = is_md ? (t->sb_blocks + t->md_num_blocks) : t->sb_blocks;
+	band->phys_offset = phys_offset;
 	if (is_md) {
 		if (t->md_mirror_a == UINT32_MAX) {
 			t->md_mirror_a = band_id;

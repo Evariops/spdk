@@ -23,6 +23,7 @@
 #include "spdk/assert.h"
 #include "spdk/bdev.h"
 #include "spdk/bdev_module.h"
+#include "spdk/string.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -152,6 +153,67 @@ tier_part_uuid_hex(const uint8_t uuid[TIER_PART_UUID_LEN], char out[2 * TIER_PAR
 	}
 	out[all_zero ? 0 : 2 * TIER_PART_UUID_LEN] = '\0';
 	return out;
+}
+
+/* Parse an OPTIONAL part_uuid wire value: exactly 32 lowercase hex chars into 16
+ * bytes; NULL/empty means "no partition identity" and yields all-zero. The strict
+ * form (no dashes, no upper case) keeps the wire value the byte-exact mirror of
+ * what tier_part_uuid_hex emits. Returns 0 or -EINVAL. */
+static inline int
+tier_part_uuid_parse(const char *str, uint8_t out[TIER_PART_UUID_LEN])
+{
+	int i;
+
+	memset(out, 0, TIER_PART_UUID_LEN);
+	if (str == NULL || str[0] == '\0') {
+		return 0;
+	}
+	if (strlen(str) != 2 * TIER_PART_UUID_LEN) {
+		return -EINVAL;
+	}
+	for (i = 0; i < 2 * TIER_PART_UUID_LEN; i++) {
+		char c = str[i];
+		uint8_t v;
+
+		if (c >= '0' && c <= '9') {
+			v = (uint8_t)(c - '0');
+		} else if (c >= 'a' && c <= 'f') {
+			v = (uint8_t)(c - 'a' + 10);
+		} else {
+			return -EINVAL;
+		}
+		out[i / 2] = (uint8_t)((out[i / 2] << 4) | v);
+	}
+	return 0;
+}
+
+/* True when [a_start, a_start+a_len) and [b_start, b_start+b_len) intersect.
+ * Callers guarantee the ends do not wrap u64 (assemble refuses an overflowing
+ * range before any overlap check). */
+static inline bool
+tier_ranges_overlap(uint64_t a_start, uint64_t a_len, uint64_t b_start, uint64_t b_len)
+{
+	return a_start < b_start + b_len && b_start < a_start + a_len;
+}
+
+/* The contract admits exactly two unit-identity encodings: all-zero part_uuid +
+ * 0/0 geometry (whole disk) or a non-zero part_uuid + its real geometry on the
+ * parent device (partition). Anything else is a tuple the reassembly contract
+ * declares impossible — refuse it at admission instead of persisting it.
+ * part_uuid must be TIER_PART_UUID_LEN bytes (never NULL). Returns 0 or -EINVAL. */
+static inline int
+tier_unit_identity_validate(const uint8_t *part_uuid, uint64_t part_start_lba,
+			    uint64_t part_size_blocks)
+{
+	bool has_uuid = !spdk_mem_all_zero(part_uuid, TIER_PART_UUID_LEN);
+
+	if (!has_uuid && (part_start_lba != 0 || part_size_blocks != 0)) {
+		return -EINVAL;
+	}
+	if (has_uuid && part_size_blocks == 0) {
+		return -EINVAL;
+	}
+	return 0;
 }
 
 /*
@@ -305,6 +367,32 @@ struct tier_io_channel {
 
 /* ---- Internal API (vbdev_tier.c, vbdev_tier_rpc.c) ------------------------- */
 
+/* Identity admission: the band already carrying this unit identity, or NULL. One
+ * unit (a disk by wwn, a partition by part_uuid) may occupy at most one band —
+ * two bands over one physical extent double-count capacity and cross-corrupt
+ * (a write through either lands in the other's blocks). Shared by add_band and
+ * assemble_band so the invariant is defined ONCE, at the depth where bands are
+ * admitted. An empty wwn / all-zero part_uuid carries no identity and never
+ * conflicts. part_uuid must be TIER_PART_UUID_LEN bytes (never NULL). */
+static inline struct tier_band *
+tier_band_identity_conflict(struct vbdev_tier *t, const char *wwn, const uint8_t *part_uuid)
+{
+	struct tier_band *existing;
+	bool has_wwn = wwn != NULL && wwn[0] != '\0';
+	bool has_uuid = !spdk_mem_all_zero(part_uuid, TIER_PART_UUID_LEN);
+
+	TAILQ_FOREACH(existing, &t->bands, link) {
+		if (has_wwn && strncmp(existing->wwn, wwn, sizeof(existing->wwn)) == 0) {
+			return existing;
+		}
+		if (has_uuid &&
+		    memcmp(existing->part_uuid, part_uuid, TIER_PART_UUID_LEN) == 0) {
+			return existing;
+		}
+	}
+	return NULL;
+}
+
 /* Resolve a composite LBA to the owning band + offset within that band.
  * Returns NULL if the LBA falls outside any active band's range. The md region
  * [0, md_num_blocks) is special-cased by the caller (mirrored). */
@@ -339,7 +427,11 @@ tier_align_up(const struct vbdev_tier *t, uint64_t v)
 /* Lifecycle (RPC-driven). */
 struct vbdev_tier *vbdev_tier_create(const char *name, uint64_t md_num_blocks, uint64_t cluster_blocks);
 struct vbdev_tier *vbdev_tier_get_by_name(const char *name);
-/* part_uuid is TIER_PART_UUID_LEN bytes or NULL (= all-zero, whole disk). */
+/* part_uuid is TIER_PART_UUID_LEN bytes, never NULL (all-zero = whole disk; the
+ * RPC layer always decodes into a real buffer). Refused with -EPROTO on an
+ * assembled composite: the on-disk superblock may list bands whose disks are
+ * ABSENT (no in-memory placeholder), so auto-placement at the in-memory
+ * high-water mark could silently reuse an absent band's range and slot id. */
 int vbdev_tier_add_band(struct vbdev_tier *t, const char *base_bdev_name,
 			enum tier_class tier, const char *wwn, const char *serial,
 			const uint8_t *part_uuid, uint64_t part_start_lba,
@@ -373,10 +465,15 @@ int vbdev_tier_delete(struct vbdev_tier *t);
 bool vbdev_tier_sb_fanout_idle(struct vbdev_tier *t);
 
 /* Register/clear the fill-accounting provider of a composite (lvol layer; see
- * vbdev_tier_usage_fn). Both tolerate an unknown tier_name: the composite may
- * already be gone when the lvolstore unloads. */
-void vbdev_tier_set_usage_provider(const char *tier_name, vbdev_tier_usage_fn fn, void *ctx);
-void vbdev_tier_clear_usage_provider(const char *tier_name);
+ * vbdev_tier_usage_fn). The caller resolves the composite (and tolerates its
+ * absence — it may already be gone when the lvolstore unloads); these take the
+ * resolved pointer so the API cannot silently target a homonym. The provider
+ * must be CLEARED at teardown INITIATION (before spdk_lvs_unload/destroy), not
+ * at completion: the lvol layer frees its store synchronously while the
+ * blobstore teardown is still an async chain, and a get_bands poll landing in
+ * that window would call the provider on freed state. */
+void vbdev_tier_set_usage_provider(struct vbdev_tier *t, vbdev_tier_usage_fn fn, void *ctx);
+void vbdev_tier_clear_usage_provider(struct vbdev_tier *t);
 
 /* Superblock (vbdev_tier_sb.c). */
 void tier_sb_serialize(struct vbdev_tier *t, struct tier_band *self, uint64_t seq,
