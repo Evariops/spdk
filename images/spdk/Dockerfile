@@ -31,7 +31,7 @@
 # Digest-pinned (2026-08-03): the rolling :43 tag shipped a broken python3-pip
 # (pip-internal TypeError in pkgdep.sh) — this is the digest of the last green
 # build (2026-07-16). Bump deliberately, never by drift.
-FROM docker.io/library/fedora:43@sha256:762d73ba1c455232b0272c5d445a34f36c4b9f421cbc05ce8102552325b6a222 AS builder
+FROM docker.io/library/fedora:46@sha256:a9bab18d01cf2c2cf62f3e79c72623405bce14ac062995cc6651a3073c802e41 AS builder
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -198,7 +198,7 @@ RUN set -euo pipefail && \
 #   docker build --target debug --build-arg BUILD_TYPE=debug .
 # ============================================================================
 # Same digest pin as the builder stage (see comment there).
-FROM docker.io/library/fedora:43@sha256:762d73ba1c455232b0272c5d445a34f36c4b9f421cbc05ce8102552325b6a222 AS debug
+FROM docker.io/library/fedora:46@sha256:a9bab18d01cf2c2cf62f3e79c72623405bce14ac062995cc6651a3073c802e41 AS debug
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
