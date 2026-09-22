@@ -1,0 +1,30 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+# ------------------------------------------------------------------
+# CI Gate — pendant de `ci-gate` pour les PR hors périmètre des images
+# ------------------------------------------------------------------
+# `spdk.yml` est filtré par chemins : il ne démarre pas sur une PR qui ne
+# touche ni les images, ni les modules bdev, ni les patches. Sans ce
+# workflow, le check `ci-gate` exigé par la branch protection resterait
+# indéfiniment en attente sur ces PR. Il publie donc le même statut
+# quand aucun de ces chemins n'est concerné.
+# ------------------------------------------------------------------
+name: CI Gate
+
+on:
+  pull_request:
+    paths-ignore:
+      - "images/spdk/**"
+      - "module/bdev/cbt/**"
+      - "module/bdev/tier/**"
+      - "patches/**"
+      - ".github/workflows/spdk.yml"
+
+permissions: {}
+
+jobs:
+  ci-gate:
+    name: ci-gate
+    runs-on: ubuntu-24.04
+    steps:
+      - name: No image change
+        run: echo "Aucune modification d'image ou de module, rien a construire."

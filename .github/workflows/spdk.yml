@@ -375,3 +375,28 @@ jobs:
             --predicate sbom.cdx.json \
             --type cyclonedx \
             "${IMAGE}@${DIGEST}"
+
+  # ────────────────────────────────────────────────────────────────
+  # 5. CI gate — statut unique exigé par la branch protection
+  # ────────────────────────────────────────────────────────────────
+  # `publish` et `publish-pr` ne sont pas dans `needs` : ils ne tournent
+  # que sur tag ou après autorisation, donc leur `skipped` n'apporte rien.
+  # Une PR non autorisée saute build, et seul lint reste déterminant.
+  ci-gate:
+    name: ci-gate
+    needs: [lint, build]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check upstream jobs
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          set -euo pipefail
+          echo "Resultats amont : ${RESULTS}"
+          for result in ${RESULTS}; do
+            case "${result}" in
+              success | skipped) ;;
+              *) echo "::error::job amont en echec (${result})" ; exit 1 ;;
+            esac
+          done
