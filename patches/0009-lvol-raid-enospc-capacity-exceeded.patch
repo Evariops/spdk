@@ -119,3 +119,17 @@ index 4b24829..4fc593f 100644
  		}
  	}
  
+diff --git a/test/unit/lib/bdev/vbdev_lvol.c/vbdev_lvol_ut.c b/test/unit/lib/bdev/vbdev_lvol.c/vbdev_lvol_ut.c
+index d0e3cbb..339dd32 100644
+--- a/test/unit/lib/bdev/vbdev_lvol.c/vbdev_lvol_ut.c
++++ b/test/unit/lib/bdev/vbdev_lvol.c/vbdev_lvol_ut.c
+@@ -42,6 +42,9 @@ bool g_bdev_is_missing = false;
+ 
+ DEFINE_STUB_V(spdk_bdev_module_fini_start_done, (void));
+ DEFINE_STUB_V(spdk_bdev_update_bs_blockcnt, (struct spdk_bs_dev *bs_dev));
++/* Evariops 0009: an ENOSPC completes the I/O with an NVMe status. */
++DEFINE_STUB_V(spdk_bdev_io_complete_nvme_status, (struct spdk_bdev_io *bdev_io, uint32_t cdw0,
++	      int sct, int sc));
+ DEFINE_STUB_V(spdk_lvs_grow_live, (struct spdk_lvol_store *lvs,
+ 				   spdk_lvs_op_complete cb_fn, void *cb_arg));
+ DEFINE_STUB(spdk_bdev_get_memory_domains, int, (struct spdk_bdev *bdev,

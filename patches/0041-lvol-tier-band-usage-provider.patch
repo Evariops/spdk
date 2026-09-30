@@ -402,3 +402,34 @@ index 3673b97..bb9e82a 100644
  
  	SPDK_INFOLOG(vbdev_lvol, "Lvol store found on %s - begin parsing\n",
  		     req->base_bdev->name);
+diff --git a/test/unit/lib/bdev/vbdev_lvol.c/Makefile b/test/unit/lib/bdev/vbdev_lvol.c/Makefile
+index 5e8f2e1..42e4a31 100644
+--- a/test/unit/lib/bdev/vbdev_lvol.c/Makefile
++++ b/test/unit/lib/bdev/vbdev_lvol.c/Makefile
+@@ -7,4 +7,7 @@ SPDK_ROOT_DIR := $(abspath $(CURDIR)/../../../../../)
+ 
+ TEST_FILE = vbdev_lvol_ut.c
+ 
++# Evariops 0041: vbdev_lvol.c includes vbdev_tier.h (the injected bdev_tier module).
++CFLAGS += -I$(SPDK_ROOT_DIR)/module/bdev/tier
++
+ include $(SPDK_ROOT_DIR)/mk/spdk.unittest.mk
+diff --git a/test/unit/lib/bdev/vbdev_lvol.c/vbdev_lvol_ut.c b/test/unit/lib/bdev/vbdev_lvol.c/vbdev_lvol_ut.c
+index 339dd32..de98175 100644
+--- a/test/unit/lib/bdev/vbdev_lvol.c/vbdev_lvol_ut.c
++++ b/test/unit/lib/bdev/vbdev_lvol.c/vbdev_lvol_ut.c
+@@ -60,6 +60,14 @@ DEFINE_STUB(spdk_lvs_esnap_missing_add, int,
+ DEFINE_STUB(spdk_blob_get_esnap_bs_dev, struct spdk_bs_dev *, (const struct spdk_blob *blob), NULL);
+ DEFINE_STUB(spdk_lvol_is_degraded, bool, (const struct spdk_lvol *lvol), false);
+ DEFINE_STUB(spdk_blob_get_num_allocated_clusters, uint64_t, (struct spdk_blob *blob), 0);
++/* Evariops 0041: an lvolstore on a bdev_tier composite registers a per-band usage provider.
++ * No composite here: the lookup finds none, so no provider is registered or counted. */
++DEFINE_STUB(vbdev_tier_get_by_name, struct vbdev_tier *, (const char *name), NULL);
++DEFINE_STUB_V(vbdev_tier_set_usage_provider, (struct vbdev_tier *t, vbdev_tier_usage_fn fn,
++		void *ctx));
++DEFINE_STUB_V(vbdev_tier_clear_usage_provider, (struct vbdev_tier *t));
++DEFINE_STUB(spdk_bs_count_allocated_clusters_in_lba_range, uint64_t,
++	    (struct spdk_blob_store *bs, uint64_t lba_start, uint64_t lba_count), 0);
+ 
+ struct spdk_blob {
+ 	uint64_t	id;

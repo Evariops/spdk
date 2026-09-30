@@ -83,19 +83,24 @@ printf '  %s\n' "${suites[@]}"
 
 # ── Build ──
 # The ut library is built with the tests only (lib/Makefile), and the image
-# configures them off.
+# configures them off. Every suite is built even after one fails, and so run
+# below: one pass reports every broken suite, not the first one in the list.
 make -C lib/ut -j"$(nproc)"
+logs="$(mktemp -d)"
+failed=()
 for s in "${suites[@]}"; do
 	if [[ ! -d "test/unit/${s}" ]]; then
 		echo "FATAL: unit-tests.map names test/unit/${s}, which does not exist" >&2
 		exit 1
 	fi
-	make -C "test/unit/${s}" -j"$(nproc)"
+	if ! make -C "test/unit/${s}" -j"$(nproc)" > "${logs}/${s//\//_}.build.log" 2>&1; then
+		echo "FAIL ${s}: does not build"
+		{ grep -E 'error|undefined reference' "${logs}/${s//\//_}.build.log" | head -n 40 | sed 's/^/     /'; } || true
+		failed+=("${s}")
+	fi
 done
 
 # ── Run ──
-logs="$(mktemp -d)"
-failed=()
 for s in "${suites[@]}"; do
 	src="$(find "test/unit/${s}" -maxdepth 1 -name '*_ut.c' | head -n 1)"
 	if [[ -z "${src}" ]]; then
@@ -105,8 +110,12 @@ for s in "${suites[@]}"; do
 	bin="${src%.c}"
 	log="${logs}/${s//\//_}.log"
 	if [[ ! -x "${bin}" ]]; then
-		echo "FAIL ${s}: ${bin} was not built"
-		failed+=("${s}")
+		# A build that failed is reported above; a build that "succeeded"
+		# without its binary (a skip) is reported here.
+		[[ " ${failed[*]} " == *" ${s} "* ]] || {
+			echo "FAIL ${s}: ${bin} was not built"
+			failed+=("${s}")
+		}
 		continue
 	fi
 	start=${SECONDS}
