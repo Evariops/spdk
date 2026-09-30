@@ -1,0 +1,207 @@
+diff --git a/test/unit/lib/blob/blob.c/blob_ut.c b/test/unit/lib/blob/blob.c/blob_ut.c
+index c168e08..3bb3f5c 100644
+--- a/test/unit/lib/blob/blob.c/blob_ut.c
++++ b/test/unit/lib/blob/blob.c/blob_ut.c
+@@ -4628,8 +4628,9 @@ blob_thin_prov_rw(void)
+ 	CU_ASSERT(free_clusters - 1 == spdk_bs_free_cluster_count(bs));
+ 	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob) == 1);
+ 	/* For thin-provisioned blob we need to write 20 io_units plus one page metadata and
+-	 * read 0 bytes */
+-	expected_bytes = 20 * io_unit_size + spdk_bs_get_page_size(bs);
++	 * read 0 bytes. Each thread allocated a cluster and cleared it before inserting it,
++	 * the one that lost the race included. */
++	expected_bytes = 20 * io_unit_size + spdk_bs_get_page_size(bs) + 2 * spdk_bs_get_cluster_size(bs);
+ 	if (g_use_extent_table) {
+ 		/* Add one more page for EXTENT_PAGE write */
+ 		expected_bytes += spdk_bs_get_page_size(bs);
+@@ -4731,17 +4732,18 @@ blob_thin_prov_write_count_io(void)
+ 		CU_ASSERT(free_clusters - (2 * i + 1) == spdk_bs_free_cluster_count(bs));
+ 
+ 		CU_ASSERT(g_dev_read_bytes == read_bytes);
++		/* The write covers one io_unit of a new cluster: the cluster is cleared first. */
+ 		if (!g_use_extent_table) {
+ 			/* For legacy metadata, we should have written the io_unit for
+ 			 * the write I/O, plus the blob's primary metadata page
+ 			 */
+-			expected_bytes = io_unit_size + spdk_bs_get_page_size(bs);
++			expected_bytes = CLUSTER_SZ + io_unit_size + spdk_bs_get_page_size(bs);
+ 		} else {
+ 			/* For extent table metadata, we should have written the io_unit for
+ 			 * the write I/O, plus 2 metadata pages - the extent page and the
+ 			 * blob's primary metadata page
+ 			 */
+-			expected_bytes = io_unit_size + 2 * spdk_bs_get_page_size(bs);
++			expected_bytes = CLUSTER_SZ + io_unit_size + 2 * spdk_bs_get_page_size(bs);
+ 		}
+ 		CU_ASSERT((g_dev_write_bytes - write_bytes) == expected_bytes);
+ 
+@@ -4774,8 +4776,9 @@ blob_thin_prov_write_count_io(void)
+ 		/*
+ 		 * For legacy metadata, we should have written the I/O and the primary metadata page.
+ 		 * For extent table metadata, we should have written the I/O and the extent metadata page.
++		 * Both clear the new cluster first.
+ 		 */
+-		expected_bytes = io_unit_size + spdk_bs_get_page_size(bs);
++		expected_bytes = CLUSTER_SZ + io_unit_size + spdk_bs_get_page_size(bs);
+ 		CU_ASSERT((g_dev_write_bytes - write_bytes) == expected_bytes);
+ 
+ 		/* Send unmap aligned to the whole cluster - should free it up */
+@@ -4809,6 +4812,138 @@ blob_thin_prov_write_count_io(void)
+ 	g_bs = NULL;
+ }
+ 
++/*
++ * Fills every free cluster of the device with a pattern: what a device whose unmap does not
++ * zero keeps in the clusters of blobs deleted earlier.
++ */
++static void
++ut_fill_free_clusters(struct spdk_blob_store *bs, uint8_t pattern)
++{
++	uint32_t i;
++
++	for (i = 0; i < bs->total_clusters; i++) {
++		if (!spdk_bit_pool_is_allocated(bs->used_clusters, i)) {
++			memset(&g_dev_buffer[bs_cluster_to_lba(bs, i) * bs->dev->blocklen], pattern,
++			       bs->cluster_sz);
++		}
++	}
++}
++
++/*
++ * A cluster allocated by a write that covers part of it is cleared first: the rest of it
++ * reads zeroes, not what the device held there, which is another blob's data where the
++ * device's unmap does not zero (and on each leg of a mirror, something different).
++ */
++static void
++blob_thin_prov_new_cluster_reads_zeroes(void)
++{
++	struct spdk_blob_store *bs = g_bs;
++	struct spdk_blob *blob;
++	struct spdk_io_channel *channel;
++	struct spdk_blob_opts opts;
++	uint64_t io_unit_size = spdk_bs_get_io_unit_size(bs);
++	uint64_t cluster_size = spdk_bs_get_cluster_size(bs);
++	uint64_t io_units_per_cluster = cluster_size / io_unit_size;
++	uint8_t payload_write[BLOCKLEN];
++	uint8_t *payload_read;
++
++	channel = spdk_bs_alloc_io_channel(bs);
++	SPDK_CU_ASSERT_FATAL(channel != NULL);
++
++	ut_fill_free_clusters(bs, 0xAA);
++
++	ut_spdk_blob_opts_init(&opts);
++	opts.thin_provision = true;
++	opts.num_clusters = 1;
++	blob = ut_blob_create_and_open(bs, &opts);
++	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob) == 0);
++
++	/* One io_unit at the start of the cluster: the rest of it is never written. */
++	memset(payload_write, 0xE5, sizeof(payload_write));
++	spdk_blob_io_write(blob, channel, payload_write, 0, 1, blob_op_complete, NULL);
++	poll_threads();
++	CU_ASSERT(g_bserrno == 0);
++	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob) == 1);
++
++	payload_read = calloc(1, cluster_size);
++	SPDK_CU_ASSERT_FATAL(payload_read != NULL);
++	spdk_blob_io_read(blob, channel, payload_read, 0, io_units_per_cluster, blob_op_complete, NULL);
++	poll_threads();
++	CU_ASSERT(g_bserrno == 0);
++	CU_ASSERT(memcmp(payload_read, payload_write, io_unit_size) == 0);
++	CU_ASSERT(spdk_mem_all_zero(payload_read + io_unit_size, cluster_size - io_unit_size));
++
++	free(payload_read);
++	ut_blob_close_and_delete(bs, blob);
++	spdk_bs_free_io_channel(channel);
++	poll_threads();
++	g_blob = NULL;
++	g_blobid = 0;
++}
++
++/*
++ * A write that covers the whole new cluster leaves nothing of the device's old content, so the
++ * cluster is not cleared first: a rebuild or a copy writes whole clusters, and clearing each of
++ * them would double what it writes.
++ */
++static void
++blob_thin_prov_full_cluster_write_is_not_cleared_first(void)
++{
++	struct spdk_blob_store *bs = g_bs;
++	struct spdk_blob *blob;
++	struct spdk_io_channel *channel;
++	struct spdk_blob_opts opts;
++	uint64_t io_unit_size = spdk_bs_get_io_unit_size(bs);
++	uint64_t cluster_size = spdk_bs_get_cluster_size(bs);
++	uint64_t io_units_per_cluster = cluster_size / io_unit_size;
++	uint64_t write_bytes;
++	uint64_t expected_bytes;
++	uint8_t *payload_write;
++	uint8_t *payload_read;
++
++	channel = spdk_bs_alloc_io_channel(bs);
++	SPDK_CU_ASSERT_FATAL(channel != NULL);
++
++	ut_fill_free_clusters(bs, 0xAA);
++
++	ut_spdk_blob_opts_init(&opts);
++	opts.thin_provision = true;
++	opts.num_clusters = 1;
++	blob = ut_blob_create_and_open(bs, &opts);
++
++	payload_write = malloc(cluster_size);
++	payload_read = calloc(1, cluster_size);
++	SPDK_CU_ASSERT_FATAL(payload_write != NULL && payload_read != NULL);
++	memset(payload_write, 0xE5, cluster_size);
++
++	write_bytes = g_dev_write_bytes;
++	spdk_blob_io_write(blob, channel, payload_write, 0, io_units_per_cluster, blob_op_complete, NULL);
++	poll_threads();
++	CU_ASSERT(g_bserrno == 0);
++	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob) == 1);
++
++	/* The payload and the blob's metadata page; no cleared cluster before them. */
++	expected_bytes = cluster_size + spdk_bs_get_page_size(bs);
++	if (g_use_extent_table) {
++		/* Add one more page for EXTENT_PAGE write */
++		expected_bytes += spdk_bs_get_page_size(bs);
++	}
++	CU_ASSERT(g_dev_write_bytes - write_bytes == expected_bytes);
++
++	spdk_blob_io_read(blob, channel, payload_read, 0, io_units_per_cluster, blob_op_complete, NULL);
++	poll_threads();
++	CU_ASSERT(g_bserrno == 0);
++	CU_ASSERT(memcmp(payload_read, payload_write, cluster_size) == 0);
++
++	free(payload_write);
++	free(payload_read);
++	ut_blob_close_and_delete(bs, blob);
++	spdk_bs_free_io_channel(channel);
++	poll_threads();
++	g_blob = NULL;
++	g_blobid = 0;
++}
++
+ static void
+ blob_thin_prov_unmap_cluster(void)
+ {
+@@ -5124,8 +5259,8 @@ blob_thin_prov_rle(void)
+ 	CU_ASSERT(g_bserrno == 0);
+ 	CU_ASSERT(free_clusters - 1 == spdk_bs_free_cluster_count(bs));
+ 	/* For thin-provisioned blob we need to write 10 pages plus one page metadata and
+-	 * read 0 bytes */
+-	expected_bytes = 10 * io_unit_size + spdk_bs_get_page_size(bs);
++	 * read 0 bytes, and clear the new cluster before the write lands in it. */
++	expected_bytes = 10 * io_unit_size + spdk_bs_get_page_size(bs) + spdk_bs_get_cluster_size(bs);
+ 	if (g_use_extent_table) {
+ 		/* Add one more page for EXTENT_PAGE write */
+ 		expected_bytes += spdk_bs_get_page_size(bs);
+@@ -10364,6 +10499,8 @@ main(int argc, char **argv)
+ 		CU_ADD_TEST(suite_bs, blob_insert_cluster_msg_test);
+ 		CU_ADD_TEST(suite_bs, blob_thin_prov_rw);
+ 		CU_ADD_TEST(suite, blob_thin_prov_write_count_io);
++		CU_ADD_TEST(suite_bs, blob_thin_prov_new_cluster_reads_zeroes);
++		CU_ADD_TEST(suite_bs, blob_thin_prov_full_cluster_write_is_not_cleared_first);
+ 		CU_ADD_TEST(suite, blob_thin_prov_unmap_cluster);
+ 		CU_ADD_TEST(suite_bs, blob_thin_prov_rle);
+ 		CU_ADD_TEST(suite_bs, blob_thin_prov_rw_iov);
