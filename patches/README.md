@@ -4,7 +4,7 @@ Out-of-tree patches applied on top of upstream SPDK during the container build (
 
 ## Application order
 
-Patches are applied in **lexicographic order of filename** (`0001` … `0041`) — the Dockerfile globs `patches/*.patch` and `git apply`s each. The numeric prefix IS the contract; do not rely on any other ordering. Order matters:
+Patches are applied in **lexicographic order of filename** (`0001` … `0044`) — the Dockerfile globs `patches/*.patch` and `git apply`s each. The numeric prefix IS the contract; do not rely on any other ordering. Order matters:
 
 | # | Patch | Touches | Depends on |
 |--:|:------|:--------|:-----------|
@@ -49,6 +49,7 @@ Patches are applied in **lexicographic order of filename** (`0001` … `0041`) �
 | 0039 | an armed delayed reconnect owns the continuation — the path returns instead of re-driving a failed disconnect, ending a mutual recursion that overflows the reactor stack | module/bdev/nvme (bdev_nvme.c) | 0032 |
 | 0040 | the delete-stop only MARKS — 0035's stop drove the window machinery from a foreign thread, unquiescing under in-flight requests; it now sets STOPPING with `-ECANCELED` and each resting state concludes | module/bdev/raid (bdev_raid.c) | 0035, 0039 |
 | 0041 | lvol → tier band usage provider — when an lvolstore loads on a `bdev_tier` composite the lvol layer registers a per-band fill-accounting provider, gated on the tier grain being a whole multiple of the lvolstore cluster (else no provider, honest unknown), and **unregisters it at teardown INITIATION** (before `spdk_lvs_unload`/`destroy`, whose synchronous store free would otherwise race a `get_bands` poll — UAF); `bdev_tier_get_bands` then fills `used_blocks` by counting allocated clusters of the blobstore's `used_clusters` pool in the band's LBA range (`spdk_bs_count_allocated_clusters_in_lba_range`, new in lib/blob — exclusive cluster-aligned bounds, one masked popcount per 64 clusters via `spdk_bit_pool_count_allocated_in_range` / `spdk_bit_array_count_set_in_range`, new in lib/util) | lib/blob, lib/util (ranged popcount), bdev_lvol; `#include`s `vbdev_tier.h` (requires the tier module, like 0005) | 0004 (bit-pool accessors), 0005 (lvol `-I` tier CFLAGS), tier module |
+| 0044 | a thin cluster is cleared before use — a cluster allocated by a write (or write_zeroes, or an inflate) that covers only part of it is zeroed before the blob sees it. Its unwritten part returned what the device held there: another blob's data wherever the device's unmap does not zero (the free path counts on unmap to), and different bytes on each leg of a mirror, which a verify of the mirror reads as a content divergence. A write that covers the whole cluster skips the clear, so a rebuild or a copy does not write twice. `blob_ut` pins both, and its thin-provisioning I/O accounting now counts the cleared cluster | lib/blob (blobstore.c), test/unit/lib/blob | — |
 
 0005 `#include`s `vbdev_tier.h` and adds `-I module/bdev/tier` to the lvol module CFLAGS via its own Makefile hunk; the Dockerfile injects the module dirs before applying patches (copy-before-apply ordering matters).
 
