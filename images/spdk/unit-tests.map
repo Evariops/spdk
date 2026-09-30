@@ -1,0 +1,30 @@
+# Which upstream unit-test suites a patched source file owes (see
+# unit-tests.sh, and patches/README.md, "Unit tests").
+#
+# One line: <path prefix> <suite> [<suite> ...]
+#   - the prefix is matched against the files the series patches (the
+#     `+++ b/` lines of patches/*.patch); the LONGEST matching prefix wins;
+#   - a suite is a leaf directory under test/unit/ holding one *_ut.c, whose
+#     binary is that file without its .c;
+#   - "-" says upstream has no suite for it: said, not guessed.
+#
+# Only .c files under lib/, module/ and app/ are looked up. Headers, symbol
+# maps and Makefiles are covered by the suites of the .c files beside them. A
+# patched .c file that matches no line fails the stage: a component is mapped
+# when its first patch lands. A file the series patches under test/unit/ adds
+# its own suite, so a patch's own tests always run.
+
+lib/bdev/                   lib/bdev/bdev.c lib/bdev/mt/bdev.c lib/bdev/part.c
+lib/blob/                   lib/blob/blob.c lib/blob/blob_bdev.c
+lib/jsonrpc/                lib/jsonrpc/jsonrpc_server.c
+lib/nvme/nvme_tcp.c         lib/nvme/nvme_tcp.c
+lib/nvmf/subsystem.c        lib/nvmf/subsystem.c
+lib/nvmf/nvmf_rpc.c         -
+lib/nvmf/nvmf_pause_rpc.c   -
+lib/rpc/                    lib/rpc/rpc.c
+lib/util/bit_array.c        lib/util/bit_array.c
+module/bdev/lvol/           lib/bdev/vbdev_lvol.c
+module/bdev/nvme/           lib/bdev/nvme/bdev_nvme.c
+module/bdev/raid/           lib/bdev/raid/bdev_raid.c lib/bdev/raid/bdev_raid_sb.c lib/bdev/raid/raid0.c lib/bdev/raid/raid1.c lib/bdev/raid/raid5f.c lib/bdev/raid/concat.c
+module/bdev/uring/          -
+app/spdk_dd/                -

@@ -94,6 +94,23 @@ scripts/patches.sh regen   /path/to/spdk-worktree
 
 **Series format: RAW `git diff` output, no mail header.** `git apply` (Dockerfile + `check`/`apply`) is the only consumer; **`git am` is NOT part of the contract** — it chokes on raw diffs. `regen` emits raw per-commit diffs with the commit subject as filename, so a regen of an untouched series is byte-stable. Never hand-edit hunks.
 
+## Unit tests
+
+The image build configures `--disable-unit-tests`, and until the `unit-tests` stage of `images/spdk/Dockerfile` existed, no patch had run the upstream suites of the code it changes. That stage runs them now:
+
+- **On the image's own tree.** It comes after the builder and compiles the suites against the libraries the builder made. SPDK is built once. The collector (release image) and the debug image both derive from it.
+- **In the debug build, on each arch.** Asserts are on there, which is the configuration upstream runs its suites in. The release build passes through at no cost. A failing suite fails the debug build of the matrix, and with it `ci-gate` and the release publish, which needs every build.
+- **The suites a patch owes.** `images/spdk/unit-tests.map` maps a path prefix to the leaf directories of `test/unit/` that cover it. The longest prefix wins, and `-` says upstream has no suite. Every `.c` under `lib/`, `module/` or `app/` that the series patches must match a line, or the stage fails: a component is mapped when its first patch lands. A patch that touches a file under `test/unit/` adds that suite, so a patch's own tests always run.
+- **No silent skip.** Each suite is built from its leaf directory: parent Makefiles skip some suites with a warning (`blob.c` needs CUnit 2.1-3). A suite whose binary is missing fails, as does a suite that fails.
+
+A patch that changes behavior an upstream suite pins updates that suite in the same patch. A PR's build, and so its unit tests, runs with the `build-images` label.
+
+Locally, the same stage (`docker build` is enough; no registry):
+
+```sh
+docker build -f images/spdk/Dockerfile --target unit-tests --build-arg BUILD_TYPE=debug .
+```
+
 ## Upstreaming
 
 Candidates, easiest first: 0006 (degraded-read, small/general), 0003 (pause/resume), 0002 (allocated_ranges). 0004 (blob relocate) needs an RFC. Each patch merged upstream removes rebase surface here.
