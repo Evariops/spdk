@@ -192,3 +192,28 @@ index 43841bc..ebe39cc 100644
  };
  
  struct raid_bdev_io;
+diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+index c538a3c..ff51486 100644
+--- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
++++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+@@ -176,6 +176,9 @@ DEFINE_STUB(spdk_json_write_array_end, int, (struct spdk_json_write_ctx *w), 0);
+ DEFINE_STUB(spdk_json_write_named_array_begin, int, (struct spdk_json_write_ctx *w,
+ 		const char *name), 0);
+ DEFINE_STUB(spdk_json_write_null, int, (struct spdk_json_write_ctx *w), 0);
++/* Evariops 0017: a member is reported with the time it entered its state. */
++DEFINE_STUB(spdk_json_write_named_int64, int, (struct spdk_json_write_ctx *w, const char *name,
++		int64_t val), 0);
+ DEFINE_STUB(spdk_json_write_named_uint64, int, (struct spdk_json_write_ctx *w, const char *name,
+ 		uint64_t val), 0);
+ /* Evariops 0013: the seeded-rebuild RPC answers with a formatted rebuild id. */
+@@ -230,6 +233,10 @@ DEFINE_STUB_V(raid_rebuild_outcome_finish, (struct raid_rebuild_outcome *outcome
+ 	      enum raid_rebuild_outcome_state terminal, bool verified));
+ DEFINE_STUB_V(raid_rebuild_outcomes_write_json, (struct spdk_json_write_ctx *w,
+ 	      const char *token_filter));
++/* Evariops 0017: a member is reported with its CBT epoch. The CBT module is not part
++ * of this suite: no member has one (-ENODEV). */
++DEFINE_STUB(vbdev_cbt_query_latest_epoch, int, (const char *bdev_name,
++		struct vbdev_cbt_epoch_facts *out), -ENODEV);
+ 
+ uint32_t
+ spdk_bdev_get_data_block_size(const struct spdk_bdev *bdev)

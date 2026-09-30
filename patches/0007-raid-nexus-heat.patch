@@ -387,3 +387,18 @@ index 0000000..2eda221
 +	free(req.name);
 +}
 +SPDK_RPC_REGISTER("vbdev_nexus_get_heat", rpc_vbdev_nexus_get_heat, SPDK_RPC_RUNTIME)
+diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+index c4b478a..ce3af2f 100644
+--- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
++++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+@@ -200,6 +200,10 @@ DEFINE_STUB(spdk_bdev_writev_blocks_ext, int, (struct spdk_bdev_desc *desc,
+ 		struct spdk_io_channel *ch, struct iovec *iov, int iovcnt, uint64_t offset_blocks,
+ 		uint64_t num_blocks, spdk_bdev_io_completion_cb cb, void *cb_arg,
+ 		struct spdk_bdev_ext_io_opts *opts), 0);
++/* Evariops 0007: a raid records its I/O heat once heat is enabled, which no test
++ * here does, and destroys it with the raid. */
++DEFINE_STUB_V(raid_tier_heat_record, (void *heat, uint64_t offset_blocks, bool is_write));
++DEFINE_STUB_V(raid_tier_heat_destroy, (void *heat));
+ 
+ uint32_t
+ spdk_bdev_get_data_block_size(const struct spdk_bdev *bdev)

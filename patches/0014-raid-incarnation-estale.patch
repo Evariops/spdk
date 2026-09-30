@@ -446,3 +446,127 @@ index 830a42d..3de537f 100644
  }
  SPDK_RPC_REGISTER("bdev_raid_remove_base_bdev", rpc_bdev_raid_remove_base_bdev, SPDK_RPC_RUNTIME)
  
+diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+index 4b33262..c262806 100644
+--- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
++++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+@@ -18,6 +18,8 @@
+ #define MAX_RAIDS 2
+ #define BLOCK_CNT (1024ul * 1024ul * 1024ul * 1024ul)
+ #define MD_SIZE 8
++/* Evariops 0014: the incarnation the suite creates its raids under. */
++#define UT_INCARNATION "ut-incarnation"
+ 
+ struct spdk_bdev_channel {
+ 	struct spdk_io_channel *channel;
+@@ -552,6 +554,10 @@ spdk_json_decode_object(const struct spdk_json_val *values,
+ 		_out->strip_size_kb = req->strip_size_kb;
+ 		_out->level = req->level;
+ 		_out->superblock_enabled = req->superblock_enabled;
++		if (req->incarnation != NULL) {
++			_out->incarnation = strdup(req->incarnation);
++			SPDK_CU_ASSERT_FATAL(_out->incarnation != NULL);
++		}
+ 		_out->base_bdevs.num_base_bdevs = req->base_bdevs.num_base_bdevs;
+ 		for (i = 0; i < req->base_bdevs.num_base_bdevs; i++) {
+ 			_out->base_bdevs.base_bdevs[i] = strdup(req->base_bdevs.base_bdevs[i]);
+@@ -856,6 +862,8 @@ create_test_req(struct rpc_bdev_raid_create *r, const char *raid_name,
+ 	r->strip_size_kb = (g_strip_size * g_block_len) / 1024;
+ 	r->level = 123;
+ 	r->superblock_enabled = superblock_enabled;
++	r->incarnation = strdup(UT_INCARNATION);
++	SPDK_CU_ASSERT_FATAL(r->incarnation != NULL);
+ 	r->base_bdevs.num_base_bdevs = g_max_base_drives;
+ 	for (i = 0; i < g_max_base_drives; i++, bbdev_idx++) {
+ 		snprintf(name, 16, "%s%u%s", "Nvme", bbdev_idx, "n1");
+@@ -888,6 +896,7 @@ free_test_req(struct rpc_bdev_raid_create *r)
+ 	uint8_t i;
+ 
+ 	free(r->name);
++	free(r->incarnation);
+ 	for (i = 0; i < r->base_bdevs.num_base_bdevs; i++) {
+ 		free(r->base_bdevs.base_bdevs[i]);
+ 	}
+@@ -899,6 +908,8 @@ create_raid_bdev_delete_req(struct rpc_bdev_raid_delete *r, const char *raid_nam
+ {
+ 	r->name = strdup(raid_name);
+ 	SPDK_CU_ASSERT_FATAL(r->name != NULL);
++	/* Evariops 0014: unchecked unless a test names the incarnation it expects. */
++	r->expected_incarnation = NULL;
+ 
+ 	g_rpc_req = r;
+ 	g_rpc_req_size = sizeof(*r);
+@@ -974,6 +985,64 @@ test_delete_raid(void)
+ 	reset_globals();
+ }
+ 
++/* Evariops 0014: no creation without an incarnation identity. */
++static void
++test_create_raid_without_incarnation(void)
++{
++	struct rpc_bdev_raid_create req;
++
++	set_globals();
++	CU_ASSERT(raid_bdev_init() == 0);
++
++	create_raid_bdev_create_req(&req, "raid1", 0, true, 0, false);
++	free(req.incarnation);
++	req.incarnation = NULL;
++	rpc_bdev_raid_create(NULL, NULL);
++	CU_ASSERT(g_rpc_err == 1);
++	verify_raid_bdev_present("raid1", false);
++	free_test_req(&req);
++
++	raid_bdev_exit();
++	base_bdevs_cleanup();
++	reset_globals();
++}
++
++/* Evariops 0014: a delete that expects another incarnation is refused (-ESTALE),
++ * and the raid stays. The one that expects the raid's own deletes it. */
++static void
++test_delete_raid_stale_incarnation(void)
++{
++	struct rpc_bdev_raid_create construct_req;
++	struct rpc_bdev_raid_delete delete_req;
++
++	set_globals();
++	CU_ASSERT(raid_bdev_init() == 0);
++
++	create_raid_bdev_create_req(&construct_req, "raid1", 0, true, 0, false);
++	rpc_bdev_raid_create(NULL, NULL);
++	CU_ASSERT(g_rpc_err == 0);
++	verify_raid_bdev_present("raid1", true);
++	free_test_req(&construct_req);
++
++	create_raid_bdev_delete_req(&delete_req, "raid1", 0);
++	delete_req.expected_incarnation = strdup("another-incarnation");
++	SPDK_CU_ASSERT_FATAL(delete_req.expected_incarnation != NULL);
++	rpc_bdev_raid_delete(NULL, NULL);
++	CU_ASSERT(g_rpc_err == 1);
++	verify_raid_bdev_present("raid1", true);
++
++	create_raid_bdev_delete_req(&delete_req, "raid1", 0);
++	delete_req.expected_incarnation = strdup(UT_INCARNATION);
++	SPDK_CU_ASSERT_FATAL(delete_req.expected_incarnation != NULL);
++	rpc_bdev_raid_delete(NULL, NULL);
++	CU_ASSERT(g_rpc_err == 0);
++	verify_raid_bdev_present("raid1", false);
++
++	raid_bdev_exit();
++	base_bdevs_cleanup();
++	reset_globals();
++}
++
+ static void
+ test_create_raid_invalid_args(void)
+ {
+@@ -1832,6 +1901,8 @@ main(int argc, char **argv)
+ 	CU_ADD_TEST(suite, test_create_raid);
+ 	CU_ADD_TEST(suite, test_create_raid_superblock);
+ 	CU_ADD_TEST(suite, test_delete_raid);
++	CU_ADD_TEST(suite, test_create_raid_without_incarnation);
++	CU_ADD_TEST(suite, test_delete_raid_stale_incarnation);
+ 	CU_ADD_TEST(suite, test_create_raid_invalid_args);
+ 	CU_ADD_TEST(suite, test_delete_raid_invalid_args);
+ 	CU_ADD_TEST(suite, test_io_channel);
