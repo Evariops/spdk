@@ -1,0 +1,119 @@
+diff --git a/test/unit/lib/blob/blob.c/blob_ut.c b/test/unit/lib/blob/blob.c/blob_ut.c
+index 3bb3f5c..cdf55b1 100644
+--- a/test/unit/lib/blob/blob.c/blob_ut.c
++++ b/test/unit/lib/blob/blob.c/blob_ut.c
+@@ -4944,6 +4944,106 @@ blob_thin_prov_full_cluster_write_is_not_cleared_first(void)
+ 	g_blobid = 0;
+ }
+ 
++/*
++ * Evariops 0049: write-zeroes on a cluster that a thin blob backed by zeroes has not allocated
++ * changes nothing it reads, so it allocates nothing and writes nothing. A full rebuild sends every
++ * never-written part of its source as write-zeroes (0048): allocating the cluster of each made the
++ * rebuilt replica fully allocated, and wrote zeroes across the target's disk. An allocated cluster
++ * is still zeroed, and a clone, which reads its unallocated clusters from its parent, still
++ * allocates and zeroes.
++ */
++static void
++blob_thin_prov_write_zeroes_on_unallocated_cluster_allocates_nothing(void)
++{
++	struct spdk_blob_store *bs = g_bs;
++	struct spdk_blob *blob, *clone;
++	struct spdk_io_channel *channel;
++	struct spdk_blob_opts opts;
++	uint64_t io_unit_size = spdk_bs_get_io_unit_size(bs);
++	uint64_t cluster_size = spdk_bs_get_cluster_size(bs);
++	uint64_t io_units_per_cluster = cluster_size / io_unit_size;
++	uint64_t half = io_units_per_cluster / 2;
++	uint64_t write_bytes;
++	spdk_blob_id snapshotid;
++	uint8_t *payload;
++
++	channel = spdk_bs_alloc_io_channel(bs);
++	SPDK_CU_ASSERT_FATAL(channel != NULL);
++	payload = malloc(cluster_size);
++	SPDK_CU_ASSERT_FATAL(payload != NULL);
++
++	ut_fill_free_clusters(bs, 0xAA);
++
++	ut_spdk_blob_opts_init(&opts);
++	opts.thin_provision = true;
++	opts.num_clusters = 2;
++	blob = ut_blob_create_and_open(bs, &opts);
++
++	/* Half of cluster 0, never written: nothing allocated, nothing written, zeroes read back. */
++	write_bytes = g_dev_write_bytes;
++	spdk_blob_io_write_zeroes(blob, channel, 0, half, blob_op_complete, NULL);
++	poll_threads();
++	CU_ASSERT(g_bserrno == 0);
++	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob) == 0);
++	CU_ASSERT(g_dev_write_bytes == write_bytes);
++	memset(payload, 0xFF, cluster_size);
++	spdk_blob_io_read(blob, channel, payload, 0, io_units_per_cluster, blob_op_complete, NULL);
++	poll_threads();
++	CU_ASSERT(g_bserrno == 0);
++	CU_ASSERT(spdk_mem_all_zero(payload, cluster_size));
++
++	/* An allocated cluster holding data: write-zeroes still zeroes what it covers. */
++	memset(payload, 0xE5, cluster_size);
++	spdk_blob_io_write(blob, channel, payload, io_units_per_cluster, io_units_per_cluster, blob_op_complete, NULL);
++	poll_threads();
++	CU_ASSERT(g_bserrno == 0);
++	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob) == 1);
++	spdk_blob_io_write_zeroes(blob, channel, io_units_per_cluster, half, blob_op_complete, NULL);
++	poll_threads();
++	CU_ASSERT(g_bserrno == 0);
++	spdk_blob_io_read(blob, channel, payload, io_units_per_cluster, io_units_per_cluster, blob_op_complete, NULL);
++	poll_threads();
++	CU_ASSERT(g_bserrno == 0);
++	CU_ASSERT(spdk_mem_all_zero(payload, cluster_size / 2));
++	CU_ASSERT(payload[cluster_size / 2] == 0xE5 && payload[cluster_size - 1] == 0xE5);
++
++	/* A clone reads its unallocated cluster 1 from the snapshot, whose second half holds data:
++	 * write-zeroes there allocates the cluster and zeroes it. */
++	spdk_bs_create_snapshot(bs, spdk_blob_get_id(blob), NULL, blob_op_with_id_complete, NULL);
++	poll_threads();
++	CU_ASSERT(g_bserrno == 0);
++	snapshotid = g_blobid;
++	spdk_bs_create_clone(bs, snapshotid, NULL, blob_op_with_id_complete, NULL);
++	poll_threads();
++	CU_ASSERT(g_bserrno == 0);
++	spdk_bs_open_blob(bs, g_blobid, blob_op_with_handle_complete, NULL);
++	poll_threads();
++	CU_ASSERT(g_bserrno == 0);
++	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
++	clone = g_blob;
++
++	spdk_blob_io_write_zeroes(clone, channel, io_units_per_cluster + half, half, blob_op_complete, NULL);
++	poll_threads();
++	CU_ASSERT(g_bserrno == 0);
++	CU_ASSERT(spdk_blob_get_num_allocated_clusters(clone) == 1);
++	memset(payload, 0xFF, cluster_size);
++	spdk_blob_io_read(clone, channel, payload, io_units_per_cluster, io_units_per_cluster, blob_op_complete, NULL);
++	poll_threads();
++	CU_ASSERT(g_bserrno == 0);
++	CU_ASSERT(spdk_mem_all_zero(payload, cluster_size));
++
++	free(payload);
++	ut_blob_close_and_delete(bs, clone);
++	ut_blob_close_and_delete(bs, blob);
++	spdk_bs_delete_blob(bs, snapshotid, blob_op_complete, NULL);
++	poll_threads();
++	CU_ASSERT(g_bserrno == 0);
++	spdk_bs_free_io_channel(channel);
++	poll_threads();
++	g_blob = NULL;
++	g_blobid = 0;
++}
++
+ static void
+ blob_thin_prov_unmap_cluster(void)
+ {
+@@ -10501,6 +10601,7 @@ main(int argc, char **argv)
+ 		CU_ADD_TEST(suite, blob_thin_prov_write_count_io);
+ 		CU_ADD_TEST(suite_bs, blob_thin_prov_new_cluster_reads_zeroes);
+ 		CU_ADD_TEST(suite_bs, blob_thin_prov_full_cluster_write_is_not_cleared_first);
++		CU_ADD_TEST(suite_bs, blob_thin_prov_write_zeroes_on_unallocated_cluster_allocates_nothing);
+ 		CU_ADD_TEST(suite, blob_thin_prov_unmap_cluster);
+ 		CU_ADD_TEST(suite_bs, blob_thin_prov_rle);
+ 		CU_ADD_TEST(suite_bs, blob_thin_prov_rw_iov);
