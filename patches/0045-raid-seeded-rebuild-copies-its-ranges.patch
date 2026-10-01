@@ -1,3 +1,102 @@
+diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
+index 5064454..583707e 100644
+--- a/module/bdev/raid/bdev_raid.c
++++ b/module/bdev/raid/bdev_raid.c
+@@ -3332,6 +3332,71 @@ raid_bdev_process_window_seeded_clean(struct raid_bdev_process *process)
+ 	return true;
+ }
+ 
++/* Evariops 0045: the copy of a seeded window — every seed range part the window
++ * holds, all under its one lock. The window then ends where everything before it
++ * is either copied or clean; out of requests, it ends at the first block not
++ * submitted, and the next window resumes there. Copying the window whole as soon
++ * as one range touched it made scattered writes copy the whole volume (5 GiB for
++ * 395 MiB of dirty chunks), and one window per range part made them pay a lock
++ * cycle per part (100 s for the same 395 MiB). Process thread only. */
++static void
++raid_bdev_process_window_seeded_copy(struct raid_bdev_process *process, uint64_t offset_end)
++{
++	const uint64_t offset = process->window_offset;
++	uint64_t covered = offset_end;
++	uint32_t idx;
++	int ret;
++
++	for (idx = process->seed_range_idx; idx < process->num_seed_ranges; idx++) {
++		const struct raid_bdev_seed_range *range = &process->seed_ranges[idx];
++		uint64_t start = spdk_max(range->offset_blocks, offset);
++		const uint64_t end = spdk_min(range->offset_blocks + range->num_blocks, offset_end);
++
++		if (start >= offset_end) {
++			break;
++		}
++		while (start < end) {
++			ret = raid_bdev_submit_process_request(process, start, end - start);
++			if (ret <= 0) {
++				covered = start;
++				goto submitted;
++			}
++			process->window_remaining += ret;
++			start += ret;
++		}
++	}
++
++submitted:
++	if (process->window_remaining > 0) {
++		process->window_size = covered - offset;
++	} else {
++		raid_bdev_process_finish(process, process->window_status);
++	}
++}
++
++/* Evariops 0045: a seeded process jumps, with no window, over what its ranges
++ * leave clean. Only a copy needs a window's quiesce (a write landing between the
++ * read of the source and the write of the target); the seeded target is a member
++ * of every channel for writes, so the routing by process.offset sends a write to
++ * it on either side of the offset. Without the jump, every clean window was
++ * locked and fast-skipped in turn: 262144 cycles on a 1 TiB volume, whatever its
++ * delta. Process thread, no window locked. */
++static void
++raid_bdev_process_seeded_skip_clean(struct raid_bdev_process *process)
++{
++	while (process->seed_range_idx < process->num_seed_ranges) {
++		const struct raid_bdev_seed_range *range = &process->seed_ranges[process->seed_range_idx];
++
++		if (range->offset_blocks + range->num_blocks <= process->window_offset) {
++			process->seed_range_idx++;
++			continue;
++		}
++		process->window_offset = spdk_max(process->window_offset, range->offset_blocks);
++		return;
++	}
++	process->window_offset = process->raid_bdev->bdev.blockcnt;
++}
++
+ static void
+ _raid_bdev_process_thread_run(struct raid_bdev_process *process)
+ {
+@@ -3351,6 +3416,11 @@ _raid_bdev_process_thread_run(struct raid_bdev_process *process)
+ 		return;
+ 	}
+ 
++	if (spdk_unlikely(process->seeded)) {
++		raid_bdev_process_window_seeded_copy(process, offset_end);
++		return;
++	}
++
+ 	while (offset < offset_end) {
+ 		ret = raid_bdev_submit_process_request(process, offset, offset_end - offset);
+ 		if (ret <= 0) {
+@@ -3907,6 +3977,10 @@ raid_bdev_process_thread_run(struct raid_bdev_process *process)
+ 		return;
+ 	}
+ 
++	if (spdk_unlikely(process->seeded)) {
++		raid_bdev_process_seeded_skip_clean(process);
++	}
++
+ 	if (process->window_offset == raid_bdev->bdev.blockcnt) {
+ 		SPDK_DEBUGLOG(bdev_raid, "process completed on %s\n", raid_bdev->bdev.name);
+ 		/* Evariops 0018: run the verify phase before concluding. The
 diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
 index 9efc3c3..f5a439b 100644
 --- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
