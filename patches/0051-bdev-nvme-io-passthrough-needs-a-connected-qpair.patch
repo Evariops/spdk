@@ -1,3 +1,27 @@
+diff --git a/module/bdev/nvme/nvme_rpc.c b/module/bdev/nvme/nvme_rpc.c
+index bbcb903..d43a9ec 100644
+--- a/module/bdev/nvme/nvme_rpc.c
++++ b/module/bdev/nvme/nvme_rpc.c
+@@ -162,7 +162,19 @@ nvme_rpc_io_cmd_bdev_nvme(struct rpc_bdev_nvme_send_cmd_ctx *ctx, struct spdk_nv
+ 	int ret;
+ 
+ 	ctx->ctrlr_io_ch = spdk_get_io_channel(_nvme_ctrlr);
++	if (ctx->ctrlr_io_ch == NULL) {
++		return -ENOMEM;
++	}
++
++	/* bdev_nvme frees a channel's I/O qpair from a disconnect until the reconnect (reset,
++	 * failed controller, delayed reconnect). Submitting on it dereferenced NULL and took the
++	 * whole process down, every raid with it; refuse the command instead. */
+ 	io_qpair = bdev_nvme_get_io_qpair(ctx->ctrlr_io_ch);
++	if (io_qpair == NULL) {
++		spdk_put_io_channel(ctx->ctrlr_io_ch);
++		ctx->ctrlr_io_ch = NULL;
++		return -ENXIO;
++	}
+ 
+ 	ret = spdk_nvme_ctrlr_cmd_io_raw_with_md(_nvme_ctrlr->ctrlr, io_qpair,
+ 			cmd, buf, nbytes, md_buf, nvme_rpc_bdev_nvme_cb, ctx);
 diff --git a/test/unit/lib/bdev/nvme/bdev_nvme.c/bdev_nvme_ut.c b/test/unit/lib/bdev/nvme/bdev_nvme.c/bdev_nvme_ut.c
 index c64dc7c..bd022fe 100644
 --- a/test/unit/lib/bdev/nvme/bdev_nvme.c/bdev_nvme_ut.c
