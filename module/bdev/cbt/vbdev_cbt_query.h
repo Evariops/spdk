@@ -45,4 +45,27 @@ int vbdev_cbt_query_latest_epoch(const char *bdev_name, struct vbdev_cbt_epoch_f
  */
 int vbdev_cbt_auto_epoch_open(const char *bdev_name, const char *stale_backend_id);
 
+/* One dirty range of an epoch, in blocks of the cbt bdev: the raid's own, since
+ * a cbt bdev passes its LBAs through. */
+struct vbdev_cbt_range {
+	uint64_t	offset_blocks;
+	uint64_t	num_blocks;
+};
+
+/**
+ * The dirty ranges of a frozen (or rebuilding) epoch of the cbt bdev named
+ * \c bdev_name, sorted and non-overlapping, for the raid module to seed a
+ * rebuild with in-process. A JSON-RPC request carries ~200 ranges at most
+ * (1024 parsed values, a 32 KiB receive buffer), and folding a scattered delta
+ * down to that many recopies every clean block in between.
+ *
+ * \param max the most ranges the caller takes. A delta with more is -E2BIG:
+ *            truncated, it would not be a smaller delta but a wrong one.
+ * \return 0 with \c *out allocated (the caller frees it; NULL when \c *count is
+ *         0); -ENODEV, -ENOENT or -EINVAL as bdev_cbt_epoch_get_dirty_ranges;
+ *         -E2BIG; -ENOMEM. App thread only.
+ */
+int vbdev_cbt_query_epoch_ranges(const char *bdev_name, const char *epoch_id, uint32_t max,
+				 struct vbdev_cbt_range **out, uint32_t *count);
+
 #endif /* SPDK_VBDEV_CBT_QUERY_H */

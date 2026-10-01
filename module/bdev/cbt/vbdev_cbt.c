@@ -573,6 +573,53 @@ vbdev_cbt_query_latest_epoch(const char *bdev_name, struct vbdev_cbt_epoch_facts
 	return 0;
 }
 
+/* Cross-module query — the delta of an epoch for the raid module's seeded
+ * rebuild (see vbdev_cbt_query.h): the ranges bdev_cbt_epoch_get_dirty_ranges
+ * walks, in the query's own type, refused whole when they do not all fit. */
+int
+vbdev_cbt_query_epoch_ranges(const char *bdev_name, const char *epoch_id, uint32_t max,
+			     struct vbdev_cbt_range **out, uint32_t *count)
+{
+	struct cbt_dirty_range *ranges = NULL;
+	struct vbdev_cbt_range *copy = NULL;
+	uint64_t dirty_chunks, total_chunks;
+	uint32_t num_ranges = 0, chunk_size_kb, i;
+	bool truncated = false;
+	int rc;
+
+	assert(spdk_get_thread() == spdk_thread_get_app_thread());
+
+	*out = NULL;
+	*count = 0;
+
+	rc = bdev_cbt_epoch_get_dirty_ranges(bdev_name, epoch_id, max, &ranges, &num_ranges,
+					     &dirty_chunks, &total_chunks, &chunk_size_kb, &truncated);
+	if (rc != 0) {
+		return rc;
+	}
+	if (truncated) {
+		free(ranges);
+		return -E2BIG;
+	}
+
+	if (num_ranges > 0) {
+		copy = calloc(num_ranges, sizeof(*copy));
+		if (copy == NULL) {
+			free(ranges);
+			return -ENOMEM;
+		}
+		for (i = 0; i < num_ranges; i++) {
+			copy[i].offset_blocks = ranges[i].offset_blocks;
+			copy[i].num_blocks = ranges[i].length_blocks;
+		}
+	}
+	free(ranges);
+
+	*out = copy;
+	*count = num_ranges;
+	return 0;
+}
+
 static int
 vbdev_cbt_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 {
