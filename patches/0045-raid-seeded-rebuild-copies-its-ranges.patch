@@ -1,0 +1,157 @@
+diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+index 9efc3c3..f5a439b 100644
+--- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
++++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+@@ -667,11 +667,23 @@ spdk_bdev_unquiesce(struct spdk_bdev *bdev, struct spdk_bdev_module *module,
+ 	return 0;
+ }
+ 
++/* Evariops 0045: the windows the copy phase of a process locks, the verify
++ * phase's aside, and the lowest of them. */
++static uint32_t g_copy_windows_locked;
++static uint64_t g_lowest_copy_window = UINT64_MAX;
++
+ int
+ spdk_bdev_quiesce_range(struct spdk_bdev *bdev, struct spdk_bdev_module *module,
+ 			uint64_t offset, uint64_t length,
+ 			spdk_bdev_quiesce_cb cb_fn, void *cb_arg)
+ {
++	struct raid_bdev *raid_bdev = SPDK_CONTAINEROF(bdev, struct raid_bdev, bdev);
++
++	if (raid_bdev->process != NULL && raid_bdev->process->verify == NULL) {
++		g_copy_windows_locked++;
++		g_lowest_copy_window = spdk_min(g_lowest_copy_window, offset);
++	}
++
+ 	if (cb_fn) {
+ 		cb_fn(cb_arg, 0);
+ 	}
+@@ -1547,6 +1559,118 @@ test_raid_process(void)
+ 	reset_globals();
+ }
+ 
++/* Evariops 0045: a seeded rebuild copies its seed ranges and nothing else. A
++ * window that intersected a range used to be copied whole: scattered writes
++ * across a volume dirty every window, and the "seeded" pass copied the volume.
++ * Runs the rebuild with the given window and returns the blocks copied. */
++static uint64_t
++run_seeded_rebuild(uint32_t window_size_kb, const struct raid_bdev_seed_range *seed, uint32_t num_ranges)
++{
++	struct rpc_bdev_raid_create req;
++	struct rpc_bdev_raid_delete destroy_req;
++	struct raid_bdev *pbdev;
++	struct spdk_bdev *base_bdev;
++	struct spdk_thread *process_thread;
++	struct raid_bdev_seed_range *ranges;
++	struct spdk_raid_bdev_opts opts = {};
++	uint64_t num_blocks_processed = 0;
++
++	set_globals();
++	CU_ASSERT(raid_bdev_init() == 0);
++	opts.process_window_size_kb = window_size_kb;
++	CU_ASSERT(raid_bdev_set_opts(&opts) == 0);
++	g_copy_windows_locked = 0;
++	g_lowest_copy_window = UINT64_MAX;
++
++	create_raid_bdev_create_req(&req, "raid1", 0, true, 0, false);
++	TAILQ_FOREACH(base_bdev, &g_bdev_list, internal.link) {
++		base_bdev->blockcnt = 128;
++	}
++	rpc_bdev_raid_create(NULL, NULL);
++	CU_ASSERT(g_rpc_err == 0);
++	free_test_req(&req);
++
++	TAILQ_FOREACH(pbdev, &g_raid_bdev_list, global_link) {
++		if (strcmp(pbdev->bdev.name, "raid1") == 0) {
++			break;
++		}
++	}
++	SPDK_CU_ASSERT_FATAL(pbdev != NULL);
++	pbdev->module_private = &num_blocks_processed;
++	pbdev->min_base_bdevs_operational = 0;
++
++	ranges = calloc(num_ranges, sizeof(*ranges));
++	SPDK_CU_ASSERT_FATAL(ranges != NULL);
++	memcpy(ranges, seed, num_ranges * sizeof(*ranges));
++	pbdev->base_bdev_info[0].write_only_pending = true;
++	CU_ASSERT(raid_bdev_start_seeded_rebuild(&pbdev->base_bdev_info[0], ranges, num_ranges, NULL) == 0);
++	poll_app_thread();
++	SPDK_CU_ASSERT_FATAL(pbdev->process != NULL);
++
++	process_thread = g_latest_thread;
++	while (spdk_thread_poll(process_thread, 0, 0) > 0) {
++		poll_app_thread();
++	}
++	CU_ASSERT(pbdev->process == NULL);
++	poll_app_thread();
++
++	create_raid_bdev_delete_req(&destroy_req, "raid1", 0);
++	rpc_bdev_raid_delete(NULL, NULL);
++	CU_ASSERT(g_rpc_err == 0);
++
++	/* The window size is global: put the default back for the next tests. */
++	opts.process_window_size_kb = 1024;
++	CU_ASSERT(raid_bdev_set_opts(&opts) == 0);
++	raid_bdev_exit();
++	base_bdevs_cleanup();
++	reset_globals();
++
++	return num_blocks_processed;
++}
++
++static void
++test_raid_process_seeded_copies_only_its_ranges(void)
++{
++	/* One 1 MiB window holds the whole 128-block raid: both ranges fall in it,
++	 * and are copied under that one window's lock. */
++	const struct raid_bdev_seed_range seed[] = {
++		{ .offset_blocks = 10, .num_blocks = 4 },
++		{ .offset_blocks = 40, .num_blocks = 8 },
++	};
++
++	CU_ASSERT(run_seeded_rebuild(1024, seed, 2) == 12);
++	CU_ASSERT(g_copy_windows_locked == 1);
++}
++
++static void
++test_raid_process_seeded_range_across_windows(void)
++{
++	/* 16 KiB windows of 4 blocks: [6, 15) starts mid-window and spans three,
++	 * the first of them at the range. */
++	const struct raid_bdev_seed_range seed[] = {
++		{ .offset_blocks = 6, .num_blocks = 9 },
++	};
++
++	CU_ASSERT(run_seeded_rebuild(16, seed, 1) == 9);
++	CU_ASSERT(g_copy_windows_locked == 3);
++	CU_ASSERT(g_lowest_copy_window == 6);
++}
++
++static void
++test_raid_process_seeded_skips_a_clean_span_without_a_window(void)
++{
++	/* A clean span needs no copy, hence no lock: the 25 windows before the
++	 * one range used to be locked and fast-skipped one after the other — on a
++	 * 1 TiB volume, 262144 window cycles for an empty delta. */
++	const struct raid_bdev_seed_range seed[] = {
++		{ .offset_blocks = 100, .num_blocks = 4 },
++	};
++
++	CU_ASSERT(run_seeded_rebuild(16, seed, 1) == 4);
++	CU_ASSERT(g_copy_windows_locked == 1);
++	CU_ASSERT(g_lowest_copy_window == 100);
++}
++
+ static void
+ test_raid_process_with_qos(void)
+ {
+@@ -1953,6 +2077,9 @@ main(int argc, char **argv)
+ 	CU_ADD_TEST(suite, test_raid_level_conversions);
+ 	CU_ADD_TEST(suite, test_raid_io_split);
+ 	CU_ADD_TEST(suite, test_raid_process);
++	CU_ADD_TEST(suite, test_raid_process_seeded_copies_only_its_ranges);
++	CU_ADD_TEST(suite, test_raid_process_seeded_range_across_windows);
++	CU_ADD_TEST(suite, test_raid_process_seeded_skips_a_clean_span_without_a_window);
+ 	CU_ADD_TEST(suite, test_raid_process_with_qos);
+ 
+ 	spdk_thread_lib_init(test_new_thread_fn, 0);
