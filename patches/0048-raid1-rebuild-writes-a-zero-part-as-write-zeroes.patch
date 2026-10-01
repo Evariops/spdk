@@ -1,3 +1,86 @@
+diff --git a/module/bdev/raid/bdev_raid.h b/module/bdev/raid/bdev_raid.h
+index f584d19..947359c 100644
+--- a/module/bdev/raid/bdev_raid.h
++++ b/module/bdev/raid/bdev_raid.h
+@@ -560,6 +560,18 @@ raid_bdev_unmap_blocks(struct raid_base_bdev_info *base_info, struct spdk_io_cha
+ 				      num_blocks, cb, cb_arg);
+ }
+ 
++/**
++ * Raid bdev I/O wrapper for spdk_bdev_write_zeroes_blocks function.
++ */
++static inline int
++raid_bdev_write_zeroes_blocks(struct raid_base_bdev_info *base_info, struct spdk_io_channel *ch,
++			      uint64_t offset_blocks, uint64_t num_blocks,
++			      spdk_bdev_io_completion_cb cb, void *cb_arg)
++{
++	return spdk_bdev_write_zeroes_blocks(base_info->desc, ch, base_info->data_offset + offset_blocks,
++					     num_blocks, cb, cb_arg);
++}
++
+ /**
+  * Raid bdev I/O read/write wrapper for spdk_bdev_flush_blocks function.
+  */
+diff --git a/module/bdev/raid/raid1.c b/module/bdev/raid/raid1.c
+index 51efb51..388b9a9 100644
+--- a/module/bdev/raid/raid1.c
++++ b/module/bdev/raid/raid1.c
+@@ -7,6 +7,7 @@
+ 
+ #include "spdk/likely.h"
+ #include "spdk/log.h"
++#include "spdk/string.h"	/* Evariops 0048: spdk_mem_all_zero */
+ #include "spdk/nvme_spec.h"	/* Evariops 0009: CAPACITY_EXCEEDED discrimination */
+ 
+ struct raid1_info {
+@@ -547,6 +548,24 @@ _raid1_process_submit_write(void *ctx)
+ 	raid1_process_submit_write(process_req);
+ }
+ 
++/* Evariops 0048: a part the source read back as nothing but zeroes goes to the target as
++ * write-zeroes — the same blocks, read back the same, and no payload on the wire, so a full
++ * rebuild of a sparse volume no longer ships its never-written clusters across the link. Not
++ * when the target cannot take write-zeroes (the bdev layer would send a zero buffer anyway), nor
++ * when the blocks carry metadata. */
++static bool
++raid1_process_part_is_zeroes(struct raid_bdev_process_request *process_req)
++{
++	struct raid_base_bdev_info *target = process_req->target;
++
++	if (target->raid_bdev->bdev.md_len != 0 ||
++	    !spdk_bdev_io_type_supported(spdk_bdev_desc_get_bdev(target->desc), SPDK_BDEV_IO_TYPE_WRITE_ZEROES)) {
++		return false;
++	}
++
++	return spdk_mem_all_zero(process_req->iov.iov_base, process_req->iov.iov_len);
++}
++
+ static void
+ raid1_process_submit_write(struct raid_bdev_process_request *process_req)
+ {
+@@ -554,11 +573,17 @@ raid1_process_submit_write(struct raid_bdev_process_request *process_req)
+ 	struct spdk_bdev_ext_io_opts io_opts;
+ 	int ret;
+ 
+-	raid1_init_ext_io_opts(&io_opts, raid_io);
+-	ret = raid_bdev_writev_blocks_ext(process_req->target, process_req->target_ch,
+-					  raid_io->iovs, raid_io->iovcnt,
+-					  raid_io->offset_blocks, raid_io->num_blocks,
+-					  raid1_process_write_completed, process_req, &io_opts);
++	if (raid1_process_part_is_zeroes(process_req)) {
++		ret = raid_bdev_write_zeroes_blocks(process_req->target, process_req->target_ch,
++						    raid_io->offset_blocks, raid_io->num_blocks,
++						    raid1_process_write_completed, process_req);
++	} else {
++		raid1_init_ext_io_opts(&io_opts, raid_io);
++		ret = raid_bdev_writev_blocks_ext(process_req->target, process_req->target_ch,
++						  raid_io->iovs, raid_io->iovcnt,
++						  raid_io->offset_blocks, raid_io->num_blocks,
++						  raid1_process_write_completed, process_req, &io_opts);
++	}
+ 	if (spdk_unlikely(ret != 0)) {
+ 		if (ret == -ENOMEM) {
+ 			raid_bdev_queue_io_wait(raid_io, spdk_bdev_desc_get_bdev(process_req->target->desc),
 diff --git a/test/unit/lib/bdev/raid/raid1.c/raid1_ut.c b/test/unit/lib/bdev/raid/raid1.c/raid1_ut.c
 index 88f4295..cad171b 100644
 --- a/test/unit/lib/bdev/raid/raid1.c/raid1_ut.c
