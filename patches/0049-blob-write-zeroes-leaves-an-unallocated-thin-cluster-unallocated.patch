@@ -1,3 +1,22 @@
+diff --git a/lib/blob/blobstore.c b/lib/blob/blobstore.c
+index 4d656c9..b3105f4 100644
+--- a/lib/blob/blobstore.c
++++ b/lib/blob/blobstore.c
+@@ -3255,6 +3255,14 @@ blob_request_submit_op_single(struct spdk_io_channel *_ch, struct spdk_blob *blo
+ 			}
+ 
+ 			bs_batch_close(batch);
++		} else if (op_type == SPDK_BLOB_WRITE_ZEROES && blob_backed_with_zeroes_dev(blob)) {
++			/* Evariops 0049: an unallocated cluster of a blob backed by zeroes already reads
++			 * zeroes, so zeroing it changes nothing: no cluster is allocated and nothing is
++			 * written. A full rebuild sends every never-written part of its source as
++			 * write-zeroes, and allocating each made the rebuilt replica fully allocated. A
++			 * clone reads its unallocated clusters from its parent and keeps the allocation. */
++			cb_fn(cb_arg, 0);
++			return;
+ 		} else {
+ 			/* Queue this operation and allocate the cluster */
+ 			spdk_bs_user_op_t *op;
 diff --git a/test/unit/lib/blob/blob.c/blob_ut.c b/test/unit/lib/blob/blob.c/blob_ut.c
 index 3bb3f5c..cdf55b1 100644
 --- a/test/unit/lib/blob/blob.c/blob_ut.c
