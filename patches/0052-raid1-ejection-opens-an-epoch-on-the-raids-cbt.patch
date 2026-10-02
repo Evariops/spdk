@@ -1,0 +1,220 @@
+diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+index a488d6d..c359160 100644
+--- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
++++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+@@ -242,10 +242,22 @@ DEFINE_STUB(vbdev_cbt_query_latest_epoch, int, (const char *bdev_name,
+ 		struct vbdev_cbt_epoch_facts *out), -ENODEV);
+ /* Evariops 0018: a rebuild's outcome turns to verifying before its verify pass. */
+ DEFINE_STUB_V(raid_rebuild_outcome_set_verifying, (struct raid_rebuild_outcome *outcome));
+-/* Evariops 0019: a raid1 ejection opens a CBT epoch on each survivor. No survivor
+- * has CBT here (-ENODEV), which the raid passes over. */
+-DEFINE_STUB(vbdev_cbt_auto_epoch_open, int, (const char *bdev_name, const char *stale_backend_id),
+-	    -ENODEV);
++/* Evariops 0019, 0052: a raid1 ejection opens a CBT epoch for the member that
++ * leaves. The CBT module is not part of this suite: this fake records what the
++ * raid asks it for. */
++static uint32_t g_ejection_epochs;
++static char g_ejection_epoch_over[64];
++static char g_ejection_epoch_member[64];
++
++int
++vbdev_cbt_auto_epoch_open(const char *bdev_name, const char *member_id)
++{
++	g_ejection_epochs++;
++	snprintf(g_ejection_epoch_over, sizeof(g_ejection_epoch_over), "%s", bdev_name);
++	snprintf(g_ejection_epoch_member, sizeof(g_ejection_epoch_member), "%s", member_id);
++
++	return 0;
++}
+ 
+ /* Evariops 0046: a seeded rebuild reads its ranges from a CBT epoch. The CBT
+  * module is not part of this suite: the epoch's delta is this fake's. */
+@@ -679,12 +691,15 @@ spdk_bdev_get_by_name(const char *bdev_name)
+ 	return NULL;
+ }
+ 
++/* Evariops 0052: the status a quiesce of a whole bdev completes with. */
++static int g_quiesce_status;
++
+ int
+ spdk_bdev_quiesce(struct spdk_bdev *bdev, struct spdk_bdev_module *module,
+ 		  spdk_bdev_quiesce_cb cb_fn, void *cb_arg)
+ {
+ 	if (cb_fn) {
+-		cb_fn(cb_arg, 0);
++		cb_fn(cb_arg, g_quiesce_status);
+ 	}
+ 
+ 	return 0;
+@@ -2156,6 +2171,162 @@ test_raid_io_split(void)
+ 	reset_globals();
+ }
+ 
++/* Evariops 0052: how the member in slot 0 leaves the raid. */
++enum ut_ejection {
++	/* removed by the control plane, or hot-removed with its bdev */
++	UT_EJECTION_REMOVED,
++	/* failed by an I/O error */
++	UT_EJECTION_FAILED,
++	/* failed again after its first removal failed */
++	UT_EJECTION_FAILED_AFTER_A_FAILED_REMOVAL,
++};
++
++/* Evariops 0052: creates a superblock raid1 whose members all sit CONFIGURED at
++ * one generation, lets setup change that, ejects the member in slot 0 and returns
++ * how many epochs the ejection opened; member receives that member's UUID. The
++ * suite stubs the superblock's allocation, so the raid gets one here, and the
++ * suite's own module stands in for raid1. */
++static uint32_t
++ejection_epochs_run(enum ut_ejection ejection,
++		    void (*setup)(struct raid_bdev *raid_bdev, struct raid_bdev_superblock *sb),
++		    char *member, size_t member_len)
++{
++	struct rpc_bdev_raid_create req;
++	struct rpc_bdev_raid_delete destroy_req;
++	struct raid_bdev_superblock *sb;
++	struct raid_base_bdev_info *base_info;
++	struct raid_bdev *pbdev;
++	uint8_t i;
++
++	set_globals();
++	CU_ASSERT(raid_bdev_init() == 0);
++	create_raid_bdev_create_req(&req, "raid1", 0, true, 0, true);
++	rpc_bdev_raid_create(NULL, NULL);
++	CU_ASSERT(g_rpc_err == 0);
++	free_test_req(&req);
++
++	pbdev = raid_bdev_find_by_name("raid1");
++	SPDK_CU_ASSERT_FATAL(pbdev != NULL);
++	pbdev->level = RAID1;
++	pbdev->min_base_bdevs_operational = 1;
++	sb = calloc(1, sizeof(*sb) + pbdev->num_base_bdevs * sizeof(sb->base_bdevs[0]));
++	SPDK_CU_ASSERT_FATAL(sb != NULL);
++	sb->base_bdevs_size = pbdev->num_base_bdevs;
++	for (i = 0; i < pbdev->num_base_bdevs; i++) {
++		sb->base_bdevs[i].slot = i;
++		sb->base_bdevs[i].state = RAID_SB_BASE_BDEV_CONFIGURED;
++		sb->base_bdevs[i].content_generation = 7;
++		pbdev->base_bdev_info[i].content_generation = 7;
++	}
++	pbdev->sb = sb;
++	if (setup != NULL) {
++		setup(pbdev, sb);
++	}
++
++	base_info = &pbdev->base_bdev_info[0];
++	spdk_uuid_fmt_lower(member, member_len, &base_info->uuid);
++	g_ejection_epochs = 0;
++	g_ejection_epoch_over[0] = '\0';
++	g_ejection_epoch_member[0] = '\0';
++
++	switch (ejection) {
++	case UT_EJECTION_REMOVED:
++		CU_ASSERT(raid_bdev_remove_base_bdev(spdk_bdev_desc_get_bdev(base_info->desc), NULL,
++						     NULL, NULL) == 0);
++		break;
++	case UT_EJECTION_FAILED_AFTER_A_FAILED_REMOVAL:
++		g_quiesce_status = -EIO;
++		raid_bdev_fail_base_bdev(base_info);
++		poll_app_thread();
++		g_quiesce_status = 0;
++		CU_ASSERT(base_info->is_configured);
++		CU_ASSERT(base_info->remove_error == -EIO);
++	/* fallthrough */
++	case UT_EJECTION_FAILED:
++		raid_bdev_fail_base_bdev(base_info);
++		break;
++	}
++	poll_app_thread();
++	CU_ASSERT(!base_info->is_configured);
++
++	pbdev->sb = NULL;
++	free(sb);
++	create_raid_bdev_delete_req(&destroy_req, "raid1", 0);
++	rpc_bdev_raid_delete(NULL, NULL);
++	CU_ASSERT(g_rpc_err == 0);
++	raid_bdev_exit();
++	base_bdevs_cleanup();
++	reset_globals();
++
++	return g_ejection_epochs;
++}
++
++/* Evariops 0052: a raid1 member that leaves current, removed or failed, opens one
++ * epoch, on the cbt bdev stacked on the raid and named after the member's UUID:
++ * the identity the control plane derives from the replica it placed there. 0019
++ * opened one under each survivor's own name, a bdev no cbt sits on (-ENODEV), so
++ * a member lost without notice was always rebuilt in full. */
++static void
++test_raid1_ejection_opens_an_epoch_on_the_raids_cbt(void)
++{
++	const enum ut_ejection ejections[] = { UT_EJECTION_REMOVED, UT_EJECTION_FAILED };
++	char member[SPDK_UUID_STRING_LEN];
++	size_t i;
++
++	for (i = 0; i < SPDK_COUNTOF(ejections); i++) {
++		CU_ASSERT(ejection_epochs_run(ejections[i], NULL, member, sizeof(member)) == 1);
++		CU_ASSERT(strcmp(g_ejection_epoch_over, "raid1") == 0);
++		CU_ASSERT(strcmp(g_ejection_epoch_member, member) == 0);
++	}
++}
++
++static void
++ut_member_rebuilt_in_full(struct raid_bdev *raid_bdev, struct raid_bdev_superblock *sb)
++{
++	sb->base_bdevs[0].state = RAID_SB_BASE_BDEV_MISSING;
++}
++
++static void
++ut_member_behind(struct raid_bdev *raid_bdev, struct raid_bdev_superblock *sb)
++{
++	sb->base_bdevs[0].content_generation = 6;
++	raid_bdev->base_bdev_info[0].content_generation = 6;
++}
++
++static void
++ut_member_joining_write_only(struct raid_bdev *raid_bdev, struct raid_bdev_superblock *sb)
++{
++	raid_bdev->base_bdev_info[0].write_only_pending = true;
++	raid_bdev->base_bdev_info[0].read_excluded = true;
++}
++
++static void
++ut_no_superblock(struct raid_bdev *raid_bdev, struct raid_bdev_superblock *sb)
++{
++	raid_bdev->sb = NULL;
++}
++
++/* Evariops 0052: an epoch holds the writes a member misses from its departure on.
++ * A member that already lacked some (being rebuilt in full, behind the generation
++ * its peers carry, or joining write-only) would be seeded with less than it owes,
++ * and so would one a removal already failed to take, which may have missed writes
++ * since that attempt. None of their ejections opens an epoch, nor one with no
++ * superblock to tell: each of them is rebuilt in full. */
++static void
++test_raid1_ejection_of_a_member_behind_opens_no_epoch(void)
++{
++	char member[SPDK_UUID_STRING_LEN];
++
++	CU_ASSERT(ejection_epochs_run(UT_EJECTION_REMOVED, ut_member_rebuilt_in_full,
++				      member, sizeof(member)) == 0);
++	CU_ASSERT(ejection_epochs_run(UT_EJECTION_REMOVED, ut_member_behind, member, sizeof(member)) == 0);
++	CU_ASSERT(ejection_epochs_run(UT_EJECTION_REMOVED, ut_member_joining_write_only,
++				      member, sizeof(member)) == 0);
++	CU_ASSERT(ejection_epochs_run(UT_EJECTION_REMOVED, ut_no_superblock, member, sizeof(member)) == 0);
++	CU_ASSERT(ejection_epochs_run(UT_EJECTION_FAILED_AFTER_A_FAILED_REMOVAL, NULL,
++				      member, sizeof(member)) == 0);
++}
++
+ static int
+ test_new_thread_fn(struct spdk_thread *thread)
+ {
+@@ -2207,6 +2378,8 @@ main(int argc, char **argv)
+ 	CU_ADD_TEST(suite, test_raid_seeded_rebuild_from_epoch_refuses_a_delta_it_cannot_take_whole);
+ 	CU_ADD_TEST(suite, test_raid_process_request_max_part);
+ 	CU_ADD_TEST(suite, test_raid_process_with_qos);
++	CU_ADD_TEST(suite, test_raid1_ejection_opens_an_epoch_on_the_raids_cbt);
++	CU_ADD_TEST(suite, test_raid1_ejection_of_a_member_behind_opens_no_epoch);
+ 
+ 	spdk_thread_lib_init(test_new_thread_fn, 0);
+ 	g_app_thread = spdk_thread_create("app_thread", NULL);
