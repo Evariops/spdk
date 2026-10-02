@@ -1,3 +1,142 @@
+diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
+index da919f1..22ea08b 100644
+--- a/module/bdev/raid/bdev_raid.c
++++ b/module/bdev/raid/bdev_raid.c
+@@ -516,6 +516,7 @@ raid_bdev_free_base_bdev_resource(struct raid_base_bdev_info *base_info)
+ 	/* Evariops 0033: reset remove_error with is_failed, so a reused slot never
+ 	 * inherits the previous incarnation's removal failure. */
+ 	base_info->remove_error = 0;
++	base_info->removal_failed = false;
+ 	raid_bdev_base_bdev_state_touch(base_info);
+ 
+ 	/* clear `data_offset` to allow it to be recalculated during configuration */
+@@ -2271,12 +2272,69 @@ raid_bdev_remove_base_bdev_write_sb_cb(int status, struct raid_bdev *raid_bdev,
+ 	raid_bdev_remove_base_bdev_cont(base_info);
+ }
+ 
++static uint64_t raid_bdev_sb_max_content_generation(const struct raid_bdev_superblock *sb);
++
++/* Evariops 0052: whether the member leaving held every write the raid acknowledged
++ * before it left: its superblock slot CONFIGURED at the generation its peers carry
++ * (read before the ejection rewrites the slot), not a write-only joiner, and not a
++ * failed member whose earlier removal failed, which may have missed writes since. */
++static bool
++raid_bdev_base_bdev_left_current(struct raid_base_bdev_info *base_info)
++{
++	const struct raid_bdev_superblock *sb = base_info->raid_bdev->sb;
++	uint8_t slot = raid_bdev_base_bdev_slot(base_info);
++	uint8_t i;
++
++	if (sb == NULL || base_info->write_only_pending || base_info->read_excluded ||
++	    base_info->removal_failed) {
++		return false;
++	}
++
++	for (i = 0; i < sb->base_bdevs_size; i++) {
++		const struct raid_bdev_sb_base_bdev *sb_base_bdev = &sb->base_bdevs[i];
++
++		if (sb_base_bdev->state == RAID_SB_BASE_BDEV_CONFIGURED && sb_base_bdev->slot == slot) {
++			return sb_base_bdev->content_generation == raid_bdev_sb_max_content_generation(sb);
++		}
++	}
++
++	return false;
++}
++
++/* Evariops 0019, 0052: bound the delta the moment a raid1 member leaves. The cbt
++ * bdev stacked on the raid opens an epoch named after the member's UUID, which the
++ * control plane derives from the replica it placed there, and records from then on
++ * every write the member misses. Only for a member that left current: the epoch
++ * holds what it misses from now on, not what it never had. -EEXIST means the cbt
++ * already carries a live epoch, -ENODEV that no cbt sits on the raid; the member is
++ * then rebuilt in full, as it is when it leaves behind. */
++static void
++raid_bdev_open_ejection_epoch(struct raid_base_bdev_info *base_info)
++{
++	struct raid_bdev *raid_bdev = base_info->raid_bdev;
++	char member_id[SPDK_UUID_STRING_LEN];
++	int rc;
++
++	if (raid_bdev->level != RAID1 || spdk_uuid_is_null(&base_info->uuid) ||
++	    !raid_bdev_base_bdev_left_current(base_info)) {
++		return;
++	}
++
++	spdk_uuid_fmt_lower(member_id, sizeof(member_id), &base_info->uuid);
++	rc = vbdev_cbt_auto_epoch_open(raid_bdev->bdev.name, member_id);
++	if (rc != 0 && rc != -EEXIST && rc != -ENODEV) {
++		SPDK_WARNLOG("raid bdev '%s': no epoch for ejected member '%s' (%s): %s; it will be "
++			     "rebuilt in full\n", raid_bdev->bdev.name,
++			     base_info->name != NULL ? base_info->name : "(null)", member_id,
++			     spdk_strerror(-rc));
++	}
++}
++
+ static void
+ raid_bdev_remove_base_bdev_on_quiesced(void *ctx, int status)
+ {
+ 	struct raid_base_bdev_info *base_info = ctx;
+ 	struct raid_bdev *raid_bdev = base_info->raid_bdev;
+-	struct raid_base_bdev_info *survivor;
+ 
+ 	if (status != 0) {
+ 		SPDK_ERRLOG("Failed to quiesce raid bdev %s: %s\n",
+@@ -2285,28 +2343,7 @@ raid_bdev_remove_base_bdev_on_quiesced(void *ctx, int status)
+ 		return;
+ 	}
+ 
+-	/* Evariops 0019: bound the delta the moment the member leaves, by opening
+-	 * an auto epoch on every surviving member's cbt — each survivor then records
+-	 * every post-ejection write. -EEXIST means a live round already bounds it,
+-	 * -ENODEV that the member is not cbt-wrapped; both are expected. */
+-	if (raid_bdev->level == RAID1 && base_info->name != NULL) {
+-		RAID_FOR_EACH_BASE_BDEV(raid_bdev, survivor) {
+-			int rc;
+-
+-			if (survivor == base_info || !survivor->is_configured ||
+-			    survivor->name == NULL) {
+-				continue;
+-			}
+-			rc = vbdev_cbt_auto_epoch_open(survivor->name, base_info->name);
+-			if (rc != 0 && rc != -EEXIST && rc != -ENODEV) {
+-				SPDK_WARNLOG("raid bdev '%s': auto epoch on '%s' for "
+-					     "ejected '%s' failed: %s — the debt path "
+-					     "will degrade to a full rebuild (D14)\n",
+-					     raid_bdev->bdev.name, survivor->name,
+-					     base_info->name, spdk_strerror(-rc));
+-			}
+-		}
+-	}
++	raid_bdev_open_ejection_epoch(base_info);
+ 
+ 	if (raid_bdev->sb) {
+ 		struct raid_bdev_superblock *sb = raid_bdev->sb;
+@@ -2599,6 +2636,9 @@ raid_bdev_fail_base_remove_cb(void *ctx, int status)
+ 	 * local reflex. Service I/O is unaffected either way: raid1 routes on the
+ 	 * slot's channel, never on is_failed. */
+ 	base_info->remove_error = status;
++	/* Evariops 0052: unlike remove_error, which the next attempt clears, this
++	 * stays until the slot is freed. */
++	base_info->removal_failed = true;
+ 	raid_bdev_base_bdev_state_touch(base_info);
+ 
+ 	SPDK_NOTICELOG("Failed to remove failed base bdev '%s' from raid bdev '%s' slot %d: %s (%d) — the member "
+diff --git a/module/bdev/raid/bdev_raid.h b/module/bdev/raid/bdev_raid.h
+index 947359c..8f5d692 100644
+--- a/module/bdev/raid/bdev_raid.h
++++ b/module/bdev/raid/bdev_raid.h
+@@ -116,6 +116,11 @@ struct raid_base_bdev_info {
+ 	 * the only thing that re-arms the local fail path. */
+ 	int			remove_error;
+ 
++	/* Evariops 0052: a removal of this failed member has itself failed. The member
++	 * may have missed writes since, so the removal that finally takes it opens no
++	 * CBT epoch. Cleared with remove_error when the slot is freed. */
++	bool			removal_failed;
++
+ 	/* callback for base bdev configuration */
+ 	raid_base_bdev_cb	configure_cb;
+ 
 diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
 index a488d6d..c359160 100644
 --- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c

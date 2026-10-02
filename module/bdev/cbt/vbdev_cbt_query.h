@@ -33,17 +33,21 @@ struct vbdev_cbt_epoch_facts {
 int vbdev_cbt_query_latest_epoch(const char *bdev_name, struct vbdev_cbt_epoch_facts *out);
 
 /**
- * Open a delta epoch bounding an unplanned member loss. The raid module calls
- * this on each surviving member's cbt when a member leaves, so the missing
- * writes stay a delta instead of degrading to a full rebuild. The generated
- * epoch id and nonce are reported through get_bdevs, which is how the
- * control-plane adopts the round.
+ * Open a delta epoch bounding an unplanned member loss, on the cbt bdev stacked
+ * on the bdev named \c base_bdev_name. The raid module calls this when a current
+ * member leaves a raid1, with the raid's name and the member's UUID as
+ * \c member_id: from then on the cbt records every write the member misses, so
+ * its return is a delta instead of a full rebuild. The generated epoch id and
+ * nonce are reported through get_bdevs, which is how the control-plane adopts
+ * the round.
  *
- * \return 0 on success; -EEXIST if an OPEN epoch already tracks the round
- *         (never take over implicitly); -ENODEV if \c bdev_name is not a cbt
- *         bdev; other negative errno from the epoch machinery. App thread only.
+ * \return 0 on success; -EEXIST if the cbt carries a live epoch (open, frozen or
+ *         rebuilding): never take a round over, nor start one short of writes a
+ *         freeze took out of the live bitmap; -ENODEV if no cbt bdev sits on
+ *         \c base_bdev_name; other negative errno from the epoch machinery. App
+ *         thread only.
  */
-int vbdev_cbt_auto_epoch_open(const char *bdev_name, const char *stale_backend_id);
+int vbdev_cbt_auto_epoch_open(const char *base_bdev_name, const char *member_id);
 
 /* One dirty range of an epoch, in blocks of the cbt bdev: the raid's own, since
  * a cbt bdev passes its LBAs through. */

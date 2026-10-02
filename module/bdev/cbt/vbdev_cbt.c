@@ -503,44 +503,61 @@ cbt_epoch_state_name(enum cbt_epoch_state state)
 	}
 }
 
-/* Epoch-at-ejection — see vbdev_cbt_query.h. Refuses (-EEXIST) when an OPEN
- * epoch already bounds the round: an implicit takeover would steal the nonce
- * from under the controller. FROZEN/REBUILDING epochs do not block — those are
- * prior rounds being digested while the live bitmap keeps tracking. */
+/* The cbt bdev stacked on the bdev named base_bdev_name, if any. */
+static struct vbdev_cbt *
+cbt_find_by_base_name(const char *base_bdev_name)
+{
+	struct vbdev_cbt *node;
+
+	TAILQ_FOREACH(node, &g_cbt_nodes, link) {
+		if (node->base_bdev != NULL &&
+		    strcmp(spdk_bdev_get_name(node->base_bdev), base_bdev_name) == 0) {
+			return node;
+		}
+	}
+	return NULL;
+}
+
+/* Epoch-at-ejection — see vbdev_cbt_query.h. Refuses (-EEXIST) while the cbt
+ * carries a live epoch. An open one bounds a round the controller started, and
+ * taking it over would steal its nonce. A frozen or rebuilding one may have taken
+ * out of the live bitmap, at its freeze, writes the member missed just before it
+ * left: an epoch opened now would start short of them. */
 int
-vbdev_cbt_auto_epoch_open(const char *bdev_name, const char *stale_backend_id)
+vbdev_cbt_auto_epoch_open(const char *base_bdev_name, const char *member_id)
 {
 	struct vbdev_cbt *cbt;
 	struct cbt_epoch *ep;
 	char epoch_id[CBT_EPOCH_ID_MAX];
 	char nonce[CBT_NONCE_MAX];
+	const char *cbt_name;
 	uint64_t max_gen = 0;
 	uint64_t ticks = spdk_get_ticks();
 
 	assert(spdk_get_thread() == spdk_thread_get_app_thread());
 
-	cbt = cbt_find_by_name(bdev_name);
+	cbt = cbt_find_by_base_name(base_bdev_name);
 	if (cbt == NULL) {
 		return -ENODEV;
 	}
+	if (cbt_any_epoch_open(cbt)) {
+		return -EEXIST;
+	}
 
 	TAILQ_FOREACH(ep, &cbt->epochs, link) {
-		if (ep->state == CBT_EPOCH_OPEN) {
-			return -EEXIST;
-		}
 		if (ep->generation > max_gen) {
 			max_gen = ep->generation;
 		}
 	}
 
+	cbt_name = spdk_bdev_get_name(&cbt->cbt_bdev);
 	snprintf(epoch_id, sizeof(epoch_id), "auto-%016" PRIx64, ticks);
 	snprintf(nonce, sizeof(nonce), "auto%08x", (uint32_t)ticks);
 
-	SPDK_NOTICELOG("CBT: auto epoch '%s' (nonce %s) on '%s' — member '%s' ejected\n",
-		       epoch_id, nonce, bdev_name, stale_backend_id);
+	SPDK_NOTICELOG("CBT: auto epoch '%s' (nonce %s) on '%s' — member '%s' left '%s'\n",
+		       epoch_id, nonce, cbt_name, member_id, base_bdev_name);
 
-	return bdev_cbt_epoch_open(bdev_name, epoch_id, stale_backend_id,
-				   max_gen + 1, nonce);
+	return bdev_cbt_epoch_open(cbt_name, epoch_id, member_id, max_gen + 1, nonce);
 }
 
 /* Cross-module query — the raid module publishes these facts per member in ITS
