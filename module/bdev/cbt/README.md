@@ -55,6 +55,8 @@ The module cannot converge on its own when the write rate approaches rebuild ban
 
 Clearing is reset-driven: there is no automatic clear. Once the backend is re-added and all backends are synchronized, the orchestrator MUST call `bdev_cbt_reset`, or the bitmap grows monotonically and "partial" rebuilds degrade toward full-surface copies.
 
+A reset needs a moment when every backend is known in sync, and a member that leaves without notice gives none: the epoch the raid opens at its ejection (`vbdev_cbt_auto_epoch_open`) cannot clear anything, since the writes the member just missed are in the live bitmap. So the live bitmap is also kept in windows: `bdev_cbt_rotate`, called periodically while no epoch is live, moves it to a previous-window bitmap and starts it again empty, and the epoch at ejection takes the previous window back before it opens. Its delta then holds one to two windows of writes before the departure, and everything after, instead of every write since the last reset. Two rotations are at least `CBT_ROTATE_MIN_INTERVAL_US` (10 s) apart whoever asks, so a write missed a few milliseconds before the ejection is always in one of the two bitmaps. A reset clears both.
+
 ## RAID integration
 
 The companion patch (`patches/0001-raid-add-skip_rebuild-parameter.patch`) adds a `skip_rebuild` boolean to `bdev_raid_add_base_bdev`. When true, the RAID module skips its full surface rebuild and instead quiesces the raid, opens `base_channel[slot]` on every existing I/O channel for the re-added bdev — without this, existing channels would never write to the backend — then unquiesces and writes the superblock.
