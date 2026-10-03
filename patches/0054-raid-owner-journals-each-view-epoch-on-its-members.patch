@@ -1,0 +1,596 @@
+diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
+index c18bde7..0bd65e1 100644
+--- a/module/bdev/raid/bdev_raid.c
++++ b/module/bdev/raid/bdev_raid.c
+@@ -5147,6 +5147,77 @@ raid_bdev_lay_out_view(struct raid_bdev *raid_bdev, const struct raid_bdev_view
+ 	return 0;
+ }
+ 
++/* Evariops 0054: an owner that stays in the view stamps each new epoch on the
++ * members it serves, so a create from a view no more recent finds the legs held
++ * and is refused for as long as the owner serves. The stamp names the raid's
++ * incarnation, which takes over the stamp of a raid it claimed after a
++ * reassembly, and a raid created outside the view protocol joins its volume's
++ * view through it. The same epoch is written again, so a journal whose write
++ * failed is retried as it was. */
++int
++raid_bdev_journal_view_epoch(struct raid_bdev *raid_bdev, uint64_t epoch,
++			     const struct spdk_uuid *lineage, raid_bdev_write_sb_cb cb, void *cb_ctx)
++{
++	struct raid_bdev_superblock *sb = raid_bdev->sb;
++	struct raid_base_bdev_info *base_info;
++	uint8_t i;
++
++	assert(spdk_get_thread() == spdk_thread_get_app_thread());
++
++	if (raid_bdev->state != RAID_BDEV_STATE_ONLINE || sb == NULL ||
++	    raid_bdev->incarnation == NULL || epoch == 0) {
++		return -EINVAL;
++	}
++
++	if (lineage != NULL && !spdk_uuid_is_null(&raid_bdev->lineage) &&
++	    spdk_uuid_compare(lineage, &raid_bdev->lineage) != 0) {
++		return -EEXIST;
++	}
++
++	if (lineage == NULL && spdk_uuid_is_null(&raid_bdev->lineage)) {
++		return -EINVAL;
++	}
++
++	if (epoch < raid_bdev->view_epoch) {
++		return -ESTALE;
++	}
++
++	if (spdk_uuid_is_null(&raid_bdev->lineage)) {
++		spdk_uuid_copy(&raid_bdev->lineage, lineage);
++	}
++	raid_bdev->view_epoch = epoch;
++
++	/* a superblock an older image wrote has no stamp to read before minor 2 */
++	if (sb->version.minor < 2) {
++		sb->version.minor = 2;
++	}
++	spdk_uuid_copy(&sb->lineage, &raid_bdev->lineage);
++	memset(sb->owner, 0, sizeof(sb->owner));
++	snprintf((char *)sb->owner, sizeof(sb->owner), "%s", raid_bdev->incarnation);
++	sb->view_epoch = epoch;
++
++	for (i = 0; i < sb->base_bdevs_size; i++) {
++		struct raid_bdev_sb_base_bdev *sb_base_bdev = &sb->base_bdevs[i];
++
++		if (sb_base_bdev->state != RAID_SB_BASE_BDEV_CONFIGURED ||
++		    sb_base_bdev->slot >= raid_bdev->num_base_bdevs) {
++			continue;
++		}
++
++		base_info = &raid_bdev->base_bdev_info[sb_base_bdev->slot];
++		if (!base_info->is_configured) {
++			continue;
++		}
++
++		sb_base_bdev->view_epoch = epoch;
++		base_info->view_epoch = epoch;
++	}
++
++	raid_bdev_write_superblock(raid_bdev, cb, cb_ctx);
++
++	return 0;
++}
++
+ static void raid_bdev_examine_sb(const struct raid_bdev_superblock *sb, struct spdk_bdev *bdev,
+ 				 raid_base_bdev_cb cb_fn, void *cb_ctx);
+ 
+diff --git a/module/bdev/raid/bdev_raid.h b/module/bdev/raid/bdev_raid.h
+index 2594564..5c30917 100644
+--- a/module/bdev/raid/bdev_raid.h
++++ b/module/bdev/raid/bdev_raid.h
+@@ -793,6 +793,14 @@ void raid_bdev_write_superblock(struct raid_bdev *raid_bdev, raid_bdev_write_sb_
+ int raid_bdev_load_base_bdev_superblock(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+ 					raid_bdev_load_sb_cb cb, void *cb_ctx);
+ 
++/* Evariops 0054: stamps view epoch on an online raid's members, under the raid's
++ * incarnation; lineage joins a raid created outside the view protocol to its
++ * volume's view. cb reports the superblock write. -ESTALE for an epoch older
++ * than the raid's, -EEXIST for another lineage, -EINVAL for a raid offline,
++ * without a superblock or an owner, or outside the view without a lineage. */
++int raid_bdev_journal_view_epoch(struct raid_bdev *raid_bdev, uint64_t epoch,
++				 const struct spdk_uuid *lineage, raid_bdev_write_sb_cb cb, void *cb_ctx);
++
+ struct spdk_raid_bdev_opts {
+ 	/* Size of the background process window in KiB */
+ 	uint32_t process_window_size_kb;
+diff --git a/module/bdev/raid/bdev_raid_rpc.c b/module/bdev/raid/bdev_raid_rpc.c
+index 9119230..aada046 100644
+--- a/module/bdev/raid/bdev_raid_rpc.c
++++ b/module/bdev/raid/bdev_raid_rpc.c
+@@ -597,6 +597,83 @@ rpc_bdev_raid_claim(struct spdk_jsonrpc_request *request, const struct spdk_json
+ }
+ SPDK_RPC_REGISTER("bdev_raid_claim", rpc_bdev_raid_claim, SPDK_RPC_RUNTIME)
+ 
++/* Evariops 0054: the raid's owner stamps a new view epoch on its members. Only
++ * the raid's incarnation journals (-ESTALE for another), and lineage joins a
++ * raid created outside the view protocol to its volume's view. */
++struct rpc_bdev_raid_journal_view_epoch {
++	char			*name;
++	uint64_t		view_epoch;
++	char			*expected_incarnation;
++	struct spdk_uuid	lineage;
++};
++
++static const struct spdk_json_object_decoder rpc_bdev_raid_journal_view_epoch_decoders[] = {
++	{"name", offsetof(struct rpc_bdev_raid_journal_view_epoch, name), spdk_json_decode_string},
++	{"view_epoch", offsetof(struct rpc_bdev_raid_journal_view_epoch, view_epoch), spdk_json_decode_uint64},
++	{"expected_incarnation", offsetof(struct rpc_bdev_raid_journal_view_epoch, expected_incarnation), spdk_json_decode_string},
++	{"lineage", offsetof(struct rpc_bdev_raid_journal_view_epoch, lineage), spdk_json_decode_uuid, true},
++};
++
++static void
++rpc_bdev_raid_journal_view_epoch_written(int status, struct raid_bdev *raid_bdev, void *ctx)
++{
++	struct spdk_jsonrpc_request *request = ctx;
++
++	if (status != 0) {
++		spdk_jsonrpc_send_error_response_fmt(request, status,
++						     "raid bdev %s: view epoch %" PRIu64 " not written: %s",
++						     raid_bdev->bdev.name, raid_bdev->view_epoch,
++						     spdk_strerror(-status));
++		return;
++	}
++
++	spdk_jsonrpc_send_bool_response(request, true);
++}
++
++static void
++rpc_bdev_raid_journal_view_epoch(struct spdk_jsonrpc_request *request,
++				 const struct spdk_json_val *params)
++{
++	struct rpc_bdev_raid_journal_view_epoch req = {};
++	struct raid_bdev *raid_bdev;
++	int rc;
++
++	if (spdk_json_decode_object(params, rpc_bdev_raid_journal_view_epoch_decoders,
++				    SPDK_COUNTOF(rpc_bdev_raid_journal_view_epoch_decoders), &req)) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
++						 "Invalid parameters");
++		goto cleanup;
++	}
++
++	raid_bdev = raid_bdev_find_by_name(req.name);
++	if (raid_bdev == NULL) {
++		spdk_jsonrpc_send_error_response_fmt(request, -ENODEV, "No such raid bdev: %s", req.name);
++		goto cleanup;
++	}
++
++	rc = raid_bdev_check_incarnation(raid_bdev, req.expected_incarnation);
++	if (rc != 0) {
++		spdk_jsonrpc_send_error_response_fmt(request, rc,
++						     "raid bdev %s belongs to another incarnation than '%s'",
++						     req.name, req.expected_incarnation);
++		goto cleanup;
++	}
++
++	rc = raid_bdev_journal_view_epoch(raid_bdev, req.view_epoch,
++					  spdk_uuid_is_null(&req.lineage) ? NULL : &req.lineage,
++					  rpc_bdev_raid_journal_view_epoch_written, request);
++	if (rc != 0) {
++		spdk_jsonrpc_send_error_response_fmt(request, rc,
++						     "raid bdev %s: view epoch %" PRIu64 " not journaled "
++						     "(the raid's: %" PRIu64 "): %s", req.name, req.view_epoch,
++						     raid_bdev->view_epoch, spdk_strerror(-rc));
++	}
++cleanup:
++	free(req.name);
++	free(req.expected_incarnation);
++}
++SPDK_RPC_REGISTER("bdev_raid_journal_view_epoch", rpc_bdev_raid_journal_view_epoch, SPDK_RPC_RUNTIME)
++
+ /*
+  * Input structure for RPC deleting a raid bdev
+  */
+diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+index 0f21d2c..beaec9b 100644
+--- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
++++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+@@ -355,7 +355,7 @@ spdk_bdev_get_data_block_size(const struct spdk_bdev *bdev)
+  * its later superblock when it has one: a leg that changed between a create's
+  * survey and its claim. */
+ #define UT_LEGS_MAX 4
+-#define UT_SBS_MAX 8
++#define UT_SBS_MAX 16
+ 
+ struct ut_leg {
+ 	const char			*name;
+@@ -413,6 +413,23 @@ ut_legs_reset(void)
+ 	}
+ }
+ 
++/* Evariops 0054: a superblock buffer, freed with the legs. */
++static struct raid_bdev_superblock *
++ut_sb_alloc(void)
++{
++	struct raid_bdev_superblock *sb;
++	size_t i;
++
++	for (i = 0; i < SPDK_COUNTOF(g_ut_sbs) && g_ut_sbs[i] != NULL; i++) {
++	}
++	SPDK_CU_ASSERT_FATAL(i < SPDK_COUNTOF(g_ut_sbs));
++	sb = calloc(1, RAID_BDEV_SB_MAX_LENGTH);
++	SPDK_CU_ASSERT_FATAL(sb != NULL);
++	g_ut_sbs[i] = sb;
++
++	return sb;
++}
++
+ int
+ raid_bdev_load_base_bdev_superblock(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+ 				    raid_bdev_load_sb_cb cb, void *cb_ctx)
+@@ -450,10 +467,33 @@ raid_bdev_load_base_bdev_superblock(struct spdk_bdev_desc *desc, struct spdk_io_
+ 	return 0;
+ }
+ 
++/* Evariops 0054: the superblock writes the raids ask for, the status they
++ * complete with, and, while g_ut_sb_writes_land, each lands on the raid's
++ * configured members as the superblock their next read returns. */
++static uint32_t g_ut_sb_writes;
++static int g_ut_sb_write_status;
++static bool g_ut_sb_writes_land;
++
+ void
+ raid_bdev_write_superblock(struct raid_bdev *raid_bdev, raid_bdev_write_sb_cb cb, void *cb_ctx)
+ {
+-	cb(0, raid_bdev, cb_ctx);
++	struct raid_base_bdev_info *base_info;
++	struct raid_bdev_superblock *landed;
++
++	g_ut_sb_writes++;
++	if (g_ut_sb_write_status == 0 && g_ut_sb_writes_land && raid_bdev->sb != NULL) {
++		landed = ut_sb_alloc();
++		memcpy(landed, raid_bdev->sb, RAID_BDEV_SB_MAX_LENGTH);
++		RAID_FOR_EACH_BASE_BDEV(raid_bdev, base_info) {
++			if (base_info->is_configured && base_info->desc != NULL) {
++				struct ut_leg *leg = ut_leg(spdk_bdev_desc_get_bdev(base_info->desc)->name);
++
++				leg->sb = landed;
++				leg->later_sb = NULL;
++			}
++		}
++	}
++	cb(g_ut_sb_write_status, raid_bdev, cb_ctx);
+ }
+ 
+ const struct spdk_uuid *
+@@ -2498,6 +2538,8 @@ ut_view_teardown(void)
+ 	reset_globals();
+ 	ut_legs_reset();
+ 	g_ut_alloc_superblock = false;
++	g_ut_sb_write_status = 0;
++	g_ut_sb_writes_land = false;
+ 	g_max_base_drives = g_ut_saved_max_base_drives;
+ }
+ 
+@@ -2519,15 +2561,7 @@ ut_view_create_req(struct rpc_bdev_raid_create *r, uint64_t epoch)
+ static struct raid_bdev_superblock *
+ ut_sb(const struct spdk_uuid *lineage, const char *owner, uint64_t epoch)
+ {
+-	struct raid_bdev_superblock *sb;
+-	size_t i;
+-
+-	for (i = 0; i < SPDK_COUNTOF(g_ut_sbs) && g_ut_sbs[i] != NULL; i++) {
+-	}
+-	SPDK_CU_ASSERT_FATAL(i < SPDK_COUNTOF(g_ut_sbs));
+-	sb = calloc(1, RAID_BDEV_SB_MAX_LENGTH);
+-	SPDK_CU_ASSERT_FATAL(sb != NULL);
+-	g_ut_sbs[i] = sb;
++	struct raid_bdev_superblock *sb = ut_sb_alloc();
+ 
+ 	memcpy(sb->signature, RAID_BDEV_SB_SIG, sizeof(sb->signature));
+ 	sb->version.major = RAID_BDEV_SB_VERSION_MAJOR;
+@@ -3181,6 +3215,296 @@ test_raid_reassembled_from_a_stamped_superblock_keeps_its_view(void)
+ 	ut_view_teardown();
+ }
+ 
++/* Evariops 0054: fills the superblock the suite's stubbed init leaves empty, as
++ * init writes it, at minor: each slot under its member, CONFIGURED or MISSING,
++ * at the generation and epoch the raid holds for it. */
++static void
++ut_fill_sb(struct raid_bdev *raid_bdev, uint16_t minor)
++{
++	struct raid_bdev_superblock *sb = raid_bdev->sb;
++	struct raid_base_bdev_info *base_info;
++	uint8_t i = 0;
++
++	SPDK_CU_ASSERT_FATAL(sb != NULL);
++	memcpy(sb->signature, RAID_BDEV_SB_SIG, sizeof(sb->signature));
++	sb->version.major = RAID_BDEV_SB_VERSION_MAJOR;
++	sb->version.minor = minor;
++	spdk_uuid_copy(&sb->uuid, &raid_bdev->bdev.uuid);
++	sb->block_size = g_block_len;
++	sb->level = raid_bdev->level;
++	sb->num_base_bdevs = sb->base_bdevs_size = raid_bdev->num_base_bdevs;
++	sb->length = sizeof(*sb) + sb->base_bdevs_size * sizeof(sb->base_bdevs[0]);
++	RAID_FOR_EACH_BASE_BDEV(raid_bdev, base_info) {
++		struct raid_bdev_sb_base_bdev *slot = &sb->base_bdevs[i];
++
++		spdk_uuid_copy(&slot->uuid, base_info->is_configured ? &base_info->uuid :
++			       &base_info->excluded_uuid);
++		slot->state = base_info->is_configured ? RAID_SB_BASE_BDEV_CONFIGURED :
++			      RAID_SB_BASE_BDEV_MISSING;
++		slot->slot = i++;
++		slot->content_generation = base_info->content_generation;
++		slot->view_epoch = base_info->view_epoch;
++	}
++}
++
++/* Evariops 0054: journals epoch on raid name as incarnation, with lineage
++ * unless NULL. */
++static void
++ut_journal(const char *name, uint64_t epoch, const char *incarnation, const struct spdk_uuid *lineage)
++{
++	struct rpc_bdev_raid_journal_view_epoch req = {};
++
++	req.name = strdup(name);
++	req.expected_incarnation = strdup(incarnation);
++	SPDK_CU_ASSERT_FATAL(req.name != NULL && req.expected_incarnation != NULL);
++	req.view_epoch = epoch;
++	if (lineage != NULL) {
++		spdk_uuid_copy(&req.lineage, lineage);
++	}
++	g_rpc_req = &req;
++	g_rpc_req_size = sizeof(req);
++	g_json_decode_obj_create = 0;
++	g_json_decode_obj_err = 0;
++	g_rpc_err = 0;
++	g_rpc_err_code = 0;
++	rpc_bdev_raid_journal_view_epoch(NULL, NULL);
++	poll_app_thread();
++	g_rpc_req = NULL;
++}
++
++/* Evariops 0054: the raid of the view tests after an ejection, created at epoch
++ * 4: Nvme1n1 and Nvme2n1 configured at generation 7, Nvme0n1 left out. Its
++ * superblock is filled at minor. */
++static struct raid_bdev *
++ut_view_raid_after_an_ejection(uint16_t minor)
++{
++	struct rpc_bdev_raid_create req;
++	struct raid_bdev *raid_bdev;
++
++	g_ut_alloc_superblock = true;
++	ut_view_create_req(&req, 4);
++	ut_sb_after_an_ejection();
++	rpc_bdev_raid_create(NULL, NULL);
++	poll_app_thread();
++	free_test_req(&req);
++	CU_ASSERT(g_rpc_err == 0);
++	raid_bdev = ut_view_raid_online(2);
++	ut_fill_sb(raid_bdev, minor);
++
++	return raid_bdev;
++}
++
++/* Evariops 0054: the owner journals a new epoch: the raid, its superblock and
++ * the members it serves carry it, under the owner's incarnation, and a
++ * superblock an older image wrote is raised to minor 2, where the stamp is
++ * read. The slot of a member not serving keeps its epoch. The same epoch is
++ * written again. */
++static void
++test_raid_journal_stamps_the_view_epoch_on_the_members(void)
++{
++	struct raid_bdev_superblock *sb;
++	struct raid_bdev *raid_bdev;
++	uint32_t writes;
++
++	ut_view_setup();
++	raid_bdev = ut_view_raid_after_an_ejection(1);
++	sb = raid_bdev->sb;
++	writes = g_ut_sb_writes;
++
++	ut_journal("raid1", 6, UT_INCARNATION, NULL);
++	CU_ASSERT(g_rpc_err == 0);
++	CU_ASSERT(g_ut_sb_writes == writes + 1);
++	CU_ASSERT(raid_bdev->view_epoch == 6);
++	CU_ASSERT(sb->version.minor == 2);
++	CU_ASSERT(spdk_uuid_compare(&sb->lineage, &g_ut_lineage) == 0);
++	CU_ASSERT(strcmp((const char *)sb->owner, UT_INCARNATION) == 0);
++	CU_ASSERT(sb->view_epoch == 6);
++	CU_ASSERT(sb->base_bdevs[0].view_epoch == 6);
++	CU_ASSERT(sb->base_bdevs[1].view_epoch == 6);
++	CU_ASSERT(sb->base_bdevs[2].view_epoch == 0);
++	CU_ASSERT(raid_bdev->base_bdev_info[0].view_epoch == 6);
++	CU_ASSERT(raid_bdev->base_bdev_info[1].view_epoch == 6);
++	CU_ASSERT(raid_bdev->base_bdev_info[2].view_epoch == 0);
++
++	ut_journal("raid1", 6, UT_INCARNATION, NULL);
++	CU_ASSERT(g_rpc_err == 0);
++	CU_ASSERT(g_ut_sb_writes == writes + 2);
++
++	ut_view_teardown();
++}
++
++/* Evariops 0054: no journal goes back in time, none comes from another
++ * incarnation or names another volume, and none journals epoch 0 or a raid that
++ * is not there. Each leaves the raid's epoch and writes nothing. */
++static void
++test_raid_journal_refuses_what_its_owner_did_not_send(void)
++{
++	struct raid_bdev *raid_bdev;
++	uint32_t writes;
++
++	ut_view_setup();
++	raid_bdev = ut_view_raid_after_an_ejection(2);
++	writes = g_ut_sb_writes;
++
++	ut_journal("raid1", 3, UT_INCARNATION, NULL);
++	CU_ASSERT(g_rpc_err == 1);
++	CU_ASSERT(g_rpc_err_code == -ESTALE);
++
++	ut_journal("raid1", 5, "incarnation-elsewhere", NULL);
++	CU_ASSERT(g_rpc_err == 1);
++	CU_ASSERT(g_rpc_err_code == -ESTALE);
++
++	ut_journal("raid1", 5, UT_INCARNATION, &g_ut_other_lineage);
++	CU_ASSERT(g_rpc_err == 1);
++	CU_ASSERT(g_rpc_err_code == -EEXIST);
++
++	ut_journal("raid1", 0, UT_INCARNATION, NULL);
++	CU_ASSERT(g_rpc_err == 1);
++	CU_ASSERT(g_rpc_err_code == -EINVAL);
++
++	ut_journal("raid2", 5, UT_INCARNATION, NULL);
++	CU_ASSERT(g_rpc_err == 1);
++	CU_ASSERT(g_rpc_err_code == -ENODEV);
++
++	CU_ASSERT(raid_bdev->view_epoch == 4);
++	CU_ASSERT(g_ut_sb_writes == writes);
++
++	ut_view_teardown();
++}
++
++/* Evariops 0054: a raid created outside the view protocol joins its volume's
++ * view through the journal, which names the lineage; without one it is
++ * refused. */
++static void
++test_raid_journal_joins_a_raid_created_outside_the_view(void)
++{
++	struct rpc_bdev_raid_create req;
++	struct raid_bdev *raid_bdev;
++
++	ut_view_setup();
++	g_ut_alloc_superblock = true;
++	create_raid_bdev_create_req(&req, "raid1", 0, true, 0, true);
++	req.level = RAID1;
++	req.strip_size_kb = 0;
++	rpc_bdev_raid_create(NULL, NULL);
++	poll_app_thread();
++	free_test_req(&req);
++	CU_ASSERT(g_rpc_err == 0);
++	raid_bdev = ut_view_raid_online(3);
++	ut_fill_sb(raid_bdev, 1);
++
++	ut_journal("raid1", 2, UT_INCARNATION, NULL);
++	CU_ASSERT(g_rpc_err == 1);
++	CU_ASSERT(g_rpc_err_code == -EINVAL);
++	CU_ASSERT(spdk_uuid_is_null(&raid_bdev->lineage));
++
++	ut_journal("raid1", 2, UT_INCARNATION, &g_ut_lineage);
++	CU_ASSERT(g_rpc_err == 0);
++	CU_ASSERT(spdk_uuid_compare(&raid_bdev->lineage, &g_ut_lineage) == 0);
++	CU_ASSERT(spdk_uuid_compare(&raid_bdev->sb->lineage, &g_ut_lineage) == 0);
++	CU_ASSERT(raid_bdev->sb->version.minor == 2);
++	CU_ASSERT(raid_bdev->sb->view_epoch == 2);
++
++	ut_journal("raid1", 3, UT_INCARNATION, &g_ut_lineage);
++	CU_ASSERT(g_rpc_err == 0);
++	CU_ASSERT(raid_bdev->view_epoch == 3);
++
++	ut_view_teardown();
++}
++
++/* Evariops 0054: a journal whose write fails reports it, and is retried at the
++ * same epoch. */
++static void
++test_raid_journal_reports_a_failed_write(void)
++{
++	uint32_t writes;
++
++	ut_view_setup();
++	ut_view_raid_after_an_ejection(2);
++	writes = g_ut_sb_writes;
++
++	g_ut_sb_write_status = -EIO;
++	ut_journal("raid1", 5, UT_INCARNATION, NULL);
++	CU_ASSERT(g_rpc_err == 1);
++	CU_ASSERT(g_rpc_err_code == -EIO);
++	g_ut_sb_write_status = 0;
++
++	ut_journal("raid1", 5, UT_INCARNATION, NULL);
++	CU_ASSERT(g_rpc_err == 0);
++	CU_ASSERT(g_ut_sb_writes == writes + 2);
++
++	ut_view_teardown();
++}
++
++/* Evariops 0054: once the owner journals epoch 6 on its members, a create by
++ * another incarnation from a view no more recent is refused while those stamps
++ * stand, and one from a newer view takes the legs. */
++static void
++test_raid_journaled_epoch_refuses_a_create_from_an_older_view(void)
++{
++	const uint64_t refused_epochs[] = { 5, 6 };
++	struct rpc_bdev_raid_create req;
++	struct rpc_bdev_raid_delete delete_req;
++	struct raid_bdev *raid_bdev;
++	size_t i;
++
++	ut_view_setup();
++	g_ut_alloc_superblock = true;
++	g_ut_sb_writes_land = true;
++	ut_view_create_req(&req, 4);
++	rpc_bdev_raid_create(NULL, NULL);
++	poll_app_thread();
++	free_test_req(&req);
++	CU_ASSERT(g_rpc_err == 0);
++	raid_bdev = ut_view_raid_online(3);
++	ut_fill_sb(raid_bdev, 2);
++	ut_journal("raid1", 6, UT_INCARNATION, NULL);
++	CU_ASSERT(g_rpc_err == 0);
++
++	create_raid_bdev_delete_req(&delete_req, "raid1", 0);
++	rpc_bdev_raid_delete(NULL, NULL);
++	CU_ASSERT(g_rpc_err == 0);
++
++	for (i = 0; i < SPDK_COUNTOF(refused_epochs); i++) {
++		create_test_req(&req, "raid1", 0, false, true);
++		g_rpc_err = 0;
++		g_json_decode_obj_create = 1;
++		g_json_decode_obj_err = 0;
++		g_test_multi_raids = 0;
++		req.level = RAID1;
++		req.strip_size_kb = 0;
++		spdk_uuid_copy(&req.lineage, &g_ut_lineage);
++		req.view_epoch = refused_epochs[i];
++		free(req.incarnation);
++		req.incarnation = strdup("incarnation-elsewhere");
++		SPDK_CU_ASSERT_FATAL(req.incarnation != NULL);
++		rpc_bdev_raid_create(NULL, NULL);
++		poll_app_thread();
++		free_test_req(&req);
++		ut_view_refused(-EBUSY);
++	}
++
++	create_test_req(&req, "raid1", 0, false, true);
++	g_rpc_err = 0;
++	g_json_decode_obj_create = 1;
++	g_json_decode_obj_err = 0;
++	g_test_multi_raids = 0;
++	req.level = RAID1;
++	req.strip_size_kb = 0;
++	spdk_uuid_copy(&req.lineage, &g_ut_lineage);
++	req.view_epoch = 7;
++	free(req.incarnation);
++	req.incarnation = strdup("incarnation-elsewhere");
++	SPDK_CU_ASSERT_FATAL(req.incarnation != NULL);
++	rpc_bdev_raid_create(NULL, NULL);
++	poll_app_thread();
++	free_test_req(&req);
++	CU_ASSERT(g_rpc_err == 0);
++	ut_view_raid_online(3);
++
++	ut_view_teardown();
++}
++
+ static int
+ test_new_thread_fn(struct spdk_thread *thread)
+ {
+@@ -3248,6 +3572,11 @@ main(int argc, char **argv)
+ 	CU_ADD_TEST(suite, test_raid_create_with_declared_slots_leaves_the_slots_past_its_legs_empty);
+ 	CU_ADD_TEST(suite, test_raid_add_into_a_raid_of_a_lineage_checks_the_stamp);
+ 	CU_ADD_TEST(suite, test_raid_reassembled_from_a_stamped_superblock_keeps_its_view);
++	CU_ADD_TEST(suite, test_raid_journal_stamps_the_view_epoch_on_the_members);
++	CU_ADD_TEST(suite, test_raid_journal_refuses_what_its_owner_did_not_send);
++	CU_ADD_TEST(suite, test_raid_journal_joins_a_raid_created_outside_the_view);
++	CU_ADD_TEST(suite, test_raid_journal_reports_a_failed_write);
++	CU_ADD_TEST(suite, test_raid_journaled_epoch_refuses_a_create_from_an_older_view);
+ 
+ 	spdk_thread_lib_init(test_new_thread_fn, 0);
+ 	g_app_thread = spdk_thread_create("app_thread", NULL);
