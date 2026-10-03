@@ -584,3 +584,24 @@ index 3de537f..31896d5 100644
  static const struct spdk_json_object_decoder rpc_bdev_raid_set_options_decoders[] = {
  	{"process_window_size_kb", offsetof(struct spdk_raid_bdev_opts, process_window_size_kb), spdk_json_decode_uint32, true},
  	{"process_max_bandwidth_mb_sec", offsetof(struct spdk_raid_bdev_opts, process_max_bandwidth_mb_sec), spdk_json_decode_uint32, true},
+diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+index c262806..c538a3c 100644
+--- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
++++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+@@ -220,6 +220,16 @@ DEFINE_STUB_V(spdk_bdev_io_complete_nvme_status, (struct spdk_bdev_io *bdev_io,
+  * audit is stubbed rather than linked. */
+ DEFINE_STUB_V(spdk_jsonrpc_request_audit, (struct spdk_jsonrpc_request *request,
+ 	      const char *method, const char *detail));
++/* Evariops 0015: a rebuild records its outcome in a registry. None is opened here,
++ * which the raid allows: a rebuild without an entry is only unobservable. */
++DEFINE_STUB(raid_rebuild_outcome_open, struct raid_rebuild_outcome *, (const char *token,
++		const char *raid_name, const char *base_bdev_name), NULL);
++DEFINE_STUB_V(raid_rebuild_outcome_add_bytes, (struct raid_rebuild_outcome *outcome,
++	      uint64_t bytes));
++DEFINE_STUB_V(raid_rebuild_outcome_finish, (struct raid_rebuild_outcome *outcome,
++	      enum raid_rebuild_outcome_state terminal, bool verified));
++DEFINE_STUB_V(raid_rebuild_outcomes_write_json, (struct spdk_json_write_ctx *w,
++	      const char *token_filter));
+ 
+ uint32_t
+ spdk_bdev_get_data_block_size(const struct spdk_bdev *bdev)

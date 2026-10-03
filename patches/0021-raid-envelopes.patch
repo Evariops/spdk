@@ -376,3 +376,20 @@ index 31896d5..5d9917f 100644
  /* Evariops 0015: bdev_raid_get_rebuild_outcomes {token?} — read the rebuild
   * outcome registry. Entries outlive the raid bdev they describe and are matched
   * by token, so an attempt can still be resolved after its raid is gone. See
+diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+index 43d6c52..55bdca4 100644
+--- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
++++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+@@ -243,6 +243,12 @@ DEFINE_STUB_V(raid_rebuild_outcome_set_verifying, (struct raid_rebuild_outcome *
+  * has CBT here (-ENODEV), which the raid passes over. */
+ DEFINE_STUB(vbdev_cbt_auto_epoch_open, int, (const char *bdev_name, const char *stale_backend_id),
+ 	    -ENODEV);
++/* Evariops 0021: the envelopes pace and admit the rebuilds. At their defaults here:
++ * no cap (0), and every rebuild admitted. */
++DEFINE_STUB(raid_envelope_active_mb_sec, uint32_t, (enum raid_envelope_class klass), 0);
++DEFINE_STUB(raid_envelopes_admit_rebuild, bool, (void), true);
++DEFINE_STUB_V(raid_envelopes_get, (struct raid_envelopes *out));
++DEFINE_STUB_V(raid_envelopes_set, (const struct raid_envelopes *envelopes));
+ 
+ uint32_t
+ spdk_bdev_get_data_block_size(const struct spdk_bdev *bdev)

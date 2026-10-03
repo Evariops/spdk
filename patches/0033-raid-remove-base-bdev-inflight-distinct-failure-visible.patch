@@ -190,3 +190,17 @@ index d137c1a..44066af 100644
  int raid_bdev_remove_base_bdev(struct spdk_bdev *base_bdev, const char *expected_incarnation,
  			       raid_base_bdev_cb cb_fn, void *cb_ctx);
  
+diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+index 806c8d3..9efc3c3 100644
+--- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
++++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+@@ -170,6 +170,9 @@ DEFINE_STUB(spdk_json_write_object_begin, int, (struct spdk_json_write_ctx *w),
+ DEFINE_STUB(spdk_json_write_named_object_begin, int, (struct spdk_json_write_ctx *w,
+ 		const char *name), 0);
+ DEFINE_STUB(spdk_json_write_string, int, (struct spdk_json_write_ctx *w, const char *val), 0);
++/* Evariops 0033: a member is reported with the errno of its failed removal. */
++DEFINE_STUB(spdk_json_write_named_int32, int, (struct spdk_json_write_ctx *w, const char *name,
++		int32_t val), 0);
+ DEFINE_STUB(spdk_json_write_object_end, int, (struct spdk_json_write_ctx *w), 0);
+ DEFINE_STUB(spdk_json_write_array_begin, int, (struct spdk_json_write_ctx *w), 0);
+ DEFINE_STUB(spdk_json_write_array_end, int, (struct spdk_json_write_ctx *w), 0);

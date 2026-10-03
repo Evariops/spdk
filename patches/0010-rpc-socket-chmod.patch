@@ -57,3 +57,126 @@ index ead7c66..46446e2 100644
  	return server;
  
  ret:
+diff --git a/test/unit/lib/rpc/rpc.c/Makefile b/test/unit/lib/rpc/rpc.c/Makefile
+index 5801065..641a9e9 100644
+--- a/test/unit/lib/rpc/rpc.c/Makefile
++++ b/test/unit/lib/rpc/rpc.c/Makefile
+@@ -8,10 +8,12 @@ include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
+ 
+ TEST_FILE = rpc_ut.c
+ 
++# Evariops 0010: chmod, which the listen applies to the socket file.
+ SPDK_MOCK_SYMBOLS = \
+ 	open \
+ 	close \
+ 	flock \
+-	unlink
++	unlink \
++	chmod
+ 
+ include $(SPDK_ROOT_DIR)/mk/spdk.unittest.mk
+diff --git a/test/unit/lib/rpc/rpc.c/rpc_ut.c b/test/unit/lib/rpc/rpc.c/rpc_ut.c
+index 1512b10..b438ab6 100644
+--- a/test/unit/lib/rpc/rpc.c/rpc_ut.c
++++ b/test/unit/lib/rpc/rpc.c/rpc_ut.c
+@@ -24,9 +24,6 @@ DEFINE_STUB_V(spdk_jsonrpc_end_result, (struct spdk_jsonrpc_request *request,
+ DEFINE_STUB(spdk_jsonrpc_begin_result, struct spdk_json_write_ctx *,
+ 	    (struct spdk_jsonrpc_request *request), (void *)1);
+ DEFINE_STUB(spdk_json_decode_bool, int, (const struct spdk_json_val *val, void *out), 0);
+-DEFINE_STUB(spdk_jsonrpc_server_listen, struct spdk_jsonrpc_server *, (int domain, int protocol,
+-		struct sockaddr *listen_addr, socklen_t addrlen, spdk_jsonrpc_handle_request_fn handle_request),
+-	    (struct spdk_jsonrpc_server *)0Xdeaddead);
+ DEFINE_STUB(spdk_jsonrpc_server_poll, int, (struct spdk_jsonrpc_server *server), 0);
+ DEFINE_STUB_V(spdk_jsonrpc_server_shutdown, (struct spdk_jsonrpc_server *server));
+ 
+@@ -37,6 +34,33 @@ DEFINE_WRAPPER(open, int, (const char *pathname, int flags, mode_t mode), (pathn
+ DEFINE_WRAPPER(close, int, (int fd), (fd));
+ DEFINE_WRAPPER(flock, int, (int fd, int operation), (fd, operation));
+ 
++/* Evariops 0010: the listen binds the socket under umask 077, then chmods it to
++ * 0600. The bind is stubbed: the umask it runs under is recorded, and the chmod
++ * of a socket file it did not create is recorded rather than performed. */
++static mode_t g_listen_umask;
++static mode_t g_chmod_mode;
++static int g_chmod_rc;
++
++struct spdk_jsonrpc_server *
++spdk_jsonrpc_server_listen(int domain, int protocol, struct sockaddr *listen_addr,
++			   socklen_t addrlen, spdk_jsonrpc_handle_request_fn handle_request)
++{
++	g_listen_umask = umask(0);
++	umask(g_listen_umask);
++
++	return (struct spdk_jsonrpc_server *)0Xdeaddead;
++}
++
++int __wrap_chmod(const char *pathname, mode_t mode);
++
++int
++__wrap_chmod(const char *pathname, mode_t mode)
++{
++	g_chmod_mode = mode;
++
++	return g_chmod_rc;
++}
++
+ int
+ spdk_json_decode_object(const struct spdk_json_val *values,
+ 			const struct spdk_json_object_decoder *decoders, size_t num_decoders, void *out)
+@@ -217,14 +241,22 @@ test_spdk_rpc_listen_close(void)
+ 	struct spdk_rpc_server *server;
+ 	const char listen_addr[128] = "/var/tmp/spdk-rpc-ut.sock";
+ 	char rpc_lock_path[128] = {};
++	mode_t saved_umask;
+ 
+ 	MOCK_SET(open, 1);
+ 	MOCK_SET(close, 0);
+ 	MOCK_SET(flock, 0);
+ 
++	saved_umask = umask(022);
+ 	server = spdk_rpc_server_listen(listen_addr);
+ 	SPDK_CU_ASSERT_FATAL(server != NULL);
+ 
++	/* Evariops 0010: bound owner-only, re-asserted 0600, and the process umask
++	 * given back. */
++	CU_ASSERT(g_listen_umask == 077);
++	CU_ASSERT(g_chmod_mode == 0600);
++	CU_ASSERT(umask(saved_umask) == 022);
++
+ 	snprintf(rpc_lock_path, sizeof(server->lock_path), "%s.lock",
+ 		 server->listen_addr_unix.sun_path);
+ 
+@@ -240,6 +272,25 @@ test_spdk_rpc_listen_close(void)
+ 	MOCK_CLEAR(flock);
+ }
+ 
++static void
++test_spdk_rpc_listen_chmod_failure(void)
++{
++	const char listen_addr[128] = "/var/tmp/spdk-rpc-ut.sock";
++
++	MOCK_SET(open, 1);
++	MOCK_SET(close, 0);
++	MOCK_SET(flock, 0);
++
++	/* Evariops 0010: a socket that cannot be made owner-only is not served. */
++	g_chmod_rc = -1;
++	CU_ASSERT(spdk_rpc_server_listen(listen_addr) == NULL);
++	g_chmod_rc = 0;
++
++	MOCK_CLEAR(open);
++	MOCK_CLEAR(close);
++	MOCK_CLEAR(flock);
++}
++
+ static void
+ test_rpc_run_multiple_servers(void)
+ {
+@@ -283,6 +334,7 @@ main(int argc, char **argv)
+ 	CU_ADD_TEST(suite, test_rpc_get_methods);
+ 	CU_ADD_TEST(suite, test_rpc_spdk_get_version);
+ 	CU_ADD_TEST(suite, test_spdk_rpc_listen_close);
++	CU_ADD_TEST(suite, test_spdk_rpc_listen_chmod_failure);
+ 	CU_ADD_TEST(suite, test_rpc_run_multiple_servers);
+ 
+ 	num_failures = spdk_ut_run_tests(argc, argv, NULL);

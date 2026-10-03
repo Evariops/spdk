@@ -183,6 +183,23 @@ test_identity_tuple_validate(void)
 	CHECK(tier_unit_identity_validate(uuid, 0, 0) == -EINVAL);
 }
 
+/* ---- tier_sb_read_answer: a failed read is not a disk without a superblock -- */
+
+static void
+test_sb_read_answer(void)
+{
+	struct tier_superblock sb = {0};
+
+	CHECK(tier_sb_read_answer(&sb, 0) == TIER_SB_READ_FOUND);
+	/* The disk carries no valid superblock: a fact about it. */
+	CHECK(tier_sb_read_answer(NULL, -EILSEQ) == TIER_SB_READ_NONE);
+	/* A failed read says nothing about the disk. */
+	CHECK(tier_sb_read_answer(NULL, -EIO) == TIER_SB_READ_FAILED);
+	CHECK(tier_sb_read_answer(NULL, -ENOMEM) == TIER_SB_READ_FAILED);
+	/* No superblock and no error is no answer either. */
+	CHECK(tier_sb_read_answer(NULL, 0) == TIER_SB_READ_FAILED);
+}
+
 int
 main(void)
 {
@@ -191,6 +208,7 @@ main(void)
 	test_ranges_overlap();
 	test_identity_conflict();
 	test_identity_tuple_validate();
+	test_sb_read_answer();
 
 	if (g_failures != 0) {
 		fprintf(stderr, "test_tier_units: %d FAILURE(S)\n", g_failures);
