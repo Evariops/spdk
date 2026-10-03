@@ -1,0 +1,190 @@
+diff --git a/lib/nvmf/subsystem.c b/lib/nvmf/subsystem.c
+index 356361f..3d53309 100644
+--- a/lib/nvmf/subsystem.c
++++ b/lib/nvmf/subsystem.c
+@@ -2919,6 +2919,7 @@ nvmf_ns_reservation_restore(struct spdk_nvmf_ns *ns, struct spdk_nvmf_reservatio
+ 	struct spdk_nvmf_registrant *reg, *holder = NULL;
+ 	struct spdk_uuid bdev_uuid, holder_uuid;
+ 	bool rkey_flag = false;
++	bool all_regs;
+ 
+ 	SPDK_DEBUGLOG(nvmf, "NSID %u, PTPL %u, Number of registrants %u\n",
+ 		      ns->nsid, info->ptpl_activated, info->num_regs);
+@@ -2934,7 +2935,12 @@ nvmf_ns_reservation_restore(struct spdk_nvmf_ns *ns, struct spdk_nvmf_reservatio
+ 			rkey_flag = true;
+ 		}
+ 	}
+-	if (!rkey_flag && info->crkey != 0) {
++	/* Evariops 0050: a reservation held by all registrants outlives the registrant that
++	 * acquired it, and a state persisted before 0050 still records the key of that registrant
++	 * after it left: it restores, under the key of the registrant that holds it (below). */
++	all_regs = (info->rtype == SPDK_NVME_RESERVE_WRITE_EXCLUSIVE_ALL_REGS ||
++		    info->rtype == SPDK_NVME_RESERVE_EXCLUSIVE_ACCESS_ALL_REGS);
++	if (!rkey_flag && info->crkey != 0 && !all_regs) {
+ 		return -EINVAL;
+ 	}
+ 
+@@ -2972,6 +2978,9 @@ nvmf_ns_reservation_restore(struct spdk_nvmf_ns *ns, struct spdk_nvmf_reservatio
+ 
+ 	if (nvmf_ns_reservation_all_registrants_type(ns)) {
+ 		ns->holder = TAILQ_FIRST(&ns->registrants);
++		if (!rkey_flag) {
++			ns->crkey = ns->holder->rkey;
++		}
+ 	} else {
+ 		ns->holder = holder;
+ 	}
+@@ -3267,6 +3276,10 @@ nvmf_ns_reservation_check_release_on_remove_registrant(struct spdk_nvmf_ns *ns,
+ 	if (next_reg && nvmf_ns_reservation_all_registrants_type(ns)) {
+ 		/* the next valid registrant is the new holder now */
+ 		ns->holder = next_reg;
++		/* Evariops 0050: every registrant holds the reservation, so it outlives the one that
++		 * acquired it, and now stands under the key of the registrant that holds it. Left under
++		 * the key of a registrant that is gone, its persisted state fails to restore. */
++		ns->crkey = next_reg->rkey;
+ 	} else if (nvmf_ns_reservation_registrant_is_holder(ns, reg)) {
+ 		/* release the reservation */
+ 		nvmf_ns_reservation_release_reservation(ns);
+diff --git a/test/unit/lib/nvmf/subsystem.c/subsystem_ut.c b/test/unit/lib/nvmf/subsystem.c/subsystem_ut.c
+index d53d45d..28622b8 100644
+--- a/test/unit/lib/nvmf/subsystem.c/subsystem_ut.c
++++ b/test/unit/lib/nvmf/subsystem.c/subsystem_ut.c
+@@ -1779,6 +1779,98 @@ test_reservation_acquire_release_with_ptpl(void)
+ 	ut_reservation_deinit();
+ }
+ 
++/* Restores the persisted reservation of g_ns onto a fresh namespace of the same bdev, as a
++ * target restart does, and checks it stands under the expected key. */
++static void
++ut_reservation_check_restores_under(uint64_t crkey)
++{
++	struct spdk_nvmf_reservation_info info;
++	struct spdk_nvmf_ns ns = {};
++	int rc;
++
++	rc = nvmf_ns_update_reservation_info(&g_ns);
++	SPDK_CU_ASSERT_FATAL(rc == 0);
++	memset(&info, 0, sizeof(info));
++	rc = nvmf_ns_reservation_load(&g_ns, &info);
++	SPDK_CU_ASSERT_FATAL(rc == 0);
++	CU_ASSERT(info.rtype == SPDK_NVME_RESERVE_WRITE_EXCLUSIVE_ALL_REGS);
++	CU_ASSERT(info.crkey == crkey);
++
++	ns.bdev = g_ns.bdev;
++	TAILQ_INIT(&ns.registrants);
++	rc = nvmf_ns_reservation_restore(&ns, &info);
++	CU_ASSERT(rc == 0);
++	CU_ASSERT(ns.rtype == SPDK_NVME_RESERVE_WRITE_EXCLUSIVE_ALL_REGS);
++	CU_ASSERT(ns.crkey == crkey);
++	nvmf_ns_reservation_clear_all_registrants(&ns);
++}
++
++/* Evariops 0050: a reservation held by all registrants outlives the registrant that acquired
++ * it. When that registrant leaves, preempted by another or unregistering, the reservation
++ * stands under the key of a registrant that stays, and its persisted state restores. */
++static void
++test_reservation_all_regs_acquirer_leaves_with_ptpl(void)
++{
++	struct spdk_nvmf_request *req;
++	struct spdk_nvme_cpl *rsp;
++	struct spdk_nvmf_registrant *reg;
++	bool update_sgroup;
++
++	ut_reservation_init();
++
++	req = ut_reservation_build_req(16);
++	rsp = &req->rsp->nvme_cpl;
++	SPDK_CU_ASSERT_FATAL(req != NULL);
++
++	g_ns.ptpl_file = "/tmp/Ns1PR.cfg";
++	ut_reservation_build_register_request(req, SPDK_NVME_RESERVE_REGISTER_KEY, 0,
++					      SPDK_NVME_RESERVE_PTPL_PERSIST_POWER_LOSS, 0, 0xa1);
++	update_sgroup = nvmf_ns_reservation_register(&g_ns, &g_ctrlr1_A, req);
++	SPDK_CU_ASSERT_FATAL(update_sgroup == true);
++	SPDK_CU_ASSERT_FATAL(rsp->status.sc == SPDK_NVME_SC_SUCCESS);
++	ut_reservation_build_register_request(req, SPDK_NVME_RESERVE_REGISTER_KEY, 0, 0, 0, 0xb1);
++	nvmf_ns_reservation_register(&g_ns, &g_ctrlr_B, req);
++	SPDK_CU_ASSERT_FATAL(rsp->status.sc == SPDK_NVME_SC_SUCCESS);
++
++	ut_reservation_build_acquire_request(req, SPDK_NVME_RESERVE_ACQUIRE, 0,
++					     SPDK_NVME_RESERVE_WRITE_EXCLUSIVE_ALL_REGS, 0xa1, 0x0);
++	nvmf_ns_reservation_acquire(&g_ns, &g_ctrlr1_A, req);
++	SPDK_CU_ASSERT_FATAL(rsp->status.sc == SPDK_NVME_SC_SUCCESS);
++	SPDK_CU_ASSERT_FATAL(g_ns.crkey == 0xa1);
++
++	/* TEST CASE: B preempts A, the registrant that acquired the reservation */
++	ut_reservation_build_acquire_request(req, SPDK_NVME_RESERVE_PREEMPT, 0,
++					     SPDK_NVME_RESERVE_WRITE_EXCLUSIVE_ALL_REGS, 0xb1, 0xa1);
++	nvmf_ns_reservation_acquire(&g_ns, &g_ctrlr_B, req);
++	SPDK_CU_ASSERT_FATAL(rsp->status.sc == SPDK_NVME_SC_SUCCESS);
++	SPDK_CU_ASSERT_FATAL(nvmf_ns_reservation_get_registrant(&g_ns, &g_ctrlr1_A.hostid) == NULL);
++	reg = nvmf_ns_reservation_get_registrant(&g_ns, &g_ctrlr_B.hostid);
++	SPDK_CU_ASSERT_FATAL(reg != NULL);
++	CU_ASSERT(g_ns.rtype == SPDK_NVME_RESERVE_WRITE_EXCLUSIVE_ALL_REGS);
++	CU_ASSERT(g_ns.holder == reg);
++	CU_ASSERT(g_ns.crkey == 0xb1);
++	ut_reservation_check_restores_under(0xb1);
++
++	/* TEST CASE: C registers, then B, whose key the reservation now stands under, unregisters */
++	ut_reservation_build_register_request(req, SPDK_NVME_RESERVE_REGISTER_KEY, 0, 0, 0, 0xc1);
++	nvmf_ns_reservation_register(&g_ns, &g_ctrlr_C, req);
++	SPDK_CU_ASSERT_FATAL(rsp->status.sc == SPDK_NVME_SC_SUCCESS);
++	ut_reservation_build_register_request(req, SPDK_NVME_RESERVE_UNREGISTER_KEY, 0, 0, 0xb1, 0);
++	nvmf_ns_reservation_register(&g_ns, &g_ctrlr_B, req);
++	SPDK_CU_ASSERT_FATAL(rsp->status.sc == SPDK_NVME_SC_SUCCESS);
++	SPDK_CU_ASSERT_FATAL(nvmf_ns_reservation_get_registrant(&g_ns, &g_ctrlr_B.hostid) == NULL);
++	reg = nvmf_ns_reservation_get_registrant(&g_ns, &g_ctrlr_C.hostid);
++	SPDK_CU_ASSERT_FATAL(reg != NULL);
++	CU_ASSERT(g_ns.rtype == SPDK_NVME_RESERVE_WRITE_EXCLUSIVE_ALL_REGS);
++	CU_ASSERT(g_ns.holder == reg);
++	CU_ASSERT(g_ns.crkey == 0xc1);
++	ut_reservation_check_restores_under(0xc1);
++
++	unlink(g_ns.ptpl_file);
++	ut_reservation_free_req(req);
++	ut_reservation_deinit();
++}
++
+ static void
+ test_reservation_release(void)
+ {
+@@ -3346,12 +3438,30 @@ test_nvmf_ns_reservation_restore(void)
+ 	spdk_uuid_fmt_lower(uuid, sizeof(uuid), &s_uuid);
+ 	snprintf(info.registrants[1].host_uuid, SPDK_UUID_STRING_LEN, "%s", uuid);
+ 
+-	/* info->rkey not exist in registrants */
++	/* info->rkey not exist in registrants: the key of a single holder that no registrant holds */
++	info.rtype = SPDK_NVME_RESERVE_WRITE_EXCLUSIVE;
+ 	info.crkey = 0xa;
+ 
+ 	rc = nvmf_ns_reservation_restore(&ns, &info);
+ 	CU_ASSERT(rc == -EINVAL);
+ 
++	/* Evariops 0050: info->rkey not exist in registrants of a reservation held by all registrants:
++	 * the registrant that acquired it left, which a state persisted before 0050 still records. It
++	 * restores, under the key of the registrant that holds it now. */
++	info.rtype = SPDK_NVME_RESERVE_WRITE_EXCLUSIVE_ALL_REGS;
++
++	rc = nvmf_ns_reservation_restore(&ns, &info);
++	CU_ASSERT(rc == 0);
++	CU_ASSERT(ns.rtype == SPDK_NVME_RESERVE_WRITE_EXCLUSIVE_ALL_REGS);
++	reg0 = TAILQ_FIRST(&ns.registrants);
++	SPDK_CU_ASSERT_FATAL(reg0 != NULL);
++	CU_ASSERT(ns.holder == reg0);
++	CU_ASSERT(ns.crkey == reg0->rkey);
++
++	rc = nvmf_ns_reservation_clear_all_registrants(&ns);
++	CU_ASSERT(rc == 2);
++	CU_ASSERT(TAILQ_EMPTY(&ns.registrants));
++
+ 	/* info->rkey exists in registrants */
+ 	info.crkey = 0xb;
+ 
+@@ -3630,6 +3740,7 @@ main(int argc, char **argv)
+ 	CU_ADD_TEST(suite, test_reservation_register_with_ptpl);
+ 	CU_ADD_TEST(suite, test_reservation_acquire_preempt);
+ 	CU_ADD_TEST(suite, test_reservation_acquire_release_with_ptpl);
++	CU_ADD_TEST(suite, test_reservation_all_regs_acquirer_leaves_with_ptpl);
+ 	CU_ADD_TEST(suite, test_reservation_release);
+ 	CU_ADD_TEST(suite, test_reservation_unregister_notification);
+ 	CU_ADD_TEST(suite, test_reservation_release_notification);

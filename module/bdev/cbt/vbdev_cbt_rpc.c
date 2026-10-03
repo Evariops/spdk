@@ -702,6 +702,38 @@ cleanup:
 }
 SPDK_RPC_REGISTER("bdev_cbt_reset", rpc_bdev_cbt_reset, SPDK_RPC_RUNTIME)
 
+/* bdev_cbt_rotate: start a new history window (see bdev_cbt_rotate). Answers the
+ * errno as the JSON-RPC error code, as bdev_cbt_reset does: -EBUSY while an epoch
+ * is live, -EAGAIN when called again too soon. */
+static void
+rpc_bdev_cbt_rotate(struct spdk_jsonrpc_request *request,
+		    const struct spdk_json_val *params)
+{
+	struct rpc_cbt_name_only req = {NULL};
+	int rc;
+
+	if (spdk_json_decode_object(params, rpc_cbt_name_only_decoders,
+				    SPDK_COUNTOF(rpc_cbt_name_only_decoders), &req)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "Failed to decode parameters");
+		goto cleanup;
+	}
+
+	rc = bdev_cbt_rotate(req.name);
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
+		goto cleanup;
+	}
+
+	struct spdk_json_write_ctx *w = spdk_jsonrpc_begin_result(request);
+	spdk_json_write_bool(w, true);
+	spdk_jsonrpc_end_result(request, w);
+
+cleanup:
+	free_rpc_cbt_name_only(&req);
+}
+SPDK_RPC_REGISTER("bdev_cbt_rotate", rpc_bdev_cbt_rotate, SPDK_RPC_RUNTIME)
+
 /* ================================================================== */
 /* bdev_cbt_partial_rebuild (async — deferred RPC response)           */
 /* ================================================================== */

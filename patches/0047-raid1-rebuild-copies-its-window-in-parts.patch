@@ -1,0 +1,331 @@
+diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
+index 583707e..da919f1 100644
+--- a/module/bdev/raid/bdev_raid.c
++++ b/module/bdev/raid/bdev_raid.c
+@@ -3266,6 +3266,21 @@ raid_bdev_process_request_complete(struct raid_bdev_process_request *process_req
+ 	}
+ }
+ 
++/* Evariops 0047: a window is offered to its requests in RAID_BDEV_PROCESS_MAX_QD
++ * parts, so all of them are in flight together: each part's write starts as its
++ * own read completes, and the reads spread over the members that serve them. A
++ * window copied as one request was read whole, then written whole — read and
++ * write never overlapped, and one member served every read. */
++uint32_t
++raid_bdev_process_request_max_part(const struct raid_bdev_process_request *process_req)
++{
++	const struct raid_bdev_process *process = process_req->process;
++	const uint64_t write_unit = spdk_max(process->raid_bdev->bdev.write_unit_size, 1);
++	const uint64_t part = spdk_divide_round_up(process->max_window_size, RAID_BDEV_PROCESS_MAX_QD);
++
++	return spdk_divide_round_up(part, write_unit) * write_unit;
++}
++
+ static int
+ raid_bdev_submit_process_request(struct raid_bdev_process *process, uint64_t offset_blocks,
+ 				 uint32_t num_blocks)
+diff --git a/module/bdev/raid/bdev_raid.h b/module/bdev/raid/bdev_raid.h
+index 280d61c..f584d19 100644
+--- a/module/bdev/raid/bdev_raid.h
++++ b/module/bdev/raid/bdev_raid.h
+@@ -481,6 +481,10 @@ void *raid_bdev_channel_get_module_ctx(struct raid_bdev_io_channel *raid_ch);
+ struct raid_base_bdev_info *raid_bdev_channel_get_base_info(struct raid_bdev_io_channel *raid_ch,
+ 		struct spdk_bdev *base_bdev);
+ void raid_bdev_process_request_complete(struct raid_bdev_process_request *process_req, int status);
++/* Evariops 0047: the largest part of its window one process request should copy,
++ * for a module that copies any range (raid1). A module bound to a stripe (raid5f)
++ * ignores it. */
++uint32_t raid_bdev_process_request_max_part(const struct raid_bdev_process_request *process_req);
+ void raid_bdev_io_init(struct raid_bdev_io *raid_io, struct raid_bdev_io_channel *raid_ch,
+ 		       enum spdk_bdev_io_type type, uint64_t offset_blocks,
+ 		       uint64_t num_blocks, struct iovec *iovs, int iovcnt, void *md_buf,
+diff --git a/module/bdev/raid/raid1.c b/module/bdev/raid/raid1.c
+index f1d4f0f..51efb51 100644
+--- a/module/bdev/raid/raid1.c
++++ b/module/bdev/raid/raid1.c
+@@ -590,6 +590,13 @@ raid1_submit_process_request(struct raid_bdev_process_request *process_req,
+ 	struct raid_bdev_io *raid_io = &process_req->raid_io;
+ 	int ret;
+ 
++	/* Evariops 0047: one part of the window, not the window whole: the next
++	 * requests take the rest, in flight beside this one. */
++	process_req->num_blocks = spdk_min(process_req->num_blocks,
++					   raid_bdev_process_request_max_part(process_req));
++	process_req->iov.iov_len = (size_t)process_req->num_blocks *
++				   process_req->target->raid_bdev->bdev.blocklen;
++
+ 	raid_bdev_io_init(raid_io, raid_ch, SPDK_BDEV_IO_TYPE_READ,
+ 			  process_req->offset_blocks, process_req->num_blocks,
+ 			  &process_req->iov, 1, process_req->md_buf, NULL, NULL);
+diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+index 11b46f2..a488d6d 100644
+--- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
++++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+@@ -1765,6 +1765,35 @@ test_raid_process_seeded_skips_a_clean_span_without_a_window(void)
+ 	CU_ASSERT(g_lowest_copy_window == 100);
+ }
+ 
++/* Evariops 0047: a window is offered to its requests in parts that all fit at once,
++ * so its copy is in flight together, and a window with room for it is split. The
++ * largest part is whole write units; the window's last part is what remains. */
++static void
++test_raid_process_request_max_part(void)
++{
++	struct raid_bdev raid_bdev = {};
++	struct raid_bdev_process process = { .raid_bdev = &raid_bdev };
++	struct raid_bdev_process_request process_req = { .process = &process };
++	const uint64_t windows[] = { 8192, 2048, 1000, 17, 3, 1 };
++	const uint32_t write_units[] = { 1, 8 };
++	uint32_t w, u, part;
++
++	for (u = 0; u < SPDK_COUNTOF(write_units); u++) {
++		raid_bdev.bdev.write_unit_size = write_units[u];
++		for (w = 0; w < SPDK_COUNTOF(windows); w++) {
++			process.max_window_size = windows[w];
++			part = raid_bdev_process_request_max_part(&process_req);
++
++			CU_ASSERT(part > 0);
++			CU_ASSERT(part % write_units[u] == 0);
++			CU_ASSERT((uint64_t)part * RAID_BDEV_PROCESS_MAX_QD >= windows[w]);
++			if (windows[w] >= 2ULL * RAID_BDEV_PROCESS_MAX_QD * write_units[u]) {
++				CU_ASSERT(part < windows[w]);
++			}
++		}
++	}
++}
++
+ static void
+ test_raid_process_with_qos(void)
+ {
+@@ -2176,6 +2205,7 @@ main(int argc, char **argv)
+ 	CU_ADD_TEST(suite, test_raid_process_seeded_skips_a_clean_span_without_a_window);
+ 	CU_ADD_TEST(suite, test_raid_seeded_rebuild_from_epoch_copies_every_range);
+ 	CU_ADD_TEST(suite, test_raid_seeded_rebuild_from_epoch_refuses_a_delta_it_cannot_take_whole);
++	CU_ADD_TEST(suite, test_raid_process_request_max_part);
+ 	CU_ADD_TEST(suite, test_raid_process_with_qos);
+ 
+ 	spdk_thread_lib_init(test_new_thread_fn, 0);
+diff --git a/test/unit/lib/bdev/raid/raid1.c/raid1_ut.c b/test/unit/lib/bdev/raid/raid1.c/raid1_ut.c
+index 9c3eb8f..88f4295 100644
+--- a/test/unit/lib/bdev/raid/raid1.c/raid1_ut.c
++++ b/test/unit/lib/bdev/raid/raid1.c/raid1_ut.c
+@@ -23,11 +23,6 @@ DEFINE_STUB_V(raid_bdev_queue_io_wait, (struct raid_bdev_io *raid_io, struct spd
+ 					struct spdk_io_channel *ch, spdk_bdev_io_wait_cb cb_fn));
+ DEFINE_STUB_V(raid_bdev_process_request_complete, (struct raid_bdev_process_request *process_req,
+ 		int status));
+-DEFINE_STUB_V(raid_bdev_io_init, (struct raid_bdev_io *raid_io,
+-				  struct raid_bdev_io_channel *raid_ch,
+-				  enum spdk_bdev_io_type type, uint64_t offset_blocks,
+-				  uint64_t num_blocks, struct iovec *iovs, int iovcnt, void *md_buf,
+-				  struct spdk_memory_domain *memory_domain, void *memory_domain_ctx));
+ DEFINE_STUB(raid_bdev_remap_dix_reftag, int, (void *md_buf, uint64_t num_blocks,
+ 		struct spdk_bdev *bdev, uint32_t remapped_offset), -1);
+ DEFINE_STUB(spdk_bdev_notify_blockcnt_change, int, (struct spdk_bdev *bdev, uint64_t size), 0);
+@@ -38,14 +33,41 @@ DEFINE_STUB(spdk_bdev_unmap_blocks, int, (struct spdk_bdev_desc *desc, struct sp
+ 		uint64_t offset_blocks, uint64_t num_blocks, spdk_bdev_io_completion_cb cb,
+ 		void *cb_arg), 0);
+ 
++/* Evariops 0047: the I/O the module submitted, in order, so a test reads back which
++ * member served a read and where a write landed, and completes each in turn. */
++struct ut_io {
++	bool write;
++	struct spdk_bdev_desc *desc;
++	uint64_t offset_blocks;
++	uint64_t num_blocks;
++	spdk_bdev_io_completion_cb cb;
++	void *cb_arg;
++};
++static struct ut_io g_ios[32];
++static int g_num_ios;
++
++static void
++ut_record_io(bool write, struct spdk_bdev_desc *desc, uint64_t offset_blocks, uint64_t num_blocks,
++	     spdk_bdev_io_completion_cb cb, void *cb_arg)
++{
++	g_last_io_desc = desc;
++	g_last_io_cb = cb;
++
++	if (g_num_ios < (int)SPDK_COUNTOF(g_ios)) {
++		g_ios[g_num_ios++] = (struct ut_io) {
++			.write = write, .desc = desc, .offset_blocks = offset_blocks,
++			.num_blocks = num_blocks, .cb = cb, .cb_arg = cb_arg,
++		};
++	}
++}
++
+ int
+ spdk_bdev_readv_blocks_ext(struct spdk_bdev_desc *desc,
+ 			   struct spdk_io_channel *ch,
+ 			   struct iovec *iov, int iovcnt, uint64_t offset_blocks, uint64_t num_blocks,
+ 			   spdk_bdev_io_completion_cb cb, void *cb_arg, struct spdk_bdev_ext_io_opts *opts)
+ {
+-	g_last_io_desc = desc;
+-	g_last_io_cb = cb;
++	ut_record_io(false, desc, offset_blocks, num_blocks, cb, cb_arg);
+ 
+ 	return 0;
+ }
+@@ -56,12 +78,34 @@ spdk_bdev_writev_blocks_ext(struct spdk_bdev_desc *desc,
+ 			    struct iovec *iov, int iovcnt, uint64_t offset_blocks, uint64_t num_blocks,
+ 			    spdk_bdev_io_completion_cb cb, void *cb_arg, struct spdk_bdev_ext_io_opts *opts)
+ {
+-	g_last_io_desc = desc;
+-	g_last_io_cb = cb;
++	ut_record_io(true, desc, offset_blocks, num_blocks, cb, cb_arg);
+ 
+ 	return 0;
+ }
+ 
++/* raid1 inits a raid_io only for a process request, whose target names the raid:
++ * enough to init it for real, so the copy it submits runs through the module. */
++void
++raid_bdev_io_init(struct raid_bdev_io *raid_io, struct raid_bdev_io_channel *raid_ch,
++		  enum spdk_bdev_io_type type, uint64_t offset_blocks,
++		  uint64_t num_blocks, struct iovec *iovs, int iovcnt, void *md_buf,
++		  struct spdk_memory_domain *memory_domain, void *memory_domain_ctx)
++{
++	struct raid_bdev_process_request *process_req =
++		SPDK_CONTAINEROF(raid_io, struct raid_bdev_process_request, raid_io);
++
++	raid_test_bdev_io_init(raid_io, process_req->target->raid_bdev, raid_ch, type,
++			       offset_blocks, num_blocks, iovs, iovcnt, md_buf);
++}
++
++static uint32_t g_process_max_part = UINT32_MAX;
++
++uint32_t
++raid_bdev_process_request_max_part(const struct raid_bdev_process_request *process_req)
++{
++	return g_process_max_part;
++}
++
+ void
+ raid_bdev_fail_base_bdev(struct raid_base_bdev_info *base_info)
+ {
+@@ -274,6 +318,118 @@ test_raid1_read_balancing(void)
+ 	run_for_each_raid1_config(_test_raid1_read_balancing);
+ }
+ 
++static int
++ut_member_of(struct raid_bdev *raid_bdev, struct spdk_bdev_desc *desc)
++{
++	uint8_t i;
++
++	for (i = 0; i < raid_bdev->num_base_bdevs; i++) {
++		if (raid_bdev->base_bdev_info[i].desc == desc) {
++			return i;
++		}
++	}
++	return -1;
++}
++
++/* Evariops 0047: a rebuild window is copied in parts, all in flight together, and
++ * the parts' reads spread over the members in sync. Copied as ONE request, the
++ * window was read whole from the first member before any of it was written: read
++ * and write never overlapped, and on a 3-node bench every byte of a 5 GiB rebuild crossed
++ * the link from a remote member (36 MiB/s) while the nexus's local member idled.
++ * The target is the last member: the process channel has no read channel for it. */
++static void
++_test_raid1_process_window_in_parts(struct raid_bdev *raid_bdev, struct raid_bdev_io_channel *raid_ch)
++{
++	struct raid1_io_channel *raid1_ch = raid_bdev_channel_get_module_ctx(raid_ch);
++	struct raid_bdev_process_request reqs[4] = {};
++	const uint8_t target = raid_bdev->num_base_bdevs - 1;
++	const uint64_t window = 64;
++	uint32_t served[8] = {};
++	uint64_t offset = 0;
++	int num_reqs = 0, num_reads, i;
++
++	if (raid_bdev->bdev.blockcnt < window) {
++		return;
++	}
++
++	g_process_max_part = window / SPDK_COUNTOF(reqs);
++	g_num_ios = 0;
++	raid_ch->_base_channels[target] = NULL;
++
++	/* As the generic layer offers it: the rest of the window, to the next request. */
++	while (offset < window && num_reqs < (int)SPDK_COUNTOF(reqs)) {
++		struct raid_bdev_process_request *req = &reqs[num_reqs++];
++		int ret;
++
++		req->target = &raid_bdev->base_bdev_info[target];
++		req->target_ch = (void *)1;
++		req->offset_blocks = offset;
++		req->num_blocks = window - offset;
++		req->iov.iov_len = req->num_blocks * raid_bdev->bdev.blocklen;
++
++		ret = raid1_submit_process_request(req, raid_ch);
++		CU_ASSERT(ret > 0 && (uint32_t)ret <= g_process_max_part);
++		CU_ASSERT(req->num_blocks == (uint32_t)ret);
++		CU_ASSERT(req->iov.iov_len == (uint64_t)ret * raid_bdev->bdev.blocklen);
++		if (ret <= 0) {
++			break;
++		}
++		offset += ret;
++	}
++	CU_ASSERT(offset == window);
++	CU_ASSERT(num_reqs == (int)SPDK_COUNTOF(reqs));
++
++	/* Every part is read before any completes, each from a member in sync, and the
++	 * reads tile the window; members in sync serve as many parts each. */
++	num_reads = g_num_ios;
++	CU_ASSERT(num_reads == num_reqs);
++	offset = 0;
++	for (i = 0; i < num_reads; i++) {
++		int member = ut_member_of(raid_bdev, g_ios[i].desc);
++
++		CU_ASSERT(!g_ios[i].write);
++		CU_ASSERT(member >= 0 && member != target);
++		CU_ASSERT(g_ios[i].offset_blocks == offset);
++		offset += g_ios[i].num_blocks;
++		if (member >= 0) {
++			served[member]++;
++		}
++	}
++	CU_ASSERT(offset == window);
++	for (i = 0; i < target; i++) {
++		CU_ASSERT(served[i] == (uint32_t)num_reqs / target);
++	}
++
++	/* Each part's read completing writes that part to the target, and only it. */
++	for (i = 0; i < num_reads; i++) {
++		struct spdk_bdev_io bdev_io = {};
++
++		g_ios[i].cb(&bdev_io, true, g_ios[i].cb_arg);
++		CU_ASSERT(g_num_ios == num_reads + i + 1);
++		CU_ASSERT(g_ios[num_reads + i].write);
++		CU_ASSERT(ut_member_of(raid_bdev, g_ios[num_reads + i].desc) == target);
++		CU_ASSERT(g_ios[num_reads + i].offset_blocks == g_ios[i].offset_blocks);
++		CU_ASSERT(g_ios[num_reads + i].num_blocks == g_ios[i].num_blocks);
++	}
++	for (i = num_reads; i < g_num_ios; i++) {
++		struct spdk_bdev_io bdev_io = {};
++
++		g_ios[i].cb(&bdev_io, true, g_ios[i].cb_arg);
++	}
++	for (i = 0; i < raid_bdev->num_base_bdevs; i++) {
++		CU_ASSERT(raid1_ch->read_blocks_outstanding[i] == 0);
++	}
++
++	raid_ch->_base_channels[target] = (void *)1;
++	g_process_max_part = UINT32_MAX;
++}
++
++static void
++test_raid1_process_window_in_parts(void)
++{
++	run_for_each_raid1_config(_test_raid1_process_window_in_parts);
++}
++
+ static void
+ _test_raid1_write_error(struct raid_bdev *raid_bdev, struct raid_bdev_io_channel *raid_ch)
+ {
+@@ -572,6 +728,7 @@ main(int argc, char **argv)
+ 	suite = CU_add_suite("raid1", test_setup, test_cleanup);
+ 	CU_ADD_TEST(suite, test_raid1_start);
+ 	CU_ADD_TEST(suite, test_raid1_read_balancing);
++	CU_ADD_TEST(suite, test_raid1_process_window_in_parts);
+ 	CU_ADD_TEST(suite, test_raid1_write_error);
+ 	CU_ADD_TEST(suite, test_raid1_write_capacity_exceeded);
+ 	CU_ADD_TEST(suite, test_raid1_read_error);

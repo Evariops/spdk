@@ -503,44 +503,70 @@ cbt_epoch_state_name(enum cbt_epoch_state state)
 	}
 }
 
-/* Epoch-at-ejection — see vbdev_cbt_query.h. Refuses (-EEXIST) when an OPEN
- * epoch already bounds the round: an implicit takeover would steal the nonce
- * from under the controller. FROZEN/REBUILDING epochs do not block — those are
- * prior rounds being digested while the live bitmap keeps tracking. */
+/* The cbt bdev stacked on the bdev named base_bdev_name, if any. */
+static struct vbdev_cbt *
+cbt_find_by_base_name(const char *base_bdev_name)
+{
+	struct vbdev_cbt *node;
+
+	TAILQ_FOREACH(node, &g_cbt_nodes, link) {
+		if (node->base_bdev != NULL &&
+		    strcmp(spdk_bdev_get_name(node->base_bdev), base_bdev_name) == 0) {
+			return node;
+		}
+	}
+	return NULL;
+}
+
+/* Epoch-at-ejection — see vbdev_cbt_query.h. Refuses (-EEXIST) while the cbt
+ * carries a live epoch. An open one bounds a round the controller started, and
+ * taking it over would steal its nonce. A frozen or rebuilding one may have taken
+ * out of the live bitmap, at its freeze, writes the member missed just before it
+ * left: an epoch opened now would start short of them. */
 int
-vbdev_cbt_auto_epoch_open(const char *bdev_name, const char *stale_backend_id)
+vbdev_cbt_auto_epoch_open(const char *base_bdev_name, const char *member_id)
 {
 	struct vbdev_cbt *cbt;
 	struct cbt_epoch *ep;
 	char epoch_id[CBT_EPOCH_ID_MAX];
 	char nonce[CBT_NONCE_MAX];
+	const char *cbt_name;
 	uint64_t max_gen = 0;
 	uint64_t ticks = spdk_get_ticks();
 
 	assert(spdk_get_thread() == spdk_thread_get_app_thread());
 
-	cbt = cbt_find_by_name(bdev_name);
+	cbt = cbt_find_by_base_name(base_bdev_name);
 	if (cbt == NULL) {
 		return -ENODEV;
 	}
+	if (cbt_any_epoch_open(cbt)) {
+		return -EEXIST;
+	}
 
 	TAILQ_FOREACH(ep, &cbt->epochs, link) {
-		if (ep->state == CBT_EPOCH_OPEN) {
-			return -EEXIST;
-		}
 		if (ep->generation > max_gen) {
 			max_gen = ep->generation;
 		}
 	}
 
+	/* The member may have missed writes from just before a rotation: those moved
+	 * to the previous window, and come back into the delta here. With no live
+	 * epoch, no rotation runs until this epoch closes. */
+	for (uint64_t i = 0; i < cbt->bitmap_size_bytes; i++) {
+		if (cbt->bitmap_prev[i] != 0) {
+			__atomic_fetch_or(&cbt->bitmap[i], cbt->bitmap_prev[i], __ATOMIC_ACQ_REL);
+		}
+	}
+
+	cbt_name = spdk_bdev_get_name(&cbt->cbt_bdev);
 	snprintf(epoch_id, sizeof(epoch_id), "auto-%016" PRIx64, ticks);
 	snprintf(nonce, sizeof(nonce), "auto%08x", (uint32_t)ticks);
 
-	SPDK_NOTICELOG("CBT: auto epoch '%s' (nonce %s) on '%s' — member '%s' ejected\n",
-		       epoch_id, nonce, bdev_name, stale_backend_id);
+	SPDK_NOTICELOG("CBT: auto epoch '%s' (nonce %s) on '%s' — member '%s' left '%s'\n",
+		       epoch_id, nonce, cbt_name, member_id, base_bdev_name);
 
-	return bdev_cbt_epoch_open(bdev_name, epoch_id, stale_backend_id,
-				   max_gen + 1, nonce);
+	return bdev_cbt_epoch_open(cbt_name, epoch_id, member_id, max_gen + 1, nonce);
 }
 
 /* Cross-module query — the raid module publishes these facts per member in ITS
@@ -570,6 +596,53 @@ vbdev_cbt_query_latest_epoch(const char *bdev_name, struct vbdev_cbt_epoch_facts
 	out->state = cbt_epoch_state_name(latest->state);
 	out->truncated = latest->truncated;
 
+	return 0;
+}
+
+/* Cross-module query — the delta of an epoch for the raid module's seeded
+ * rebuild (see vbdev_cbt_query.h): the ranges bdev_cbt_epoch_get_dirty_ranges
+ * walks, in the query's own type, refused whole when they do not all fit. */
+int
+vbdev_cbt_query_epoch_ranges(const char *bdev_name, const char *epoch_id, uint32_t max,
+			     struct vbdev_cbt_range **out, uint32_t *count)
+{
+	struct cbt_dirty_range *ranges = NULL;
+	struct vbdev_cbt_range *copy = NULL;
+	uint64_t dirty_chunks, total_chunks;
+	uint32_t num_ranges = 0, chunk_size_kb, i;
+	bool truncated = false;
+	int rc;
+
+	assert(spdk_get_thread() == spdk_thread_get_app_thread());
+
+	*out = NULL;
+	*count = 0;
+
+	rc = bdev_cbt_epoch_get_dirty_ranges(bdev_name, epoch_id, max, &ranges, &num_ranges,
+					     &dirty_chunks, &total_chunks, &chunk_size_kb, &truncated);
+	if (rc != 0) {
+		return rc;
+	}
+	if (truncated) {
+		free(ranges);
+		return -E2BIG;
+	}
+
+	if (num_ranges > 0) {
+		copy = calloc(num_ranges, sizeof(*copy));
+		if (copy == NULL) {
+			free(ranges);
+			return -ENOMEM;
+		}
+		for (i = 0; i < num_ranges; i++) {
+			copy[i].offset_blocks = ranges[i].offset_blocks;
+			copy[i].num_blocks = ranges[i].length_blocks;
+		}
+	}
+	free(ranges);
+
+	*out = copy;
+	*count = num_ranges;
 	return 0;
 }
 
@@ -629,6 +702,7 @@ _cbt_device_unregister_cb(void *io_device)
 	struct vbdev_cbt *cbt_node = io_device;
 
 	free(cbt_node->bitmap);
+	free(cbt_node->bitmap_prev);
 	free(cbt_node->cbt_bdev.name);
 
 	struct cbt_epoch *ep;
@@ -831,14 +905,18 @@ vbdev_cbt_register(const char *bdev_name)
 		cbt_node->total_blocks = bdev->blockcnt;
 
 		cbt_node->bitmap = calloc(1, cbt_node->bitmap_size_bytes);
-		if (!cbt_node->bitmap) {
-			SPDK_ERRLOG("CBT: bitmap allocation failed (%lu bytes)\n",
+		cbt_node->bitmap_prev = calloc(1, cbt_node->bitmap_size_bytes);
+		if (!cbt_node->bitmap || !cbt_node->bitmap_prev) {
+			SPDK_ERRLOG("CBT: bitmap allocation failed (2 x %lu bytes)\n",
 				    (unsigned long)cbt_node->bitmap_size_bytes);
 			spdk_bdev_close(cbt_node->base_desc);
+			free(cbt_node->bitmap);
+			free(cbt_node->bitmap_prev);
 			free(cbt_node->cbt_bdev.name);
 			free(cbt_node);
 			return -ENOMEM;
 		}
+		cbt_node->rotated_at = spdk_get_ticks();
 
 		/* ── Copy geometry from base bdev ── */
 		cbt_node->cbt_bdev.write_cache        = bdev->write_cache;
@@ -886,6 +964,7 @@ vbdev_cbt_register(const char *bdev_name)
 			TAILQ_REMOVE(&g_cbt_nodes, cbt_node, link);
 			spdk_io_device_unregister(cbt_node, NULL);
 			free(cbt_node->bitmap);
+			free(cbt_node->bitmap_prev);
 			free(cbt_node->cbt_bdev.name);
 			free(cbt_node);
 			return rc;
@@ -899,6 +978,7 @@ vbdev_cbt_register(const char *bdev_name)
 			TAILQ_REMOVE(&g_cbt_nodes, cbt_node, link);
 			spdk_io_device_unregister(cbt_node, NULL);
 			free(cbt_node->bitmap);
+			free(cbt_node->bitmap_prev);
 			free(cbt_node->cbt_bdev.name);
 			free(cbt_node);
 			return rc;
@@ -2478,6 +2558,38 @@ bdev_cbt_reset(const char *cbt_name)
 
 	__atomic_thread_fence(__ATOMIC_ACQUIRE);
 	memset(cbt->bitmap, 0, cbt->bitmap_size_bytes);
+	/* The caller vouches every backend in sync through now: the history window
+	 * goes with the rest. */
+	memset(cbt->bitmap_prev, 0, cbt->bitmap_size_bytes);
+	return 0;
+}
+
+int
+bdev_cbt_rotate(const char *cbt_name)
+{
+	struct vbdev_cbt *cbt = cbt_find_by_name(cbt_name);
+	uint64_t now = spdk_get_ticks();
+
+	assert(spdk_get_thread() == spdk_thread_get_app_thread());
+
+	if (!cbt) {
+		return -ENODEV;
+	}
+	/* A live epoch reads the live bitmap whole: moving bits out of it would take
+	 * them out of that epoch's delta. */
+	if (cbt_any_epoch_open(cbt)) {
+		return -EBUSY;
+	}
+	if (now - cbt->rotated_at < CBT_ROTATE_MIN_INTERVAL_US * spdk_get_ticks_hz() / SPDK_SEC_TO_USEC) {
+		return -EAGAIN;
+	}
+
+	/* Per-byte exchange, as at freeze: an I/O thread OR-ing a bit between a copy
+	 * and a clear would lose it. */
+	for (uint64_t i = 0; i < cbt->bitmap_size_bytes; i++) {
+		cbt->bitmap_prev[i] = __atomic_exchange_n(&cbt->bitmap[i], 0, __ATOMIC_ACQ_REL);
+	}
+	cbt->rotated_at = now;
 	return 0;
 }
 

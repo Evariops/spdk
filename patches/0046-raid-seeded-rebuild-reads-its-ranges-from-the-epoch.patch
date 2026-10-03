@@ -1,0 +1,522 @@
+diff --git a/module/bdev/raid/bdev_raid_rpc.c b/module/bdev/raid/bdev_raid_rpc.c
+index 6ded0ca..d4127d2 100644
+--- a/module/bdev/raid/bdev_raid_rpc.c
++++ b/module/bdev/raid/bdev_raid_rpc.c
+@@ -8,6 +8,8 @@
+ #include "bdev_raid.h"
+ #include "bdev_raid_outcomes.h"
+ #include "bdev_raid_envelopes.h"
++/* Evariops 0046: the seed of a rebuild read from the CBT epoch in-process. */
++#include "../cbt/vbdev_cbt_query.h"
+ #include "spdk/util.h"
+ #include "spdk/string.h"
+ #include "spdk/log.h"
+@@ -670,9 +672,9 @@ SPDK_RPC_REGISTER("bdev_raid_add_base_bdev", rpc_bdev_raid_add_base_bdev, SPDK_R
+  * progress shows up as the raid's process in bdev_raid_get_bdevs, and
+  * completion makes the member read-eligible and CONFIGURED in the superblock. */
+ 
+-/* The rebuild engine works in 1 MiB windows, so finer ranges buy nothing: the
+- * caller coalesces its dirty set down to this many ranges. Same cap as
+- * bdev_raid_rebuild_ranges. */
++/* A request decodes this many ranges at most; the JSON-RPC server parses ~200
++ * anyway. A larger delta goes through bdev_raid_start_seeded_rebuild_from_epoch,
++ * which reads it in-process. Same cap as bdev_raid_rebuild_ranges. */
+ #define RAID_SEEDED_REBUILD_MAX_RANGES 4096u
+ 
+ struct rpc_bdev_raid_start_seeded_rebuild {
+@@ -759,51 +761,40 @@ seed_range_cmp(const void *a, const void *b)
+ 	return 0;
+ }
+ 
+-static void
+-rpc_bdev_raid_start_seeded_rebuild(struct spdk_jsonrpc_request *request,
+-				   const struct spdk_json_val *params)
++/* The raid and its write_only-attached member a seeded rebuild targets, or
++ * false with the request answered: unknown raid, stale incarnation, a process
++ * already running, a member that is not write_only-attached. */
++static bool
++seeded_rebuild_target(struct spdk_jsonrpc_request *request, const char *name,
++		      const char *base_bdev, const char *expected_incarnation,
++		      struct raid_bdev **raid_out, struct raid_base_bdev_info **base_out)
+ {
+-	struct rpc_bdev_raid_start_seeded_rebuild req = {};
+ 	struct raid_bdev *raid_bdev;
+ 	struct raid_base_bdev_info *base_info = NULL, *iter;
+-	struct raid_bdev_seed_range *ranges;
+-	struct spdk_json_write_ctx *w;
+-	uint64_t blockcnt;
+-	char detail[192];
+-	uint32_t i;
+-	int rc;
+-
+-	if (spdk_json_decode_object(params, rpc_bdev_raid_start_seeded_rebuild_decoders,
+-				    SPDK_COUNTOF(rpc_bdev_raid_start_seeded_rebuild_decoders),
+-				    &req)) {
+-		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_PARSE_ERROR,
+-						 "spdk_json_decode_object failed");
+-		goto cleanup;
+-	}
+ 
+-	raid_bdev = raid_bdev_find_by_name(req.name);
++	raid_bdev = raid_bdev_find_by_name(name);
+ 	if (raid_bdev == NULL) {
+ 		spdk_jsonrpc_send_error_response_fmt(request, -ENODEV, "raid bdev %s is not found in config",
+-						     req.name);
+-		goto cleanup;
++						     name);
++		return false;
+ 	}
+ 
+-	if (raid_bdev_check_incarnation(raid_bdev, req.expected_incarnation) != 0) {
++	if (raid_bdev_check_incarnation(raid_bdev, expected_incarnation) != 0) {
+ 		spdk_jsonrpc_send_error_response_fmt(request, -ESTALE,
+ 						     "stale incarnation for raid bdev %s",
+-						     req.name);
+-		goto cleanup;
++						     name);
++		return false;
+ 	}
+ 
+ 	if (raid_bdev->process != NULL) {
+ 		spdk_jsonrpc_send_error_response_fmt(request, -EBUSY,
+ 						     "raid bdev %s already has a background process",
+-						     req.name);
+-		goto cleanup;
++						     name);
++		return false;
+ 	}
+ 
+ 	RAID_FOR_EACH_BASE_BDEV(raid_bdev, iter) {
+-		if (iter->name != NULL && strcmp(iter->name, req.base_bdev) == 0) {
++		if (iter->name != NULL && strcmp(iter->name, base_bdev) == 0) {
+ 			base_info = iter;
+ 			break;
+ 		}
+@@ -811,24 +802,41 @@ rpc_bdev_raid_start_seeded_rebuild(struct spdk_jsonrpc_request *request,
+ 	if (base_info == NULL) {
+ 		spdk_jsonrpc_send_error_response_fmt(request, -ENODEV,
+ 						     "base bdev %s is not a member of raid bdev %s",
+-						     req.base_bdev, req.name);
+-		goto cleanup;
++						     base_bdev, name);
++		return false;
+ 	}
+ 
+ 	if (!base_info->write_only_pending) {
+ 		spdk_jsonrpc_send_error_response_fmt(request, -EINVAL,
+ 						     "base bdev %s is not write_only-attached",
+-						     req.base_bdev);
+-		goto cleanup;
++						     base_bdev);
++		return false;
+ 	}
+ 
+-	/* Sort, then validate bounds and non-overlap (the engine's fast-skip
+-	 * cursor depends on both). Touching ranges are fine. */
+-	qsort(req.ranges, req.num_ranges, sizeof(*req.ranges), seed_range_cmp);
++	*raid_out = raid_bdev;
++	*base_out = base_info;
++	return true;
++}
+ 
+-	blockcnt = raid_bdev->bdev.blockcnt;
+-	for (i = 0; i < req.num_ranges; i++) {
+-		const struct raid_bdev_seed_range *range = &req.ranges[i];
++/* Validates sorted ranges against the raid, audits the RPC, starts the seeded
++ * rebuild and answers the request. Takes ownership of ranges, freed on every
++ * path the rebuild does not take them. */
++static void
++seeded_rebuild_start(struct spdk_jsonrpc_request *request, const char *method,
++		     struct raid_bdev *raid_bdev, struct raid_base_bdev_info *base_info,
++		     struct raid_bdev_seed_range *ranges, uint32_t num_ranges,
++		     const char *rebuild_token, const char *audit_extra)
++{
++	struct spdk_json_write_ctx *w;
++	uint64_t blockcnt = raid_bdev->bdev.blockcnt;
++	char detail[256];
++	uint32_t i;
++	int rc;
++
++	/* The engine's cursor depends on sorted, non-overlapping ranges; touching
++	 * ranges are fine. */
++	for (i = 0; i < num_ranges; i++) {
++		const struct raid_bdev_seed_range *range = &ranges[i];
+ 
+ 		if (range->num_blocks == 0 || range->offset_blocks >= blockcnt ||
+ 		    range->num_blocks > blockcnt - range->offset_blocks) {
+@@ -837,55 +845,85 @@ rpc_bdev_raid_start_seeded_rebuild(struct spdk_jsonrpc_request *request,
+ 							     "exceeds the raid size (%" PRIu64 " blocks)",
+ 							     i, range->offset_blocks, range->num_blocks,
+ 							     blockcnt);
+-			goto cleanup;
++			goto err;
+ 		}
+-		if (i > 0 && req.ranges[i - 1].offset_blocks + req.ranges[i - 1].num_blocks >
++		if (i > 0 && ranges[i - 1].offset_blocks + ranges[i - 1].num_blocks >
+ 		    range->offset_blocks) {
+ 			spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+ 							     "ranges %u and %u overlap", i - 1, i);
+-			goto cleanup;
++			goto err;
+ 		}
+ 	}
+ 
+-	if (req.rebuild_token != NULL &&
+-	    strnlen(req.rebuild_token, RAID_REBUILD_TOKEN_MAX) == RAID_REBUILD_TOKEN_MAX) {
++	if (rebuild_token != NULL &&
++	    strnlen(rebuild_token, RAID_REBUILD_TOKEN_MAX) == RAID_REBUILD_TOKEN_MAX) {
+ 		spdk_jsonrpc_send_error_response_fmt(request, -ENAMETOOLONG,
+ 						     "rebuild_token exceeds %d characters",
+ 						     RAID_REBUILD_TOKEN_MAX - 1);
+-		goto cleanup;
++		goto err;
+ 	}
+ 
+ 	/* Evariops 0011: audit every RPC that writes to the array — this one arms
+ 	 * a background writer. */
+-	snprintf(detail, sizeof(detail), "raid=%s base=%s ranges=%zu",
+-		 req.name, req.base_bdev, req.num_ranges);
+-	spdk_jsonrpc_request_audit(request, "bdev_raid_start_seeded_rebuild", detail);
++	snprintf(detail, sizeof(detail), "raid=%s base=%s ranges=%u%s",
++		 raid_bdev->bdev.name, base_info->name, num_ranges, audit_extra);
++	spdk_jsonrpc_request_audit(request, method, detail);
+ 
+ 	/* An empty set is legal: nothing was dirty, the backfill skips the whole
+ 	 * device, and the completion still promotes the member. */
+-	if (req.num_ranges == 0) {
+-		free(req.ranges);
++	if (num_ranges == 0) {
++		free(ranges);
+ 		ranges = NULL;
+-	} else {
+-		ranges = req.ranges;
+ 	}
+-	req.ranges = NULL;
+ 
+-	rc = raid_bdev_start_seeded_rebuild(base_info, ranges, (uint32_t)req.num_ranges,
+-					    req.rebuild_token);
++	rc = raid_bdev_start_seeded_rebuild(base_info, ranges, num_ranges, rebuild_token);
+ 	if (rc != 0) {
+-		free(ranges);
+ 		spdk_jsonrpc_send_error_response_fmt(request, rc,
+ 						     "Failed to start seeded rebuild on %s/%s: %s",
+-						     req.name, req.base_bdev, spdk_strerror(-rc));
+-		goto cleanup;
++						     raid_bdev->bdev.name, base_info->name,
++						     spdk_strerror(-rc));
++		goto err;
+ 	}
+ 
+ 	w = spdk_jsonrpc_begin_result(request);
+ 	spdk_json_write_object_begin(w);
+-	spdk_json_write_named_string_fmt(w, "rebuild_id", "%s:%s", req.name, req.base_bdev);
++	spdk_json_write_named_string_fmt(w, "rebuild_id", "%s:%s", raid_bdev->bdev.name,
++					 base_info->name);
+ 	spdk_json_write_object_end(w);
+ 	spdk_jsonrpc_end_result(request, w);
++	return;
++
++err:
++	free(ranges);
++}
++
++static void
++rpc_bdev_raid_start_seeded_rebuild(struct spdk_jsonrpc_request *request,
++				   const struct spdk_json_val *params)
++{
++	struct rpc_bdev_raid_start_seeded_rebuild req = {};
++	struct raid_bdev *raid_bdev;
++	struct raid_base_bdev_info *base_info;
++	struct raid_bdev_seed_range *ranges;
++
++	if (spdk_json_decode_object(params, rpc_bdev_raid_start_seeded_rebuild_decoders,
++				    SPDK_COUNTOF(rpc_bdev_raid_start_seeded_rebuild_decoders),
++				    &req)) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_PARSE_ERROR,
++						 "spdk_json_decode_object failed");
++		goto cleanup;
++	}
++
++	if (!seeded_rebuild_target(request, req.name, req.base_bdev, req.expected_incarnation,
++				   &raid_bdev, &base_info)) {
++		goto cleanup;
++	}
++
++	qsort(req.ranges, req.num_ranges, sizeof(*req.ranges), seed_range_cmp);
++	ranges = req.ranges;
++	req.ranges = NULL;
++	seeded_rebuild_start(request, "bdev_raid_start_seeded_rebuild", raid_bdev, base_info,
++			     ranges, (uint32_t)req.num_ranges, req.rebuild_token, "");
+ 
+ cleanup:
+ 	free_rpc_bdev_raid_start_seeded_rebuild(&req);
+@@ -893,6 +931,107 @@ cleanup:
+ SPDK_RPC_REGISTER("bdev_raid_start_seeded_rebuild", rpc_bdev_raid_start_seeded_rebuild,
+ 		  SPDK_RPC_RUNTIME)
+ 
++/* Evariops 0046: bdev_raid_start_seeded_rebuild_from_epoch {name, base_bdev,
++ * cbt_bdev, epoch_id} — the seeded rebuild of bdev_raid_start_seeded_rebuild,
++ * seeded with the dirty ranges of a frozen CBT epoch read in-process. A request
++ * carries ~200 ranges at most (1024 parsed values, a 32 KiB receive buffer):
++ * folding a scattered delta down to that many recopied the clean blocks in
++ * between, 3.2 GiB of them for 4485 dirty ranges (368 MiB), measured. A delta of
++ * more ranges than this is refused (-E2BIG): the caller rebuilds in full. */
++#define RAID_SEEDED_REBUILD_MAX_EPOCH_RANGES 65536u
++
++struct rpc_bdev_raid_start_seeded_rebuild_from_epoch {
++	char	*name;
++	char	*base_bdev;
++	/* The cbt bdev over this raid, and the frozen epoch of the member's outage. */
++	char	*cbt_bdev;
++	char	*epoch_id;
++	char	*expected_incarnation;
++	char	*rebuild_token;
++};
++
++static void
++free_rpc_bdev_raid_start_seeded_rebuild_from_epoch(
++	struct rpc_bdev_raid_start_seeded_rebuild_from_epoch *req)
++{
++	free(req->name);
++	free(req->base_bdev);
++	free(req->cbt_bdev);
++	free(req->epoch_id);
++	free(req->expected_incarnation);
++	free(req->rebuild_token);
++}
++
++static const struct spdk_json_object_decoder rpc_bdev_raid_start_seeded_rebuild_from_epoch_decoders[] = {
++	{"name", offsetof(struct rpc_bdev_raid_start_seeded_rebuild_from_epoch, name), spdk_json_decode_string},
++	{"base_bdev", offsetof(struct rpc_bdev_raid_start_seeded_rebuild_from_epoch, base_bdev), spdk_json_decode_string},
++	{"cbt_bdev", offsetof(struct rpc_bdev_raid_start_seeded_rebuild_from_epoch, cbt_bdev), spdk_json_decode_string},
++	{"epoch_id", offsetof(struct rpc_bdev_raid_start_seeded_rebuild_from_epoch, epoch_id), spdk_json_decode_string},
++	{"expected_incarnation", offsetof(struct rpc_bdev_raid_start_seeded_rebuild_from_epoch, expected_incarnation), spdk_json_decode_string, true},
++	{"rebuild_token", offsetof(struct rpc_bdev_raid_start_seeded_rebuild_from_epoch, rebuild_token), spdk_json_decode_string, true},
++};
++
++static void
++rpc_bdev_raid_start_seeded_rebuild_from_epoch(struct spdk_jsonrpc_request *request,
++		const struct spdk_json_val *params)
++{
++	struct rpc_bdev_raid_start_seeded_rebuild_from_epoch req = {};
++	struct raid_bdev *raid_bdev;
++	struct raid_base_bdev_info *base_info;
++	struct vbdev_cbt_range *epoch_ranges = NULL;
++	struct raid_bdev_seed_range *ranges = NULL;
++	uint32_t num_ranges = 0, i;
++	char audit_extra[96];
++	int rc;
++
++	if (spdk_json_decode_object(params, rpc_bdev_raid_start_seeded_rebuild_from_epoch_decoders,
++				    SPDK_COUNTOF(rpc_bdev_raid_start_seeded_rebuild_from_epoch_decoders),
++				    &req)) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_PARSE_ERROR,
++						 "spdk_json_decode_object failed");
++		goto cleanup;
++	}
++
++	if (!seeded_rebuild_target(request, req.name, req.base_bdev, req.expected_incarnation,
++				   &raid_bdev, &base_info)) {
++		goto cleanup;
++	}
++
++	rc = vbdev_cbt_query_epoch_ranges(req.cbt_bdev, req.epoch_id,
++					  RAID_SEEDED_REBUILD_MAX_EPOCH_RANGES,
++					  &epoch_ranges, &num_ranges);
++	if (rc != 0) {
++		spdk_jsonrpc_send_error_response_fmt(request, rc,
++						     "epoch %s of %s gives no seed for %s/%s: %s",
++						     req.epoch_id, req.cbt_bdev, req.name, req.base_bdev,
++						     spdk_strerror(-rc));
++		goto cleanup;
++	}
++
++	if (num_ranges > 0) {
++		ranges = calloc(num_ranges, sizeof(*ranges));
++		if (ranges == NULL) {
++			free(epoch_ranges);
++			spdk_jsonrpc_send_error_response(request, -ENOMEM, spdk_strerror(ENOMEM));
++			goto cleanup;
++		}
++		for (i = 0; i < num_ranges; i++) {
++			ranges[i].offset_blocks = epoch_ranges[i].offset_blocks;
++			ranges[i].num_blocks = epoch_ranges[i].num_blocks;
++		}
++	}
++	free(epoch_ranges);
++
++	snprintf(audit_extra, sizeof(audit_extra), " epoch=%s", req.epoch_id);
++	seeded_rebuild_start(request, "bdev_raid_start_seeded_rebuild_from_epoch", raid_bdev,
++			     base_info, ranges, num_ranges, req.rebuild_token, audit_extra);
++
++cleanup:
++	free_rpc_bdev_raid_start_seeded_rebuild_from_epoch(&req);
++}
++SPDK_RPC_REGISTER("bdev_raid_start_seeded_rebuild_from_epoch",
++		  rpc_bdev_raid_start_seeded_rebuild_from_epoch, SPDK_RPC_RUNTIME)
++
+ struct rpc_bdev_raid_remove_base_bdev {
+ 	/* Base bdev name */
+ 	char *name;
+diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+index f5a439b..11b46f2 100644
+--- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
++++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+@@ -246,6 +246,40 @@ DEFINE_STUB_V(raid_rebuild_outcome_set_verifying, (struct raid_rebuild_outcome *
+  * has CBT here (-ENODEV), which the raid passes over. */
+ DEFINE_STUB(vbdev_cbt_auto_epoch_open, int, (const char *bdev_name, const char *stale_backend_id),
+ 	    -ENODEV);
++
++/* Evariops 0046: a seeded rebuild reads its ranges from a CBT epoch. The CBT
++ * module is not part of this suite: the epoch's delta is this fake's. */
++static const struct raid_bdev_seed_range *g_epoch_seed;
++static uint32_t g_epoch_seed_count;
++static int g_epoch_query_rc;
++static char g_epoch_queried[64];
++
++int
++vbdev_cbt_query_epoch_ranges(const char *bdev_name, const char *epoch_id, uint32_t max,
++			     struct vbdev_cbt_range **out, uint32_t *count)
++{
++	uint32_t i;
++
++	snprintf(g_epoch_queried, sizeof(g_epoch_queried), "%s/%s", bdev_name, epoch_id);
++	*out = NULL;
++	*count = 0;
++	if (g_epoch_query_rc != 0) {
++		return g_epoch_query_rc;
++	}
++	if (g_epoch_seed_count > max) {
++		return -E2BIG;
++	}
++	if (g_epoch_seed_count > 0) {
++		*out = calloc(g_epoch_seed_count, sizeof(**out));
++		SPDK_CU_ASSERT_FATAL(*out != NULL);
++		for (i = 0; i < g_epoch_seed_count; i++) {
++			(*out)[i].offset_blocks = g_epoch_seed[i].offset_blocks;
++			(*out)[i].num_blocks = g_epoch_seed[i].num_blocks;
++		}
++	}
++	*count = g_epoch_seed_count;
++	return 0;
++}
+ /* Evariops 0021: the envelopes pace and admit the rebuilds. At their defaults here:
+  * no cap (0), and every rebuild admitted. */
+ DEFINE_STUB(raid_envelope_active_mb_sec, uint32_t, (enum raid_envelope_class klass), 0);
+@@ -1562,9 +1596,12 @@ test_raid_process(void)
+ /* Evariops 0045: a seeded rebuild copies its seed ranges and nothing else. A
+  * window that intersected a range used to be copied whole: scattered writes
+  * across a volume dirty every window, and the "seeded" pass copied the volume.
+- * Runs the rebuild with the given window and returns the blocks copied. */
++ * Runs the rebuild with the given window and returns the blocks copied —
++ * started directly, or (Evariops 0046) through the RPC that reads the seed from
++ * a CBT epoch, whose query answers query_rc. A refused start copies nothing. */
+ static uint64_t
+-run_seeded_rebuild(uint32_t window_size_kb, const struct raid_bdev_seed_range *seed, uint32_t num_ranges)
++seeded_rebuild_run(uint32_t window_size_kb, const struct raid_bdev_seed_range *seed, uint32_t num_ranges,
++		   bool via_epoch, int query_rc)
+ {
+ 	struct rpc_bdev_raid_create req;
+ 	struct rpc_bdev_raid_delete destroy_req;
+@@ -1599,20 +1636,43 @@ run_seeded_rebuild(uint32_t window_size_kb, const struct raid_bdev_seed_range *s
+ 	pbdev->module_private = &num_blocks_processed;
+ 	pbdev->min_base_bdevs_operational = 0;
+ 
+-	ranges = calloc(num_ranges, sizeof(*ranges));
+-	SPDK_CU_ASSERT_FATAL(ranges != NULL);
+-	memcpy(ranges, seed, num_ranges * sizeof(*ranges));
+ 	pbdev->base_bdev_info[0].write_only_pending = true;
+-	CU_ASSERT(raid_bdev_start_seeded_rebuild(&pbdev->base_bdev_info[0], ranges, num_ranges, NULL) == 0);
++	if (via_epoch) {
++		struct rpc_bdev_raid_start_seeded_rebuild_from_epoch epoch_req = {
++			.name = strdup("raid1"),
++			.base_bdev = strdup(pbdev->base_bdev_info[0].name),
++			.cbt_bdev = strdup("cbt_raid1"),
++			.epoch_id = strdup("epoch-0046"),
++		};
++
++		g_epoch_seed = seed;
++		g_epoch_seed_count = num_ranges;
++		g_epoch_query_rc = query_rc;
++		g_json_decode_obj_create = 0;
++		g_rpc_req = &epoch_req;
++		g_rpc_req_size = sizeof(epoch_req);
++		rpc_bdev_raid_start_seeded_rebuild_from_epoch(NULL, NULL);
++		g_epoch_query_rc = 0;
++		CU_ASSERT(strcmp(g_epoch_queried, "cbt_raid1/epoch-0046") == 0);
++		CU_ASSERT(g_rpc_err == (query_rc != 0));
++	} else {
++		ranges = calloc(num_ranges, sizeof(*ranges));
++		SPDK_CU_ASSERT_FATAL(ranges != NULL);
++		memcpy(ranges, seed, num_ranges * sizeof(*ranges));
++		CU_ASSERT(raid_bdev_start_seeded_rebuild(&pbdev->base_bdev_info[0], ranges, num_ranges, NULL) == 0);
++	}
+ 	poll_app_thread();
+-	SPDK_CU_ASSERT_FATAL(pbdev->process != NULL);
+ 
+-	process_thread = g_latest_thread;
+-	while (spdk_thread_poll(process_thread, 0, 0) > 0) {
+-		poll_app_thread();
++	if (query_rc == 0) {
++		SPDK_CU_ASSERT_FATAL(pbdev->process != NULL);
++		process_thread = g_latest_thread;
++		while (spdk_thread_poll(process_thread, 0, 0) > 0) {
++			poll_app_thread();
++		}
+ 	}
+ 	CU_ASSERT(pbdev->process == NULL);
+ 	poll_app_thread();
++	g_rpc_err = 0;
+ 
+ 	create_raid_bdev_delete_req(&destroy_req, "raid1", 0);
+ 	rpc_bdev_raid_delete(NULL, NULL);
+@@ -1628,6 +1688,40 @@ run_seeded_rebuild(uint32_t window_size_kb, const struct raid_bdev_seed_range *s
+ 	return num_blocks_processed;
+ }
+ 
++static uint64_t
++run_seeded_rebuild(uint32_t window_size_kb, const struct raid_bdev_seed_range *seed, uint32_t num_ranges)
++{
++	return seeded_rebuild_run(window_size_kb, seed, num_ranges, false, 0);
++}
++
++/* Evariops 0046: the epoch's ranges, read in-process, are the seed as they are —
++ * here 64 one-block ranges a block apart, each copied alone. A request carries
++ * ~200 ranges, and a scattered delta folded to fit one recopied the clean blocks
++ * in between. */
++static void
++test_raid_seeded_rebuild_from_epoch_copies_every_range(void)
++{
++	struct raid_bdev_seed_range seed[64];
++	uint32_t i;
++
++	for (i = 0; i < 64; i++) {
++		seed[i].offset_blocks = 2 * i;
++		seed[i].num_blocks = 1;
++	}
++
++	CU_ASSERT(seeded_rebuild_run(16, seed, 64, true, 0) == 64);
++}
++
++static void
++test_raid_seeded_rebuild_from_epoch_refuses_a_delta_it_cannot_take_whole(void)
++{
++	const struct raid_bdev_seed_range seed[] = {
++		{ .offset_blocks = 10, .num_blocks = 4 },
++	};
++
++	CU_ASSERT(seeded_rebuild_run(16, seed, 1, true, -E2BIG) == 0);
++}
++
+ static void
+ test_raid_process_seeded_copies_only_its_ranges(void)
+ {
+@@ -2080,6 +2174,8 @@ main(int argc, char **argv)
+ 	CU_ADD_TEST(suite, test_raid_process_seeded_copies_only_its_ranges);
+ 	CU_ADD_TEST(suite, test_raid_process_seeded_range_across_windows);
+ 	CU_ADD_TEST(suite, test_raid_process_seeded_skips_a_clean_span_without_a_window);
++	CU_ADD_TEST(suite, test_raid_seeded_rebuild_from_epoch_copies_every_range);
++	CU_ADD_TEST(suite, test_raid_seeded_rebuild_from_epoch_refuses_a_delta_it_cannot_take_whole);
+ 	CU_ADD_TEST(suite, test_raid_process_with_qos);
+ 
+ 	spdk_thread_lib_init(test_new_thread_fn, 0);
