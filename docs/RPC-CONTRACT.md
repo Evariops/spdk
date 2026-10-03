@@ -27,7 +27,7 @@ No params, read-only, idempotent. Returns `boot_id` (per-process uuid), `tier_sb
 | `bdev_tier_retire_band` | not an md-mirror band, else `-EBUSY` | idempotent: a re-run re-persists and re-closes | async; acks only once the superblock is durable. `rc ≠ 0` means retry |
 | `bdev_tier_resync_md` | target is a DEGRADED md leg; a healthy source leg exists | re-runnable; the leg stays DEGRADED on failure | copies under an md-range quiesce; acks after activate + persist |
 | `bdev_tier_delete` | — | `-ENODEV` if absent | unregister, then destruct |
-| `bdev_tier_get_bands`, `bdev_tier_read_sb` | — | read-only | `read_sb` returns the highest-seq valid slot plus `generation_uuid` |
+| `bdev_tier_get_bands`, `bdev_tier_read_sb` | — | read-only | `read_sb` returns the highest-seq valid slot plus `generation_uuid`; `valid: false` for a disk with no valid superblock, and an error (its errno) for a read that failed, which says nothing about the disk |
 
 **Assembly rules.** `bdev_tier_read_sb` exposes `version`, `seq`, `generation_uuid`, `created_epoch_sec`. Read every candidate disk's superblock, group by `generation_uuid` (this fences stale disks from a previous instance), take the highest `seq` per band, and when the two md legs disagree on `seq`, assemble the higher one ACTIVE and the other DEGRADED, then `bdev_tier_resync_md`. The fork persists DEGRADED but cannot arbitrate a split-brain across disks; that is the control-plane's.
 

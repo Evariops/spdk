@@ -522,12 +522,22 @@ static void
 rpc_read_sb_done(void *cb_arg, const struct tier_superblock *sb, int rc)
 {
 	struct rpc_read_sb_ctx *c = cb_arg;
+	enum tier_sb_read_answer answer = tier_sb_read_answer(sb, rc);
 	struct spdk_json_write_ctx *w;
 	uint32_t i;
 
+	if (answer == TIER_SB_READ_FAILED) {
+		rc = rc != 0 ? rc : -EIO;
+		spdk_jsonrpc_send_error_response_fmt(c->request, rc, "read_sb failed: %s",
+						     spdk_strerror(-rc));
+		spdk_bdev_close(c->desc);
+		free(c);
+		return;
+	}
+
 	w = spdk_jsonrpc_begin_result(c->request);
 	spdk_json_write_object_begin(w);
-	if (rc != 0 || sb == NULL) {
+	if (answer == TIER_SB_READ_NONE) {
 		spdk_json_write_named_bool(w, "valid", false);
 	} else {
 		char uuid_str[SPDK_UUID_STRING_LEN];
