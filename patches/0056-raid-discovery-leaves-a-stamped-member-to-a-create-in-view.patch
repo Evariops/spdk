@@ -1,0 +1,89 @@
+diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
+index 0bd65e1..fbb86cb 100644
+--- a/module/bdev/raid/bdev_raid.c
++++ b/module/bdev/raid/bdev_raid.c
+@@ -5982,6 +5982,19 @@ raid_bdev_examine_cont(struct spdk_bdev *bdev, const struct raid_bdev_superblock
+ 	case 0:
+ 		/* valid superblock found */
+ 		SPDK_DEBUGLOG(bdev_raid, "raid superblock found on bdev %s\n", bdev->name);
++		/* Evariops 0056: a member stamped for a lineage is assembled by a create in its
++		 * view (0053), which the control plane issues once its fence has landed, and
++		 * which arbitrates the members from their own standings. Discovery assembled
++		 * it from whichever member it read first: the raid came online on that
++		 * member's view of the others, wrote its superblock and rebuilt the others in
++		 * full before any fence, and a member whose own standing was current was
++		 * rebuilt all the same. Discovery leaves it alone, unclaimed. */
++		if (raid_bdev_sb_stamped(sb)) {
++			SPDK_NOTICELOG("bdev %s: member of raid %.*s stamped for a lineage, left to a "
++				       "create in its view (Evariops 0056)\n", bdev->name,
++				       (int)sizeof(sb->name), sb->name);
++			break;
++		}
+ 		raid_bdev_examine_sb(sb, bdev, raid_bdev_examine_done, bdev);
+ 		return;
+ 	case -EINVAL:
+diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+index fc08614..e7b9d33 100644
+--- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
++++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+@@ -3220,6 +3220,52 @@ test_raid_reassembled_from_a_stamped_superblock_keeps_its_view(void)
+ 	ut_view_teardown();
+ }
+ 
++/* Evariops 0056: discovery leaves a member stamped for a lineage alone, unclaimed:
++ * a create in its view assembles it, after the control plane's fence. A member
++ * whose superblock carries no stamp is reassembled as upstream does. */
++static void
++test_raid_discovery_leaves_a_stamped_member_to_a_create_in_view(void)
++{
++	struct raid_bdev_superblock *sb;
++	struct spdk_bdev *leg;
++	struct raid_bdev *raid_bdev;
++
++	ut_view_setup();
++	g_ut_alloc_superblock = true;
++	create_base_bdevs(0);
++	leg = spdk_bdev_get_by_name("Nvme0n1");
++	SPDK_CU_ASSERT_FATAL(leg != NULL);
++
++	sb = ut_sb(&g_ut_lineage, "incarnation-before", 4);
++	ut_sb_slot(sb, "Nvme0n1", RAID_SB_BASE_BDEV_CONFIGURED, 2);
++	ut_sb_slot(sb, "Nvme1n1", RAID_SB_BASE_BDEV_MISSING, 1);
++	ut_leg("Nvme0n1")->sb = sb;
++
++	raid_bdev_examine(leg);
++	poll_app_thread();
++
++	CU_ASSERT(ut_leg("Nvme0n1")->reads == 1);
++	CU_ASSERT(raid_bdev_find_by_uuid(&sb->uuid) == NULL);
++	CU_ASSERT(leg->internal.claim_type == SPDK_BDEV_CLAIM_NONE);
++
++	/* The control: the same member, its superblock below minor 2, has discovery create
++	 * the raid it belongs to (the suite's slots carry no data range, so the member
++	 * itself is not configured in it). */
++	sb->version.minor = 1;
++	raid_bdev_examine(leg);
++	poll_app_thread();
++
++	CU_ASSERT(ut_leg("Nvme0n1")->reads == 2);
++	raid_bdev = raid_bdev_find_by_uuid(&sb->uuid);
++	CU_ASSERT(raid_bdev != NULL);
++	if (raid_bdev != NULL) {
++		raid_bdev_delete(raid_bdev, NULL, NULL);
++		poll_app_thread();
++	}
++
++	ut_view_teardown();
++}
++
+ /* Evariops 0054: fills the superblock the suite's stubbed init leaves empty, as
+  * init writes it, at minor: each slot under its member, CONFIGURED or MISSING,
+  * at the generation and epoch the raid holds for it. */
+@@ -3577,6 +3623,7 @@ main(int argc, char **argv)
+ 	CU_ADD_TEST(suite, test_raid_create_with_declared_slots_leaves_the_slots_past_its_legs_empty);
+ 	CU_ADD_TEST(suite, test_raid_add_into_a_raid_of_a_lineage_checks_the_stamp);
+ 	CU_ADD_TEST(suite, test_raid_reassembled_from_a_stamped_superblock_keeps_its_view);
++	CU_ADD_TEST(suite, test_raid_discovery_leaves_a_stamped_member_to_a_create_in_view);
+ 	CU_ADD_TEST(suite, test_raid_journal_stamps_the_view_epoch_on_the_members);
+ 	CU_ADD_TEST(suite, test_raid_journal_refuses_what_its_owner_did_not_send);
+ 	CU_ADD_TEST(suite, test_raid_journal_joins_a_raid_created_outside_the_view);
