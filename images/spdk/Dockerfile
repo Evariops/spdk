@@ -4,9 +4,11 @@
 # ============================================================================
 #
 # Multi-stage build:
-#   Stage 1 (builder)   — Compiles SPDK from source on Fedora 43
-#   Stage 2 (collector) — Collects exact runtime closure (binary + shared libs)
-#   Stage 3 (final)     — Scratch-based, no shell, no package manager
+#   Stage 1 (builder)    — Compiles SPDK from source on Fedora 43
+#   Stage 1b (unit-tests) — Runs the upstream unit tests of what the series
+#                           patches, on the tree built in stage 1
+#   Stage 2 (collector)  — Collects exact runtime closure (binary + shared libs)
+#   Stage 3 (final)      — Scratch-based, no shell, no package manager
 #
 # Build:
 #   docker build -t ghcr.io/evariops/spdk:v1.0.0 .
@@ -59,18 +61,10 @@ RUN git clone --branch "${SPDK_VERSION}" --depth 1 --recurse-submodules \
 
 WORKDIR /build/spdk
 
-# ── Inject CBT + tier modules and patches ──
-COPY module/bdev/cbt/ module/bdev/cbt/
-COPY module/bdev/tier/ module/bdev/tier/
-COPY patches/ /build/patches/
-
-# Register CBT + tier in the bdev module build, link list, and deps & apply patches
-# hadolint ignore=SC2016
-RUN sed -i '/^DIRS-y += delay/s/$/ cbt tier/' module/bdev/Makefile && \
-    sed -i '/^BLOCKDEV_MODULES_LIST += bdev_zone_block/a BLOCKDEV_MODULES_LIST += bdev_cbt\nBLOCKDEV_MODULES_LIST += bdev_tier' mk/spdk.modules.mk && \
-    sed -i '/^DEPDIRS-bdev_passthru/a DEPDIRS-bdev_cbt := $(BDEV_DEPS_THREAD)\nDEPDIRS-bdev_tier := $(BDEV_DEPS_THREAD)' mk/spdk.lib_deps.mk && \
-    sed -i '/^DEPDIRS-bdev_lvol/s/$/ bdev_tier/' mk/spdk.lib_deps.mk && \
-    for p in /build/patches/*.patch; do echo "Applying ${p}" && git apply "${p}" || exit 1; done
+# ── Build dependencies — BEFORE the modules and patches ──
+# They depend on the upstream tree alone (pkgdep.sh is upstream's), so a change
+# to a patch or a module no longer invalidates these layers: only the apply,
+# configure and make below run again.
 
 # Fedora's CMake rejects cmake_minimum_required(<3.5) in SPDK subprojects (ISA-L, etc.)
 ENV CMAKE_POLICY_VERSION_MINIMUM=3.5
@@ -87,6 +81,19 @@ RUN ./scripts/pkgdep.sh -d
 # Ensure io_uring and AIO dependencies are present (pkgdep.sh may not install them)
 RUN dnf install -y --setopt=install_weak_deps=False --nodocs liburing-devel libaio-devel && \
     dnf clean all && rm -rf /var/cache/dnf
+
+# ── Inject CBT + tier modules and patches ──
+COPY module/bdev/cbt/ module/bdev/cbt/
+COPY module/bdev/tier/ module/bdev/tier/
+COPY patches/ /build/patches/
+
+# Register CBT + tier in the bdev module build, link list, and deps & apply patches
+# hadolint ignore=SC2016
+RUN sed -i '/^DIRS-y += delay/s/$/ cbt tier/' module/bdev/Makefile && \
+    sed -i '/^BLOCKDEV_MODULES_LIST += bdev_zone_block/a BLOCKDEV_MODULES_LIST += bdev_cbt\nBLOCKDEV_MODULES_LIST += bdev_tier' mk/spdk.modules.mk && \
+    sed -i '/^DEPDIRS-bdev_passthru/a DEPDIRS-bdev_cbt := $(BDEV_DEPS_THREAD)\nDEPDIRS-bdev_tier := $(BDEV_DEPS_THREAD)' mk/spdk.lib_deps.mk && \
+    sed -i '/^DEPDIRS-bdev_lvol/s/$/ bdev_tier/' mk/spdk.lib_deps.mk && \
+    for p in /build/patches/*.patch; do echo "Applying ${p}" && git apply "${p}" || exit 1; done
 
 # Configure: static SPDK libs + minimal module set.
 #
@@ -139,9 +146,34 @@ RUN if [ "${BUILD_TYPE}" != "debug" ]; then \
 
 
 # ============================================================================
+# Stage 1b: Upstream unit tests of what the series patches
+# ============================================================================
+# On the tree just built, not a second build: the suites are compiled against
+# the libraries above and run here. Both images derive from this stage (the
+# collector below, and the debug image's COPY). The suites run in the DEBUG
+# build (asserts on, the configuration upstream runs them in), on each arch; a
+# failing suite fails that build, and the release publish needs every build of
+# the matrix. The release build passes through at no cost.
+# images/spdk/unit-tests.map says which suites a patched file owes; see
+# patches/README.md ("Unit tests").
+FROM builder AS unit-tests
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG BUILD_TYPE=release
+
+COPY images/spdk/unit-tests.sh images/spdk/unit-tests.map /build/unit-tests/
+RUN if [ "${BUILD_TYPE}" = "debug" ]; then \
+      /build/unit-tests/unit-tests.sh /build/patches /build/unit-tests/unit-tests.map; \
+    else \
+      echo "Unit tests run in the debug build of this pipeline (asserts on)."; \
+    fi
+
+
+# ============================================================================
 # Stage 2: Collect the exact runtime closure
 # ============================================================================
-FROM builder AS collector
+FROM unit-tests AS collector
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -221,16 +253,17 @@ RUN dnf install -y --setopt=install_weak_deps=False --nodocs \
         jq \
     && dnf clean all && rm -rf /var/cache/dnf
 
-# Binary only (runtime .so provided by Fedora packages above)
-COPY --from=builder /build/spdk/build/bin/spdk_tgt /usr/local/bin/spdk_tgt
+# Binary only (runtime .so provided by Fedora packages above). Copied from the
+# unit-tests stage, so the debug image too is built only once its suites pass.
+COPY --from=unit-tests /build/spdk/build/bin/spdk_tgt /usr/local/bin/spdk_tgt
 
 # spdk_dd is the raid5f bench's full-stripe writer: raid5f only accepts full-stripe
 # writes, and remote initiators are MDTS-bounded, so the writer must run INSIDE the
 # target pod. Patch 0024 makes its exit code honest.
-COPY --from=builder /build/spdk/build/bin/spdk_dd /usr/local/bin/spdk_dd
+COPY --from=unit-tests /build/spdk/build/bin/spdk_dd /usr/local/bin/spdk_dd
 
 # SPDK RPC scripts (useful for live debugging: rpc.py, spdkcli, etc.)
-COPY --from=builder /build/spdk/scripts/ /usr/local/share/spdk/scripts/
+COPY --from=unit-tests /build/spdk/scripts/ /usr/local/share/spdk/scripts/
 
 LABEL org.opencontainers.image.title="SPDK Data Engine (debug)" \
       org.opencontainers.image.description="Fedora-based SPDK debug image with gdb, strace, perf, and RPC scripts" \

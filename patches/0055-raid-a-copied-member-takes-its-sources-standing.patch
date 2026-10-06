@@ -1,0 +1,451 @@
+diff --git a/module/bdev/raid/bdev_raid.h b/module/bdev/raid/bdev_raid.h
+index 5c30917..427addc 100644
+--- a/module/bdev/raid/bdev_raid.h
++++ b/module/bdev/raid/bdev_raid.h
+@@ -793,6 +793,22 @@ void raid_bdev_write_superblock(struct raid_bdev *raid_bdev, raid_bdev_write_sb_
+ int raid_bdev_load_base_bdev_superblock(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+ 					raid_bdev_load_sb_cb cb, void *cb_ctx);
+ 
++/* Evariops 0055: a member copied from another member of its raid while no raid
++ * was assembled (a cold repair) carries the source's superblock, where its own
++ * entry says what the source knew of it: MISSING, when it was behind. It holds
++ * the source's content, so it takes the source's standing: its own entry
++ * CONFIGURED at the source's content generation and view epoch, seq_number and
++ * crc renewed. -EINVAL for a superblock without a stamp, -EEXIST for another
++ * lineage, -ENOENT when either entry is absent, -ESTALE for a source the
++ * superblock does not record CONFIGURED. 1 when the copy already has that
++ * standing (nothing changed), 0 once restamped; either way content_generation
++ * receives the copy's generation. */
++int raid_bdev_sb_restamp_copied_member(struct raid_bdev_superblock *sb,
++				       const struct spdk_uuid *lineage,
++				       const struct spdk_uuid *member,
++				       const struct spdk_uuid *source,
++				       uint64_t *content_generation);
++
+ /* Evariops 0054: stamps view epoch on an online raid's members, under the raid's
+  * incarnation; lineage joins a raid created outside the view protocol to its
+  * volume's view. cb reports the superblock write. -ESTALE for an epoch older
+diff --git a/module/bdev/raid/bdev_raid_rpc.c b/module/bdev/raid/bdev_raid_rpc.c
+index aada046..b67facc 100644
+--- a/module/bdev/raid/bdev_raid_rpc.c
++++ b/module/bdev/raid/bdev_raid_rpc.c
+@@ -1763,3 +1763,199 @@ rpc_bdev_raid_clear_superblock(struct spdk_jsonrpc_request *request,
+ 	}
+ }
+ SPDK_RPC_REGISTER("bdev_raid_clear_superblock", rpc_bdev_raid_clear_superblock, SPDK_RPC_RUNTIME)
++
++/* Evariops 0055: a member copied from another member of its raid, while no raid
++ * was assembled, takes the source's standing in its own superblock (see
++ * raid_bdev_sb_restamp_copied_member): without it, the next create in a view
++ * leaves the copy out and rebuilds it, and with its source gone refuses the
++ * volume (-ENODATA) although the copy holds the content. As for the clear,
++ * opening for WRITE is the gate: a member of an assembled raid, or a namespace
++ * a subsystem exposes, is claimed and cannot be restamped. */
++struct rpc_bdev_raid_restamp_copied_member {
++	char			*base_bdev;
++	struct spdk_uuid	member_uuid;
++	struct spdk_uuid	source_uuid;
++	struct spdk_uuid	lineage;
++};
++
++static void
++free_rpc_bdev_raid_restamp_copied_member(struct rpc_bdev_raid_restamp_copied_member *req)
++{
++	free(req->base_bdev);
++}
++
++static const struct spdk_json_object_decoder rpc_bdev_raid_restamp_copied_member_decoders[] = {
++	{"base_bdev", offsetof(struct rpc_bdev_raid_restamp_copied_member, base_bdev), spdk_json_decode_string},
++	{"member_uuid", offsetof(struct rpc_bdev_raid_restamp_copied_member, member_uuid), spdk_json_decode_uuid},
++	{"source_uuid", offsetof(struct rpc_bdev_raid_restamp_copied_member, source_uuid), spdk_json_decode_uuid},
++	{"lineage", offsetof(struct rpc_bdev_raid_restamp_copied_member, lineage), spdk_json_decode_uuid},
++};
++
++struct rpc_restamp_ctx {
++	struct rpc_bdev_raid_restamp_copied_member req;
++	struct spdk_jsonrpc_request *request;
++	struct spdk_bdev_desc *desc;
++	struct spdk_io_channel *ch;
++	void *buf;
++	bool restamped;
++	uint64_t content_generation;
++};
++
++static void
++rpc_restamp_ctx_free(struct rpc_restamp_ctx *ctx)
++{
++	spdk_dma_free(ctx->buf);
++	if (ctx->ch != NULL) {
++		spdk_put_io_channel(ctx->ch);
++	}
++	if (ctx->desc != NULL) {
++		spdk_bdev_close(ctx->desc);
++	}
++	free_rpc_bdev_raid_restamp_copied_member(&ctx->req);
++	free(ctx);
++}
++
++static void
++rpc_restamp_complete(struct rpc_restamp_ctx *ctx, int status)
++{
++	struct spdk_jsonrpc_request *request = ctx->request;
++	struct spdk_json_write_ctx *w;
++
++	if (status != 0) {
++		spdk_jsonrpc_send_error_response(request, status, spdk_strerror(-status));
++	} else {
++		w = spdk_jsonrpc_begin_result(request);
++		spdk_json_write_object_begin(w);
++		spdk_json_write_named_bool(w, "restamped", ctx->restamped);
++		spdk_json_write_named_uint64(w, "content_generation", ctx->content_generation);
++		spdk_json_write_object_end(w);
++		spdk_jsonrpc_end_result(request, w);
++	}
++	rpc_restamp_ctx_free(ctx);
++}
++
++static void
++rpc_restamp_write_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
++{
++	struct rpc_restamp_ctx *ctx = cb_arg;
++
++	spdk_bdev_free_io(bdev_io);
++	ctx->restamped = success;
++	rpc_restamp_complete(ctx, success ? 0 : -EIO);
++}
++
++static void
++rpc_restamp_load_cb(const struct raid_bdev_superblock *sb, int status, void *cb_ctx)
++{
++	struct rpc_restamp_ctx *ctx = cb_ctx;
++	struct spdk_bdev *bdev = spdk_bdev_desc_get_bdev(ctx->desc);
++	struct raid_bdev_superblock *copy;
++	uint32_t length;
++	int rc;
++
++	if (status != 0 || sb == NULL) {
++		SPDK_ERRLOG("bdev '%s': no valid raid superblock to restamp: %s\n",
++			    ctx->req.base_bdev, spdk_strerror(-status));
++		rpc_restamp_complete(ctx, status != 0 ? status : -ENODATA);
++		return;
++	}
++
++	/* The superblock as read is the loader's: the restamp works on a copy sized
++	 * for the write, whole blocks of a bdev without interleaved metadata. */
++	if (spdk_bdev_is_md_interleaved(bdev)) {
++		rpc_restamp_complete(ctx, -ENOTSUP);
++		return;
++	}
++
++	length = SPDK_ALIGN_CEIL(sb->length, spdk_bdev_get_block_size(bdev));
++	ctx->buf = spdk_dma_zmalloc(length, spdk_bdev_get_buf_align(bdev), NULL);
++	if (ctx->buf == NULL) {
++		rpc_restamp_complete(ctx, -ENOMEM);
++		return;
++	}
++	memcpy(ctx->buf, sb, sb->length);
++	copy = ctx->buf;
++
++	rc = raid_bdev_sb_restamp_copied_member(copy, &ctx->req.lineage, &ctx->req.member_uuid,
++						&ctx->req.source_uuid, &ctx->content_generation);
++	if (rc < 0) {
++		SPDK_ERRLOG("bdev '%s': superblock of raid '%.*s' not restamped: %s\n",
++			    ctx->req.base_bdev, (int)sizeof(copy->name), copy->name, spdk_strerror(-rc));
++		rpc_restamp_complete(ctx, rc);
++		return;
++	}
++
++	if (rc == 1) {
++		/* Already the source's standing: nothing to write. */
++		rpc_restamp_complete(ctx, 0);
++		return;
++	}
++
++	SPDK_NOTICELOG("bdev '%s': copied member takes its source's standing in raid '%.*s' "
++		       "(content generation %" PRIu64 ", seq %" PRIu64 ")\n", ctx->req.base_bdev,
++		       (int)sizeof(copy->name), copy->name, ctx->content_generation, copy->seq_number);
++
++	rc = spdk_bdev_write(ctx->desc, ctx->ch, ctx->buf, 0, length, rpc_restamp_write_done, ctx);
++	if (rc != 0) {
++		rpc_restamp_complete(ctx, rc);
++	}
++}
++
++static void
++rpc_restamp_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev, void *event_ctx)
++{
++	SPDK_DEBUGLOG(bdev_raid, "restamp_copied_member: unhandled bdev event %d\n", type);
++}
++
++static void
++rpc_bdev_raid_restamp_copied_member(struct spdk_jsonrpc_request *request,
++				    const struct spdk_json_val *params)
++{
++	struct rpc_restamp_ctx *ctx;
++	char detail[256];
++	int rc;
++
++	ctx = calloc(1, sizeof(*ctx));
++	if (ctx == NULL) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
++						 spdk_strerror(ENOMEM));
++		return;
++	}
++	ctx->request = request;
++
++	if (spdk_json_decode_object(params, rpc_bdev_raid_restamp_copied_member_decoders,
++				    SPDK_COUNTOF(rpc_bdev_raid_restamp_copied_member_decoders),
++				    &ctx->req)) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
++						 "spdk_json_decode_object failed");
++		free_rpc_bdev_raid_restamp_copied_member(&ctx->req);
++		free(ctx);
++		return;
++	}
++
++	snprintf(detail, sizeof(detail), "base_bdev=%s", ctx->req.base_bdev);
++	spdk_jsonrpc_request_audit(request, "bdev_raid_restamp_copied_member", detail);
++
++	rc = spdk_bdev_open_ext(ctx->req.base_bdev, true, rpc_restamp_event_cb, NULL, &ctx->desc);
++	if (rc != 0) {
++		SPDK_ERRLOG("bdev '%s': open for restamp failed: %s\n",
++			    ctx->req.base_bdev, spdk_strerror(-rc));
++		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
++		free_rpc_bdev_raid_restamp_copied_member(&ctx->req);
++		free(ctx);
++		return;
++	}
++
++	ctx->ch = spdk_bdev_get_io_channel(ctx->desc);
++	if (ctx->ch == NULL) {
++		rpc_restamp_complete(ctx, -ENOMEM);
++		return;
++	}
++
++	rc = raid_bdev_load_base_bdev_superblock(ctx->desc, ctx->ch, rpc_restamp_load_cb, ctx);
++	if (rc != 0) {
++		rpc_restamp_complete(ctx, rc);
++	}
++}
++SPDK_RPC_REGISTER("bdev_raid_restamp_copied_member", rpc_bdev_raid_restamp_copied_member,
++		  SPDK_RPC_RUNTIME)
+diff --git a/module/bdev/raid/bdev_raid_sb.c b/module/bdev/raid/bdev_raid_sb.c
+index eb092d8..6465fbe 100644
+--- a/module/bdev/raid/bdev_raid_sb.c
++++ b/module/bdev/raid/bdev_raid_sb.c
+@@ -156,6 +156,62 @@ raid_bdev_sb_check_crc(struct raid_bdev_superblock *sb)
+ 	return crc == prev;
+ }
+ 
++/* Evariops 0055: the entry a raid of this superblock knows a member by — the
++ * first one naming it, as examine reads it. */
++static struct raid_bdev_sb_base_bdev *
++raid_bdev_sb_entry_of(struct raid_bdev_superblock *sb, const struct spdk_uuid *uuid)
++{
++	uint8_t i;
++
++	for (i = 0; i < sb->base_bdevs_size; i++) {
++		if (spdk_uuid_compare(&sb->base_bdevs[i].uuid, uuid) == 0) {
++			return &sb->base_bdevs[i];
++		}
++	}
++
++	return NULL;
++}
++
++int
++raid_bdev_sb_restamp_copied_member(struct raid_bdev_superblock *sb, const struct spdk_uuid *lineage,
++				   const struct spdk_uuid *member, const struct spdk_uuid *source,
++				   uint64_t *content_generation)
++{
++	struct raid_bdev_sb_base_bdev *own, *from;
++
++	if (sb->version.minor < 2 || spdk_uuid_is_null(&sb->lineage)) {
++		return -EINVAL;
++	}
++
++	if (spdk_uuid_compare(&sb->lineage, lineage) != 0) {
++		return -EEXIST;
++	}
++
++	own = raid_bdev_sb_entry_of(sb, member);
++	from = raid_bdev_sb_entry_of(sb, source);
++	if (own == NULL || from == NULL || own == from) {
++		return -ENOENT;
++	}
++
++	if (from->state != RAID_SB_BASE_BDEV_CONFIGURED) {
++		return -ESTALE;
++	}
++
++	*content_generation = from->content_generation;
++	if (own->state == RAID_SB_BASE_BDEV_CONFIGURED &&
++	    own->content_generation == from->content_generation) {
++		return 1;
++	}
++
++	own->state = RAID_SB_BASE_BDEV_CONFIGURED;
++	own->content_generation = from->content_generation;
++	own->view_epoch = from->view_epoch;
++	sb->seq_number++;
++	raid_bdev_sb_update_crc(sb);
++
++	return 0;
++}
++
+ static int
+ raid_bdev_parse_superblock(struct raid_bdev_read_sb_ctx *ctx)
+ {
+diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+index beaec9b..fc08614 100644
+--- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
++++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+@@ -218,6 +218,11 @@ DEFINE_STUB(spdk_bdev_notify_blockcnt_change, int, (struct spdk_bdev *bdev, uint
+ DEFINE_STUB(spdk_json_write_named_uuid, int, (struct spdk_json_write_ctx *w, const char *name,
+ 		const struct spdk_uuid *val), 0);
+ DEFINE_STUB_V(raid_bdev_init_superblock, (struct raid_bdev *raid_bdev));
++/* Evariops 0055: the restamp of a copied member is bdev_raid_sb.c's, tested by its
++ * own suite; the RPC that calls it is not exercised here. */
++DEFINE_STUB(raid_bdev_sb_restamp_copied_member, int, (struct raid_bdev_superblock *sb,
++		const struct spdk_uuid *lineage, const struct spdk_uuid *member,
++		const struct spdk_uuid *source, uint64_t *content_generation), -ENOTSUP);
+ 
+ /* Evariops 0053: the suite's raids have no superblock buffer, except while a test
+  * reassembles one from a superblock. */
+diff --git a/test/unit/lib/bdev/raid/bdev_raid_sb.c/bdev_raid_sb_ut.c b/test/unit/lib/bdev/raid/bdev_raid_sb.c/bdev_raid_sb_ut.c
+index 14125a4..8310a4a 100644
+--- a/test/unit/lib/bdev/raid/bdev_raid_sb.c/bdev_raid_sb_ut.c
++++ b/test/unit/lib/bdev/raid/bdev_raid_sb.c/bdev_raid_sb_ut.c
+@@ -492,6 +492,123 @@ test_raid_bdev_init_superblock_outside_a_view_leaves_the_stamp_empty(void)
+ 	raid_bdev_free_superblock(&raid_bdev);
+ }
+ 
++/* Evariops 0055: the superblock a cold repair copies onto a member: the
++ * source's own, stamped for the lineage at epoch 4, where the source is
++ * CONFIGURED at generation 7, the copy MISSING at 6 (it was behind) and a
++ * third member MISSING at 5. */
++static struct raid_bdev_superblock *
++ut_copied_sb(const struct spdk_uuid *lineage, const struct spdk_uuid *source,
++	     const struct spdk_uuid *copy, const struct spdk_uuid *third)
++{
++	struct raid_bdev_superblock *sb;
++
++	sb = calloc(1, sizeof(*sb) + 3 * sizeof(struct raid_bdev_sb_base_bdev));
++	SPDK_CU_ASSERT_FATAL(sb != NULL);
++	memcpy(&sb->signature, RAID_BDEV_SB_SIG, sizeof(sb->signature));
++	sb->version.major = RAID_BDEV_SB_VERSION_MAJOR;
++	sb->version.minor = 2;
++	sb->length = sizeof(*sb) + 3 * sizeof(struct raid_bdev_sb_base_bdev);
++	sb->num_base_bdevs = sb->base_bdevs_size = 3;
++	sb->seq_number = 40;
++	spdk_uuid_copy(&sb->lineage, lineage);
++	sb->view_epoch = 4;
++
++	spdk_uuid_copy(&sb->base_bdevs[0].uuid, source);
++	sb->base_bdevs[0].state = RAID_SB_BASE_BDEV_CONFIGURED;
++	sb->base_bdevs[0].content_generation = 7;
++	sb->base_bdevs[0].view_epoch = 4;
++	sb->base_bdevs[0].slot = 0;
++
++	spdk_uuid_copy(&sb->base_bdevs[1].uuid, copy);
++	sb->base_bdevs[1].state = RAID_SB_BASE_BDEV_MISSING;
++	sb->base_bdevs[1].content_generation = 6;
++	sb->base_bdevs[1].view_epoch = 3;
++	sb->base_bdevs[1].slot = 1;
++
++	spdk_uuid_copy(&sb->base_bdevs[2].uuid, third);
++	sb->base_bdevs[2].state = RAID_SB_BASE_BDEV_MISSING;
++	sb->base_bdevs[2].content_generation = 5;
++	sb->base_bdevs[2].view_epoch = 2;
++	sb->base_bdevs[2].slot = 2;
++
++	raid_bdev_sb_update_crc(sb);
++	return sb;
++}
++
++/* Evariops 0055: the copy takes its source's standing — its own entry CONFIGURED
++ * at the source's generation and epoch, the sequence number moved on and the
++ * crc renewed — and only its own: the third member stays as it was. Done once,
++ * it is a no-op that writes nothing. */
++static void
++test_raid_bdev_sb_restamp_copied_member_takes_the_sources_standing(void)
++{
++	struct spdk_uuid lineage, source, copy, third;
++	struct raid_bdev_superblock *sb;
++	uint64_t generation = 0;
++
++	spdk_uuid_generate(&lineage);
++	spdk_uuid_generate(&source);
++	spdk_uuid_generate(&copy);
++	spdk_uuid_generate(&third);
++	sb = ut_copied_sb(&lineage, &source, &copy, &third);
++
++	CU_ASSERT(raid_bdev_sb_restamp_copied_member(sb, &lineage, &copy, &source, &generation) == 0);
++	CU_ASSERT(generation == 7);
++	CU_ASSERT(sb->base_bdevs[1].state == RAID_SB_BASE_BDEV_CONFIGURED);
++	CU_ASSERT(sb->base_bdevs[1].content_generation == 7);
++	CU_ASSERT(sb->base_bdevs[1].view_epoch == 4);
++	CU_ASSERT(sb->base_bdevs[2].state == RAID_SB_BASE_BDEV_MISSING);
++	CU_ASSERT(sb->base_bdevs[2].content_generation == 5);
++	CU_ASSERT(sb->seq_number == 41);
++	CU_ASSERT(raid_bdev_sb_check_crc(sb));
++
++	generation = 0;
++	CU_ASSERT(raid_bdev_sb_restamp_copied_member(sb, &lineage, &copy, &source, &generation) == 1);
++	CU_ASSERT(generation == 7);
++	CU_ASSERT(sb->seq_number == 41);
++
++	free(sb);
++}
++
++/* Evariops 0055: each refusal leaves the superblock as it was: no stamp, another
++ * volume's, an entry missing or the same one twice, a source not CONFIGURED. */
++static void
++test_raid_bdev_sb_restamp_copied_member_refusals(void)
++{
++	struct spdk_uuid lineage, other, source, copy, third, stranger;
++	struct raid_bdev_superblock *sb;
++	uint64_t generation = 0;
++	uint32_t crc;
++
++	spdk_uuid_generate(&lineage);
++	spdk_uuid_generate(&other);
++	spdk_uuid_generate(&source);
++	spdk_uuid_generate(&copy);
++	spdk_uuid_generate(&third);
++	spdk_uuid_generate(&stranger);
++	sb = ut_copied_sb(&lineage, &source, &copy, &third);
++	crc = sb->crc;
++
++	CU_ASSERT(raid_bdev_sb_restamp_copied_member(sb, &other, &copy, &source, &generation) == -EEXIST);
++	CU_ASSERT(raid_bdev_sb_restamp_copied_member(sb, &lineage, &stranger, &source, &generation) == -ENOENT);
++	CU_ASSERT(raid_bdev_sb_restamp_copied_member(sb, &lineage, &copy, &stranger, &generation) == -ENOENT);
++	CU_ASSERT(raid_bdev_sb_restamp_copied_member(sb, &lineage, &copy, &copy, &generation) == -ENOENT);
++	/* The third member was behind too: copied from it, the copy would be behind. */
++	CU_ASSERT(raid_bdev_sb_restamp_copied_member(sb, &lineage, &copy, &third, &generation) == -ESTALE);
++	CU_ASSERT(sb->base_bdevs[1].state == RAID_SB_BASE_BDEV_MISSING);
++	CU_ASSERT(sb->seq_number == 40);
++	CU_ASSERT(sb->crc == crc);
++
++	sb->version.minor = 1;
++	CU_ASSERT(raid_bdev_sb_restamp_copied_member(sb, &lineage, &copy, &source, &generation) == -EINVAL);
++	sb->version.minor = 2;
++	spdk_uuid_set_null(&sb->lineage);
++	CU_ASSERT(raid_bdev_sb_restamp_copied_member(sb, &lineage, &copy, &source, &generation) == -EINVAL);
++	CU_ASSERT(sb->base_bdevs[1].state == RAID_SB_BASE_BDEV_MISSING);
++
++	free(sb);
++}
++
+ int
+ main(int argc, char **argv)
+ {
+@@ -502,6 +619,8 @@ main(int argc, char **argv)
+ 		{ "test_raid_bdev_parse_superblock", test_raid_bdev_parse_superblock },
+ 		{ "test_raid_bdev_init_superblock_stamps_the_view", test_raid_bdev_init_superblock_stamps_the_view },
+ 		{ "test_raid_bdev_init_superblock_outside_a_view_leaves_the_stamp_empty", test_raid_bdev_init_superblock_outside_a_view_leaves_the_stamp_empty },
++		{ "test_raid_bdev_sb_restamp_copied_member_takes_the_sources_standing", test_raid_bdev_sb_restamp_copied_member_takes_the_sources_standing },
++		{ "test_raid_bdev_sb_restamp_copied_member_refusals", test_raid_bdev_sb_restamp_copied_member_refusals },
+ 		CU_TEST_INFO_NULL,
+ 	};
+ 	CU_SuiteInfo suites[] = {

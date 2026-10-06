@@ -551,3 +551,16 @@ index fe71954..f2611d8 100644
  	free(process);
  }
  
+diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+index ff51486..aab5d12 100644
+--- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
++++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+@@ -237,6 +237,8 @@ DEFINE_STUB_V(raid_rebuild_outcomes_write_json, (struct spdk_json_write_ctx *w,
+  * of this suite: no member has one (-ENODEV). */
+ DEFINE_STUB(vbdev_cbt_query_latest_epoch, int, (const char *bdev_name,
+ 		struct vbdev_cbt_epoch_facts *out), -ENODEV);
++/* Evariops 0018: a rebuild's outcome turns to verifying before its verify pass. */
++DEFINE_STUB_V(raid_rebuild_outcome_set_verifying, (struct raid_rebuild_outcome *outcome));
+ 
+ uint32_t
+ spdk_bdev_get_data_block_size(const struct spdk_bdev *bdev)

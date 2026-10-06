@@ -171,3 +171,21 @@ index 5d9917f..720a6cb 100644
 +	}
 +}
 +SPDK_RPC_REGISTER("bdev_raid_clear_superblock", rpc_bdev_raid_clear_superblock, SPDK_RPC_RUNTIME)
+diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+index 55bdca4..806c8d3 100644
+--- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
++++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+@@ -249,6 +249,13 @@ DEFINE_STUB(raid_envelope_active_mb_sec, uint32_t, (enum raid_envelope_class kla
+ DEFINE_STUB(raid_envelopes_admit_rebuild, bool, (void), true);
+ DEFINE_STUB_V(raid_envelopes_get, (struct raid_envelopes *out));
+ DEFINE_STUB_V(raid_envelopes_set, (const struct raid_envelopes *envelopes));
++/* Evariops 0025: clearing a member's superblock writes a zeroed block over it. No
++ * test here clears one. */
++DEFINE_STUB(spdk_bdev_get_block_size, uint32_t, (const struct spdk_bdev *bdev), 0);
++DEFINE_STUB(spdk_bdev_get_buf_align, size_t, (const struct spdk_bdev *bdev), 0);
++DEFINE_STUB(spdk_bdev_write, int, (struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
++				   void *buf, uint64_t offset, uint64_t nbytes, spdk_bdev_io_completion_cb cb,
++				   void *cb_arg), 0);
+ 
+ uint32_t
+ spdk_bdev_get_data_block_size(const struct spdk_bdev *bdev)

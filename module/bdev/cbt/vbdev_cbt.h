@@ -24,6 +24,10 @@ extern "C" {
 #define CBT_EPOCH_ID_MAX                64
 #define CBT_BACKEND_ID_MAX              128
 #define CBT_NONCE_MAX                   32       /* control-plane epoch nonce */
+/* Two rotations of the history window are at least this far apart, whoever asks:
+ * a write a member missed just before it left must still be in one of the two
+ * bitmaps when the epoch for that member opens, a few milliseconds later. */
+#define CBT_ROTATE_MIN_INTERVAL_US      10000000
 #define CBT_REBUILD_TOKEN_MAX           192      /* consumed-close proof token */
 #define CBT_REBUILD_DEFAULT_QD          16
 #define CBT_REBUILD_MAX_QD              128
@@ -259,6 +263,21 @@ int bdev_cbt_epoch_get_dirty_ranges(const char *cbt_name, const char *epoch_id,
 				    uint64_t *out_total_chunks,
 				    uint32_t *out_chunk_size_kb,
 				    bool *out_truncated);
+
+/**
+ * Start a new history window: the live bitmap moves to the previous-window bitmap
+ * (dropping the window before it) and starts again empty. Without it, the live
+ * bitmap holds every write since the last reset, and the epoch opened when a
+ * member leaves (vbdev_cbt_auto_epoch_open) would copy all of them, on a volume
+ * that went days without an epoch the whole device. That epoch takes the previous
+ * window back, so it covers one to two windows before the departure and
+ * everything after.
+ *
+ * \return 0; -EBUSY while an epoch is open, frozen or rebuilding (it reads the
+ *         live bitmap whole); -EAGAIN less than CBT_ROTATE_MIN_INTERVAL_US after
+ *         the previous rotation; -ENODEV if \c cbt_name is not a cbt bdev.
+ */
+int bdev_cbt_rotate(const char *cbt_name);
 
 /* ── Legacy aliases (deprecated, will be removed in v2) ────────────── */
 

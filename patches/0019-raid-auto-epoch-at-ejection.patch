@@ -40,3 +40,18 @@ index f2611d8..0a1cdee 100644
  	if (raid_bdev->sb) {
  		struct raid_bdev_superblock *sb = raid_bdev->sb;
  		uint8_t slot = raid_bdev_base_bdev_slot(base_info);
+diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+index aab5d12..43d6c52 100644
+--- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
++++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+@@ -239,6 +239,10 @@ DEFINE_STUB(vbdev_cbt_query_latest_epoch, int, (const char *bdev_name,
+ 		struct vbdev_cbt_epoch_facts *out), -ENODEV);
+ /* Evariops 0018: a rebuild's outcome turns to verifying before its verify pass. */
+ DEFINE_STUB_V(raid_rebuild_outcome_set_verifying, (struct raid_rebuild_outcome *outcome));
++/* Evariops 0019: a raid1 ejection opens a CBT epoch on each survivor. No survivor
++ * has CBT here (-ENODEV), which the raid passes over. */
++DEFINE_STUB(vbdev_cbt_auto_epoch_open, int, (const char *bdev_name, const char *stale_backend_id),
++	    -ENODEV);
+ 
+ uint32_t
+ spdk_bdev_get_data_block_size(const struct spdk_bdev *bdev)

@@ -134,6 +134,26 @@ tier_sb_slot_for_seq(uint64_t seq)
 	return (uint32_t)(seq & 1);
 }
 
+/* What a superblock read says of a disk. A disk with no valid superblock
+ * (-EILSEQ) is a fact about the disk. A read that failed, -EIO or any other
+ * error, says nothing about it: taken for "no superblock", the disk carrying
+ * the newest one lets an older generation win the reassembly, and reads failing
+ * on every band lay a fresh layout over disks that hold data. */
+enum tier_sb_read_answer {
+	TIER_SB_READ_FOUND,
+	TIER_SB_READ_NONE,
+	TIER_SB_READ_FAILED,
+};
+
+static inline enum tier_sb_read_answer
+tier_sb_read_answer(const struct tier_superblock *sb, int rc)
+{
+	if (rc == 0 && sb != NULL) {
+		return TIER_SB_READ_FOUND;
+	}
+	return rc == -EILSEQ ? TIER_SB_READ_NONE : TIER_SB_READ_FAILED;
+}
+
 /* Render a part_uuid as 32 lowercase hex chars into out (>= 33 bytes). An
  * all-zero uuid renders as the EMPTY string — the wire convention for "no
  * partition identity" on every RPC that emits the field. Returns out. */

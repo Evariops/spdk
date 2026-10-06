@@ -1,0 +1,2120 @@
+diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
+index 22ea08b..c18bde7 100644
+--- a/module/bdev/raid/bdev_raid.c
++++ b/module/bdev/raid/bdev_raid.c
+@@ -1225,6 +1225,11 @@ raid_bdev_write_info_json(struct raid_bdev *raid_bdev, struct spdk_json_write_ct
+ 	if (raid_bdev->incarnation != NULL) {
+ 		spdk_json_write_named_string(w, "incarnation", raid_bdev->incarnation);
+ 	}
++	/* Evariops 0053: absent for a raid created outside the view protocol. */
++	if (!spdk_uuid_is_null(&raid_bdev->lineage)) {
++		spdk_json_write_named_uuid(w, "lineage", &raid_bdev->lineage);
++		spdk_json_write_named_uint64(w, "view_epoch", raid_bdev->view_epoch);
++	}
+ 	spdk_json_write_named_string(w, "state", raid_bdev_state_to_str(raid_bdev->state));
+ 	/* Evariops 0034: the verify holds an LBA range lock for a long time. Publish
+ 	 * who holds it and since when, so a stalled I/O can be attributed. */
+@@ -2023,6 +2028,33 @@ raid_bdev_configure_write_sb_cb(int status, struct raid_bdev *raid_bdev, void *c
+ 	}
+ }
+ 
++/* Evariops 0053: a slot its create left empty takes the data size of the members
++ * it configured: the level sizes the raid over every slot, and a member added
++ * there later is checked against it. Upstream configures a raid with every slot
++ * filled, or from a superblock that records the size of each. */
++static void
++raid_bdev_size_empty_slots(struct raid_bdev *raid_bdev)
++{
++	struct raid_base_bdev_info *base_info;
++	uint64_t data_size = UINT64_MAX;
++
++	RAID_FOR_EACH_BASE_BDEV(raid_bdev, base_info) {
++		if (base_info->is_configured) {
++			data_size = spdk_min(data_size, base_info->data_size);
++		}
++	}
++
++	if (data_size == UINT64_MAX) {
++		return;
++	}
++
++	RAID_FOR_EACH_BASE_BDEV(raid_bdev, base_info) {
++		if (!base_info->is_configured && base_info->data_size == 0) {
++			base_info->data_size = data_size;
++		}
++	}
++}
++
+ /*
+  * brief:
+  * If raid bdev config is complete, then only register the raid bdev to
+@@ -2054,6 +2086,11 @@ raid_bdev_configure(struct raid_bdev *raid_bdev, raid_bdev_configure_cb cb, void
+ 	}
+ 	raid_bdev->strip_size_shift = spdk_u32log2(raid_bdev->strip_size);
+ 
++	/* Evariops 0053: every member the create arbitrated has been re-read as
++	 * it was claimed. */
++	raid_bdev->arbitrating = false;
++	raid_bdev_size_empty_slots(raid_bdev);
++
+ 	rc = raid_bdev->module->start(raid_bdev);
+ 	if (rc != 0) {
+ 		SPDK_ERRLOG("raid module startup callback failed\n");
+@@ -4696,6 +4733,420 @@ raid_bdev_configure_base_bdev_cont(struct raid_base_bdev_info *base_info)
+ 	}
+ }
+ 
++/* Evariops 0053: whether a superblock carries a stamp: minor 2 or later, with a
++ * lineage. Below minor 2 the stamp's bytes were reserved. */
++static bool
++raid_bdev_sb_stamped(const struct raid_bdev_superblock *sb)
++{
++	return sb->version.minor >= 2 && !spdk_uuid_is_null(&sb->lineage);
++}
++
++/* Evariops 0053: reads into stamp what sb says of the leg member: the stamp of
++ * the raid that wrote it, and the leg's own slot, the first entry naming it as
++ * examine finds it. */
++static void
++raid_bdev_read_stamp(const struct raid_bdev_superblock *sb, const struct spdk_uuid *member,
++		     struct raid_bdev_stamp *stamp)
++{
++	uint8_t i;
++
++	stamp->stamped = raid_bdev_sb_stamped(sb);
++	if (stamp->stamped) {
++		spdk_uuid_copy(&stamp->lineage, &sb->lineage);
++		snprintf(stamp->owner, sizeof(stamp->owner), "%.*s", (int)sizeof(sb->owner) - 1,
++			 (const char *)sb->owner);
++		stamp->epoch = sb->view_epoch;
++	}
++
++	for (i = 0; i < sb->base_bdevs_size; i++) {
++		const struct raid_bdev_sb_base_bdev *sb_base_bdev = &sb->base_bdevs[i];
++
++		if (spdk_uuid_compare(&sb_base_bdev->uuid, member) == 0) {
++			stamp->own_configured = sb_base_bdev->state == RAID_SB_BASE_BDEV_CONFIGURED;
++			stamp->own_generation = sb_base_bdev->content_generation;
++			stamp->own_view_epoch = sb_base_bdev->view_epoch;
++			return;
++		}
++	}
++}
++
++/* Evariops 0053: whether a raid of view may take a leg so stamped. A leg of
++ * another lineage is another volume's (-EEXIST). A leg another owner stamped in
++ * the view's epoch or a newer one is held by a raid that a view at least as
++ * recent still counts, since an owner that stays in the view journals each new
++ * epoch on its legs (-EBUSY). Such a stamp is overwritten only at the epoch the
++ * view restamps, which the control plane names after reading it (-ESTALE at
++ * any other). An unstamped leg, or one stamped by this owner or at an older
++ * epoch, is free. */
++static int
++raid_bdev_stamp_admits(const struct raid_bdev_view *view, const struct raid_bdev_stamp *stamp)
++{
++	if (!stamp->stamped) {
++		return 0;
++	}
++
++	if (spdk_uuid_compare(&stamp->lineage, &view->lineage) != 0) {
++		return -EEXIST;
++	}
++
++	if (stamp->epoch < view->epoch ||
++	    (view->incarnation != NULL && strcmp(stamp->owner, view->incarnation) == 0)) {
++		return 0;
++	}
++
++	if (view->restamp_epoch == 0) {
++		return -EBUSY;
++	}
++
++	return stamp->epoch == view->restamp_epoch ? 0 : -ESTALE;
++}
++
++/* Evariops 0053: the view a raid stamps its members in. Restamping is the
++ * create's alone. */
++static void
++raid_bdev_view_of(const struct raid_bdev *raid_bdev, struct raid_bdev_view *view)
++{
++	spdk_uuid_copy(&view->lineage, &raid_bdev->lineage);
++	view->epoch = raid_bdev->view_epoch;
++	view->incarnation = raid_bdev->incarnation;
++	view->restamp_epoch = raid_bdev->arbitrating ? raid_bdev->restamp_epoch : 0;
++}
++
++/* Evariops 0053: whether a leg claimed by this raid is checked by its stamp:
++ * during the create that arbitrated the members, and on any add into an online
++ * raid of a lineage. A raid still assembling from its superblock keeps
++ * upstream's rules, as does a raid created outside the view protocol. */
++static bool
++raid_bdev_checks_stamps(const struct raid_bdev *raid_bdev)
++{
++	return raid_bdev->arbitrating ||
++	       (!spdk_uuid_is_null(&raid_bdev->lineage) && raid_bdev->state == RAID_BDEV_STATE_ONLINE);
++}
++
++/* Evariops 0053: checks the superblock read from a leg as the raid claims it,
++ * sb NULL when the leg carries none. The view's rules first. During the create,
++ * the leg must still be what the arbitration read, or the create is stale
++ * (-ESTALE): a stamp of the lineage, configured in its own superblock at the
++ * arbitrated generation, or no stamp of it when the create migrated. An add
++ * into an online raid takes the leg as a new member, rebuilt like any other,
++ * whatever raid its superblock names, this one included. */
++static int
++raid_bdev_check_stamp(struct raid_bdev *raid_bdev, const struct raid_bdev_superblock *sb,
++		      const struct spdk_uuid *member)
++{
++	struct raid_bdev_stamp stamp = {};
++	struct raid_bdev_view view;
++	int rc;
++
++	if (sb != NULL) {
++		raid_bdev_read_stamp(sb, member, &stamp);
++	}
++
++	raid_bdev_view_of(raid_bdev, &view);
++	rc = raid_bdev_stamp_admits(&view, &stamp);
++	if (rc != 0 || !raid_bdev->arbitrating) {
++		return rc;
++	}
++
++	if (raid_bdev->arbitration_migrates) {
++		return stamp.stamped ? -ESTALE : 0;
++	}
++
++	if (!stamp.stamped || !stamp.own_configured ||
++	    stamp.own_generation != raid_bdev->arbitrated_generation) {
++		return -ESTALE;
++	}
++
++	return 0;
++}
++
++/* Evariops 0053: why a raid of a lineage refuses a leg, for its logs. */
++static const char *
++raid_bdev_stamp_refusal(int rc)
++{
++	switch (rc) {
++	case -EEXIST:
++		return "stamped for another volume";
++	case -EBUSY:
++		return "stamped by another owner in the view's epoch or a newer one";
++	case -ESTALE:
++		return "stamped otherwise than the create read it";
++	default:
++		return spdk_strerror(-rc);
++	}
++}
++
++struct raid_bdev_survey {
++	uint32_t		remaining;
++	raid_bdev_survey_cb	cb;
++	void			*cb_ctx;
++};
++
++struct raid_bdev_survey_leg {
++	struct raid_bdev_survey	*survey;
++	struct raid_bdev_stamp	*stamp;
++	struct spdk_bdev_desc	*desc;
++	struct spdk_io_channel	*ch;
++};
++
++static void
++raid_bdev_survey_leg_done(struct raid_bdev_survey *survey)
++{
++	assert(survey->remaining > 0);
++	if (--survey->remaining == 0) {
++		survey->cb(survey->cb_ctx);
++		free(survey);
++	}
++}
++
++static void
++raid_bdev_survey_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev, void *event_ctx)
++{
++}
++
++static void
++raid_bdev_survey_load_cb(const struct raid_bdev_superblock *sb, int status, void *ctx)
++{
++	struct raid_bdev_survey_leg *leg = ctx;
++	struct raid_bdev_survey *survey = leg->survey;
++
++	/* -EINVAL: the leg carries no valid superblock, a read like any other */
++	leg->stamp->status = status == -EINVAL ? 0 : status;
++	if (status == 0) {
++		raid_bdev_read_stamp(sb, &leg->stamp->uuid, leg->stamp);
++	}
++
++	spdk_put_io_channel(leg->ch);
++	spdk_bdev_close(leg->desc);
++	free(leg);
++
++	raid_bdev_survey_leg_done(survey);
++}
++
++static int
++raid_bdev_survey_leg(struct raid_bdev_survey *survey, const char *name,
++		     struct raid_bdev_stamp *stamp)
++{
++	struct raid_bdev_survey_leg *leg;
++	int rc;
++
++	leg = calloc(1, sizeof(*leg));
++	if (leg == NULL) {
++		return -ENOMEM;
++	}
++	leg->survey = survey;
++	leg->stamp = stamp;
++
++	rc = spdk_bdev_open_ext(name, false, raid_bdev_survey_event_cb, NULL, &leg->desc);
++	if (rc != 0) {
++		free(leg);
++		return rc;
++	}
++	spdk_uuid_copy(&stamp->uuid, spdk_bdev_get_uuid(spdk_bdev_desc_get_bdev(leg->desc)));
++
++	leg->ch = spdk_bdev_get_io_channel(leg->desc);
++	if (leg->ch == NULL) {
++		spdk_bdev_close(leg->desc);
++		free(leg);
++		return -ENOMEM;
++	}
++
++	rc = raid_bdev_load_base_bdev_superblock(leg->desc, leg->ch, raid_bdev_survey_load_cb, leg);
++	if (rc != 0) {
++		spdk_put_io_channel(leg->ch);
++		spdk_bdev_close(leg->desc);
++		free(leg);
++	}
++
++	return rc;
++}
++
++int
++raid_bdev_survey(char *const *names, uint8_t num_legs, struct raid_bdev_stamp *stamps,
++		 raid_bdev_survey_cb cb, void *cb_ctx)
++{
++	struct raid_bdev_survey *survey;
++	uint8_t i;
++	int rc;
++
++	assert(spdk_get_thread() == spdk_thread_get_app_thread());
++
++	survey = calloc(1, sizeof(*survey));
++	if (survey == NULL) {
++		return -ENOMEM;
++	}
++	survey->cb = cb;
++	survey->cb_ctx = cb_ctx;
++	/* One per leg, and one the launch holds until every read has started: a
++	 * read completing inline must not end the survey early. */
++	survey->remaining = (uint32_t)num_legs + 1;
++
++	for (i = 0; i < num_legs; i++) {
++		memset(&stamps[i], 0, sizeof(stamps[i]));
++		rc = raid_bdev_survey_leg(survey, names[i], &stamps[i]);
++		if (rc != 0) {
++			/* -EINVAL would read as a leg with no superblock */
++			stamps[i].status = rc == -EINVAL ? -EIO : rc;
++			raid_bdev_survey_leg_done(survey);
++		}
++	}
++
++	raid_bdev_survey_leg_done(survey);
++
++	return 0;
++}
++
++/* Evariops 0053: a create reads its legs before it takes any. The stamps of a
++ * lineage carry comparable generations: an ejection advances the generation of
++ * the members that stay, in the superblock transaction that records it, and a
++ * create configures its members at the generation they carry. So only the legs
++ * at the highest generation among those configured in their own superblock
++ * hold every acknowledged write: they are configured, and every other leg, one
++ * without a stamp of the lineage included, stays out to be rebuilt. When no leg
++ * carries a stamp of the lineage (blank, or stamped before minor 2, whose
++ * generations restarted at 0 with each create), there is nothing to compare:
++ * every listed leg is configured, as before, on the control plane's word.
++ * refused names the leg a refusal is about, num_legs for none. */
++int
++raid_bdev_arbitrate(const struct raid_bdev_view *view, const struct raid_bdev_stamp *stamps,
++		    uint8_t num_legs, bool *configure, uint64_t *generation, bool *migrates,
++		    uint8_t *refused)
++{
++	bool stamped = false, configured = false;
++	uint64_t top = 0;
++	uint8_t i;
++	int rc;
++
++	*refused = num_legs;
++
++	for (i = 0; i < num_legs; i++) {
++		if (stamps[i].status != 0) {
++			*refused = i;
++			return stamps[i].status;
++		}
++	}
++
++	/* another volume's leg first: no epoch makes it this volume's */
++	for (i = 0; i < num_legs; i++) {
++		if (stamps[i].stamped && spdk_uuid_compare(&stamps[i].lineage, &view->lineage) != 0) {
++			*refused = i;
++			return -EEXIST;
++		}
++	}
++
++	for (i = 0; i < num_legs; i++) {
++		rc = raid_bdev_stamp_admits(view, &stamps[i]);
++		if (rc != 0) {
++			*refused = i;
++			return rc;
++		}
++	}
++
++	for (i = 0; i < num_legs; i++) {
++		if (!stamps[i].stamped) {
++			continue;
++		}
++		stamped = true;
++		if (stamps[i].own_configured && (!configured || stamps[i].own_generation > top)) {
++			top = stamps[i].own_generation;
++			configured = true;
++		}
++	}
++
++	if (!stamped) {
++		for (i = 0; i < num_legs; i++) {
++			configure[i] = true;
++		}
++		*generation = 0;
++		*migrates = true;
++		return 0;
++	}
++
++	if (!configured) {
++		return -ENODATA;
++	}
++
++	for (i = 0; i < num_legs; i++) {
++		configure[i] = stamps[i].stamped && stamps[i].own_configured &&
++			       stamps[i].own_generation == top;
++	}
++	*generation = top;
++	*migrates = false;
++
++	return 0;
++}
++
++int
++raid_bdev_lay_out(struct raid_bdev *raid_bdev, uint8_t num_members)
++{
++	assert(raid_bdev->state == RAID_BDEV_STATE_CONFIGURING);
++	assert(raid_bdev->num_base_bdevs_discovered == 0);
++
++	if (num_members == 0 || num_members > raid_bdev->num_base_bdevs ||
++	    num_members < raid_bdev->min_base_bdevs_operational) {
++		return -EINVAL;
++	}
++
++	raid_bdev->num_base_bdevs_operational = num_members;
++
++	return 0;
++}
++
++/* Evariops 0053: the members take the first slots, in the order the caller adds
++ * them, at the arbitrated generation and the view's epoch. Each leg left out
++ * takes the next slot, empty, where the superblock records it MISSING at its
++ * own generation (0 without a stamp of the lineage), as it records an ejected
++ * member. The declared slots past them stay empty. */
++int
++raid_bdev_lay_out_view(struct raid_bdev *raid_bdev, const struct raid_bdev_view *view,
++		       const struct raid_bdev_stamp *stamps, const bool *configure,
++		       uint8_t num_legs, uint64_t generation, bool migrates)
++{
++	struct raid_base_bdev_info *base_info;
++	uint8_t i, members = 0, slot;
++	int rc;
++
++	if (num_legs > raid_bdev->num_base_bdevs) {
++		return -EINVAL;
++	}
++
++	for (i = 0; i < num_legs; i++) {
++		members += configure[i] ? 1 : 0;
++	}
++
++	rc = raid_bdev_lay_out(raid_bdev, members);
++	if (rc != 0) {
++		return rc;
++	}
++
++	spdk_uuid_copy(&raid_bdev->lineage, &view->lineage);
++	raid_bdev->view_epoch = view->epoch;
++	raid_bdev->arbitrating = true;
++	raid_bdev->arbitration_migrates = migrates;
++	raid_bdev->arbitrated_generation = generation;
++	raid_bdev->restamp_epoch = view->restamp_epoch;
++
++	for (slot = 0; slot < members; slot++) {
++		base_info = &raid_bdev->base_bdev_info[slot];
++		base_info->content_generation = generation;
++		base_info->view_epoch = view->epoch;
++	}
++
++	for (i = 0; i < num_legs; i++) {
++		if (configure[i]) {
++			continue;
++		}
++		base_info = &raid_bdev->base_bdev_info[slot++];
++		spdk_uuid_copy(&base_info->excluded_uuid, &stamps[i].uuid);
++		if (stamps[i].stamped) {
++			base_info->content_generation = stamps[i].own_generation;
++			base_info->view_epoch = stamps[i].own_view_epoch;
++		}
++	}
++
++	return 0;
++}
++
+ static void raid_bdev_examine_sb(const struct raid_bdev_superblock *sb, struct spdk_bdev *bdev,
+ 				 raid_base_bdev_cb cb_fn, void *cb_ctx);
+ 
+@@ -4706,6 +5157,25 @@ raid_bdev_configure_base_bdev_check_sb_cb(const struct raid_bdev_superblock *sb,
+ 	struct raid_base_bdev_info *base_info = ctx;
+ 	raid_base_bdev_cb configure_cb = base_info->configure_cb;
+ 
++	/* Evariops 0053: a raid of a lineage checks the leg by its stamp, whatever
++	 * raid the superblock names. */
++	if ((status == 0 || status == -EINVAL) && raid_bdev_checks_stamps(base_info->raid_bdev)) {
++		status = raid_bdev_check_stamp(base_info->raid_bdev, status == 0 ? sb : NULL,
++					       &base_info->uuid);
++		if (status == 0) {
++			raid_bdev_configure_base_bdev_cont(base_info);
++			return;
++		}
++		SPDK_ERRLOG("raid bdev %s refuses bdev %s, %s\n", base_info->raid_bdev->bdev.name,
++			    base_info->name, raid_bdev_stamp_refusal(status));
++		base_info->configure_cb = NULL;
++		raid_bdev_free_base_bdev_resource(base_info);
++		if (configure_cb != NULL) {
++			configure_cb(base_info->configure_cb_ctx, status);
++		}
++		return;
++	}
++
+ 	switch (status) {
+ 	case 0:
+ 		/* valid superblock found */
+@@ -5026,6 +5496,12 @@ raid_bdev_create_from_sb(const struct raid_bdev_superblock *sb, struct raid_bdev
+ 	assert(sb->length <= RAID_BDEV_SB_MAX_LENGTH);
+ 	memcpy(raid_bdev->sb, sb, sb->length);
+ 
++	/* Evariops 0053: a raid reassembled from its superblock keeps its stamp. */
++	if (raid_bdev_sb_stamped(sb)) {
++		spdk_uuid_copy(&raid_bdev->lineage, &sb->lineage);
++		raid_bdev->view_epoch = sb->view_epoch;
++	}
++
+ 	for (i = 0; i < sb->base_bdevs_size; i++) {
+ 		const struct raid_bdev_sb_base_bdev *sb_base_bdev = &sb->base_bdevs[i];
+ 		struct raid_base_bdev_info *base_info = &raid_bdev->base_bdev_info[sb_base_bdev->slot];
+diff --git a/module/bdev/raid/bdev_raid.h b/module/bdev/raid/bdev_raid.h
+index 8f5d692..2594564 100644
+--- a/module/bdev/raid/bdev_raid.h
++++ b/module/bdev/raid/bdev_raid.h
+@@ -151,6 +151,12 @@ struct raid_base_bdev_info {
+ 	uint64_t		content_generation;
+ 	uint64_t		view_epoch;
+ 
++	/* Evariops 0053: the leg a view create left out of this empty slot, behind
++	 * the generation of the members it configured. The superblock records it
++	 * MISSING at its own generation, as it records an ejected member; the slot
++	 * stays free for the next add. */
++	struct spdk_uuid	excluded_uuid;
++
+ 	/* Evariops 0017: unix seconds of the last observable member-state change
+ 	 * (configured/failed/write_only flips), for callers applying hysteresis.
+ 	 * 0 = never transitioned. */
+@@ -301,6 +307,25 @@ struct raid_bdev {
+ 	 * until bdev_raid_claim; the create RPC requires it. */
+ 	char				*incarnation;
+ 
++	/* Evariops 0053: the view this raid belongs to: the volume's lineage, and
++	 * the last view epoch the raid stamped on its members. A null lineage for a
++	 * raid created outside the view protocol. A raid reassembled from its
++	 * superblock keeps the stamp it reads there. */
++	struct spdk_uuid		lineage;
++	uint64_t			view_epoch;
++
++	/* Evariops 0053: set while the create that arbitrated the members adds
++	 * them, until the raid configures. Each member is re-read as it is claimed
++	 * and must still be what the arbitration read: a stamp of the lineage,
++	 * configured in its own superblock at arbitrated_generation, or, when no leg
++	 * carried one (arbitration_migrates), no stamp of the lineage at all.
++	 * restamp_epoch is the epoch of another owner's stamps the create may
++	 * overwrite (force_restamp), 0 for none. */
++	bool				arbitrating;
++	bool				arbitration_migrates;
++	uint64_t			arbitrated_generation;
++	uint64_t			restamp_epoch;
++
+ 	/* Superblock */
+ 	bool				superblock_enabled;
+ 	struct raid_bdev_superblock	*sb;
+@@ -360,6 +385,61 @@ int raid_bdev_add_base_bdev(struct raid_bdev *raid_bdev, const char *name,
+ 			    bool skip_rebuild, bool write_only,
+ 			    raid_base_bdev_cb cb_fn, void *cb_ctx);
+ 
++/* Evariops 0053: a leg's superblock as a view create reads it. A leg with no
++ * superblock, or with one below minor 2 or without a lineage, is unstamped: it
++ * carries no generation of any lineage. */
++struct raid_bdev_stamp {
++	/* 0 once the leg is read, whether it carries a superblock or not; else the
++	 * error its open or its read met */
++	int			status;
++	/* the leg's bdev */
++	struct spdk_uuid	uuid;
++	bool			stamped;
++	struct spdk_uuid	lineage;
++	char			owner[RAID_INCARNATION_MAX];
++	uint64_t		epoch;
++	/* the leg's own slot in its own superblock */
++	bool			own_configured;
++	uint64_t		own_generation;
++	uint64_t		own_view_epoch;
++};
++
++/* Evariops 0053: the view a create assembles its raid in: the volume's lineage,
++ * the view epoch the control plane read at its gate, the creating incarnation,
++ * and the epoch of another owner's stamps the create may overwrite, 0 for none. */
++struct raid_bdev_view {
++	struct spdk_uuid	lineage;
++	uint64_t		epoch;
++	const char		*incarnation;
++	uint64_t		restamp_epoch;
++};
++
++typedef void (*raid_bdev_survey_cb)(void *ctx);
++
++/* Evariops 0053: reads each leg's superblock, opened read-only, into stamps[i],
++ * and calls cb once every read has completed; a leg that does not open carries
++ * the open's error as its status. */
++int raid_bdev_survey(char *const *names, uint8_t num_legs, struct raid_bdev_stamp *stamps,
++		     raid_bdev_survey_cb cb, void *cb_ctx);
++/* Evariops 0053: which legs a view create configures. 0 with configure[i], the
++ * generation they carry, and whether no leg carried a stamp of the lineage.
++ * Otherwise the refusal, with the leg it is about in *refused (num_legs for
++ * none): -EEXIST for a leg of another lineage, -EBUSY for a leg another owner
++ * stamped in the view's epoch or a newer one, -ESTALE for such a stamp at an
++ * epoch other than the one the view restamps, -ENODATA when no stamped leg
++ * holds a configured copy, or a leg's read error. */
++int raid_bdev_arbitrate(const struct raid_bdev_view *view, const struct raid_bdev_stamp *stamps,
++			uint8_t num_legs, bool *configure, uint64_t *generation, bool *migrates,
++			uint8_t *refused);
++/* Evariops 0053: a raid just created comes online with num_members members,
++ * every slot past them left empty. -EINVAL below what its level operates on. */
++int raid_bdev_lay_out(struct raid_bdev *raid_bdev, uint8_t num_members);
++/* Evariops 0053: lays a raid just created out for the verdict of
++ * raid_bdev_arbitrate. The caller then adds the configured legs, in order. */
++int raid_bdev_lay_out_view(struct raid_bdev *raid_bdev, const struct raid_bdev_view *view,
++			   const struct raid_bdev_stamp *stamps, const bool *configure,
++			   uint8_t num_legs, uint64_t generation, bool migrates);
++
+ /* Evariops 0013: one dirty range, in blocks, seeding a partial rebuild. The
+  * array must be sorted by offset and non-overlapping — the RPC validates it and
+  * the rebuild engine's skip cursor relies on it. */
+@@ -596,8 +676,11 @@ raid_bdev_flush_blocks(struct raid_base_bdev_info *base_info, struct spdk_io_cha
+ #define RAID_BDEV_SB_VERSION_MAJOR	1
+ /* Evariops 0016: minor 1 adds the per-member content_generation and view_epoch,
+  * carved out of reserved bytes, so a minor-0 superblock reads back as
+- * generation 0 / epoch 0. */
+-#define RAID_BDEV_SB_VERSION_MINOR	1
++ * generation 0 / epoch 0.
++ * Evariops 0053: minor 2 adds the raid's lineage, owner and view epoch, carved
++ * out of the header's reserved bytes, so a minor-1 superblock reads back as an
++ * unstamped one. */
++#define RAID_BDEV_SB_VERSION_MINOR	2
+ 
+ #define RAID_BDEV_SB_NAME_SIZE		64
+ 
+@@ -671,7 +754,16 @@ struct raid_bdev_superblock {
+ 	/* number of raid base devices */
+ 	uint8_t			num_base_bdevs;
+ 
+-	uint8_t			reserved[118];
++	uint8_t			reserved0[7];
++
++	/* Evariops 0053: the stamp. The volume the raid serves, null when it was
++	 * created outside the view protocol; the control-plane incarnation that
++	 * created it, NUL-terminated; and the last view epoch it stamped. */
++	struct spdk_uuid	lineage;
++	uint8_t			owner[RAID_INCARNATION_MAX];
++	uint64_t		view_epoch;
++
++	uint8_t			reserved[23];
+ 
+ 	/* size of the base bdevs array */
+ 	uint8_t			base_bdevs_size;
+@@ -679,6 +771,11 @@ struct raid_bdev_superblock {
+ 	struct raid_bdev_sb_base_bdev base_bdevs[];
+ };
+ SPDK_STATIC_ASSERT(sizeof(struct raid_bdev_superblock) == 256, "incorrect size");
++/* Evariops 0053: the stamp sits where minor 1 kept reserved bytes. */
++SPDK_STATIC_ASSERT(offsetof(struct raid_bdev_superblock, lineage) == 144, "incorrect offset");
++SPDK_STATIC_ASSERT(offsetof(struct raid_bdev_superblock, owner) == 160, "incorrect offset");
++SPDK_STATIC_ASSERT(offsetof(struct raid_bdev_superblock, view_epoch) == 224, "incorrect offset");
++SPDK_STATIC_ASSERT(offsetof(struct raid_bdev_superblock, base_bdevs_size) == 255, "incorrect offset");
+ 
+ #define RAID_BDEV_SB_MAX_LENGTH (sizeof(struct raid_bdev_superblock) + UINT8_MAX * sizeof(struct raid_bdev_sb_base_bdev))
+ 
+diff --git a/module/bdev/raid/bdev_raid_rpc.c b/module/bdev/raid/bdev_raid_rpc.c
+index d4127d2..9119230 100644
+--- a/module/bdev/raid/bdev_raid_rpc.c
++++ b/module/bdev/raid/bdev_raid_rpc.c
+@@ -145,6 +145,20 @@ struct rpc_bdev_raid_create {
+ 	/* Evariops 0014: identity of the creating control-plane incarnation.
+ 	 * Mandatory — there is no creation without an identity. */
+ 	char                                 *incarnation;
++
++	/* Evariops 0053: the view the raid is created in. A view_epoch arbitrates
++	 * the members from their superblocks: the volume's lineage, the view epoch
++	 * the control plane read at its gate, and, to overwrite another owner's
++	 * stamps of that epoch or a newer one, force_restamp with the epoch read
++	 * from them. */
++	struct spdk_uuid                     lineage;
++	uint64_t                             view_epoch;
++	bool                                 force_restamp;
++	uint64_t                             expected_view_epoch;
++
++	/* Evariops 0053: the raid's width when wider than the listed legs; the
++	 * slots past them stay empty, each for a member added later. */
++	uint32_t                             declared_slots;
+ };
+ 
+ /*
+@@ -193,6 +207,11 @@ static const struct spdk_json_object_decoder rpc_bdev_raid_create_decoders[] = {
+ 	{"uuid", offsetof(struct rpc_bdev_raid_create, uuid), spdk_json_decode_uuid, true},
+ 	{"superblock", offsetof(struct rpc_bdev_raid_create, superblock_enabled), spdk_json_decode_bool, true},
+ 	{"incarnation", offsetof(struct rpc_bdev_raid_create, incarnation), spdk_json_decode_string},
++	{"lineage", offsetof(struct rpc_bdev_raid_create, lineage), spdk_json_decode_uuid, true},
++	{"view_epoch", offsetof(struct rpc_bdev_raid_create, view_epoch), spdk_json_decode_uint64, true},
++	{"force_restamp", offsetof(struct rpc_bdev_raid_create, force_restamp), spdk_json_decode_bool, true},
++	{"expected_view_epoch", offsetof(struct rpc_bdev_raid_create, expected_view_epoch), spdk_json_decode_uint64, true},
++	{"declared_slots", offsetof(struct rpc_bdev_raid_create, declared_slots), spdk_json_decode_uint32, true},
+ };
+ 
+ struct rpc_bdev_raid_create_ctx {
+@@ -201,6 +220,10 @@ struct rpc_bdev_raid_create_ctx {
+ 	struct spdk_jsonrpc_request *request;
+ 	uint8_t remaining;
+ 	int status;
++	/* Evariops 0053: a view create's read of each listed leg, and the legs its
++	 * arbitration configures */
++	struct raid_bdev_stamp *stamps;
++	bool *configure;
+ };
+ 
+ static void
+@@ -221,6 +244,8 @@ free_rpc_bdev_raid_create_ctx(struct rpc_bdev_raid_create_ctx *ctx)
+ 		free(req->base_bdevs.base_bdevs[i]);
+ 	}
+ 
++	free(ctx->stamps);
++	free(ctx->configure);
+ 	free(ctx);
+ }
+ 
+@@ -261,16 +286,186 @@ rpc_bdev_raid_create_add_base_bdev_cb(void *_ctx, int status)
+  * returns:
+  * none
+  */
++/* Evariops 0053: creates the raid and adds its members: every listed leg, or,
++ * for a create in a view, the legs its arbitration configured. A create in a
++ * view fails on a leg gone since it read it, where a plain create waits for it. */
++static void
++rpc_bdev_raid_create_members(struct rpc_bdev_raid_create_ctx *ctx, const struct raid_bdev_view *view,
++			     uint64_t generation, bool migrates)
++{
++	struct rpc_bdev_raid_create	*req = &ctx->req;
++	uint8_t				num_legs = req->base_bdevs.num_base_bdevs;
++	uint8_t				num_slots = spdk_max(req->declared_slots, num_legs);
++	uint8_t				num_members = 0, added = 0;
++	struct raid_bdev		*raid_bdev;
++	int				rc = 0;
++	size_t				i;
++
++	rc = raid_bdev_create(req->name, req->strip_size_kb, num_slots,
++			      req->level, req->superblock_enabled, &req->uuid,
++			      req->incarnation, &raid_bdev);
++	if (rc != 0) {
++		spdk_jsonrpc_send_error_response_fmt(ctx->request, rc,
++						     "Failed to create RAID bdev %s: %s",
++						     req->name, spdk_strerror(-rc));
++		free_rpc_bdev_raid_create_ctx(ctx);
++		return;
++	}
++
++	if (view != NULL) {
++		rc = raid_bdev_lay_out_view(raid_bdev, view, ctx->stamps, ctx->configure, num_legs,
++					    generation, migrates);
++	} else if (num_slots > num_legs) {
++		rc = raid_bdev_lay_out(raid_bdev, num_legs);
++	}
++	if (rc != 0) {
++		raid_bdev_delete(raid_bdev, NULL, NULL);
++		spdk_jsonrpc_send_error_response_fmt(ctx->request, rc,
++						     "Failed to create RAID bdev %s: %u members of %u slots: %s",
++						     req->name, num_legs, num_slots, spdk_strerror(-rc));
++		free_rpc_bdev_raid_create_ctx(ctx);
++		return;
++	}
++
++	for (i = 0; i < num_legs; i++) {
++		if (view == NULL || ctx->configure[i]) {
++			num_members++;
++		} else {
++			SPDK_NOTICELOG("raid bdev %s leaves bdev %s out, behind the generation %" PRIu64
++				       " of its members (Evariops 0053)\n", req->name,
++				       req->base_bdevs.base_bdevs[i], generation);
++		}
++	}
++
++	ctx->raid_bdev = raid_bdev;
++	ctx->remaining = num_members;
++
++	assert(num_members > 0);
++
++	/* The add of the last member can complete the request, and free ctx, before
++	 * it returns: the loop stops there. */
++	for (i = 0; i < num_legs && added < num_members; i++) {
++		const char *base_bdev_name = req->base_bdevs.base_bdevs[i];
++
++		if (view != NULL && !ctx->configure[i]) {
++			continue;
++		}
++
++		rc = raid_bdev_add_base_bdev(raid_bdev, base_bdev_name, false, false,
++					     rpc_bdev_raid_create_add_base_bdev_cb, ctx);
++		if (rc == -ENODEV && view == NULL) {
++			SPDK_DEBUGLOG(bdev_raid, "base bdev %s doesn't exist now\n", base_bdev_name);
++			assert(ctx->remaining > 1 || added + 1 == num_members);
++			rpc_bdev_raid_create_add_base_bdev_cb(ctx, 0);
++		} else if (rc != 0) {
++			SPDK_DEBUGLOG(bdev_raid, "Failed to add base bdev %s to RAID bdev %s: %s",
++				      base_bdev_name, req->name, spdk_strerror(-rc));
++			ctx->remaining -= (num_members - added - 1);
++			rpc_bdev_raid_create_add_base_bdev_cb(ctx, rc);
++			break;
++		}
++		added++;
++	}
++}
++
++/* Evariops 0053: why a create in a view refuses. */
++static const char *
++rpc_bdev_raid_create_refusal(int rc)
++{
++	switch (rc) {
++	case -EEXIST:
++		return "stamped for another volume";
++	case -EBUSY:
++		return "stamped by another owner in the view's epoch or a newer one";
++	case -ESTALE:
++		return "stamped by another owner at an epoch other than the one to restamp";
++	case -ENODATA:
++		return "no leg stamped for the volume holds a configured copy";
++	default:
++		return spdk_strerror(-rc);
++	}
++}
++
++static void
++rpc_bdev_raid_create_surveyed(void *_ctx)
++{
++	struct rpc_bdev_raid_create_ctx *ctx = _ctx;
++	struct rpc_bdev_raid_create *req = &ctx->req;
++	struct raid_bdev_view view = {
++		.epoch = req->view_epoch,
++		.incarnation = req->incarnation,
++		.restamp_epoch = req->force_restamp ? req->expected_view_epoch : 0,
++	};
++	uint8_t num_legs = req->base_bdevs.num_base_bdevs;
++	uint64_t generation;
++	uint8_t refused;
++	bool migrates;
++	int rc;
++
++	spdk_uuid_copy(&view.lineage, &req->lineage);
++
++	rc = raid_bdev_arbitrate(&view, ctx->stamps, num_legs, ctx->configure, &generation, &migrates,
++				 &refused);
++	if (rc == 0) {
++		rpc_bdev_raid_create_members(ctx, &view, generation, migrates);
++		return;
++	}
++
++	if (refused < num_legs && ctx->stamps[refused].status == 0) {
++		const struct raid_bdev_stamp *stamp = &ctx->stamps[refused];
++
++		spdk_jsonrpc_send_error_response_fmt(ctx->request, rc,
++						     "Failed to create RAID bdev %s: base bdev %s is %s "
++						     "(owner '%s', view epoch %" PRIu64 ")",
++						     req->name, req->base_bdevs.base_bdevs[refused],
++						     rpc_bdev_raid_create_refusal(rc), stamp->owner, stamp->epoch);
++	} else if (refused < num_legs) {
++		spdk_jsonrpc_send_error_response_fmt(ctx->request, rc,
++						     "Failed to create RAID bdev %s: base bdev %s: %s",
++						     req->name, req->base_bdevs.base_bdevs[refused],
++						     spdk_strerror(-rc));
++	} else {
++		spdk_jsonrpc_send_error_response_fmt(ctx->request, rc,
++						     "Failed to create RAID bdev %s: %s",
++						     req->name, rpc_bdev_raid_create_refusal(rc));
++	}
++	free_rpc_bdev_raid_create_ctx(ctx);
++}
++
++/* Evariops 0053: what a create in a view needs: a raid1 with a superblock, the
++ * volume's lineage, and force_restamp named with the epoch it overwrites. */
++static int
++rpc_bdev_raid_create_check_view(struct rpc_bdev_raid_create *req, const char **why)
++{
++	if (req->view_epoch == 0) {
++		*why = "lineage, force_restamp and expected_view_epoch need a view_epoch";
++		return spdk_uuid_is_null(&req->lineage) && !req->force_restamp &&
++		       req->expected_view_epoch == 0 ? 0 : -EINVAL;
++	}
++
++	if (req->level != RAID1 || !req->superblock_enabled || spdk_uuid_is_null(&req->lineage)) {
++		*why = "a create in a view needs a raid1 with a superblock and a lineage";
++		return -EINVAL;
++	}
++
++	if (req->force_restamp != (req->expected_view_epoch != 0)) {
++		*why = "force_restamp needs the expected_view_epoch it overwrites, and only it";
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
+ static void
+ rpc_bdev_raid_create(struct spdk_jsonrpc_request *request,
+ 		     const struct spdk_json_val *params)
+ {
+ 	struct rpc_bdev_raid_create	*req;
+-	struct raid_bdev		*raid_bdev;
+ 	int				rc;
+ 	size_t				i;
+ 	struct rpc_bdev_raid_create_ctx *ctx;
+ 	uint8_t				num_base_bdevs;
++	const char			*why = NULL;
+ 
+ 	ctx = calloc(1, sizeof(*ctx));
+ 	if (ctx == NULL) {
+@@ -278,6 +473,7 @@ rpc_bdev_raid_create(struct spdk_jsonrpc_request *request,
+ 		goto cleanup;
+ 	}
+ 	req = &ctx->req;
++	ctx->request = request;
+ 
+ 	if (spdk_json_decode_object(params, rpc_bdev_raid_create_decoders,
+ 				    SPDK_COUNTOF(rpc_bdev_raid_create_decoders),
+@@ -297,38 +493,38 @@ rpc_bdev_raid_create(struct spdk_jsonrpc_request *request,
+ 		}
+ 	}
+ 
+-	rc = raid_bdev_create(req->name, req->strip_size_kb, num_base_bdevs,
+-			      req->level, req->superblock_enabled, &req->uuid,
+-			      req->incarnation, &raid_bdev);
+-	if (rc != 0) {
+-		spdk_jsonrpc_send_error_response_fmt(request, rc,
+-						     "Failed to create RAID bdev %s: %s",
+-						     req->name, spdk_strerror(-rc));
++	if (req->declared_slots > RPC_MAX_BASE_BDEVS) {
++		spdk_jsonrpc_send_error_response_fmt(request, -EINVAL,
++						     "declared_slots %u exceeds %d",
++						     req->declared_slots, RPC_MAX_BASE_BDEVS);
+ 		goto cleanup;
+ 	}
+ 
+-	ctx->raid_bdev = raid_bdev;
+-	ctx->request = request;
+-	ctx->remaining = num_base_bdevs;
++	rc = rpc_bdev_raid_create_check_view(req, &why);
++	if (rc != 0) {
++		spdk_jsonrpc_send_error_response_fmt(request, rc, "Failed to create RAID bdev %s: %s",
++						     req->name, why);
++		goto cleanup;
++	}
+ 
+-	assert(num_base_bdevs > 0);
++	if (req->view_epoch == 0) {
++		rpc_bdev_raid_create_members(ctx, NULL, 0, false);
++		return;
++	}
+ 
+-	for (i = 0; i < num_base_bdevs; i++) {
+-		const char *base_bdev_name = req->base_bdevs.base_bdevs[i];
++	ctx->stamps = calloc(num_base_bdevs, sizeof(*ctx->stamps));
++	ctx->configure = calloc(num_base_bdevs, sizeof(*ctx->configure));
++	if (ctx->stamps == NULL || ctx->configure == NULL) {
++		spdk_jsonrpc_send_error_response(request, -ENOMEM, spdk_strerror(ENOMEM));
++		goto cleanup;
++	}
+ 
+-		rc = raid_bdev_add_base_bdev(raid_bdev, base_bdev_name, false, false,
+-					     rpc_bdev_raid_create_add_base_bdev_cb, ctx);
+-		if (rc == -ENODEV) {
+-			SPDK_DEBUGLOG(bdev_raid, "base bdev %s doesn't exist now\n", base_bdev_name);
+-			assert(ctx->remaining > 1 || i + 1 == num_base_bdevs);
+-			rpc_bdev_raid_create_add_base_bdev_cb(ctx, 0);
+-		} else if (rc != 0) {
+-			SPDK_DEBUGLOG(bdev_raid, "Failed to add base bdev %s to RAID bdev %s: %s",
+-				      base_bdev_name, req->name, spdk_strerror(-rc));
+-			ctx->remaining -= (num_base_bdevs - i - 1);
+-			rpc_bdev_raid_create_add_base_bdev_cb(ctx, rc);
+-			break;
+-		}
++	rc = raid_bdev_survey(req->base_bdevs.base_bdevs, num_base_bdevs, ctx->stamps,
++			      rpc_bdev_raid_create_surveyed, ctx);
++	if (rc != 0) {
++		spdk_jsonrpc_send_error_response_fmt(request, rc, "Failed to create RAID bdev %s: %s",
++						     req->name, spdk_strerror(-rc));
++		goto cleanup;
+ 	}
+ 	return;
+ cleanup:
+diff --git a/module/bdev/raid/bdev_raid_sb.c b/module/bdev/raid/bdev_raid_sb.c
+index bb0fcfc..eb092d8 100644
+--- a/module/bdev/raid/bdev_raid_sb.c
++++ b/module/bdev/raid/bdev_raid_sb.c
+@@ -81,13 +81,37 @@ raid_bdev_init_superblock(struct raid_bdev *raid_bdev)
+ 	sb->num_base_bdevs = sb->base_bdevs_size = raid_bdev->num_base_bdevs;
+ 	sb->length = sizeof(*sb) + sizeof(*sb_base_bdev) * sb->base_bdevs_size;
+ 
++	/* Evariops 0053: a raid created in a view stamps it. */
++	if (!spdk_uuid_is_null(&raid_bdev->lineage)) {
++		spdk_uuid_copy(&sb->lineage, &raid_bdev->lineage);
++		snprintf((char *)sb->owner, sizeof(sb->owner), "%s",
++			 raid_bdev->incarnation != NULL ? raid_bdev->incarnation : "");
++		sb->view_epoch = raid_bdev->view_epoch;
++	}
++
++	/* Evariops 0053: a slot its create left empty is recorded MISSING, under
++	 * the leg it left out or, for a slot no leg ever held, a UUID of its own:
++	 * every slot needs an entry, which a member added there later takes over,
++	 * and examine expects each entry to name one. Upstream creates a raid with
++	 * every slot filled. The generations are the ones the create set. */
+ 	sb_base_bdev = &sb->base_bdevs[0];
+ 	RAID_FOR_EACH_BASE_BDEV(raid_bdev, base_info) {
+-		spdk_uuid_copy(&sb_base_bdev->uuid, &base_info->uuid);
++		if (base_info->is_configured) {
++			spdk_uuid_copy(&sb_base_bdev->uuid, &base_info->uuid);
++			sb_base_bdev->state = RAID_SB_BASE_BDEV_CONFIGURED;
++		} else {
++			if (!spdk_uuid_is_null(&base_info->excluded_uuid)) {
++				spdk_uuid_copy(&sb_base_bdev->uuid, &base_info->excluded_uuid);
++			} else {
++				spdk_uuid_generate(&sb_base_bdev->uuid);
++			}
++			sb_base_bdev->state = RAID_SB_BASE_BDEV_MISSING;
++		}
+ 		sb_base_bdev->data_offset = base_info->data_offset;
+ 		sb_base_bdev->data_size = base_info->data_size;
+-		sb_base_bdev->state = RAID_SB_BASE_BDEV_CONFIGURED;
+ 		sb_base_bdev->slot = raid_bdev_base_bdev_slot(base_info);
++		sb_base_bdev->content_generation = base_info->content_generation;
++		sb_base_bdev->view_epoch = base_info->view_epoch;
+ 		sb_base_bdev++;
+ 	}
+ }
+diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+index c359160..0f21d2c 100644
+--- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
++++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+@@ -51,6 +51,8 @@ uint32_t g_max_io_size;
+ uint8_t g_max_base_drives;
+ uint8_t g_max_raids;
+ uint8_t g_rpc_err;
++/* Evariops 0053: the code of the last error response */
++int g_rpc_err_code;
+ char *g_get_raids_output[MAX_RAIDS];
+ uint32_t g_get_raids_count;
+ uint8_t g_json_decode_obj_err;
+@@ -142,6 +144,19 @@ static struct raid_bdev_module g_ut_raid_module = {
+ };
+ RAID_MODULE_REGISTER(&g_ut_raid_module)
+ 
++/* Evariops 0053: a create in a view is raid1 only. This module carries raid1's
++ * constraint and the suite's I/O. */
++static struct raid_bdev_module g_ut_raid1_module = {
++	.level = RAID1,
++	.base_bdevs_min = 2,
++	.base_bdevs_constraint = {CONSTRAINT_MIN_BASE_BDEVS_OPERATIONAL, 1},
++	.start = ut_raid_start,
++	.submit_rw_request = ut_raid_submit_rw_request,
++	.submit_null_payload_request = ut_raid_submit_null_payload_request,
++	.submit_process_request = ut_raid_submit_process_request,
++};
++RAID_MODULE_REGISTER(&g_ut_raid1_module)
++
+ DEFINE_STUB_V(spdk_bdev_module_examine_done, (struct spdk_bdev_module *module));
+ DEFINE_STUB_V(spdk_bdev_module_list_add, (struct spdk_bdev_module *bdev_module));
+ DEFINE_STUB(spdk_bdev_io_type_supported, bool, (struct spdk_bdev *bdev,
+@@ -203,8 +218,29 @@ DEFINE_STUB(spdk_bdev_notify_blockcnt_change, int, (struct spdk_bdev *bdev, uint
+ DEFINE_STUB(spdk_json_write_named_uuid, int, (struct spdk_json_write_ctx *w, const char *name,
+ 		const struct spdk_uuid *val), 0);
+ DEFINE_STUB_V(raid_bdev_init_superblock, (struct raid_bdev *raid_bdev));
+-DEFINE_STUB(raid_bdev_alloc_superblock, int, (struct raid_bdev *raid_bdev, uint32_t block_size), 0);
+-DEFINE_STUB_V(raid_bdev_free_superblock, (struct raid_bdev *raid_bdev));
++
++/* Evariops 0053: the suite's raids have no superblock buffer, except while a test
++ * reassembles one from a superblock. */
++static bool g_ut_alloc_superblock;
++
++int
++raid_bdev_alloc_superblock(struct raid_bdev *raid_bdev, uint32_t block_size)
++{
++	if (g_ut_alloc_superblock) {
++		raid_bdev->sb = calloc(1, RAID_BDEV_SB_MAX_LENGTH);
++		if (raid_bdev->sb == NULL) {
++			return -ENOMEM;
++		}
++	}
++	return 0;
++}
++
++void
++raid_bdev_free_superblock(struct raid_bdev *raid_bdev)
++{
++	free(raid_bdev->sb);
++	raid_bdev->sb = NULL;
++}
+ DEFINE_STUB(spdk_bdev_readv_blocks_ext, int, (struct spdk_bdev_desc *desc,
+ 		struct spdk_io_channel *ch, struct iovec *iov, int iovcnt, uint64_t offset_blocks,
+ 		uint64_t num_blocks, spdk_bdev_io_completion_cb cb, void *cb_arg,
+@@ -312,11 +348,104 @@ spdk_bdev_get_data_block_size(const struct spdk_bdev *bdev)
+ 	return g_block_len;
+ }
+ 
++/* Evariops 0053: what reading each base bdev's superblock returns, by bdev name.
++ * A bdev without an entry, or whose entry has no superblock, carries none
++ * (-EINVAL). Otherwise the entry returns its read error (on its first read only
++ * when the error is transient), or its superblock, and from its second read on
++ * its later superblock when it has one: a leg that changed between a create's
++ * survey and its claim. */
++#define UT_LEGS_MAX 4
++#define UT_SBS_MAX 8
++
++struct ut_leg {
++	const char			*name;
++	struct raid_bdev_superblock	*sb;
++	struct raid_bdev_superblock	*later_sb;
++	int				read_status;
++	bool				read_error_transient;
++	uint32_t			reads;
++};
++
++static struct ut_leg g_ut_legs[UT_LEGS_MAX];
++static struct raid_bdev_superblock *g_ut_sbs[UT_SBS_MAX];
++
++static struct ut_leg *
++ut_leg(const char *name)
++{
++	size_t i;
++
++	for (i = 0; i < SPDK_COUNTOF(g_ut_legs); i++) {
++		if (g_ut_legs[i].name != NULL && strcmp(g_ut_legs[i].name, name) == 0) {
++			return &g_ut_legs[i];
++		}
++	}
++	for (i = 0; i < SPDK_COUNTOF(g_ut_legs); i++) {
++		if (g_ut_legs[i].name == NULL) {
++			g_ut_legs[i].name = name;
++			return &g_ut_legs[i];
++		}
++	}
++	SPDK_CU_ASSERT_FATAL(false);
++	return NULL;
++}
++
++static uint32_t
++ut_leg_reads(void)
++{
++	uint32_t reads = 0;
++	size_t i;
++
++	for (i = 0; i < SPDK_COUNTOF(g_ut_legs); i++) {
++		reads += g_ut_legs[i].reads;
++	}
++	return reads;
++}
++
++static void
++ut_legs_reset(void)
++{
++	size_t i;
++
++	memset(g_ut_legs, 0, sizeof(g_ut_legs));
++	for (i = 0; i < SPDK_COUNTOF(g_ut_sbs); i++) {
++		free(g_ut_sbs[i]);
++		g_ut_sbs[i] = NULL;
++	}
++}
++
+ int
+ raid_bdev_load_base_bdev_superblock(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+ 				    raid_bdev_load_sb_cb cb, void *cb_ctx)
+ {
+-	cb(NULL, -EINVAL, cb_ctx);
++	const char *name = spdk_bdev_desc_get_bdev(desc)->name;
++	struct raid_bdev_superblock *sb;
++	struct ut_leg *leg = NULL;
++	size_t i;
++
++	for (i = 0; i < SPDK_COUNTOF(g_ut_legs); i++) {
++		if (g_ut_legs[i].name != NULL && strcmp(g_ut_legs[i].name, name) == 0) {
++			leg = &g_ut_legs[i];
++			break;
++		}
++	}
++
++	if (leg == NULL) {
++		cb(NULL, -EINVAL, cb_ctx);
++		return 0;
++	}
++
++	leg->reads++;
++	if (leg->read_status != 0 && (!leg->read_error_transient || leg->reads == 1)) {
++		cb(NULL, leg->read_status, cb_ctx);
++		return 0;
++	}
++
++	sb = leg->reads > 1 && leg->later_sb != NULL ? leg->later_sb : leg->sb;
++	if (sb == NULL) {
++		cb(NULL, -EINVAL, cb_ctx);
++	} else {
++		cb(sb, 0, cb_ctx);
++	}
+ 
+ 	return 0;
+ }
+@@ -643,6 +772,11 @@ spdk_json_decode_object(const struct spdk_json_val *values,
+ 			_out->incarnation = strdup(req->incarnation);
+ 			SPDK_CU_ASSERT_FATAL(_out->incarnation != NULL);
+ 		}
++		spdk_uuid_copy(&_out->lineage, &req->lineage);
++		_out->view_epoch = req->view_epoch;
++		_out->force_restamp = req->force_restamp;
++		_out->expected_view_epoch = req->expected_view_epoch;
++		_out->declared_slots = req->declared_slots;
+ 		_out->base_bdevs.num_base_bdevs = req->base_bdevs.num_base_bdevs;
+ 		for (i = 0; i < req->base_bdevs.num_base_bdevs; i++) {
+ 			_out->base_bdevs.base_bdevs[i] = strdup(req->base_bdevs.base_bdevs[i]);
+@@ -666,6 +800,7 @@ spdk_jsonrpc_send_error_response(struct spdk_jsonrpc_request *request,
+ 				 int error_code, const char *msg)
+ {
+ 	g_rpc_err = 1;
++	g_rpc_err_code = error_code;
+ }
+ 
+ void
+@@ -673,6 +808,7 @@ spdk_jsonrpc_send_error_response_fmt(struct spdk_jsonrpc_request *request,
+ 				     int error_code, const char *fmt, ...)
+ {
+ 	g_rpc_err = 1;
++	g_rpc_err_code = error_code;
+ }
+ 
+ struct spdk_bdev *
+@@ -957,6 +1093,7 @@ create_test_req(struct rpc_bdev_raid_create *r, const char *raid_name,
+ 	char name[16];
+ 	uint8_t bbdev_idx = bbdev_start_idx;
+ 
++	memset(r, 0, sizeof(*r));
+ 	r->name = strdup(raid_name);
+ 	SPDK_CU_ASSERT_FATAL(r->name != NULL);
+ 	r->strip_size_kb = (g_strip_size * g_block_len) / 1024;
+@@ -2327,6 +2464,723 @@ test_raid1_ejection_of_a_member_behind_opens_no_epoch(void)
+ 				      member, sizeof(member)) == 0);
+ }
+ 
++/* Evariops 0053: the volume the view tests create a raid for, and another one. */
++static struct spdk_uuid g_ut_lineage;
++static struct spdk_uuid g_ut_other_lineage;
++static uint8_t g_ut_saved_max_base_drives;
++
++static void
++ut_view_setup(void)
++{
++	g_ut_saved_max_base_drives = g_max_base_drives;
++	g_max_base_drives = 3;
++	set_globals();
++	CU_ASSERT(raid_bdev_init() == 0);
++	ut_legs_reset();
++	spdk_uuid_generate(&g_ut_lineage);
++	spdk_uuid_generate(&g_ut_other_lineage);
++	g_rpc_err_code = 0;
++}
++
++static void
++ut_view_teardown(void)
++{
++	struct rpc_bdev_raid_delete delete_req;
++
++	if (raid_bdev_find_by_name("raid1") != NULL) {
++		create_raid_bdev_delete_req(&delete_req, "raid1", 0);
++		rpc_bdev_raid_delete(NULL, NULL);
++		CU_ASSERT(g_rpc_err == 0);
++	}
++	poll_app_thread();
++	raid_bdev_exit();
++	base_bdevs_cleanup();
++	reset_globals();
++	ut_legs_reset();
++	g_ut_alloc_superblock = false;
++	g_max_base_drives = g_ut_saved_max_base_drives;
++}
++
++/* Evariops 0053: a create over Nvme0n1, Nvme1n1 and Nvme2n1, which exist once it
++ * returns, in the view of the test volume at epoch, under the suite's
++ * incarnation. */
++static void
++ut_view_create_req(struct rpc_bdev_raid_create *r, uint64_t epoch)
++{
++	create_raid_bdev_create_req(r, "raid1", 0, true, 0, true);
++	r->level = RAID1;
++	r->strip_size_kb = 0;
++	spdk_uuid_copy(&r->lineage, &g_ut_lineage);
++	r->view_epoch = epoch;
++}
++
++/* Evariops 0053: a superblock as a raid of lineage writes it, owned by owner at
++ * epoch; with no lineage, an unstamped one. Freed with the legs. */
++static struct raid_bdev_superblock *
++ut_sb(const struct spdk_uuid *lineage, const char *owner, uint64_t epoch)
++{
++	struct raid_bdev_superblock *sb;
++	size_t i;
++
++	for (i = 0; i < SPDK_COUNTOF(g_ut_sbs) && g_ut_sbs[i] != NULL; i++) {
++	}
++	SPDK_CU_ASSERT_FATAL(i < SPDK_COUNTOF(g_ut_sbs));
++	sb = calloc(1, RAID_BDEV_SB_MAX_LENGTH);
++	SPDK_CU_ASSERT_FATAL(sb != NULL);
++	g_ut_sbs[i] = sb;
++
++	memcpy(sb->signature, RAID_BDEV_SB_SIG, sizeof(sb->signature));
++	sb->version.major = RAID_BDEV_SB_VERSION_MAJOR;
++	sb->version.minor = RAID_BDEV_SB_VERSION_MINOR;
++	sb->length = sizeof(*sb);
++	spdk_uuid_generate(&sb->uuid);
++	snprintf((char *)sb->name, sizeof(sb->name), "%s", "raid-before");
++	sb->block_size = g_block_len;
++	sb->level = RAID1;
++	if (lineage != NULL) {
++		spdk_uuid_copy(&sb->lineage, lineage);
++		snprintf((char *)sb->owner, sizeof(sb->owner), "%s", owner);
++		sb->view_epoch = epoch;
++	}
++
++	return sb;
++}
++
++/* Evariops 0053: records bdev name in the next slot of sb, in state at generation. */
++static void
++ut_sb_slot(struct raid_bdev_superblock *sb, const char *name, uint32_t state, uint64_t generation)
++{
++	struct spdk_bdev *bdev = spdk_bdev_get_by_name(name);
++	struct raid_bdev_sb_base_bdev *slot = &sb->base_bdevs[sb->base_bdevs_size];
++
++	SPDK_CU_ASSERT_FATAL(bdev != NULL);
++	spdk_uuid_copy(&slot->uuid, &bdev->uuid);
++	slot->state = state;
++	slot->content_generation = generation;
++	slot->slot = sb->base_bdevs_size;
++	sb->base_bdevs_size++;
++	sb->num_base_bdevs = sb->base_bdevs_size;
++	sb->length = sizeof(*sb) + sb->base_bdevs_size * sizeof(*slot);
++}
++
++/* Evariops 0053: the superblock every leg of a raid of the test volume carries,
++ * owned by owner at epoch, its three legs configured at generation. */
++static struct raid_bdev_superblock *
++ut_sb_all_configured(const char *owner, uint64_t epoch, uint64_t generation)
++{
++	struct raid_bdev_superblock *sb = ut_sb(&g_ut_lineage, owner, epoch);
++
++	ut_sb_slot(sb, "Nvme0n1", RAID_SB_BASE_BDEV_CONFIGURED, generation);
++	ut_sb_slot(sb, "Nvme1n1", RAID_SB_BASE_BDEV_CONFIGURED, generation);
++	ut_sb_slot(sb, "Nvme2n1", RAID_SB_BASE_BDEV_CONFIGURED, generation);
++	ut_leg("Nvme0n1")->sb = sb;
++	ut_leg("Nvme1n1")->sb = sb;
++	ut_leg("Nvme2n1")->sb = sb;
++
++	return sb;
++}
++
++/* Evariops 0053: Nvme0n1 was ejected at generation 6 from a raid of the test
++ * volume that incarnation-before created at epoch 3: the two members that
++ * stayed advanced to 7 in their own superblocks, and its own still has it
++ * configured at 6. */
++static struct raid_bdev_superblock *
++ut_sb_after_an_ejection(void)
++{
++	struct raid_bdev_superblock *survivors, *ejected;
++
++	survivors = ut_sb(&g_ut_lineage, "incarnation-before", 3);
++	ut_sb_slot(survivors, "Nvme0n1", RAID_SB_BASE_BDEV_MISSING, 6);
++	ut_sb_slot(survivors, "Nvme1n1", RAID_SB_BASE_BDEV_CONFIGURED, 7);
++	ut_sb_slot(survivors, "Nvme2n1", RAID_SB_BASE_BDEV_CONFIGURED, 7);
++	ejected = ut_sb(&g_ut_lineage, "incarnation-before", 3);
++	ut_sb_slot(ejected, "Nvme0n1", RAID_SB_BASE_BDEV_CONFIGURED, 6);
++	ut_sb_slot(ejected, "Nvme1n1", RAID_SB_BASE_BDEV_CONFIGURED, 6);
++	ut_sb_slot(ejected, "Nvme2n1", RAID_SB_BASE_BDEV_CONFIGURED, 6);
++	ut_leg("Nvme0n1")->sb = ejected;
++	ut_leg("Nvme1n1")->sb = survivors;
++	ut_leg("Nvme2n1")->sb = survivors;
++
++	return ejected;
++}
++
++/* Evariops 0053: the raid the view tests created, online with num_members. */
++static struct raid_bdev *
++ut_view_raid_online(uint8_t num_members)
++{
++	struct raid_bdev *raid_bdev = raid_bdev_find_by_name("raid1");
++
++	SPDK_CU_ASSERT_FATAL(raid_bdev != NULL);
++	CU_ASSERT(raid_bdev->state == RAID_BDEV_STATE_ONLINE);
++	CU_ASSERT(raid_bdev->num_base_bdevs_operational == num_members);
++	CU_ASSERT(raid_bdev->num_base_bdevs_discovered == num_members);
++	CU_ASSERT(!raid_bdev->arbitrating);
++	/* sized by its members, not by the slots they left empty */
++	CU_ASSERT(raid_bdev->bdev.blockcnt == raid_bdev->base_bdev_info[0].data_size);
++	CU_ASSERT(raid_bdev->bdev.blockcnt != 0);
++
++	return raid_bdev;
++}
++
++/* Evariops 0053: the member of slot, bdev name, at generation and epoch. */
++static void
++ut_view_member(struct raid_bdev *raid_bdev, uint8_t slot, const char *name, uint64_t generation,
++	       uint64_t epoch)
++{
++	struct raid_base_bdev_info *base_info = &raid_bdev->base_bdev_info[slot];
++	struct spdk_bdev *bdev = spdk_bdev_get_by_name(name);
++
++	SPDK_CU_ASSERT_FATAL(bdev != NULL);
++	CU_ASSERT(base_info->is_configured);
++	CU_ASSERT(base_info->name != NULL && strcmp(base_info->name, name) == 0);
++	CU_ASSERT(base_info->content_generation == generation);
++	CU_ASSERT(base_info->view_epoch == epoch);
++	CU_ASSERT(bdev->internal.claim_type == SPDK_BDEV_CLAIM_EXCL_WRITE);
++}
++
++/* Evariops 0053: slot is empty, free for the next add, and records the leg
++ * name left out at its own generation; the leg is not claimed. */
++static void
++ut_view_left_out(struct raid_bdev *raid_bdev, uint8_t slot, const char *name, uint64_t generation)
++{
++	struct raid_base_bdev_info *base_info = &raid_bdev->base_bdev_info[slot];
++	struct spdk_bdev *bdev = spdk_bdev_get_by_name(name);
++
++	SPDK_CU_ASSERT_FATAL(bdev != NULL);
++	CU_ASSERT(!base_info->is_configured);
++	CU_ASSERT(base_info->name == NULL);
++	CU_ASSERT(spdk_uuid_is_null(&base_info->uuid));
++	CU_ASSERT(spdk_uuid_compare(&base_info->excluded_uuid, &bdev->uuid) == 0);
++	CU_ASSERT(base_info->content_generation == generation);
++	CU_ASSERT(base_info->data_size == raid_bdev->bdev.blockcnt);
++	CU_ASSERT(bdev->internal.claim_type == SPDK_BDEV_CLAIM_NONE);
++}
++
++/* Evariops 0053: a refused create leaves no raid and takes no leg. */
++static void
++ut_view_refused(int code)
++{
++	const char *names[] = { "Nvme0n1", "Nvme1n1", "Nvme2n1" };
++	size_t i;
++
++	CU_ASSERT(g_rpc_err == 1);
++	CU_ASSERT(g_rpc_err_code == code);
++	CU_ASSERT(raid_bdev_find_by_name("raid1") == NULL);
++	for (i = 0; i < SPDK_COUNTOF(names); i++) {
++		struct spdk_bdev *bdev = spdk_bdev_get_by_name(names[i]);
++
++		SPDK_CU_ASSERT_FATAL(bdev != NULL);
++		CU_ASSERT(bdev->internal.claim_type == SPDK_BDEV_CLAIM_NONE);
++	}
++}
++
++/* Evariops 0053: legs that carry no superblock, a new volume's, have nothing to
++ * compare: every leg is configured, at generation 0, and the raid carries the
++ * view it was created in. */
++static void
++test_raid_view_create_over_blank_legs_configures_every_leg(void)
++{
++	struct rpc_bdev_raid_create req;
++	struct raid_bdev *raid_bdev;
++
++	ut_view_setup();
++	ut_view_create_req(&req, 5);
++	rpc_bdev_raid_create(NULL, NULL);
++	poll_app_thread();
++	free_test_req(&req);
++
++	CU_ASSERT(g_rpc_err == 0);
++	raid_bdev = ut_view_raid_online(3);
++	CU_ASSERT(spdk_uuid_compare(&raid_bdev->lineage, &g_ut_lineage) == 0);
++	CU_ASSERT(raid_bdev->view_epoch == 5);
++	ut_view_member(raid_bdev, 0, "Nvme0n1", 0, 5);
++	ut_view_member(raid_bdev, 1, "Nvme1n1", 0, 5);
++	ut_view_member(raid_bdev, 2, "Nvme2n1", 0, 5);
++
++	ut_view_teardown();
++}
++
++/* Evariops 0053: only the legs at the highest generation hold every write the
++ * raid before acknowledged. They are configured, in the first slots, at that
++ * generation; the ejected leg stays out, in the next slot, at its own, never
++ * claimed: the control plane rebuilds it. */
++static void
++test_raid_view_create_configures_the_legs_at_the_highest_generation(void)
++{
++	struct rpc_bdev_raid_create req;
++	struct raid_bdev *raid_bdev;
++
++	ut_view_setup();
++	ut_view_create_req(&req, 4);
++	ut_sb_after_an_ejection();
++	rpc_bdev_raid_create(NULL, NULL);
++	poll_app_thread();
++	free_test_req(&req);
++
++	CU_ASSERT(g_rpc_err == 0);
++	raid_bdev = ut_view_raid_online(2);
++	CU_ASSERT(raid_bdev->num_base_bdevs == 3);
++	CU_ASSERT(raid_bdev->view_epoch == 4);
++	ut_view_member(raid_bdev, 0, "Nvme1n1", 7, 4);
++	ut_view_member(raid_bdev, 1, "Nvme2n1", 7, 4);
++	ut_view_left_out(raid_bdev, 2, "Nvme0n1", 6);
++	/* read once, by the survey, and never claimed */
++	CU_ASSERT(ut_leg("Nvme0n1")->reads == 1);
++
++	ut_view_teardown();
++}
++
++/* Evariops 0053: a leg with no stamp of the volume carries no generation of it
++ * once another leg does: a blank one, and one stamped before minor 2, whatever
++ * generation it claims, stay out. A copy its leg never completed (its own slot
++ * not configured) does not count either, however high its generation. */
++static void
++test_raid_view_create_leaves_out_a_leg_without_a_configured_stamp(void)
++{
++	struct rpc_bdev_raid_create req;
++	struct raid_bdev_superblock *stamped, *before_minor_2, *never_completed;
++	struct raid_bdev *raid_bdev;
++
++	ut_view_setup();
++	ut_view_create_req(&req, 4);
++	stamped = ut_sb(&g_ut_lineage, "incarnation-before", 2);
++	ut_sb_slot(stamped, "Nvme0n1", RAID_SB_BASE_BDEV_CONFIGURED, 4);
++	ut_sb_slot(stamped, "Nvme1n1", RAID_SB_BASE_BDEV_MISSING, 4);
++	ut_leg("Nvme0n1")->sb = stamped;
++	before_minor_2 = ut_sb(&g_ut_lineage, "incarnation-before", 2);
++	ut_sb_slot(before_minor_2, "Nvme2n1", RAID_SB_BASE_BDEV_CONFIGURED, 9);
++	before_minor_2->version.minor = 1;
++	ut_leg("Nvme2n1")->sb = before_minor_2;
++	/* Nvme1n1 blank */
++	rpc_bdev_raid_create(NULL, NULL);
++	poll_app_thread();
++	free_test_req(&req);
++
++	CU_ASSERT(g_rpc_err == 0);
++	raid_bdev = ut_view_raid_online(1);
++	ut_view_member(raid_bdev, 0, "Nvme0n1", 4, 4);
++	ut_view_left_out(raid_bdev, 1, "Nvme1n1", 0);
++	ut_view_left_out(raid_bdev, 2, "Nvme2n1", 0);
++	ut_view_teardown();
++
++	ut_view_setup();
++	ut_view_create_req(&req, 4);
++	stamped = ut_sb(&g_ut_lineage, "incarnation-before", 2);
++	ut_sb_slot(stamped, "Nvme0n1", RAID_SB_BASE_BDEV_CONFIGURED, 5);
++	ut_sb_slot(stamped, "Nvme1n1", RAID_SB_BASE_BDEV_CONFIGURED, 5);
++	ut_sb_slot(stamped, "Nvme2n1", RAID_SB_BASE_BDEV_MISSING, 5);
++	ut_leg("Nvme0n1")->sb = stamped;
++	ut_leg("Nvme1n1")->sb = stamped;
++	never_completed = ut_sb(&g_ut_lineage, "incarnation-before", 2);
++	ut_sb_slot(never_completed, "Nvme0n1", RAID_SB_BASE_BDEV_CONFIGURED, 5);
++	ut_sb_slot(never_completed, "Nvme2n1", RAID_SB_BASE_BDEV_MISSING, 8);
++	ut_leg("Nvme2n1")->sb = never_completed;
++	rpc_bdev_raid_create(NULL, NULL);
++	poll_app_thread();
++	free_test_req(&req);
++
++	CU_ASSERT(g_rpc_err == 0);
++	raid_bdev = ut_view_raid_online(2);
++	ut_view_member(raid_bdev, 0, "Nvme0n1", 5, 4);
++	ut_view_member(raid_bdev, 1, "Nvme1n1", 5, 4);
++	ut_view_left_out(raid_bdev, 2, "Nvme2n1", 8);
++	ut_view_teardown();
++}
++
++/* Evariops 0053: legs another owner stamped in the view's epoch or a newer one
++ * belong to a raid that a view at least as recent still counts: the create is
++ * refused before it claims any leg (-EBUSY). */
++static void
++test_raid_view_create_refuses_legs_another_owner_holds(void)
++{
++	const uint64_t stamp_epochs[] = { 5, 6 };
++	struct rpc_bdev_raid_create req;
++	size_t i;
++
++	for (i = 0; i < SPDK_COUNTOF(stamp_epochs); i++) {
++		ut_view_setup();
++		ut_view_create_req(&req, 5);
++		ut_sb_all_configured("incarnation-elsewhere", stamp_epochs[i], 2);
++		rpc_bdev_raid_create(NULL, NULL);
++		poll_app_thread();
++		free_test_req(&req);
++
++		ut_view_refused(-EBUSY);
++		ut_view_teardown();
++	}
++}
++
++/* Evariops 0053: legs stamped at an older epoch belong to an owner that left
++ * the view, and legs stamped by this create's own incarnation to a replay of
++ * it: both are taken. */
++static void
++test_raid_view_create_takes_legs_of_an_older_epoch_or_of_its_own(void)
++{
++	struct rpc_bdev_raid_create req;
++	struct raid_bdev *raid_bdev;
++
++	ut_view_setup();
++	ut_view_create_req(&req, 5);
++	ut_sb_all_configured("incarnation-elsewhere", 4, 2);
++	rpc_bdev_raid_create(NULL, NULL);
++	poll_app_thread();
++	free_test_req(&req);
++
++	CU_ASSERT(g_rpc_err == 0);
++	raid_bdev = ut_view_raid_online(3);
++	ut_view_member(raid_bdev, 0, "Nvme0n1", 2, 5);
++	ut_view_teardown();
++
++	ut_view_setup();
++	ut_view_create_req(&req, 5);
++	ut_sb_all_configured(UT_INCARNATION, 7, 3);
++	rpc_bdev_raid_create(NULL, NULL);
++	poll_app_thread();
++	free_test_req(&req);
++
++	CU_ASSERT(g_rpc_err == 0);
++	raid_bdev = ut_view_raid_online(3);
++	ut_view_member(raid_bdev, 2, "Nvme2n1", 3, 5);
++	ut_view_teardown();
++}
++
++/* Evariops 0053: a leg stamped for another volume is refused whatever its
++ * epoch (-EEXIST), before any other refusal. */
++static void
++test_raid_view_create_refuses_a_leg_of_another_volume(void)
++{
++	struct rpc_bdev_raid_create req;
++	struct raid_bdev_superblock *held, *other_volume;
++
++	ut_view_setup();
++	ut_view_create_req(&req, 5);
++	held = ut_sb(&g_ut_lineage, "incarnation-elsewhere", 9);
++	ut_sb_slot(held, "Nvme0n1", RAID_SB_BASE_BDEV_CONFIGURED, 1);
++	ut_leg("Nvme0n1")->sb = held;
++	other_volume = ut_sb(&g_ut_other_lineage, "incarnation-elsewhere", 1);
++	ut_sb_slot(other_volume, "Nvme1n1", RAID_SB_BASE_BDEV_CONFIGURED, 1);
++	ut_leg("Nvme1n1")->sb = other_volume;
++	rpc_bdev_raid_create(NULL, NULL);
++	poll_app_thread();
++	free_test_req(&req);
++
++	ut_view_refused(-EEXIST);
++	ut_view_teardown();
++}
++
++/* Evariops 0053: force_restamp overwrites another owner's stamps only at the
++ * epoch the control plane read from them; at any other, the create is refused
++ * (-ESTALE). */
++static void
++test_raid_view_create_restamps_only_the_epoch_it_names(void)
++{
++	struct rpc_bdev_raid_create req;
++	struct raid_bdev *raid_bdev;
++
++	ut_view_setup();
++	ut_view_create_req(&req, 5);
++	req.force_restamp = true;
++	req.expected_view_epoch = 6;
++	ut_sb_all_configured("incarnation-elsewhere", 6, 3);
++	rpc_bdev_raid_create(NULL, NULL);
++	poll_app_thread();
++	free_test_req(&req);
++
++	CU_ASSERT(g_rpc_err == 0);
++	raid_bdev = ut_view_raid_online(3);
++	ut_view_member(raid_bdev, 1, "Nvme1n1", 3, 5);
++	ut_view_teardown();
++
++	ut_view_setup();
++	ut_view_create_req(&req, 5);
++	req.force_restamp = true;
++	req.expected_view_epoch = 5;
++	ut_sb_all_configured("incarnation-elsewhere", 6, 3);
++	rpc_bdev_raid_create(NULL, NULL);
++	poll_app_thread();
++	free_test_req(&req);
++
++	ut_view_refused(-ESTALE);
++	ut_view_teardown();
++}
++
++/* Evariops 0053: when no stamped leg holds a configured copy, nothing tells
++ * which one holds the volume's writes: refused (-ENODATA). */
++static void
++test_raid_view_create_refuses_without_a_configured_copy(void)
++{
++	struct rpc_bdev_raid_create req;
++	struct raid_bdev_superblock *sb;
++
++	ut_view_setup();
++	ut_view_create_req(&req, 5);
++	sb = ut_sb(&g_ut_lineage, "incarnation-before", 2);
++	ut_sb_slot(sb, "Nvme0n1", RAID_SB_BASE_BDEV_MISSING, 3);
++	ut_sb_slot(sb, "Nvme1n1", RAID_SB_BASE_BDEV_FAILED, 3);
++	ut_leg("Nvme0n1")->sb = sb;
++	ut_leg("Nvme1n1")->sb = sb;
++	rpc_bdev_raid_create(NULL, NULL);
++	poll_app_thread();
++	free_test_req(&req);
++
++	ut_view_refused(-ENODATA);
++	ut_view_teardown();
++}
++
++/* Evariops 0053: a leg the survey cannot read refuses the create with the
++ * error: an unread leg is not a blank one. Read as blank, the one leg at the
++ * highest generation would be left out, never to be read again, and the raid
++ * would come up on the legs behind it, even if the next read succeeds. */
++static void
++test_raid_view_create_refuses_a_leg_it_cannot_read(void)
++{
++	struct rpc_bdev_raid_create req;
++	struct raid_bdev_superblock *ahead, *behind;
++
++	ut_view_setup();
++	ut_view_create_req(&req, 5);
++	ahead = ut_sb(&g_ut_lineage, "incarnation-before", 3);
++	ut_sb_slot(ahead, "Nvme0n1", RAID_SB_BASE_BDEV_CONFIGURED, 7);
++	ut_leg("Nvme0n1")->sb = ahead;
++	ut_leg("Nvme0n1")->read_status = -EIO;
++	ut_leg("Nvme0n1")->read_error_transient = true;
++	behind = ut_sb(&g_ut_lineage, "incarnation-before", 3);
++	ut_sb_slot(behind, "Nvme1n1", RAID_SB_BASE_BDEV_CONFIGURED, 6);
++	ut_sb_slot(behind, "Nvme2n1", RAID_SB_BASE_BDEV_CONFIGURED, 6);
++	ut_leg("Nvme1n1")->sb = behind;
++	ut_leg("Nvme2n1")->sb = behind;
++	rpc_bdev_raid_create(NULL, NULL);
++	poll_app_thread();
++	free_test_req(&req);
++
++	ut_view_refused(-EIO);
++	ut_view_teardown();
++}
++
++/* Evariops 0053: each member is read again as the raid claims it, and must still
++ * be what the arbitration read: a leg whose generation moved, or a leg the
++ * survey found blank that now carries a stamp of the volume, makes the create
++ * stale (-ESTALE), and the raid goes with every leg it had claimed. */
++static void
++test_raid_view_create_fails_when_a_leg_changed_since_it_was_read(void)
++{
++	struct rpc_bdev_raid_create req;
++	struct raid_bdev_superblock *advanced, *stamped;
++
++	ut_view_setup();
++	ut_view_create_req(&req, 5);
++	ut_sb_all_configured("incarnation-before", 4, 4);
++	advanced = ut_sb(&g_ut_lineage, "incarnation-before", 4);
++	ut_sb_slot(advanced, "Nvme1n1", RAID_SB_BASE_BDEV_CONFIGURED, 5);
++	ut_leg("Nvme1n1")->later_sb = advanced;
++	rpc_bdev_raid_create(NULL, NULL);
++	poll_app_thread();
++	free_test_req(&req);
++
++	ut_view_refused(-ESTALE);
++	ut_view_teardown();
++
++	ut_view_setup();
++	ut_view_create_req(&req, 5);
++	stamped = ut_sb(&g_ut_lineage, "incarnation-elsewhere", 1);
++	ut_sb_slot(stamped, "Nvme2n1", RAID_SB_BASE_BDEV_CONFIGURED, 1);
++	ut_leg("Nvme2n1")->later_sb = stamped;
++	ut_leg("Nvme2n1")->sb = NULL;
++	rpc_bdev_raid_create(NULL, NULL);
++	poll_app_thread();
++	free_test_req(&req);
++
++	ut_view_refused(-ESTALE);
++	ut_view_teardown();
++}
++
++/* Evariops 0053: a create in a view is a raid1 with a superblock and the
++ * volume's lineage, and force_restamp names the epoch it overwrites; view
++ * parameters without a view_epoch are refused too. Each is refused before any
++ * leg is read. */
++static void
++test_raid_view_create_refuses_what_it_cannot_arbitrate(void)
++{
++	struct rpc_bdev_raid_create req;
++	int c;
++
++	for (c = 0; c < 7; c++) {
++		ut_view_setup();
++		ut_view_create_req(&req, 5);
++		ut_leg("Nvme0n1");
++		ut_leg("Nvme1n1");
++		ut_leg("Nvme2n1");
++		switch (c) {
++		case 0:
++			req.superblock_enabled = false;
++			break;
++		case 1:
++			spdk_uuid_set_null(&req.lineage);
++			break;
++		case 2:
++			req.level = 123;
++			req.strip_size_kb = (g_strip_size * g_block_len) / 1024;
++			break;
++		case 3:
++			req.force_restamp = true;
++			break;
++		case 4:
++			req.expected_view_epoch = 5;
++			break;
++		case 5:
++			req.view_epoch = 0;
++			break;
++		case 6:
++			req.declared_slots = 256;
++			break;
++		}
++		rpc_bdev_raid_create(NULL, NULL);
++		poll_app_thread();
++		free_test_req(&req);
++
++		ut_view_refused(-EINVAL);
++		CU_ASSERT(ut_leg_reads() == 0);
++		ut_view_teardown();
++	}
++}
++
++/* Evariops 0053: declared_slots makes a raid wider than its legs, the slots
++ * past them empty and sized like its members, for members added later; a
++ * level that operates only whole refuses them, and takes no leg. */
++static void
++test_raid_create_with_declared_slots_leaves_the_slots_past_its_legs_empty(void)
++{
++	struct rpc_bdev_raid_create req;
++	struct raid_bdev *raid_bdev;
++	struct raid_base_bdev_info *empty;
++
++	ut_view_setup();
++	create_raid_bdev_create_req(&req, "raid1", 0, true, 0, false);
++	req.level = RAID1;
++	req.strip_size_kb = 0;
++	req.declared_slots = 4;
++	rpc_bdev_raid_create(NULL, NULL);
++	poll_app_thread();
++	free_test_req(&req);
++
++	CU_ASSERT(g_rpc_err == 0);
++	raid_bdev = ut_view_raid_online(3);
++	CU_ASSERT(raid_bdev->num_base_bdevs == 4);
++	CU_ASSERT(spdk_uuid_is_null(&raid_bdev->lineage));
++	empty = &raid_bdev->base_bdev_info[3];
++	CU_ASSERT(!empty->is_configured);
++	CU_ASSERT(empty->name == NULL);
++	CU_ASSERT(empty->data_size == raid_bdev->bdev.blockcnt);
++	CU_ASSERT(raid_bdev->bdev.blockcnt == raid_bdev->base_bdev_info[0].data_size);
++	ut_view_teardown();
++
++	ut_view_setup();
++	create_raid_bdev_create_req(&req, "raid1", 0, true, 0, false);
++	req.declared_slots = 4;
++	rpc_bdev_raid_create(NULL, NULL);
++	poll_app_thread();
++	free_test_req(&req);
++
++	ut_view_refused(-EINVAL);
++	ut_view_teardown();
++}
++
++static void
++ut_add_cb(void *ctx, int status)
++{
++	*(int *)ctx = status;
++}
++
++/* Evariops 0053: an add into an online raid of a lineage checks the leg by its
++ * stamp, where upstream refuses any leg another raid stamped: refused when
++ * another owner stamped it in the raid's epoch or a newer one (-EBUSY), or for
++ * another volume (-EEXIST), the slot staying free; taken, as a new member, when
++ * an owner that left the view stamped it. */
++static void
++test_raid_add_into_a_raid_of_a_lineage_checks_the_stamp(void)
++{
++	struct rpc_bdev_raid_create req;
++	struct raid_bdev_superblock *ejected, *held, *other_volume;
++	struct raid_bdev *raid_bdev;
++	struct spdk_bdev *leg;
++	int status;
++
++	ut_view_setup();
++	g_ut_alloc_superblock = true;
++	ut_view_create_req(&req, 4);
++	ejected = ut_sb_after_an_ejection();
++	rpc_bdev_raid_create(NULL, NULL);
++	poll_app_thread();
++	free_test_req(&req);
++	CU_ASSERT(g_rpc_err == 0);
++	raid_bdev = ut_view_raid_online(2);
++	leg = spdk_bdev_get_by_name("Nvme0n1");
++	SPDK_CU_ASSERT_FATAL(leg != NULL);
++
++	held = ut_sb(&g_ut_lineage, "incarnation-elsewhere", 4);
++	ut_sb_slot(held, "Nvme0n1", RAID_SB_BASE_BDEV_CONFIGURED, 9);
++	ut_leg("Nvme0n1")->sb = held;
++	status = 1;
++	CU_ASSERT(raid_bdev_add_base_bdev(raid_bdev, "Nvme0n1", true, false, ut_add_cb, &status) == 0);
++	poll_app_thread();
++	CU_ASSERT(status == -EBUSY);
++	ut_view_left_out(raid_bdev, 2, "Nvme0n1", 6);
++
++	other_volume = ut_sb(&g_ut_other_lineage, "incarnation-elsewhere", 1);
++	ut_sb_slot(other_volume, "Nvme0n1", RAID_SB_BASE_BDEV_CONFIGURED, 1);
++	ut_leg("Nvme0n1")->sb = other_volume;
++	status = 1;
++	CU_ASSERT(raid_bdev_add_base_bdev(raid_bdev, "Nvme0n1", true, false, ut_add_cb, &status) == 0);
++	poll_app_thread();
++	CU_ASSERT(status == -EEXIST);
++	CU_ASSERT(leg->internal.claim_type == SPDK_BDEV_CLAIM_NONE);
++
++	ut_leg("Nvme0n1")->sb = ejected;
++	status = 1;
++	CU_ASSERT(raid_bdev_add_base_bdev(raid_bdev, "Nvme0n1", true, false, ut_add_cb, &status) == 0);
++	poll_app_thread();
++	CU_ASSERT(status == 0);
++	CU_ASSERT(raid_bdev->base_bdev_info[2].is_configured);
++	CU_ASSERT(raid_bdev->num_base_bdevs_discovered == 3);
++	CU_ASSERT(leg->internal.claim_type == SPDK_BDEV_CLAIM_EXCL_WRITE);
++
++	ut_view_teardown();
++}
++
++/* Evariops 0053: a raid reassembled from a stamped superblock keeps the view it
++ * was stamped in, so an add into it checks stamps; one reassembled from a
++ * superblock below minor 2 has none, whatever its reserved bytes held. */
++static void
++test_raid_reassembled_from_a_stamped_superblock_keeps_its_view(void)
++{
++	struct raid_bdev_superblock *sb;
++	struct raid_bdev *raid_bdev;
++
++	ut_view_setup();
++	g_ut_alloc_superblock = true;
++	create_base_bdevs(0);
++
++	sb = ut_sb(&g_ut_lineage, "incarnation-before", 4);
++	ut_sb_slot(sb, "Nvme0n1", RAID_SB_BASE_BDEV_CONFIGURED, 2);
++	ut_sb_slot(sb, "Nvme1n1", RAID_SB_BASE_BDEV_CONFIGURED, 2);
++	CU_ASSERT(raid_bdev_create_from_sb(sb, &raid_bdev) == 0);
++	CU_ASSERT(spdk_uuid_compare(&raid_bdev->lineage, &g_ut_lineage) == 0);
++	CU_ASSERT(raid_bdev->view_epoch == 4);
++	CU_ASSERT(raid_bdev->incarnation == NULL);
++	raid_bdev_delete(raid_bdev, NULL, NULL);
++
++	sb = ut_sb(&g_ut_lineage, "incarnation-before", 4);
++	ut_sb_slot(sb, "Nvme0n1", RAID_SB_BASE_BDEV_CONFIGURED, 2);
++	ut_sb_slot(sb, "Nvme1n1", RAID_SB_BASE_BDEV_CONFIGURED, 2);
++	sb->version.minor = 1;
++	CU_ASSERT(raid_bdev_create_from_sb(sb, &raid_bdev) == 0);
++	CU_ASSERT(spdk_uuid_is_null(&raid_bdev->lineage));
++	CU_ASSERT(raid_bdev->view_epoch == 0);
++	raid_bdev_delete(raid_bdev, NULL, NULL);
++
++	ut_view_teardown();
++}
++
+ static int
+ test_new_thread_fn(struct spdk_thread *thread)
+ {
+@@ -2380,6 +3234,20 @@ main(int argc, char **argv)
+ 	CU_ADD_TEST(suite, test_raid_process_with_qos);
+ 	CU_ADD_TEST(suite, test_raid1_ejection_opens_an_epoch_on_the_raids_cbt);
+ 	CU_ADD_TEST(suite, test_raid1_ejection_of_a_member_behind_opens_no_epoch);
++	CU_ADD_TEST(suite, test_raid_view_create_over_blank_legs_configures_every_leg);
++	CU_ADD_TEST(suite, test_raid_view_create_configures_the_legs_at_the_highest_generation);
++	CU_ADD_TEST(suite, test_raid_view_create_leaves_out_a_leg_without_a_configured_stamp);
++	CU_ADD_TEST(suite, test_raid_view_create_refuses_legs_another_owner_holds);
++	CU_ADD_TEST(suite, test_raid_view_create_takes_legs_of_an_older_epoch_or_of_its_own);
++	CU_ADD_TEST(suite, test_raid_view_create_refuses_a_leg_of_another_volume);
++	CU_ADD_TEST(suite, test_raid_view_create_restamps_only_the_epoch_it_names);
++	CU_ADD_TEST(suite, test_raid_view_create_refuses_without_a_configured_copy);
++	CU_ADD_TEST(suite, test_raid_view_create_refuses_a_leg_it_cannot_read);
++	CU_ADD_TEST(suite, test_raid_view_create_fails_when_a_leg_changed_since_it_was_read);
++	CU_ADD_TEST(suite, test_raid_view_create_refuses_what_it_cannot_arbitrate);
++	CU_ADD_TEST(suite, test_raid_create_with_declared_slots_leaves_the_slots_past_its_legs_empty);
++	CU_ADD_TEST(suite, test_raid_add_into_a_raid_of_a_lineage_checks_the_stamp);
++	CU_ADD_TEST(suite, test_raid_reassembled_from_a_stamped_superblock_keeps_its_view);
+ 
+ 	spdk_thread_lib_init(test_new_thread_fn, 0);
+ 	g_app_thread = spdk_thread_create("app_thread", NULL);
+diff --git a/test/unit/lib/bdev/raid/bdev_raid_sb.c/bdev_raid_sb_ut.c b/test/unit/lib/bdev/raid/bdev_raid_sb.c/bdev_raid_sb_ut.c
+index f5ce7ec..14125a4 100644
+--- a/test/unit/lib/bdev/raid/bdev_raid_sb.c/bdev_raid_sb_ut.c
++++ b/test/unit/lib/bdev/raid/bdev_raid_sb.c/bdev_raid_sb_ut.c
+@@ -377,6 +377,121 @@ test_raid_bdev_parse_superblock(void)
+ 	CU_ASSERT(raid_bdev_parse_superblock(&ctx) == -EINVAL);
+ }
+ 
++/* Evariops 0053: a raid created in a view stamps its lineage, its owner and its
++ * epoch, at minor 2, and records each slot as its create laid it out: a member
++ * CONFIGURED, a leg left out MISSING under its UUID, a slot no leg held MISSING
++ * under a UUID of its own, each at the generation and epoch the create set. The
++ * stamp survives the write and the read back. */
++static void
++test_raid_bdev_init_superblock_stamps_the_view(void)
++{
++	struct raid_base_bdev_info base_info[3] = {};
++	char incarnation[] = "incarnation-ut";
++	struct raid_bdev raid_bdev = {
++		.num_base_bdevs = SPDK_COUNTOF(base_info),
++		.base_bdev_info = base_info,
++		.bdev = g_bdev,
++		.incarnation = incarnation,
++		.view_epoch = 4,
++	};
++	struct raid_bdev_superblock *sb;
++	struct spdk_uuid member, left_out;
++	int status;
++	uint8_t i;
++
++	spdk_uuid_generate(&raid_bdev.lineage);
++	spdk_uuid_generate(&member);
++	spdk_uuid_generate(&left_out);
++	for (i = 0; i < SPDK_COUNTOF(base_info); i++) {
++		base_info[i].raid_bdev = &raid_bdev;
++		base_info[i].data_size = 1024;
++	}
++	base_info[0].is_configured = true;
++	spdk_uuid_copy(&base_info[0].uuid, &member);
++	base_info[0].data_offset = 2048;
++	base_info[0].content_generation = 7;
++	base_info[0].view_epoch = 4;
++	spdk_uuid_copy(&base_info[1].excluded_uuid, &left_out);
++	base_info[1].content_generation = 6;
++	base_info[1].view_epoch = 3;
++
++	CU_ASSERT(raid_bdev_alloc_superblock(&raid_bdev,
++					     spdk_bdev_get_data_block_size(&raid_bdev.bdev)) == 0);
++	raid_bdev_init_superblock(&raid_bdev);
++	sb = raid_bdev.sb;
++
++	CU_ASSERT(sb->version.minor == 2);
++	CU_ASSERT(spdk_uuid_compare(&sb->lineage, &raid_bdev.lineage) == 0);
++	CU_ASSERT(strcmp((const char *)sb->owner, incarnation) == 0);
++	CU_ASSERT(sb->view_epoch == 4);
++	CU_ASSERT(sb->base_bdevs_size == 3);
++
++	CU_ASSERT(sb->base_bdevs[0].state == RAID_SB_BASE_BDEV_CONFIGURED);
++	CU_ASSERT(spdk_uuid_compare(&sb->base_bdevs[0].uuid, &member) == 0);
++	CU_ASSERT(sb->base_bdevs[0].data_offset == 2048);
++	CU_ASSERT(sb->base_bdevs[0].content_generation == 7);
++	CU_ASSERT(sb->base_bdevs[0].view_epoch == 4);
++
++	CU_ASSERT(sb->base_bdevs[1].state == RAID_SB_BASE_BDEV_MISSING);
++	CU_ASSERT(spdk_uuid_compare(&sb->base_bdevs[1].uuid, &left_out) == 0);
++	CU_ASSERT(sb->base_bdevs[1].content_generation == 6);
++	CU_ASSERT(sb->base_bdevs[1].view_epoch == 3);
++
++	CU_ASSERT(sb->base_bdevs[2].state == RAID_SB_BASE_BDEV_MISSING);
++	CU_ASSERT(!spdk_uuid_is_null(&sb->base_bdevs[2].uuid));
++	CU_ASSERT(spdk_uuid_compare(&sb->base_bdevs[2].uuid, &member) != 0);
++	CU_ASSERT(spdk_uuid_compare(&sb->base_bdevs[2].uuid, &left_out) != 0);
++	CU_ASSERT(sb->base_bdevs[2].content_generation == 0);
++	CU_ASSERT(sb->base_bdevs[2].data_size == 1024);
++
++	status = INT_MAX;
++	raid_bdev_write_superblock(&raid_bdev, write_sb_cb, &status);
++	process_io_completions();
++	CU_ASSERT(status == 0);
++	status = INT_MAX;
++	CU_ASSERT(raid_bdev_load_base_bdev_superblock(NULL, NULL, load_sb_cb, &status) == 0);
++	CU_ASSERT(status == 0);
++
++	raid_bdev_free_superblock(&raid_bdev);
++}
++
++/* Evariops 0053: a raid created outside the view protocol writes minor 2 with no
++ * stamp: a null lineage, no owner, epoch 0. */
++static void
++test_raid_bdev_init_superblock_outside_a_view_leaves_the_stamp_empty(void)
++{
++	struct raid_base_bdev_info base_info[2] = {};
++	char incarnation[] = "incarnation-ut";
++	struct raid_bdev raid_bdev = {
++		.num_base_bdevs = SPDK_COUNTOF(base_info),
++		.base_bdev_info = base_info,
++		.bdev = g_bdev,
++		.incarnation = incarnation,
++	};
++	struct raid_bdev_superblock *sb;
++	uint8_t i;
++
++	for (i = 0; i < SPDK_COUNTOF(base_info); i++) {
++		base_info[i].raid_bdev = &raid_bdev;
++		base_info[i].is_configured = true;
++		spdk_uuid_generate(&base_info[i].uuid);
++	}
++
++	CU_ASSERT(raid_bdev_alloc_superblock(&raid_bdev,
++					     spdk_bdev_get_data_block_size(&raid_bdev.bdev)) == 0);
++	raid_bdev_init_superblock(&raid_bdev);
++	sb = raid_bdev.sb;
++
++	CU_ASSERT(sb->version.minor == 2);
++	CU_ASSERT(spdk_uuid_is_null(&sb->lineage));
++	CU_ASSERT(sb->owner[0] == '\0');
++	CU_ASSERT(sb->view_epoch == 0);
++	CU_ASSERT(sb->base_bdevs[0].state == RAID_SB_BASE_BDEV_CONFIGURED);
++	CU_ASSERT(sb->base_bdevs[1].state == RAID_SB_BASE_BDEV_CONFIGURED);
++
++	raid_bdev_free_superblock(&raid_bdev);
++}
++
+ int
+ main(int argc, char **argv)
+ {
+@@ -385,6 +500,8 @@ main(int argc, char **argv)
+ 		{ "test_raid_bdev_write_superblock", test_raid_bdev_write_superblock },
+ 		{ "test_raid_bdev_load_base_bdev_superblock", test_raid_bdev_load_base_bdev_superblock },
+ 		{ "test_raid_bdev_parse_superblock", test_raid_bdev_parse_superblock },
++		{ "test_raid_bdev_init_superblock_stamps_the_view", test_raid_bdev_init_superblock_stamps_the_view },
++		{ "test_raid_bdev_init_superblock_outside_a_view_leaves_the_stamp_empty", test_raid_bdev_init_superblock_outside_a_view_leaves_the_stamp_empty },
+ 		CU_TEST_INFO_NULL,
+ 	};
+ 	CU_SuiteInfo suites[] = {

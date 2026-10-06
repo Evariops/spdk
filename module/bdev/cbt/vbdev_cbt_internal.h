@@ -33,6 +33,15 @@ struct vbdev_cbt {
 	 * bdev_cbt_reset, refused while any epoch is active. Nothing inside the
 	 * target can know that every distributed backend is in sync. */
 
+	/* ── History window (bdev_cbt_rotate) ── */
+	/* The writes of the previous window, rotated out of the live bitmap while no
+	 * epoch was active. An epoch opened when a member leaves takes them back:
+	 * the writes the member missed just before it left are in one of the two. */
+	uint8_t                     *bitmap_prev;
+	/* Ticks of the last rotation; rotations are at least
+	 * CBT_ROTATE_MIN_INTERVAL_US apart. */
+	uint64_t                     rotated_at;
+
 	/* ── Epoch management ── */
 	TAILQ_HEAD(, cbt_epoch)      epochs;
 	uint64_t                     epoch_count;
