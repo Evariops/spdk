@@ -122,6 +122,9 @@ RUN sed -i '/^DIRS-y += delay/s/$/ cbt tier/' module/bdev/Makefile && \
 # Modules REMOVED (unused attack surface):
 #   iscsi-initiator, vhost, virtio, fsdev (FUSE), daos, rbd (Ceph),
 #   dpdk-compressdev
+#
+# ublk is built only when asked for (--with-ublk), and the configure is checked
+# for it: without the flag the image built, silently, with no ublk at all.
 RUN SPDK_ARCH=$([ "${TARGETARCH}" = "arm64" ] && echo "armv8-a" || echo "nehalem") && \
     DEBUG_FLAG=$([ "${BUILD_TYPE}" = "debug" ] && echo "--enable-debug" || true) && \
     ./configure \
@@ -140,7 +143,9 @@ RUN SPDK_ARCH=$([ "${TARGETARCH}" = "arm64" ] && echo "armv8-a" || echo "nehalem
         --without-fsdev \
         --without-daos \
         --without-rbd \
-        --without-dpdk-compressdev
+        --with-ublk \
+        --without-dpdk-compressdev && \
+    grep -q "^CONFIG_UBLK?=y" mk/config.mk
 
 RUN make -j"$(nproc)"
 
