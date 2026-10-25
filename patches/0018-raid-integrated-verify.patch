@@ -1,5 +1,5 @@
 diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
-index fe71954..f2611d8 100644
+index 249c0f0..79a67ec 100644
 --- a/module/bdev/raid/bdev_raid.c
 +++ b/module/bdev/raid/bdev_raid.c
 @@ -88,20 +88,28 @@ struct raid_bdev_process {
@@ -38,7 +38,7 @@ index fe71954..f2611d8 100644
  };
  
  struct raid_process_finish_action {
-@@ -2835,24 +2843,24 @@ raid_bdev_process_finish_done(void *ctx)
+@@ -2946,24 +2954,24 @@ raid_bdev_process_finish_done(void *ctx)
  
  	process->state = RAID_PROCESS_STATE_STOPPED;
  
@@ -71,7 +71,7 @@ index fe71954..f2611d8 100644
  		process->outcome = NULL;
  	}
  
-@@ -3239,6 +3247,437 @@ raid_bdev_process_lock_window_range(struct raid_bdev_process *process)
+@@ -3350,6 +3358,437 @@ raid_bdev_process_lock_window_range(struct raid_bdev_process *process)
  	return true;
  }
  
@@ -412,7 +412,7 @@ index fe71954..f2611d8 100644
 +	/* Scope: raid1 with plain data. Anything else completes UNVERIFIED — the
 +	 * registry entry stays verified=false and bdev_cbt_epoch_close(consumed)
 +	 * stays locked for its token. */
-+	if (raid_bdev->level != RAID1 ||
++	if (raid_bdev->level != SPDK_BDEV_RAID_LEVEL_RAID1 ||
 +	    spdk_bdev_get_dif_type(&raid_bdev->bdev) != SPDK_DIF_DISABLE) {
 +		raid_bdev_process_finish(process, 0);
 +		return;
@@ -509,7 +509,7 @@ index fe71954..f2611d8 100644
  static int
  raid_bdev_process_continue_poll(void *arg)
  {
-@@ -3266,6 +3705,14 @@ raid_bdev_process_thread_run(struct raid_bdev_process *process)
+@@ -3377,6 +3816,14 @@ raid_bdev_process_thread_run(struct raid_bdev_process *process)
  
  	if (process->window_offset == raid_bdev->bdev.blockcnt) {
  		SPDK_DEBUGLOG(bdev_raid, "process completed on %s\n", raid_bdev->bdev.name);
@@ -524,7 +524,7 @@ index fe71954..f2611d8 100644
  		raid_bdev_process_finish(process, 0);
  		return;
  	}
-@@ -3441,16 +3888,21 @@ raid_bdev_process_free(struct raid_bdev_process *process)
+@@ -3552,16 +3999,21 @@ raid_bdev_process_free(struct raid_bdev_process *process)
  		raid_bdev_process_request_free(process_req);
  	}
  
@@ -552,10 +552,10 @@ index fe71954..f2611d8 100644
  }
  
 diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
-index ff51486..aab5d12 100644
+index 60d2094..8dc84fd 100644
 --- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
 +++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
-@@ -237,6 +237,8 @@ DEFINE_STUB_V(raid_rebuild_outcomes_write_json, (struct spdk_json_write_ctx *w,
+@@ -234,6 +234,8 @@ DEFINE_STUB_V(raid_rebuild_outcomes_write_json, (struct spdk_json_write_ctx *w,
   * of this suite: no member has one (-ENODEV). */
  DEFINE_STUB(vbdev_cbt_query_latest_epoch, int, (const char *bdev_name,
  		struct vbdev_cbt_epoch_facts *out), -ENODEV);

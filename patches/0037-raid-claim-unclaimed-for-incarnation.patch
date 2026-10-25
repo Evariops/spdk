@@ -1,8 +1,8 @@
 diff --git a/module/bdev/raid/bdev_raid_rpc.c b/module/bdev/raid/bdev_raid_rpc.c
-index 85ac078..6ded0ca 100644
+index ab1a943..40f0600 100644
 --- a/module/bdev/raid/bdev_raid_rpc.c
 +++ b/module/bdev/raid/bdev_raid_rpc.c
-@@ -334,6 +334,71 @@ cleanup:
+@@ -146,6 +146,71 @@ cleanup:
  }
  SPDK_RPC_REGISTER("bdev_raid_create", rpc_bdev_raid_create, SPDK_RPC_RUNTIME)
  
@@ -72,5 +72,5 @@ index 85ac078..6ded0ca 100644
 +SPDK_RPC_REGISTER("bdev_raid_claim", rpc_bdev_raid_claim, SPDK_RPC_RUNTIME)
 +
  /*
-  * Input structure for RPC deleting a raid bdev
-  */
+  * brief:
+  * params:

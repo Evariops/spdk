@@ -79,10 +79,10 @@ index 357bf31..ea69301 100644
   * Hold all I/O submitted to this blob. I/O released by the matching unfreeze
   * re-executes the blob-to-LBA translation, so a cluster relocated meanwhile is
 diff --git a/lib/blob/blobstore.c b/lib/blob/blobstore.c
-index e1daf9c..f774f99 100644
+index 5b419e6..436d762 100644
 --- a/lib/blob/blobstore.c
 +++ b/lib/blob/blobstore.c
-@@ -9136,6 +9136,42 @@ spdk_blob_release_cluster_lba(struct spdk_blob *blob, uint64_t lba)
+@@ -9277,6 +9277,42 @@ spdk_blob_release_cluster_lba(struct spdk_blob *blob, uint64_t lba)
  	spdk_spin_unlock(&bs->used_lock);
  }
  
@@ -204,7 +204,7 @@ index 067b25a..b8425bd 100644
  spdk_bit_pool_find_first_free_from(const struct spdk_bit_pool *pool, uint32_t start_bit_index)
  {
 diff --git a/lib/util/spdk_util.map b/lib/util/spdk_util.map
-index 40ee55b..422ca4b 100644
+index 0eba947..a0fd161 100644
 --- a/lib/util/spdk_util.map
 +++ b/lib/util/spdk_util.map
 @@ -18,6 +18,7 @@
@@ -224,7 +224,7 @@ index 40ee55b..422ca4b 100644
  	spdk_bit_pool_allocate_bit;
  	spdk_bit_pool_set_bit_allocated;
 diff --git a/module/bdev/lvol/vbdev_lvol.c b/module/bdev/lvol/vbdev_lvol.c
-index 3673b97..bb9e82a 100644
+index 9546aa2..b03f5a7 100644
 --- a/module/bdev/lvol/vbdev_lvol.c
 +++ b/module/bdev/lvol/vbdev_lvol.c
 @@ -13,6 +13,7 @@
@@ -377,7 +377,7 @@ index 3673b97..bb9e82a 100644
  		spdk_lvs_unload(lvs_bdev->lvs, _vbdev_lvol_unregister_unload_lvs, lvol_bdev);
  		return;
  	}
-@@ -1518,6 +1619,7 @@ vbdev_lvs_fini_start_unload_cb(void *cb_arg, int lvserrno)
+@@ -1542,6 +1643,7 @@ vbdev_lvs_fini_start_unload_cb(void *cb_arg, int lvserrno)
  		SPDK_NOTICELOG("shutdown: lvolstore unloaded clean (fini_start path)\n");
  	}
  
@@ -385,7 +385,7 @@ index 3673b97..bb9e82a 100644
  	TAILQ_REMOVE(&g_spdk_lvol_pairs, lvs_bdev, lvol_stores);
  	free(lvs_bdev);
  
-@@ -1533,6 +1635,8 @@ vbdev_lvs_fini_start_iter(struct lvol_store_bdev *lvs_bdev)
+@@ -1557,6 +1659,8 @@ vbdev_lvs_fini_start_iter(struct lvol_store_bdev *lvs_bdev)
  		lvs = lvs_bdev->lvs;
  
  		if (_vbdev_lvs_are_lvols_closed(lvs)) {
@@ -394,7 +394,7 @@ index 3673b97..bb9e82a 100644
  			spdk_lvs_unload(lvs, vbdev_lvs_fini_start_unload_cb, lvs_bdev);
  			return;
  		}
-@@ -1703,6 +1807,7 @@ _vbdev_lvs_examine_cb(void *arg, struct spdk_lvol_store *lvol_store, int lvserrn
+@@ -1727,6 +1831,7 @@ _vbdev_lvs_examine_cb(void *arg, struct spdk_lvol_store *lvol_store, int lvserrn
  	lvs_bdev->bdev = req->base_bdev;
  
  	TAILQ_INSERT_TAIL(&g_spdk_lvol_pairs, lvs_bdev, lvol_stores);
@@ -415,10 +415,10 @@ index 5e8f2e1..42e4a31 100644
 +
  include $(SPDK_ROOT_DIR)/mk/spdk.unittest.mk
 diff --git a/test/unit/lib/bdev/vbdev_lvol.c/vbdev_lvol_ut.c b/test/unit/lib/bdev/vbdev_lvol.c/vbdev_lvol_ut.c
-index 339dd32..de98175 100644
+index c5df587..b3d8750 100644
 --- a/test/unit/lib/bdev/vbdev_lvol.c/vbdev_lvol_ut.c
 +++ b/test/unit/lib/bdev/vbdev_lvol.c/vbdev_lvol_ut.c
-@@ -60,6 +60,14 @@ DEFINE_STUB(spdk_lvs_esnap_missing_add, int,
+@@ -64,6 +64,14 @@ DEFINE_STUB(spdk_lvs_esnap_missing_add, int,
  DEFINE_STUB(spdk_blob_get_esnap_bs_dev, struct spdk_bs_dev *, (const struct spdk_blob *blob), NULL);
  DEFINE_STUB(spdk_lvol_is_degraded, bool, (const struct spdk_lvol *lvol), false);
  DEFINE_STUB(spdk_blob_get_num_allocated_clusters, uint64_t, (struct spdk_blob *blob), 0);

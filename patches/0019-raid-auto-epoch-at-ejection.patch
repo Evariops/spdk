@@ -1,8 +1,8 @@
 diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
-index f2611d8..0a1cdee 100644
+index 79a67ec..4e5bd0e 100644
 --- a/module/bdev/raid/bdev_raid.c
 +++ b/module/bdev/raid/bdev_raid.c
-@@ -2251,6 +2251,7 @@ raid_bdev_remove_base_bdev_on_quiesced(void *ctx, int status)
+@@ -2334,6 +2334,7 @@ raid_bdev_remove_base_bdev_on_quiesced(void *ctx, int status)
  {
  	struct raid_base_bdev_info *base_info = ctx;
  	struct raid_bdev *raid_bdev = base_info->raid_bdev;
@@ -10,7 +10,7 @@ index f2611d8..0a1cdee 100644
  
  	if (status != 0) {
  		SPDK_ERRLOG("Failed to quiesce raid bdev %s: %s\n",
-@@ -2259,6 +2260,29 @@ raid_bdev_remove_base_bdev_on_quiesced(void *ctx, int status)
+@@ -2342,6 +2343,29 @@ raid_bdev_remove_base_bdev_on_quiesced(void *ctx, int status)
  		return;
  	}
  
@@ -41,10 +41,10 @@ index f2611d8..0a1cdee 100644
  		struct raid_bdev_superblock *sb = raid_bdev->sb;
  		uint8_t slot = raid_bdev_base_bdev_slot(base_info);
 diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
-index aab5d12..43d6c52 100644
+index 8dc84fd..4bb1925 100644
 --- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
 +++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
-@@ -239,6 +239,10 @@ DEFINE_STUB(vbdev_cbt_query_latest_epoch, int, (const char *bdev_name,
+@@ -236,6 +236,10 @@ DEFINE_STUB(vbdev_cbt_query_latest_epoch, int, (const char *bdev_name,
  		struct vbdev_cbt_epoch_facts *out), -ENODEV);
  /* Evariops 0018: a rebuild's outcome turns to verifying before its verify pass. */
  DEFINE_STUB_V(raid_rebuild_outcome_set_verifying, (struct raid_rebuild_outcome *outcome));

@@ -1,8 +1,8 @@
 diff --git a/app/spdk_dd/spdk_dd.c b/app/spdk_dd/spdk_dd.c
-index 2bbcca1..4ce2505 100644
+index 826ac73..a341338 100644
 --- a/app/spdk_dd/spdk_dd.c
 +++ b/app/spdk_dd/spdk_dd.c
-@@ -339,6 +339,13 @@ _dd_write_bdev_done(struct spdk_bdev_io *bdev_io,
+@@ -338,6 +338,13 @@ _dd_write_bdev_done(struct spdk_bdev_io *bdev_io,
  {
  	struct dd_io *io = cb_arg;
  
@@ -16,7 +16,7 @@ index 2bbcca1..4ce2505 100644
  	assert(g_job.outstanding > 0);
  	g_job.outstanding--;
  	spdk_bdev_free_io(bdev_io);
-@@ -412,6 +419,12 @@ _dd_read_bdev_done(struct spdk_bdev_io *bdev_io,
+@@ -411,6 +418,12 @@ _dd_read_bdev_done(struct spdk_bdev_io *bdev_io,
  
  	spdk_bdev_free_io(bdev_io);
  
@@ -29,7 +29,7 @@ index 2bbcca1..4ce2505 100644
  	assert(g_job.outstanding > 0);
  	g_job.outstanding--;
  	dd_target_write(io);
-@@ -472,6 +485,11 @@ _dd_target_populate_buffer_done(struct spdk_bdev_io *bdev_io,
+@@ -471,6 +484,11 @@ _dd_target_populate_buffer_done(struct spdk_bdev_io *bdev_io,
  {
  	struct dd_io *io = cb_arg;
  

@@ -1,5 +1,5 @@
 diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
-index 6c2d6b4..fe71954 100644
+index c8c99b5..249c0f0 100644
 --- a/module/bdev/raid/bdev_raid.c
 +++ b/module/bdev/raid/bdev_raid.c
 @@ -6,6 +6,12 @@
@@ -15,7 +15,7 @@ index 6c2d6b4..fe71954 100644
  #include "spdk/nvme_spec.h"	/* Evariops C-1 */
  #include "spdk/env.h"
  #include "spdk/thread.h"
-@@ -448,6 +454,15 @@ raid_bdev_cleanup_and_free(struct raid_bdev *raid_bdev)
+@@ -447,6 +453,15 @@ raid_bdev_cleanup_and_free(struct raid_bdev *raid_bdev)
  	raid_bdev_free(raid_bdev);
  }
  
@@ -31,7 +31,7 @@ index 6c2d6b4..fe71954 100644
  static void
  raid_bdev_deconfigure_base_bdev(struct raid_base_bdev_info *base_info)
  {
-@@ -458,6 +473,7 @@ raid_bdev_deconfigure_base_bdev(struct raid_base_bdev_info *base_info)
+@@ -457,6 +472,7 @@ raid_bdev_deconfigure_base_bdev(struct raid_base_bdev_info *base_info)
  	raid_bdev->num_base_bdevs_discovered--;
  	base_info->is_configured = false;
  	base_info->is_process_target = false;
@@ -39,7 +39,7 @@ index 6c2d6b4..fe71954 100644
  	/* Per-add request flags and seeded-rebuild state die with the membership:
  	 * a reused slot, or a superblock re-examine of a returning disk, must not
  	 * inherit a stale skip_rebuild/write_only request or read exclusion. */
-@@ -489,6 +505,7 @@ raid_bdev_free_base_bdev_resource(struct raid_base_bdev_info *base_info)
+@@ -488,6 +504,7 @@ raid_bdev_free_base_bdev_resource(struct raid_base_bdev_info *base_info)
  		spdk_uuid_set_null(&base_info->uuid);
  	}
  	base_info->is_failed = false;
@@ -47,7 +47,7 @@ index 6c2d6b4..fe71954 100644
  
  	/* clear `data_offset` to allow it to be recalculated during configuration */
  	base_info->data_offset = 0;
-@@ -1159,6 +1176,28 @@ raid_bdev_get_io_channel(void *ctxt)
+@@ -1158,6 +1175,28 @@ raid_bdev_get_io_channel(void *ctxt)
  	return spdk_get_io_channel(raid_bdev);
  }
  
@@ -76,7 +76,7 @@ index 6c2d6b4..fe71954 100644
  void
  raid_bdev_write_info_json(struct raid_bdev *raid_bdev, struct spdk_json_write_ctx *w)
  {
-@@ -1220,6 +1259,26 @@ raid_bdev_write_info_json(struct raid_bdev *raid_bdev, struct spdk_json_write_ct
+@@ -1219,6 +1258,26 @@ raid_bdev_write_info_json(struct raid_bdev *raid_bdev, struct spdk_json_write_ct
  		spdk_json_write_named_bool(w, "is_configured", base_info->is_configured);
  		spdk_json_write_named_uint64(w, "data_offset", base_info->data_offset);
  		spdk_json_write_named_uint64(w, "data_size", base_info->data_size);
@@ -103,7 +103,7 @@ index 6c2d6b4..fe71954 100644
  		spdk_json_write_object_end(w);
  	}
  	spdk_json_write_array_end(w);
-@@ -2445,6 +2504,7 @@ raid_bdev_fail_base_remove_cb(void *ctx, int status)
+@@ -2528,6 +2587,7 @@ raid_bdev_fail_base_remove_cb(void *ctx, int status)
  	if (status != 0) {
  		SPDK_WARNLOG("Failed to remove base bdev %s\n", base_info->name);
  		base_info->is_failed = false;
@@ -111,7 +111,7 @@ index 6c2d6b4..fe71954 100644
  	}
  }
  
-@@ -2458,6 +2518,7 @@ _raid_bdev_fail_base_bdev(void *ctx)
+@@ -2541,6 +2601,7 @@ _raid_bdev_fail_base_bdev(void *ctx)
  		return;
  	}
  	base_info->is_failed = true;
@@ -119,7 +119,7 @@ index 6c2d6b4..fe71954 100644
  
  	SPDK_NOTICELOG("Failing base bdev in slot %d ('%s') of raid bdev '%s'\n",
  		       raid_bdev_base_bdev_slot(base_info), base_info->name, base_info->raid_bdev->bdev.name);
-@@ -2870,6 +2931,7 @@ raid_bdev_process_finish_quiesced(void *ctx, int status)
+@@ -2981,6 +3042,7 @@ raid_bdev_process_finish_quiesced(void *ctx, int status)
  		 * to CONFIGURED. */
  		process->target->read_excluded = false;
  		process->target->write_only_pending = false;
@@ -127,7 +127,7 @@ index 6c2d6b4..fe71954 100644
  	}
  
  	spdk_for_each_channel(process->raid_bdev, raid_bdev_channel_process_finish, process,
-@@ -3719,6 +3781,7 @@ raid_bdev_skip_rebuild_quiesced(void *ctx, int status)
+@@ -3830,6 +3892,7 @@ raid_bdev_skip_rebuild_quiesced(void *ctx, int status)
  		 * when the channels are wired below. */
  		base_info->read_excluded = true;
  		base_info->write_only_pending = true;
@@ -135,7 +135,7 @@ index 6c2d6b4..fe71954 100644
  	}
  
  	base_info->is_process_target = false;
-@@ -3750,6 +3813,7 @@ raid_bdev_configure_base_bdev_cont(struct raid_base_bdev_info *base_info)
+@@ -3881,6 +3944,7 @@ raid_bdev_configure_base_bdev_cont(struct raid_base_bdev_info *base_info)
  	}
  
  	base_info->is_configured = true;
@@ -144,10 +144,10 @@ index 6c2d6b4..fe71954 100644
  	raid_bdev->num_base_bdevs_discovered++;
  	assert(raid_bdev->num_base_bdevs_discovered <= raid_bdev->num_base_bdevs);
 diff --git a/module/bdev/raid/bdev_raid.h b/module/bdev/raid/bdev_raid.h
-index 43841bc..ebe39cc 100644
+index e958701..a982709 100644
 --- a/module/bdev/raid/bdev_raid.h
 +++ b/module/bdev/raid/bdev_raid.h
-@@ -119,27 +119,31 @@ struct raid_base_bdev_info {
+@@ -88,27 +88,31 @@ struct raid_base_bdev_info {
  	/* When true, skip the full rebuild on re-add (CBT partial sync done) */
  	bool			skip_rebuild;
  
@@ -193,10 +193,10 @@ index 43841bc..ebe39cc 100644
  
  struct raid_bdev_io;
 diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
-index c538a3c..ff51486 100644
+index c5b2c85..60d2094 100644
 --- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
 +++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
-@@ -176,6 +176,9 @@ DEFINE_STUB(spdk_json_write_array_end, int, (struct spdk_json_write_ctx *w), 0);
+@@ -169,6 +169,9 @@ DEFINE_STUB(spdk_json_write_array_end, int, (struct spdk_json_write_ctx *w), 0);
  DEFINE_STUB(spdk_json_write_named_array_begin, int, (struct spdk_json_write_ctx *w,
  		const char *name), 0);
  DEFINE_STUB(spdk_json_write_null, int, (struct spdk_json_write_ctx *w), 0);
@@ -206,7 +206,7 @@ index c538a3c..ff51486 100644
  DEFINE_STUB(spdk_json_write_named_uint64, int, (struct spdk_json_write_ctx *w, const char *name,
  		uint64_t val), 0);
  /* Evariops 0013: the seeded-rebuild RPC answers with a formatted rebuild id. */
-@@ -230,6 +233,10 @@ DEFINE_STUB_V(raid_rebuild_outcome_finish, (struct raid_rebuild_outcome *outcome
+@@ -227,6 +230,10 @@ DEFINE_STUB_V(raid_rebuild_outcome_finish, (struct raid_rebuild_outcome *outcome
  	      enum raid_rebuild_outcome_state terminal, bool verified));
  DEFINE_STUB_V(raid_rebuild_outcomes_write_json, (struct spdk_json_write_ctx *w,
  	      const char *token_filter));

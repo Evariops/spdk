@@ -1,8 +1,8 @@
 diff --git a/module/bdev/raid/bdev_raid.h b/module/bdev/raid/bdev_raid.h
-index 5c30917..427addc 100644
+index a77984b..6154f11 100644
 --- a/module/bdev/raid/bdev_raid.h
 +++ b/module/bdev/raid/bdev_raid.h
-@@ -793,6 +793,22 @@ void raid_bdev_write_superblock(struct raid_bdev *raid_bdev, raid_bdev_write_sb_
+@@ -773,6 +773,22 @@ void raid_bdev_clear_superblock(struct raid_bdev *raid_bdev, raid_bdev_write_sb_
  int raid_bdev_load_base_bdev_superblock(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
  					raid_bdev_load_sb_cb cb, void *cb_ctx);
  
@@ -26,10 +26,10 @@ index 5c30917..427addc 100644
   * incarnation; lineage joins a raid created outside the view protocol to its
   * volume's view. cb reports the superblock write. -ESTALE for an epoch older
 diff --git a/module/bdev/raid/bdev_raid_rpc.c b/module/bdev/raid/bdev_raid_rpc.c
-index aada046..b67facc 100644
+index a8b074f..aea9ecc 100644
 --- a/module/bdev/raid/bdev_raid_rpc.c
 +++ b/module/bdev/raid/bdev_raid_rpc.c
-@@ -1763,3 +1763,199 @@ rpc_bdev_raid_clear_superblock(struct spdk_jsonrpc_request *request,
+@@ -1506,3 +1506,199 @@ rpc_bdev_raid_clear_superblock(struct spdk_jsonrpc_request *request,
  	}
  }
  SPDK_RPC_REGISTER("bdev_raid_clear_superblock", rpc_bdev_raid_clear_superblock, SPDK_RPC_RUNTIME)
@@ -230,10 +230,10 @@ index aada046..b67facc 100644
 +SPDK_RPC_REGISTER("bdev_raid_restamp_copied_member", rpc_bdev_raid_restamp_copied_member,
 +		  SPDK_RPC_RUNTIME)
 diff --git a/module/bdev/raid/bdev_raid_sb.c b/module/bdev/raid/bdev_raid_sb.c
-index eb092d8..6465fbe 100644
+index 61dfd3c..48e958c 100644
 --- a/module/bdev/raid/bdev_raid_sb.c
 +++ b/module/bdev/raid/bdev_raid_sb.c
-@@ -156,6 +156,62 @@ raid_bdev_sb_check_crc(struct raid_bdev_superblock *sb)
+@@ -170,6 +170,62 @@ raid_bdev_sb_check_crc(struct raid_bdev_superblock *sb)
  	return crc == prev;
  }
  
@@ -297,10 +297,10 @@ index eb092d8..6465fbe 100644
  raid_bdev_parse_superblock(struct raid_bdev_read_sb_ctx *ctx)
  {
 diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
-index beaec9b..fc08614 100644
+index 62a023b..d40e6cf 100644
 --- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
 +++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
-@@ -218,6 +218,11 @@ DEFINE_STUB(spdk_bdev_notify_blockcnt_change, int, (struct spdk_bdev *bdev, uint
+@@ -215,6 +215,11 @@ DEFINE_STUB(spdk_bdev_notify_blockcnt_change, int, (struct spdk_bdev *bdev, uint
  DEFINE_STUB(spdk_json_write_named_uuid, int, (struct spdk_json_write_ctx *w, const char *name,
  		const struct spdk_uuid *val), 0);
  DEFINE_STUB_V(raid_bdev_init_superblock, (struct raid_bdev *raid_bdev));
@@ -313,10 +313,10 @@ index beaec9b..fc08614 100644
  /* Evariops 0053: the suite's raids have no superblock buffer, except while a test
   * reassembles one from a superblock. */
 diff --git a/test/unit/lib/bdev/raid/bdev_raid_sb.c/bdev_raid_sb_ut.c b/test/unit/lib/bdev/raid/bdev_raid_sb.c/bdev_raid_sb_ut.c
-index 14125a4..8310a4a 100644
+index ca381bf..17ff761 100644
 --- a/test/unit/lib/bdev/raid/bdev_raid_sb.c/bdev_raid_sb_ut.c
 +++ b/test/unit/lib/bdev/raid/bdev_raid_sb.c/bdev_raid_sb_ut.c
-@@ -492,6 +492,123 @@ test_raid_bdev_init_superblock_outside_a_view_leaves_the_stamp_empty(void)
+@@ -513,6 +513,123 @@ test_raid_bdev_init_superblock_outside_a_view_leaves_the_stamp_empty(void)
  	raid_bdev_free_superblock(&raid_bdev);
  }
  
@@ -440,7 +440,7 @@ index 14125a4..8310a4a 100644
  int
  main(int argc, char **argv)
  {
-@@ -502,6 +619,8 @@ main(int argc, char **argv)
+@@ -523,6 +640,8 @@ main(int argc, char **argv)
  		{ "test_raid_bdev_parse_superblock", test_raid_bdev_parse_superblock },
  		{ "test_raid_bdev_init_superblock_stamps_the_view", test_raid_bdev_init_superblock_stamps_the_view },
  		{ "test_raid_bdev_init_superblock_outside_a_view_leaves_the_stamp_empty", test_raid_bdev_init_superblock_outside_a_view_leaves_the_stamp_empty },

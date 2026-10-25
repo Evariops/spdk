@@ -1,8 +1,8 @@
 diff --git a/module/bdev/nvme/nvme_rpc.c b/module/bdev/nvme/nvme_rpc.c
-index bbcb903..d43a9ec 100644
+index 97551cb..fc322f0 100644
 --- a/module/bdev/nvme/nvme_rpc.c
 +++ b/module/bdev/nvme/nvme_rpc.c
-@@ -162,7 +162,19 @@ nvme_rpc_io_cmd_bdev_nvme(struct rpc_bdev_nvme_send_cmd_ctx *ctx, struct spdk_nv
+@@ -161,7 +161,19 @@ nvme_rpc_io_cmd_bdev_nvme(struct rpc_bdev_nvme_send_cmd_tmp *ctx, struct spdk_nv
  	int ret;
  
  	ctx->ctrlr_io_ch = spdk_get_io_channel(_nvme_ctrlr);
@@ -23,20 +23,19 @@ index bbcb903..d43a9ec 100644
  	ret = spdk_nvme_ctrlr_cmd_io_raw_with_md(_nvme_ctrlr->ctrlr, io_qpair,
  			cmd, buf, nbytes, md_buf, nvme_rpc_bdev_nvme_cb, ctx);
 diff --git a/test/unit/lib/bdev/nvme/bdev_nvme.c/bdev_nvme_ut.c b/test/unit/lib/bdev/nvme/bdev_nvme.c/bdev_nvme_ut.c
-index c64dc7c..bd022fe 100644
+index 38d3389..c6a6f64 100644
 --- a/test/unit/lib/bdev/nvme/bdev_nvme.c/bdev_nvme_ut.c
 +++ b/test/unit/lib/bdev/nvme/bdev_nvme.c/bdev_nvme_ut.c
-@@ -15,6 +15,19 @@
+@@ -15,6 +15,18 @@
  
  #include "unit/lib/json_mock.c"
  
 +/* nvme_rpc.c is compiled in so its I/O passthrough can be driven against a real controller
 + * channel (Evariops 0051); its JSON decoding and RPC registration are not exercised here. */
 +#include "spdk/rpc.h"
++#include "common/lib/json/common_stubs.h"
 +DEFINE_STUB(spdk_json_decode_object, int, (const struct spdk_json_val *values,
 +		const struct spdk_json_object_decoder *decoders, size_t num_decoders, void *out), 0);
-+DEFINE_STUB(spdk_json_decode_string, int, (const struct spdk_json_val *val, void *out), 0);
-+DEFINE_STUB(spdk_json_decode_uint32, int, (const struct spdk_json_val *val, void *out), 0);
 +DEFINE_STUB(spdk_json_strequal, bool, (const struct spdk_json_val *val, const char *str), false);
 +DEFINE_STUB_V(spdk_rpc_register_method, (const char *method, spdk_rpc_method_handler func,
 +		uint32_t state_mask));
@@ -46,8 +45,8 @@ index c64dc7c..bd022fe 100644
  #include "bdev/nvme/bdev_mdns_client.c"
  
  static void *g_accel_p = (void *)0xdeadbeaf;
-@@ -8490,6 +8503,68 @@ test_race_between_ctrlr_loss_timeout_and_pending_failover(void)
- 	CU_ASSERT(nvme_ctrlr_get_by_name("nvme0") == NULL);
+@@ -8450,6 +8462,68 @@ test_bdev_nvme_ctrlr_iterators(void)
+ 	CU_ASSERT(spdk_bdev_nvme_first_bdev_ctrlr() == NULL);
  }
  
 +/* bdev_nvme frees a controller channel's I/O qpair from a disconnect until the reconnect
@@ -60,7 +59,7 @@ index c64dc7c..bd022fe 100644
 +	struct spdk_nvme_transport_id trid = {};
 +	struct spdk_nvme_ctrlr ctrlr = {};
 +	struct nvme_ctrlr *nvme_ctrlr;
-+	struct rpc_bdev_nvme_send_cmd_ctx ctx = {};
++	struct rpc_bdev_nvme_send_cmd_tmp ctx = {};
 +	struct spdk_nvme_cmd cmd = {};
 +	struct spdk_io_channel *ch;
 +	struct nvme_ctrlr_channel *ctrlr_ch;
@@ -115,10 +114,10 @@ index c64dc7c..bd022fe 100644
  int
  main(int argc, char **argv)
  {
-@@ -8554,6 +8629,7 @@ main(int argc, char **argv)
- 	CU_ADD_TEST(suite, test_bdev_reset_abort_io);
- 	CU_ADD_TEST(suite, test_race_between_clear_pending_resets_and_reset_ctrlr_complete);
- 	CU_ADD_TEST(suite, test_race_between_ctrlr_loss_timeout_and_pending_failover);
+@@ -8518,6 +8592,7 @@ main(int argc, char **argv)
+ 	CU_ADD_TEST(suite, test_multipath_opts_mismatch);
+ 	CU_ADD_TEST(suite, test_multipath_opts_validation);
+ 	CU_ADD_TEST(suite, test_bdev_nvme_ctrlr_iterators);
 +	CU_ADD_TEST(suite, test_nvme_rpc_io_cmd_needs_a_connected_qpair);
  
  	allocate_threads(3);

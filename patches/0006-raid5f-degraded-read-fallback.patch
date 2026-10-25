@@ -1,5 +1,5 @@
 diff --git a/module/bdev/raid/raid5f.c b/module/bdev/raid/raid5f.c
-index 0a2274f..9d8e2c6 100644
+index 0671c23..496265a 100644
 --- a/module/bdev/raid/raid5f.c
 +++ b/module/bdev/raid/raid5f.c
 @@ -649,15 +649,46 @@ raid5f_submit_write_request(struct raid_bdev_io *raid_io, uint64_t stripe_index)

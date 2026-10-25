@@ -1,8 +1,8 @@
 diff --git a/module/bdev/uring/bdev_uring.c b/module/bdev/uring/bdev_uring.c
-index b7e27cc..717e260 100644
+index ca2dbcf..bf9f520 100644
 --- a/module/bdev/uring/bdev_uring.c
 +++ b/module/bdev/uring/bdev_uring.c
-@@ -607,6 +607,7 @@ bdev_uring_check_zoned_support(struct bdev_uring *uring, const char *name, const
+@@ -610,6 +610,7 @@ bdev_uring_check_zoned_support(struct bdev_uring *uring, const char *name, const
  	struct stat sb;
  	char resolved_path[PATH_MAX], *rp;
  	char *sysfs_path = NULL;
@@ -10,7 +10,7 @@ index b7e27cc..717e260 100644
  
  	uring->bdev.zoned = false;
  
-@@ -628,8 +629,21 @@ bdev_uring_check_zoned_support(struct bdev_uring *uring, const char *name, const
+@@ -631,8 +632,21 @@ bdev_uring_check_zoned_support(struct bdev_uring *uring, const char *name, const
  	}
  
  	base = basename(filename_dup);
@@ -33,7 +33,7 @@ index b7e27cc..717e260 100644
  	/* Check if this is a zoned block device */
  	if (retval < 0) {
  		URING_ERRLOG(uring, "Unable to open file %s. errno: %d\n", sysfs_path, retval);
-@@ -652,14 +666,14 @@ bdev_uring_check_zoned_support(struct bdev_uring *uring, const char *name, const
+@@ -655,14 +669,14 @@ bdev_uring_check_zoned_support(struct bdev_uring *uring, const char *name, const
  		uring->bdev.zone_size = (zinfo >> uring->zd.lba_shift);
  		uring->zd.zone_shift = spdk_u32log2(zinfo >> uring->zd.lba_shift);
  
@@ -50,7 +50,7 @@ index b7e27cc..717e260 100644
  		if (retval < 0) {
  			URING_ERRLOG(uring, "Failed to get max active zones %d (%s)\n", retval, strerror(-retval));
  			goto err_ret;
-@@ -672,6 +686,7 @@ bdev_uring_check_zoned_support(struct bdev_uring *uring, const char *name, const
+@@ -675,6 +689,7 @@ bdev_uring_check_zoned_support(struct bdev_uring *uring, const char *name, const
  err_ret:
  	free(str);
  	free(sysfs_path);

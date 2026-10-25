@@ -1,8 +1,8 @@
 diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
-index 583707e..da919f1 100644
+index 9d96cf1..5a793d8 100644
 --- a/module/bdev/raid/bdev_raid.c
 +++ b/module/bdev/raid/bdev_raid.c
-@@ -3266,6 +3266,21 @@ raid_bdev_process_request_complete(struct raid_bdev_process_request *process_req
+@@ -3377,6 +3377,21 @@ raid_bdev_process_request_complete(struct raid_bdev_process_request *process_req
  	}
  }
  
@@ -25,10 +25,10 @@ index 583707e..da919f1 100644
  raid_bdev_submit_process_request(struct raid_bdev_process *process, uint64_t offset_blocks,
  				 uint32_t num_blocks)
 diff --git a/module/bdev/raid/bdev_raid.h b/module/bdev/raid/bdev_raid.h
-index 280d61c..f584d19 100644
+index bfbc0be..a425960 100644
 --- a/module/bdev/raid/bdev_raid.h
 +++ b/module/bdev/raid/bdev_raid.h
-@@ -481,6 +481,10 @@ void *raid_bdev_channel_get_module_ctx(struct raid_bdev_io_channel *raid_ch);
+@@ -454,6 +454,10 @@ void *raid_bdev_channel_get_module_ctx(struct raid_bdev_io_channel *raid_ch);
  struct raid_base_bdev_info *raid_bdev_channel_get_base_info(struct raid_bdev_io_channel *raid_ch,
  		struct spdk_bdev *base_bdev);
  void raid_bdev_process_request_complete(struct raid_bdev_process_request *process_req, int status);
@@ -40,7 +40,7 @@ index 280d61c..f584d19 100644
  		       enum spdk_bdev_io_type type, uint64_t offset_blocks,
  		       uint64_t num_blocks, struct iovec *iovs, int iovcnt, void *md_buf,
 diff --git a/module/bdev/raid/raid1.c b/module/bdev/raid/raid1.c
-index f1d4f0f..51efb51 100644
+index 4cbaa42..e037b52 100644
 --- a/module/bdev/raid/raid1.c
 +++ b/module/bdev/raid/raid1.c
 @@ -590,6 +590,13 @@ raid1_submit_process_request(struct raid_bdev_process_request *process_req,
@@ -58,10 +58,10 @@ index f1d4f0f..51efb51 100644
  			  process_req->offset_blocks, process_req->num_blocks,
  			  &process_req->iov, 1, process_req->md_buf, NULL, NULL);
 diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
-index 11b46f2..a488d6d 100644
+index 811f718..d6412f0 100644
 --- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
 +++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
-@@ -1765,6 +1765,35 @@ test_raid_process_seeded_skips_a_clean_span_without_a_window(void)
+@@ -1762,6 +1762,35 @@ test_raid_process_seeded_skips_a_clean_span_without_a_window(void)
  	CU_ASSERT(g_lowest_copy_window == 100);
  }
  
@@ -97,7 +97,7 @@ index 11b46f2..a488d6d 100644
  static void
  test_raid_process_with_qos(void)
  {
-@@ -2176,6 +2205,7 @@ main(int argc, char **argv)
+@@ -2173,6 +2202,7 @@ main(int argc, char **argv)
  	CU_ADD_TEST(suite, test_raid_process_seeded_skips_a_clean_span_without_a_window);
  	CU_ADD_TEST(suite, test_raid_seeded_rebuild_from_epoch_copies_every_range);
  	CU_ADD_TEST(suite, test_raid_seeded_rebuild_from_epoch_refuses_a_delta_it_cannot_take_whole);
@@ -106,7 +106,7 @@ index 11b46f2..a488d6d 100644
  
  	spdk_thread_lib_init(test_new_thread_fn, 0);
 diff --git a/test/unit/lib/bdev/raid/raid1.c/raid1_ut.c b/test/unit/lib/bdev/raid/raid1.c/raid1_ut.c
-index 9c3eb8f..88f4295 100644
+index 51b4bb2..f8f3379 100644
 --- a/test/unit/lib/bdev/raid/raid1.c/raid1_ut.c
 +++ b/test/unit/lib/bdev/raid/raid1.c/raid1_ut.c
 @@ -23,11 +23,6 @@ DEFINE_STUB_V(raid_bdev_queue_io_wait, (struct raid_bdev_io *raid_io, struct spd

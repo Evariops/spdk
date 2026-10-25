@@ -1,8 +1,8 @@
 diff --git a/module/bdev/nvme/bdev_nvme.c b/module/bdev/nvme/bdev_nvme.c
-index fa7fc4f..b022fdd 100644
+index a8be8f4..dae987a 100644
 --- a/module/bdev/nvme/bdev_nvme.c
 +++ b/module/bdev/nvme/bdev_nvme.c
-@@ -2303,6 +2303,21 @@ nvme_ctrlr_disconnect(struct nvme_ctrlr *nvme_ctrlr, nvme_ctrlr_disconnected_cb
+@@ -2378,6 +2378,21 @@ nvme_ctrlr_disconnect(struct nvme_ctrlr *nvme_ctrlr, nvme_ctrlr_disconnected_cb
  			return;
  		}
  

@@ -1,8 +1,8 @@
 diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
-index dd3cb51..feebb76 100644
+index 3c50e57..791b28e 100644
 --- a/module/bdev/raid/bdev_raid.c
 +++ b/module/bdev/raid/bdev_raid.c
-@@ -4849,6 +4849,12 @@ out:
+@@ -4980,6 +4980,12 @@ out:
  	raid_bdev_examine_others_done(ctx, status);
  }
  
@@ -14,8 +14,8 @@ index dd3cb51..feebb76 100644
 +
  static void
  raid_bdev_examine_sb(const struct raid_bdev_superblock *sb, struct spdk_bdev *bdev,
- 		     raid_base_bdev_cb cb_fn, void *cb_ctx)
-@@ -4858,6 +4864,10 @@ raid_bdev_examine_sb(const struct raid_bdev_superblock *sb, struct spdk_bdev *bd
+ 		     raid_bdev_action_cb cb_fn, void *cb_ctx)
+@@ -4989,6 +4995,10 @@ raid_bdev_examine_sb(const struct raid_bdev_superblock *sb, struct spdk_bdev *bd
  	struct raid_base_bdev_info *iter, *base_info;
  	uint8_t i;
  	int rc;
@@ -26,10 +26,10 @@ index dd3cb51..feebb76 100644
  
  	if (sb->block_size != spdk_bdev_get_data_block_size(bdev)) {
  		SPDK_WARNLOG("Bdev %s block size (%u) does not match the value in superblock (%u)\n",
-@@ -4948,6 +4958,22 @@ raid_bdev_examine_sb(const struct raid_bdev_superblock *sb, struct spdk_bdev *bd
+@@ -5079,6 +5089,22 @@ raid_bdev_examine_sb(const struct raid_bdev_superblock *sb, struct spdk_bdev *bd
  	}
  
- 	if (raid_bdev->state == RAID_BDEV_STATE_ONLINE) {
+ 	if (raid_bdev->state == SPDK_BDEV_RAID_STATE_ONLINE) {
 +		/* Evariops 0026: never auto re-add a returning member into a CLAIMED
 +		 * raid. Re-admission belongs to the control plane (write_only attach
 +		 * plus seeded rebuild); an examine-driven re-add races the controller's

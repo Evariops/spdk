@@ -1,8 +1,8 @@
 diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
-index 1a9849e..ed1a1ad 100644
+index 04f9a32..3b33841 100644
 --- a/module/bdev/raid/bdev_raid.c
 +++ b/module/bdev/raid/bdev_raid.c
-@@ -408,11 +408,34 @@ raid_bdev_free(struct raid_bdev *raid_bdev)
+@@ -407,11 +407,34 @@ raid_bdev_free(struct raid_bdev *raid_bdev)
  	raid_tier_heat_destroy(raid_bdev->tier_heat);
  	raid_bdev->tier_heat = NULL;
  	raid_bdev_free_superblock(raid_bdev);
@@ -37,7 +37,7 @@ index 1a9849e..ed1a1ad 100644
  static void
  raid_bdev_cleanup_and_free(struct raid_bdev *raid_bdev)
  {
-@@ -1141,6 +1164,11 @@ raid_bdev_write_info_json(struct raid_bdev *raid_bdev, struct spdk_json_write_ct
+@@ -1140,6 +1163,11 @@ raid_bdev_write_info_json(struct raid_bdev *raid_bdev, struct spdk_json_write_ct
  
  	spdk_json_write_named_uuid(w, "uuid", &raid_bdev->bdev.uuid);
  	spdk_json_write_named_uint32(w, "strip_size_kb", raid_bdev->strip_size_kb);
@@ -49,7 +49,7 @@ index 1a9849e..ed1a1ad 100644
  	spdk_json_write_named_string(w, "state", raid_bdev_state_to_str(raid_bdev->state));
  	spdk_json_write_named_string(w, "raid_level", raid_bdev_level_to_str(raid_bdev->level));
  	spdk_json_write_named_bool(w, "superblock", raid_bdev->superblock_enabled);
-@@ -1246,6 +1274,11 @@ raid_bdev_write_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx *
+@@ -1245,6 +1273,11 @@ raid_bdev_write_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx *
  	spdk_json_write_named_object_begin(w, "params");
  	spdk_json_write_named_string(w, "name", bdev->name);
  	spdk_json_write_named_uuid(w, "uuid", &raid_bdev->bdev.uuid);
@@ -61,17 +61,19 @@ index 1a9849e..ed1a1ad 100644
  	if (raid_bdev->strip_size_kb != 0) {
  		spdk_json_write_named_uint32(w, "strip_size_kb", raid_bdev->strip_size_kb);
  	}
-@@ -1706,19 +1739,37 @@ _raid_bdev_create(const char *name, uint32_t strip_size, uint8_t num_base_bdevs,
+@@ -1749,7 +1782,8 @@ static int raid_bdev_configure_base_bdev(struct raid_base_bdev_info *base_info,
  int
  raid_bdev_create(const char *name, uint32_t strip_size, uint8_t num_base_bdevs,
- 		 enum raid_level level, bool superblock_enabled, const struct spdk_uuid *uuid,
--		 struct raid_bdev **raid_bdev_out)
-+		 const char *incarnation, struct raid_bdev **raid_bdev_out)
+ 		 char **base_bdev_names, enum spdk_bdev_raid_level level, bool superblock_enabled,
+-		 const struct spdk_uuid *uuid, raid_bdev_action_cb cb_fn, void *cb_ctx)
++		 const struct spdk_uuid *uuid, const char *incarnation,
++		 raid_bdev_action_cb cb_fn, void *cb_ctx)
  {
+ 	struct raid_bdev_create_ctx *ctx;
  	struct raid_bdev *raid_bdev;
- 	int rc;
- 
+@@ -1760,12 +1794,30 @@ raid_bdev_create(const char *name, uint32_t strip_size, uint8_t num_base_bdevs,
  	assert(uuid != NULL);
+ 	assert(cb_fn != NULL);
  
 +	/* Evariops 0014: no creation without identity. Only the internal
 +	 * superblock-reassembly path may create an unclaimed raid. */
@@ -100,7 +102,7 @@ index 1a9849e..ed1a1ad 100644
  	if (superblock_enabled && spdk_uuid_is_null(uuid)) {
  		/* we need to have the uuid to store in the superblock before the bdev is registered */
  		spdk_uuid_generate(&raid_bdev->bdev.uuid);
-@@ -2332,6 +2383,8 @@ _raid_bdev_remove_base_bdev(struct raid_base_bdev_info *base_info,
+@@ -2414,6 +2466,8 @@ _raid_bdev_remove_base_bdev(struct raid_base_bdev_info *base_info,
   * or not. If yes, it takes necessary action on that particular raid bdev.
   * params:
   * base_bdev - pointer to base bdev which got removed
@@ -109,20 +111,20 @@ index 1a9849e..ed1a1ad 100644
   * cb_fn - callback function
   * cb_arg - argument to callback function
   * returns:
-@@ -2339,9 +2392,11 @@ _raid_bdev_remove_base_bdev(struct raid_base_bdev_info *base_info,
+@@ -2421,9 +2475,11 @@ _raid_bdev_remove_base_bdev(struct raid_base_bdev_info *base_info,
   * non zero - failure
   */
  int
--raid_bdev_remove_base_bdev(struct spdk_bdev *base_bdev, raid_base_bdev_cb cb_fn, void *cb_ctx)
+-raid_bdev_remove_base_bdev(struct spdk_bdev *base_bdev, raid_bdev_action_cb cb_fn, void *cb_ctx)
 +raid_bdev_remove_base_bdev(struct spdk_bdev *base_bdev, const char *expected_incarnation,
-+			   raid_base_bdev_cb cb_fn, void *cb_ctx)
++			   raid_bdev_action_cb cb_fn, void *cb_ctx)
  {
  	struct raid_base_bdev_info *base_info;
 +	int rc;
  
  	/* Find the raid_bdev which has claimed this base_bdev */
  	base_info = raid_bdev_find_base_info_by_bdev(base_bdev);
-@@ -2350,6 +2405,11 @@ raid_bdev_remove_base_bdev(struct spdk_bdev *base_bdev, raid_base_bdev_cb cb_fn,
+@@ -2432,6 +2488,11 @@ raid_bdev_remove_base_bdev(struct spdk_bdev *base_bdev, raid_bdev_action_cb cb_f
  		return -ENODEV;
  	}
  
@@ -134,7 +136,7 @@ index 1a9849e..ed1a1ad 100644
  	return _raid_bdev_remove_base_bdev(base_info, cb_fn, cb_ctx);
  }
  
-@@ -2482,7 +2542,7 @@ raid_bdev_event_base_bdev(enum spdk_bdev_event_type type, struct spdk_bdev *bdev
+@@ -2564,7 +2625,7 @@ raid_bdev_event_base_bdev(enum spdk_bdev_event_type type, struct spdk_bdev *bdev
  
  	switch (type) {
  	case SPDK_BDEV_EVENT_REMOVE:
@@ -144,21 +146,20 @@ index 1a9849e..ed1a1ad 100644
  			SPDK_ERRLOG("Failed to remove base bdev %s: %s\n",
  				    spdk_bdev_get_name(bdev), spdk_strerror(-rc));
 diff --git a/module/bdev/raid/bdev_raid.h b/module/bdev/raid/bdev_raid.h
-index 0c6aa63..a66ad3d 100644
+index 6645dac..c430bdf 100644
 --- a/module/bdev/raid/bdev_raid.h
 +++ b/module/bdev/raid/bdev_raid.h
-@@ -11,6 +11,10 @@
+@@ -12,6 +12,9 @@
  
  #define RAID_BDEV_MIN_DATA_OFFSET_SIZE	(1024*1024) /* 1 MiB */
  
 +/* Evariops 0014: max length of the control-plane incarnation identity string,
 + * including the NUL terminator. */
 +#define RAID_INCARNATION_MAX	64
-+
- enum raid_level {
- 	INVALID_RAID_LEVEL	= -1,
- 	RAID0			= 0,
-@@ -260,9 +264,17 @@ struct raid_bdev {
+ 
+ enum raid_process_type {
+ 	RAID_PROCESS_NONE,
+@@ -228,9 +231,17 @@ struct raid_bdev {
  	/* Private data for the raid module */
  	void				*module_private;
  
@@ -177,20 +178,22 @@ index 0c6aa63..a66ad3d 100644
  	/* Superblock */
  	bool				superblock_enabled;
  	struct raid_bdev_superblock	*sb;
-@@ -293,14 +305,19 @@ typedef void (*raid_bdev_destruct_cb)(void *cb_ctx, int rc);
+@@ -266,15 +277,21 @@ extern struct raid_all_tailq		g_raid_bdev_list;
  
  int raid_bdev_create(const char *name, uint32_t strip_size, uint8_t num_base_bdevs,
- 		     enum raid_level level, bool superblock, const struct spdk_uuid *uuid,
--		     struct raid_bdev **raid_bdev_out);
-+		     const char *incarnation, struct raid_bdev **raid_bdev_out);
+ 		     char **base_bdev_names, enum spdk_bdev_raid_level level, bool superblock_enabled,
+-		     const struct spdk_uuid *uuid, raid_bdev_action_cb cb_fn, void *cb_ctx);
++		     const struct spdk_uuid *uuid, const char *incarnation,
++		     raid_bdev_action_cb cb_fn, void *cb_ctx);
 +/* Evariops 0014: returns 0 when expected matches, or when expected is NULL
 + * (the check is skipped — reserved for manual rescue tooling), -ESTALE
 + * otherwise. State-changing RPCs call this before acting. */
 +int raid_bdev_check_incarnation(struct raid_bdev *raid_bdev, const char *expected_incarnation);
- void raid_bdev_delete(struct raid_bdev *raid_bdev, raid_bdev_destruct_cb cb_fn, void *cb_ctx);
+ void raid_bdev_delete(struct raid_bdev *raid_bdev, bool clear_sb, raid_bdev_action_cb cb_fn,
+ 		      void *cb_ctx);
  int raid_bdev_add_base_bdev(struct raid_bdev *raid_bdev, const char *name,
  			    bool skip_rebuild, bool write_only,
- 			    raid_base_bdev_cb cb_fn, void *cb_ctx);
+ 			    raid_bdev_action_cb cb_fn, void *cb_ctx);
  
 -/* SPEC-74 M6 seeded rebuild: a dirty range (block units) seeding a partial
 - * rebuild. Sorted and non-overlapping (validated at the RPC). */
@@ -200,131 +203,45 @@ index 0c6aa63..a66ad3d 100644
  struct raid_bdev_seed_range {
  	uint64_t		offset_blocks;
  	uint64_t		num_blocks;
-@@ -315,7 +332,8 @@ enum raid_bdev_state raid_bdev_str_to_state(const char *str);
- const char *raid_bdev_state_to_str(enum raid_bdev_state state);
+@@ -288,8 +305,8 @@ const char *raid_bdev_level_to_str(enum spdk_bdev_raid_level level);
+ const char *raid_bdev_state_to_str(enum spdk_bdev_raid_state state);
  const char *raid_bdev_process_to_str(enum raid_process_type value);
  void raid_bdev_write_info_json(struct raid_bdev *raid_bdev, struct spdk_json_write_ctx *w);
--int raid_bdev_remove_base_bdev(struct spdk_bdev *base_bdev, raid_base_bdev_cb cb_fn, void *cb_ctx);
+-int raid_bdev_remove_base_bdev(struct spdk_bdev *base_bdev, raid_bdev_action_cb cb_fn,
+-			       void *cb_ctx);
 +int raid_bdev_remove_base_bdev(struct spdk_bdev *base_bdev, const char *expected_incarnation,
-+			       raid_base_bdev_cb cb_fn, void *cb_ctx);
++			       raid_bdev_action_cb cb_fn, void *cb_ctx);
  
  /*
   * RAID module descriptor
 diff --git a/module/bdev/raid/bdev_raid_rpc.c b/module/bdev/raid/bdev_raid_rpc.c
-index 830a42d..3de537f 100644
+index 06cb62a..7e7d61b 100644
 --- a/module/bdev/raid/bdev_raid_rpc.c
 +++ b/module/bdev/raid/bdev_raid_rpc.c
-@@ -137,6 +137,10 @@ struct rpc_bdev_raid_create {
+@@ -130,7 +130,7 @@ rpc_bdev_raid_create(struct spdk_jsonrpc_request *request,
  
- 	/* If set, information about raid bdev will be stored in superblock on each base bdev */
- 	bool                                 superblock_enabled;
-+
-+	/* Evariops 0014: identity of the creating control-plane incarnation.
-+	 * Mandatory — there is no creation without an identity. */
-+	char                                 *incarnation;
- };
- 
- /*
-@@ -184,6 +188,7 @@ static const struct spdk_json_object_decoder rpc_bdev_raid_create_decoders[] = {
- 	{"base_bdevs", offsetof(struct rpc_bdev_raid_create, base_bdevs), decode_base_bdevs},
- 	{"uuid", offsetof(struct rpc_bdev_raid_create, uuid), spdk_json_decode_uuid, true},
- 	{"superblock", offsetof(struct rpc_bdev_raid_create, superblock_enabled), spdk_json_decode_bool, true},
-+	{"incarnation", offsetof(struct rpc_bdev_raid_create, incarnation), spdk_json_decode_string},
- };
- 
- struct rpc_bdev_raid_create_ctx {
-@@ -207,6 +212,7 @@ free_rpc_bdev_raid_create_ctx(struct rpc_bdev_raid_create_ctx *ctx)
- 	req = &ctx->req;
- 
- 	free(req->name);
-+	free(req->incarnation);
- 	for (i = 0; i < req->base_bdevs.num_base_bdevs; i++) {
- 		free(req->base_bdevs.base_bdevs[i]);
- 	}
-@@ -288,7 +294,8 @@ rpc_bdev_raid_create(struct spdk_jsonrpc_request *request,
- 	}
- 
- 	rc = raid_bdev_create(req->name, req->strip_size_kb, num_base_bdevs,
--			      req->level, req->superblock_enabled, &req->uuid, &raid_bdev);
-+			      req->level, req->superblock_enabled, &req->uuid,
-+			      req->incarnation, &raid_bdev);
+ 	rc = raid_bdev_create(ctx->name, ctx->strip_size_kb, num_base_bdevs,
+ 			      ctx->base_bdevs.items, (enum spdk_bdev_raid_level)ctx->raid_level,
+-			      ctx->superblock, &ctx->uuid, rpc_bdev_raid_create_cb, ctx);
++			      ctx->superblock, &ctx->uuid, ctx->incarnation, rpc_bdev_raid_create_cb, ctx);
  	if (rc != 0) {
  		spdk_jsonrpc_send_error_response_fmt(request, rc,
  						     "Failed to create RAID bdev %s: %s",
-@@ -331,6 +338,10 @@ SPDK_RPC_REGISTER("bdev_raid_create", rpc_bdev_raid_create, SPDK_RPC_RUNTIME)
- struct rpc_bdev_raid_delete {
- 	/* raid bdev name */
- 	char *name;
-+
-+	/* Evariops 0014: -ESTALE on mismatch. Omitting it skips the check and is
-+	 * reserved for manual rescue tooling; regular clients always send it. */
-+	char *expected_incarnation;
- };
- 
- /*
-@@ -345,6 +356,7 @@ static void
- free_rpc_bdev_raid_delete(struct rpc_bdev_raid_delete *req)
- {
- 	free(req->name);
-+	free(req->expected_incarnation);
- }
- 
- /*
-@@ -352,6 +364,7 @@ free_rpc_bdev_raid_delete(struct rpc_bdev_raid_delete *req)
-  */
- static const struct spdk_json_object_decoder rpc_bdev_raid_delete_decoders[] = {
- 	{"name", offsetof(struct rpc_bdev_raid_delete, name), spdk_json_decode_string},
-+	{"expected_incarnation", offsetof(struct rpc_bdev_raid_delete, expected_incarnation), spdk_json_decode_string, true},
- };
- 
- struct rpc_bdev_raid_delete_ctx {
-@@ -427,6 +440,13 @@ rpc_bdev_raid_delete(struct spdk_jsonrpc_request *request,
+@@ -210,6 +210,13 @@ rpc_bdev_raid_delete(struct spdk_jsonrpc_request *request,
  		goto cleanup;
  	}
  
-+	if (raid_bdev_check_incarnation(raid_bdev, ctx->req.expected_incarnation) != 0) {
++	if (raid_bdev_check_incarnation(raid_bdev, ctx->expected_incarnation) != 0) {
 +		spdk_jsonrpc_send_error_response_fmt(request, -ESTALE,
 +						     "stale incarnation for raid bdev %s",
-+						     ctx->req.name);
++						     ctx->name);
 +		goto cleanup;
 +	}
 +
  	ctx->request = request;
  
- 	raid_bdev_delete(raid_bdev, bdev_raid_delete_done, ctx);
-@@ -452,9 +472,13 @@ struct rpc_bdev_raid_add_base_bdev {
- 	/* Skip the full rebuild (base bdev already synced by CBT) */
- 	bool			skip_rebuild;
- 
--	/* SPEC-74 M6: attach write-only — receives writes immediately, serves no
--	 * reads, SB flip deferred to seeded-rebuild completion */
-+	/* Evariops 0013: attach write-only — the member takes writes immediately,
-+	 * serves no reads, and its superblock slot is promoted only when the
-+	 * seeded rebuild completes. */
- 	bool			write_only;
-+
-+	/* Evariops 0014: -ESTALE on mismatch (see bdev_raid_delete). */
-+	char			*expected_incarnation;
- };
- 
- /*
-@@ -471,6 +495,7 @@ free_rpc_bdev_raid_add_base_bdev(struct rpc_bdev_raid_add_base_bdev *req)
- {
- 	free(req->base_bdev);
- 	free(req->raid_bdev);
-+	free(req->expected_incarnation);
- }
- 
- /*
-@@ -481,6 +506,7 @@ static const struct spdk_json_object_decoder rpc_bdev_raid_add_base_bdev_decoder
- 	{"raid_bdev", offsetof(struct rpc_bdev_raid_add_base_bdev, raid_bdev), spdk_json_decode_string},
- 	{"skip_rebuild", offsetof(struct rpc_bdev_raid_add_base_bdev, skip_rebuild), spdk_json_decode_bool, true},
- 	{"write_only", offsetof(struct rpc_bdev_raid_add_base_bdev, write_only), spdk_json_decode_bool, true},
-+	{"expected_incarnation", offsetof(struct rpc_bdev_raid_add_base_bdev, expected_incarnation), spdk_json_decode_string, true},
- };
- 
- static void
-@@ -541,6 +567,13 @@ rpc_bdev_raid_add_base_bdev(struct spdk_jsonrpc_request *request,
+ 	raid_bdev_delete(raid_bdev, ctx->clear_sb, bdev_raid_delete_done, ctx);
+@@ -279,6 +286,13 @@ rpc_bdev_raid_add_base_bdev(struct spdk_jsonrpc_request *request,
  		goto cleanup;
  	}
  
@@ -337,8 +254,8 @@ index 830a42d..3de537f 100644
 +
  	/* Only the raid1 read selection implements read exclusion, so a
  	 * write_only attach on any other level would serve stale reads. */
- 	if (req.write_only && raid_bdev->level != RAID1) {
-@@ -587,6 +620,9 @@ struct rpc_bdev_raid_start_seeded_rebuild {
+ 	if (req.write_only && raid_bdev->level != SPDK_BDEV_RAID_LEVEL_RAID1) {
+@@ -325,6 +339,9 @@ struct rpc_bdev_raid_start_seeded_rebuild {
  
  	/* Heap-allocated in the array decoder (0008 house pattern) */
  	struct raid_bdev_seed_range	*ranges;
@@ -348,7 +265,7 @@ index 830a42d..3de537f 100644
  };
  
  static void
-@@ -595,6 +631,7 @@ free_rpc_bdev_raid_start_seeded_rebuild(struct rpc_bdev_raid_start_seeded_rebuil
+@@ -333,6 +350,7 @@ free_rpc_bdev_raid_start_seeded_rebuild(struct rpc_bdev_raid_start_seeded_rebuil
  	free(req->name);
  	free(req->base_bdev);
  	free(req->ranges);
@@ -356,7 +273,7 @@ index 830a42d..3de537f 100644
  }
  
  static int
-@@ -630,6 +667,7 @@ static const struct spdk_json_object_decoder rpc_bdev_raid_start_seeded_rebuild_
+@@ -368,6 +386,7 @@ static const struct spdk_json_object_decoder rpc_bdev_raid_start_seeded_rebuild_
  	{"name", offsetof(struct rpc_bdev_raid_start_seeded_rebuild, name), spdk_json_decode_string},
  	{"base_bdev", offsetof(struct rpc_bdev_raid_start_seeded_rebuild, base_bdev), spdk_json_decode_string},
  	{"ranges", offsetof(struct rpc_bdev_raid_start_seeded_rebuild, ranges), decode_seed_ranges},
@@ -364,7 +281,7 @@ index 830a42d..3de537f 100644
  };
  
  static int
-@@ -676,6 +714,13 @@ rpc_bdev_raid_start_seeded_rebuild(struct spdk_jsonrpc_request *request,
+@@ -414,6 +433,13 @@ rpc_bdev_raid_start_seeded_rebuild(struct spdk_jsonrpc_request *request,
  		goto cleanup;
  	}
  
@@ -378,49 +295,25 @@ index 830a42d..3de537f 100644
  	if (raid_bdev->process != NULL) {
  		spdk_jsonrpc_send_error_response_fmt(request, -EBUSY,
  						     "raid bdev %s already has a background process",
-@@ -765,11 +810,20 @@ cleanup:
+@@ -503,13 +529,6 @@ cleanup:
  SPDK_RPC_REGISTER("bdev_raid_start_seeded_rebuild", rpc_bdev_raid_start_seeded_rebuild,
  		  SPDK_RPC_RUNTIME)
  
-+struct rpc_bdev_raid_remove_base_bdev {
-+	/* Base bdev name */
-+	char *name;
-+
-+	/* Evariops 0014: -ESTALE on mismatch (see bdev_raid_delete). */
-+	char *expected_incarnation;
-+};
-+
- /*
-  * Decoder object for RPC bdev_raid_remove_base_bdev
-  */
- static const struct spdk_json_object_decoder rpc_bdev_raid_remove_base_bdev_decoders[] = {
+-/*
+- * Decoder object for RPC bdev_raid_remove_base_bdev
+- */
+-static const struct spdk_json_object_decoder rpc_bdev_raid_remove_base_bdev_decoders[] = {
 -	{"name", 0, spdk_json_decode_string},
-+	{"name", offsetof(struct rpc_bdev_raid_remove_base_bdev, name), spdk_json_decode_string},
-+	{"expected_incarnation", offsetof(struct rpc_bdev_raid_remove_base_bdev, expected_incarnation), spdk_json_decode_string, true},
- };
- 
+-};
+-
  static void
-@@ -799,34 +853,39 @@ static void
- rpc_bdev_raid_remove_base_bdev(struct spdk_jsonrpc_request *request,
- 			       const struct spdk_json_val *params)
+ rpc_bdev_raid_remove_base_bdev_done(void *ctx, int status)
  {
-+	struct rpc_bdev_raid_remove_base_bdev req = {};
- 	struct spdk_bdev_desc *desc;
--	char *name = NULL;
- 	int rc;
- 
- 	if (spdk_json_decode_object(params, rpc_bdev_raid_remove_base_bdev_decoders,
- 				    SPDK_COUNTOF(rpc_bdev_raid_remove_base_bdev_decoders),
--				    &name)) {
-+				    &req)) {
- 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_PARSE_ERROR,
- 						 "spdk_json_decode_object failed");
- 		return;
+@@ -550,21 +569,24 @@ rpc_bdev_raid_remove_base_bdev(struct spdk_jsonrpc_request *request,
  	}
  
--	rc = spdk_bdev_open_ext(name, false, rpc_bdev_raid_event_cb, NULL, &desc);
--	free(name);
-+	rc = spdk_bdev_open_ext(req.name, false, rpc_bdev_raid_event_cb, NULL, &desc);
+ 	rc = spdk_bdev_open_ext(req.name, false, rpc_bdev_raid_event_cb, NULL, &desc);
+-	free_rpc_bdev_raid_remove_base_bdev(&req);
  	if (rc != 0) {
  		goto err;
  	}
@@ -436,21 +329,64 @@ index 830a42d..3de537f 100644
  		goto err;
  	}
  
-+	free(req.name);
-+	free(req.expected_incarnation);
++	free_rpc_bdev_raid_remove_base_bdev(&req);
  	return;
  err:
  	rpc_bdev_raid_remove_base_bdev_done(request, rc);
-+	free(req.name);
-+	free(req.expected_incarnation);
++	free_rpc_bdev_raid_remove_base_bdev(&req);
  }
  SPDK_RPC_REGISTER("bdev_raid_remove_base_bdev", rpc_bdev_raid_remove_base_bdev, SPDK_RPC_RUNTIME)
  
+diff --git a/schema/schema.yaml b/schema/schema.yaml
+index fd53dee..4e7e6d6 100644
+--- a/schema/schema.yaml
++++ b/schema/schema.yaml
+@@ -4794,6 +4794,10 @@ methods:
+       - name: superblock
+         type: boolean
+         description: 'If set, information about raid bdev will be stored in superblock on each base bdev (default: `false`)'
++      - name: incarnation
++        type: string
++        required: true
++        description: Identity of the creating control-plane incarnation; there is no creation without one (Evariops 0014)
+   - name: bdev_raid_delete
+     description: Removes RAID bdev.
+     result:
+@@ -4807,6 +4811,9 @@ methods:
+       - name: clear_sb
+         type: boolean
+         description: If set, clear the superblock from all base bdevs
++      - name: expected_incarnation
++        type: string
++        description: -ESTALE when the raid's incarnation differs; omitting it skips the check, for manual rescue only (Evariops 0014)
+   - name: bdev_raid_add_base_bdev
+     description: |
+       Add base bdev to existing raid bdev. The raid bdev must have an empty base bdev slot.
+@@ -4829,6 +4836,9 @@ methods:
+       - name: write_only
+         type: boolean
+         description: Attach the base bdev write-only, for a seeded rebuild to complete (Evariops 0013)
++      - name: expected_incarnation
++        type: string
++        description: -ESTALE when the raid's incarnation differs (Evariops 0014)
+   - name: bdev_raid_remove_base_bdev
+     description: Remove base bdev from existing raid bdev.
+     result:
+@@ -4839,6 +4849,9 @@ methods:
+         type: string
+         required: true
+         description: Base bdev name in RAID
++      - name: expected_incarnation
++        type: string
++        description: -ESTALE when the raid's incarnation differs (Evariops 0014)
+   - name: bdev_split_create
+     description: This is used to split an underlying block device and create several smaller equal-sized vbdevs.
+     params:
 diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
-index 4b33262..c262806 100644
+index c488c25..72e54d0 100644
 --- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
 +++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
-@@ -18,6 +18,8 @@
+@@ -19,6 +19,8 @@
  #define MAX_RAIDS 2
  #define BLOCK_CNT (1024ul * 1024ul * 1024ul * 1024ul)
  #define MD_SIZE 8
@@ -459,44 +395,44 @@ index 4b33262..c262806 100644
  
  struct spdk_bdev_channel {
  	struct spdk_io_channel *channel;
-@@ -552,6 +554,10 @@ spdk_json_decode_object(const struct spdk_json_val *values,
+@@ -555,6 +557,10 @@ spdk_json_decode_object(const struct spdk_json_val *values,
  		_out->strip_size_kb = req->strip_size_kb;
- 		_out->level = req->level;
- 		_out->superblock_enabled = req->superblock_enabled;
+ 		_out->raid_level = req->raid_level;
+ 		_out->superblock = req->superblock;
 +		if (req->incarnation != NULL) {
 +			_out->incarnation = strdup(req->incarnation);
 +			SPDK_CU_ASSERT_FATAL(_out->incarnation != NULL);
 +		}
- 		_out->base_bdevs.num_base_bdevs = req->base_bdevs.num_base_bdevs;
- 		for (i = 0; i < req->base_bdevs.num_base_bdevs; i++) {
- 			_out->base_bdevs.base_bdevs[i] = strdup(req->base_bdevs.base_bdevs[i]);
-@@ -856,6 +862,8 @@ create_test_req(struct rpc_bdev_raid_create *r, const char *raid_name,
+ 		_out->base_bdevs.count = req->base_bdevs.count;
+ 		for (i = 0; i < req->base_bdevs.count; i++) {
+ 			_out->base_bdevs.items[i] = strdup(req->base_bdevs.items[i]);
+@@ -859,6 +865,8 @@ create_test_req(struct rpc_bdev_raid_create_ctx *r, const char *raid_name,
  	r->strip_size_kb = (g_strip_size * g_block_len) / 1024;
- 	r->level = 123;
- 	r->superblock_enabled = superblock_enabled;
+ 	r->raid_level = 123;
+ 	r->superblock = superblock_enabled;
 +	r->incarnation = strdup(UT_INCARNATION);
 +	SPDK_CU_ASSERT_FATAL(r->incarnation != NULL);
- 	r->base_bdevs.num_base_bdevs = g_max_base_drives;
+ 	r->base_bdevs.count = g_max_base_drives;
  	for (i = 0; i < g_max_base_drives; i++, bbdev_idx++) {
  		snprintf(name, 16, "%s%u%s", "Nvme", bbdev_idx, "n1");
-@@ -888,6 +896,7 @@ free_test_req(struct rpc_bdev_raid_create *r)
+@@ -891,6 +899,7 @@ free_test_req(struct rpc_bdev_raid_create_ctx *r)
  	uint8_t i;
  
  	free(r->name);
 +	free(r->incarnation);
- 	for (i = 0; i < r->base_bdevs.num_base_bdevs; i++) {
- 		free(r->base_bdevs.base_bdevs[i]);
+ 	for (i = 0; i < r->base_bdevs.count; i++) {
+ 		free(r->base_bdevs.items[i]);
  	}
-@@ -899,6 +908,8 @@ create_raid_bdev_delete_req(struct rpc_bdev_raid_delete *r, const char *raid_nam
- {
+@@ -903,6 +912,8 @@ create_raid_bdev_delete_req(struct rpc_bdev_raid_delete_ctx *r, const char *raid
  	r->name = strdup(raid_name);
+ 	r->clear_sb = false;
  	SPDK_CU_ASSERT_FATAL(r->name != NULL);
 +	/* Evariops 0014: unchecked unless a test names the incarnation it expects. */
 +	r->expected_incarnation = NULL;
  
  	g_rpc_req = r;
  	g_rpc_req_size = sizeof(*r);
-@@ -974,6 +985,64 @@ test_delete_raid(void)
+@@ -977,6 +988,64 @@ test_delete_raid(void)
  	reset_globals();
  }
  
@@ -504,7 +440,7 @@ index 4b33262..c262806 100644
 +static void
 +test_create_raid_without_incarnation(void)
 +{
-+	struct rpc_bdev_raid_create req;
++	struct rpc_bdev_raid_create_ctx req;
 +
 +	set_globals();
 +	CU_ASSERT(raid_bdev_init() == 0);
@@ -527,8 +463,8 @@ index 4b33262..c262806 100644
 +static void
 +test_delete_raid_stale_incarnation(void)
 +{
-+	struct rpc_bdev_raid_create construct_req;
-+	struct rpc_bdev_raid_delete delete_req;
++	struct rpc_bdev_raid_create_ctx construct_req;
++	struct rpc_bdev_raid_delete_ctx delete_req;
 +
 +	set_globals();
 +	CU_ASSERT(raid_bdev_init() == 0);
@@ -561,7 +497,7 @@ index 4b33262..c262806 100644
  static void
  test_create_raid_invalid_args(void)
  {
-@@ -1832,6 +1901,8 @@ main(int argc, char **argv)
+@@ -1829,6 +1898,8 @@ main(int argc, char **argv)
  	CU_ADD_TEST(suite, test_create_raid);
  	CU_ADD_TEST(suite, test_create_raid_superblock);
  	CU_ADD_TEST(suite, test_delete_raid);

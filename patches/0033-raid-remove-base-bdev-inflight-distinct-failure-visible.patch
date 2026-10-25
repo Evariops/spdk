@@ -1,8 +1,8 @@
 diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
-index b8193b7..228233a 100644
+index 81a4dad..ddc2c30 100644
 --- a/module/bdev/raid/bdev_raid.c
 +++ b/module/bdev/raid/bdev_raid.c
-@@ -513,6 +513,9 @@ raid_bdev_free_base_bdev_resource(struct raid_base_bdev_info *base_info)
+@@ -512,6 +512,9 @@ raid_bdev_free_base_bdev_resource(struct raid_base_bdev_info *base_info)
  		spdk_uuid_set_null(&base_info->uuid);
  	}
  	base_info->is_failed = false;
@@ -12,7 +12,7 @@ index b8193b7..228233a 100644
  	raid_bdev_base_bdev_state_touch(base_info);
  
  	/* clear `data_offset` to allow it to be recalculated during configuration */
-@@ -1280,14 +1283,16 @@ raid_bdev_write_info_json(struct raid_bdev *raid_bdev, struct spdk_json_write_ct
+@@ -1279,14 +1282,16 @@ raid_bdev_write_info_json(struct raid_bdev *raid_bdev, struct spdk_json_write_ct
  		spdk_json_write_named_bool(w, "is_configured", base_info->is_configured);
  		spdk_json_write_named_uint64(w, "data_offset", base_info->data_offset);
  		spdk_json_write_named_uint64(w, "data_size", base_info->data_size);
@@ -34,7 +34,7 @@ index b8193b7..228233a 100644
  		spdk_json_write_named_uint64(w, "content_generation",
  					     base_info->content_generation);
  		spdk_json_write_named_uint64(w, "view_epoch", base_info->view_epoch);
-@@ -2457,7 +2462,24 @@ _raid_bdev_remove_base_bdev(struct raid_base_bdev_info *base_info,
+@@ -2540,7 +2545,24 @@ _raid_bdev_remove_base_bdev(struct raid_base_bdev_info *base_info,
  
  	assert(spdk_get_thread() == spdk_thread_get_app_thread());
  
@@ -60,7 +60,7 @@ index b8193b7..228233a 100644
  		return -ENODEV;
  	}
  
-@@ -2545,12 +2567,38 @@ static void
+@@ -2628,12 +2650,38 @@ static void
  raid_bdev_fail_base_remove_cb(void *ctx, int status)
  {
  	struct raid_base_bdev_info *base_info = ctx;
@@ -103,7 +103,7 @@ index b8193b7..228233a 100644
  }
  
  static void
-@@ -2559,9 +2607,14 @@ _raid_bdev_fail_base_bdev(void *ctx)
+@@ -2642,9 +2690,14 @@ _raid_bdev_fail_base_bdev(void *ctx)
  	struct raid_base_bdev_info *base_info = ctx;
  	int rc;
  
@@ -119,7 +119,7 @@ index b8193b7..228233a 100644
  	base_info->is_failed = true;
  	raid_bdev_base_bdev_state_touch(base_info);
  
-@@ -2673,7 +2726,13 @@ raid_bdev_event_base_bdev(enum spdk_bdev_event_type type, struct spdk_bdev *bdev
+@@ -2756,7 +2809,13 @@ raid_bdev_event_base_bdev(enum spdk_bdev_event_type type, struct spdk_bdev *bdev
  	switch (type) {
  	case SPDK_BDEV_EVENT_REMOVE:
  		rc = raid_bdev_remove_base_bdev(bdev, NULL, NULL, NULL);
@@ -134,7 +134,7 @@ index b8193b7..228233a 100644
  			SPDK_ERRLOG("Failed to remove base bdev %s: %s\n",
  				    spdk_bdev_get_name(bdev), spdk_strerror(-rc));
  		}
-@@ -2827,8 +2886,23 @@ raid_bdev_process_finish_target_removed(void *ctx, int status)
+@@ -2938,8 +2997,23 @@ raid_bdev_process_finish_target_removed(void *ctx, int status)
  {
  	struct raid_bdev_process *process = ctx;
  
@@ -161,10 +161,10 @@ index b8193b7..228233a 100644
  
  	spdk_thread_send_msg(process->thread, _raid_bdev_process_finish_done, process);
 diff --git a/module/bdev/raid/bdev_raid.h b/module/bdev/raid/bdev_raid.h
-index d137c1a..44066af 100644
+index 5e66302..371ab5d 100644
 --- a/module/bdev/raid/bdev_raid.h
 +++ b/module/bdev/raid/bdev_raid.h
-@@ -110,6 +110,12 @@ struct raid_base_bdev_info {
+@@ -79,6 +79,12 @@ struct raid_base_bdev_info {
  	/* Set to true to indicate that the base bdev is being removed because of a failure */
  	bool			is_failed;
  
@@ -175,10 +175,10 @@ index d137c1a..44066af 100644
 +	int			remove_error;
 +
  	/* callback for base bdev configuration */
- 	raid_base_bdev_cb	configure_cb;
+ 	raid_bdev_action_cb	configure_cb;
  
-@@ -354,6 +360,12 @@ enum raid_bdev_state raid_bdev_str_to_state(const char *str);
- const char *raid_bdev_state_to_str(enum raid_bdev_state state);
+@@ -327,6 +333,12 @@ const char *raid_bdev_level_to_str(enum spdk_bdev_raid_level level);
+ const char *raid_bdev_state_to_str(enum spdk_bdev_raid_state state);
  const char *raid_bdev_process_to_str(enum raid_process_type value);
  void raid_bdev_write_info_json(struct raid_bdev *raid_bdev, struct spdk_json_write_ctx *w);
 +/* Evariops 0033 — callers must distinguish these:
@@ -188,13 +188,13 @@ index d137c1a..44066af 100644
 + *   -ENODEV   the bdev is not a member of any raid, or the slot is not
 + *             configured — the end state is already reached. */
  int raid_bdev_remove_base_bdev(struct spdk_bdev *base_bdev, const char *expected_incarnation,
- 			       raid_base_bdev_cb cb_fn, void *cb_ctx);
+ 			       raid_bdev_action_cb cb_fn, void *cb_ctx);
  
 diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
-index 806c8d3..9efc3c3 100644
+index a3b09c2..f655184 100644
 --- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
 +++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
-@@ -170,6 +170,9 @@ DEFINE_STUB(spdk_json_write_object_begin, int, (struct spdk_json_write_ctx *w),
+@@ -163,6 +163,9 @@ DEFINE_STUB(spdk_json_write_object_begin, int, (struct spdk_json_write_ctx *w),
  DEFINE_STUB(spdk_json_write_named_object_begin, int, (struct spdk_json_write_ctx *w,
  		const char *name), 0);
  DEFINE_STUB(spdk_json_write_string, int, (struct spdk_json_write_ctx *w, const char *val), 0);

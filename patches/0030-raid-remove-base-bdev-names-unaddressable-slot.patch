@@ -1,8 +1,8 @@
 diff --git a/module/bdev/raid/bdev_raid_rpc.c b/module/bdev/raid/bdev_raid_rpc.c
-index 720a6cb..85ac078 100644
+index f4a15e1..ab1a943 100644
 --- a/module/bdev/raid/bdev_raid_rpc.c
 +++ b/module/bdev/raid/bdev_raid_rpc.c
-@@ -885,6 +885,29 @@ rpc_bdev_raid_remove_base_bdev(struct spdk_jsonrpc_request *request,
+@@ -588,6 +588,29 @@ rpc_bdev_raid_remove_base_bdev(struct spdk_jsonrpc_request *request,
  
  	rc = spdk_bdev_open_ext(req.name, false, rpc_bdev_raid_event_cb, NULL, &desc);
  	if (rc != 0) {

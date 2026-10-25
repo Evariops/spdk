@@ -1,5 +1,5 @@
 diff --git a/lib/rpc/rpc.c b/lib/rpc/rpc.c
-index ead7c66..46446e2 100644
+index f0333ea..2c56046 100644
 --- a/lib/rpc/rpc.c
 +++ b/lib/rpc/rpc.c
 @@ -5,6 +5,7 @@
@@ -10,7 +10,7 @@ index ead7c66..46446e2 100644
  
  #include "spdk/stdinc.h"
  
-@@ -147,6 +148,7 @@ struct spdk_rpc_server *
+@@ -148,6 +149,7 @@ struct spdk_rpc_server *
  spdk_rpc_server_listen(const char *listen_addr)
  {
  	struct spdk_rpc_server *server;
@@ -18,7 +18,7 @@ index ead7c66..46446e2 100644
  	int rc;
  
  	server = calloc(1, sizeof(struct spdk_rpc_server));
-@@ -194,10 +196,19 @@ spdk_rpc_server_listen(const char *listen_addr)
+@@ -195,10 +197,19 @@ spdk_rpc_server_listen(const char *listen_addr)
  	 */
  	unlink(server->listen_addr_unix.sun_path);
  
@@ -38,7 +38,7 @@ index ead7c66..46446e2 100644
  	if (server->jsonrpc_server == NULL) {
  		SPDK_ERRLOG("spdk_jsonrpc_server_listen() failed\n");
  		close(server->lock_fd);
-@@ -205,6 +216,18 @@ spdk_rpc_server_listen(const char *listen_addr)
+@@ -206,6 +217,18 @@ spdk_rpc_server_listen(const char *listen_addr)
  		goto ret;
  	}
  
@@ -76,13 +76,13 @@ index 5801065..641a9e9 100644
  
  include $(SPDK_ROOT_DIR)/mk/spdk.unittest.mk
 diff --git a/test/unit/lib/rpc/rpc.c/rpc_ut.c b/test/unit/lib/rpc/rpc.c/rpc_ut.c
-index 1512b10..b438ab6 100644
+index b630344..ce0dc56 100644
 --- a/test/unit/lib/rpc/rpc.c/rpc_ut.c
 +++ b/test/unit/lib/rpc/rpc.c/rpc_ut.c
 @@ -24,9 +24,6 @@ DEFINE_STUB_V(spdk_jsonrpc_end_result, (struct spdk_jsonrpc_request *request,
+ 					struct spdk_json_write_ctx *w));
  DEFINE_STUB(spdk_jsonrpc_begin_result, struct spdk_json_write_ctx *,
  	    (struct spdk_jsonrpc_request *request), (void *)1);
- DEFINE_STUB(spdk_json_decode_bool, int, (const struct spdk_json_val *val, void *out), 0);
 -DEFINE_STUB(spdk_jsonrpc_server_listen, struct spdk_jsonrpc_server *, (int domain, int protocol,
 -		struct sockaddr *listen_addr, socklen_t addrlen, spdk_jsonrpc_handle_request_fn handle_request),
 -	    (struct spdk_jsonrpc_server *)0Xdeaddead);

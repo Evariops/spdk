@@ -1,8 +1,8 @@
 diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
-index d448bbe..5064454 100644
+index 9e05397..89a927c 100644
 --- a/module/bdev/raid/bdev_raid.c
 +++ b/module/bdev/raid/bdev_raid.c
-@@ -3116,14 +3116,20 @@ raid_bdev_process_finish(struct raid_bdev_process *process, int status)
+@@ -3227,14 +3227,20 @@ raid_bdev_process_finish(struct raid_bdev_process *process, int status)
  	assert(process->state == RAID_PROCESS_STATE_RUNNING);
  	process->state = RAID_PROCESS_STATE_STOPPING;
  
@@ -26,7 +26,7 @@ index d448bbe..5064454 100644
  	if (process->window_range_locked) {
  		raid_bdev_process_unlock_window_range(process);
  	} else {
-@@ -3131,15 +3137,38 @@ raid_bdev_process_finish(struct raid_bdev_process *process, int status)
+@@ -3242,15 +3248,38 @@ raid_bdev_process_finish(struct raid_bdev_process *process, int status)
  	}
  }
  
@@ -69,7 +69,7 @@ index d448bbe..5064454 100644
  }
  
  static void
-@@ -3149,6 +3178,13 @@ raid_bdev_process_window_range_unlocked(void *ctx, int status)
+@@ -3260,6 +3289,13 @@ raid_bdev_process_window_range_unlocked(void *ctx, int status)
  
  	if (status != 0) {
  		SPDK_ERRLOG("Failed to unlock LBA range: %s\n", spdk_strerror(-status));
@@ -83,7 +83,7 @@ index d448bbe..5064454 100644
  		raid_bdev_process_finish(process, status);
  		return;
  	}
-@@ -3216,7 +3252,11 @@ raid_bdev_process_request_complete(struct raid_bdev_process_request *process_req
+@@ -3327,7 +3363,11 @@ raid_bdev_process_request_complete(struct raid_bdev_process_request *process_req
  
  	process->window_remaining -= process_req->num_blocks;
  	if (process->window_remaining == 0) {
@@ -96,7 +96,7 @@ index d448bbe..5064454 100644
  			raid_bdev_process_finish(process, process->window_status);
  			return;
  		}
-@@ -3335,6 +3375,13 @@ raid_bdev_process_window_range_locked(void *ctx, int status)
+@@ -3446,6 +3486,13 @@ raid_bdev_process_window_range_locked(void *ctx, int status)
  
  	if (status != 0) {
  		SPDK_ERRLOG("Failed to lock LBA range: %s\n", spdk_strerror(-status));

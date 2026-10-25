@@ -1,8 +1,8 @@
 diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
-index 40d393d..dd3cb51 100644
+index cef716a..3c50e57 100644
 --- a/module/bdev/raid/bdev_raid.c
 +++ b/module/bdev/raid/bdev_raid.c
-@@ -1228,17 +1228,30 @@ raid_bdev_write_info_json(struct raid_bdev *raid_bdev, struct spdk_json_write_ct
+@@ -1227,17 +1227,30 @@ raid_bdev_write_info_json(struct raid_bdev *raid_bdev, struct spdk_json_write_ct
  	spdk_json_write_named_uint32(w, "num_base_bdevs_discovered", raid_bdev->num_base_bdevs_discovered);
  	spdk_json_write_named_uint32(w, "num_base_bdevs_operational",
  				     raid_bdev->num_base_bdevs_operational);
@@ -40,10 +40,10 @@ index 40d393d..dd3cb51 100644
  		struct raid_bdev_process *process = raid_bdev->process;
  		uint64_t offset = process->window_offset;
 diff --git a/module/bdev/raid/bdev_raid.h b/module/bdev/raid/bdev_raid.h
-index ebe39cc..d137c1a 100644
+index a982709..5e66302 100644
 --- a/module/bdev/raid/bdev_raid.h
 +++ b/module/bdev/raid/bdev_raid.h
-@@ -296,6 +296,17 @@ struct raid_bdev {
+@@ -265,6 +265,17 @@ struct raid_bdev {
  	/* Raid bdev background process, e.g. rebuild */
  	struct raid_bdev_process	*process;
  
@@ -59,10 +59,10 @@ index ebe39cc..d137c1a 100644
 +	int64_t				last_degraded_ts;		/* unix seconds of the last event */
 +
  	/* Callback and context for raid_bdev configuration */
- 	raid_bdev_configure_cb		configure_cb;
+ 	raid_bdev_action_cb		configure_cb;
  	void				*configure_cb_ctx;
 diff --git a/module/bdev/raid/raid5f.c b/module/bdev/raid/raid5f.c
-index 9d8e2c6..1d7dbba 100644
+index 496265a..bbb9cd9 100644
 --- a/module/bdev/raid/raid5f.c
 +++ b/module/bdev/raid/raid5f.c
 @@ -16,6 +16,17 @@

@@ -1,5 +1,5 @@
 diff --git a/module/bdev/raid/bdev_raid_rpc.c b/module/bdev/raid/bdev_raid_rpc.c
-index 6ded0ca..d4127d2 100644
+index 40f0600..d8e8283 100644
 --- a/module/bdev/raid/bdev_raid_rpc.c
 +++ b/module/bdev/raid/bdev_raid_rpc.c
 @@ -8,6 +8,8 @@
@@ -11,7 +11,7 @@ index 6ded0ca..d4127d2 100644
  #include "spdk/util.h"
  #include "spdk/string.h"
  #include "spdk/log.h"
-@@ -670,9 +672,9 @@ SPDK_RPC_REGISTER("bdev_raid_add_base_bdev", rpc_bdev_raid_add_base_bdev, SPDK_R
+@@ -389,9 +391,9 @@ SPDK_RPC_REGISTER("bdev_raid_add_base_bdev", rpc_bdev_raid_add_base_bdev, SPDK_R
   * progress shows up as the raid's process in bdev_raid_get_bdevs, and
   * completion makes the member read-eligible and CONFIGURED in the superblock. */
  
@@ -24,7 +24,7 @@ index 6ded0ca..d4127d2 100644
  #define RAID_SEEDED_REBUILD_MAX_RANGES 4096u
  
  struct rpc_bdev_raid_start_seeded_rebuild {
-@@ -759,51 +761,40 @@ seed_range_cmp(const void *a, const void *b)
+@@ -478,51 +480,40 @@ seed_range_cmp(const void *a, const void *b)
  	return 0;
  }
  
@@ -92,7 +92,7 @@ index 6ded0ca..d4127d2 100644
  			base_info = iter;
  			break;
  		}
-@@ -811,24 +802,41 @@ rpc_bdev_raid_start_seeded_rebuild(struct spdk_jsonrpc_request *request,
+@@ -530,24 +521,41 @@ rpc_bdev_raid_start_seeded_rebuild(struct spdk_jsonrpc_request *request,
  	if (base_info == NULL) {
  		spdk_jsonrpc_send_error_response_fmt(request, -ENODEV,
  						     "base bdev %s is not a member of raid bdev %s",
@@ -144,7 +144,7 @@ index 6ded0ca..d4127d2 100644
  
  		if (range->num_blocks == 0 || range->offset_blocks >= blockcnt ||
  		    range->num_blocks > blockcnt - range->offset_blocks) {
-@@ -837,55 +845,85 @@ rpc_bdev_raid_start_seeded_rebuild(struct spdk_jsonrpc_request *request,
+@@ -556,55 +564,85 @@ rpc_bdev_raid_start_seeded_rebuild(struct spdk_jsonrpc_request *request,
  							     "exceeds the raid size (%" PRIu64 " blocks)",
  							     i, range->offset_blocks, range->num_blocks,
  							     blockcnt);
@@ -250,7 +250,7 @@ index 6ded0ca..d4127d2 100644
  
  cleanup:
  	free_rpc_bdev_raid_start_seeded_rebuild(&req);
-@@ -893,6 +931,107 @@ cleanup:
+@@ -612,6 +650,107 @@ cleanup:
  SPDK_RPC_REGISTER("bdev_raid_start_seeded_rebuild", rpc_bdev_raid_start_seeded_rebuild,
  		  SPDK_RPC_RUNTIME)
  
@@ -355,14 +355,14 @@ index 6ded0ca..d4127d2 100644
 +SPDK_RPC_REGISTER("bdev_raid_start_seeded_rebuild_from_epoch",
 +		  rpc_bdev_raid_start_seeded_rebuild_from_epoch, SPDK_RPC_RUNTIME)
 +
- struct rpc_bdev_raid_remove_base_bdev {
- 	/* Base bdev name */
- 	char *name;
+ static void
+ rpc_bdev_raid_remove_base_bdev_done(void *ctx, int status)
+ {
 diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
-index f5a439b..11b46f2 100644
+index d11b60e..811f718 100644
 --- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
 +++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
-@@ -246,6 +246,40 @@ DEFINE_STUB_V(raid_rebuild_outcome_set_verifying, (struct raid_rebuild_outcome *
+@@ -243,6 +243,40 @@ DEFINE_STUB_V(raid_rebuild_outcome_set_verifying, (struct raid_rebuild_outcome *
   * has CBT here (-ENODEV), which the raid passes over. */
  DEFINE_STUB(vbdev_cbt_auto_epoch_open, int, (const char *bdev_name, const char *stale_backend_id),
  	    -ENODEV);
@@ -403,7 +403,7 @@ index f5a439b..11b46f2 100644
  /* Evariops 0021: the envelopes pace and admit the rebuilds. At their defaults here:
   * no cap (0), and every rebuild admitted. */
  DEFINE_STUB(raid_envelope_active_mb_sec, uint32_t, (enum raid_envelope_class klass), 0);
-@@ -1562,9 +1596,12 @@ test_raid_process(void)
+@@ -1559,9 +1593,12 @@ test_raid_process(void)
  /* Evariops 0045: a seeded rebuild copies its seed ranges and nothing else. A
   * window that intersected a range used to be copied whole: scattered writes
   * across a volume dirty every window, and the "seeded" pass copied the volume.
@@ -416,9 +416,9 @@ index f5a439b..11b46f2 100644
 +seeded_rebuild_run(uint32_t window_size_kb, const struct raid_bdev_seed_range *seed, uint32_t num_ranges,
 +		   bool via_epoch, int query_rc)
  {
- 	struct rpc_bdev_raid_create req;
- 	struct rpc_bdev_raid_delete destroy_req;
-@@ -1599,20 +1636,43 @@ run_seeded_rebuild(uint32_t window_size_kb, const struct raid_bdev_seed_range *s
+ 	struct rpc_bdev_raid_create_ctx req;
+ 	struct rpc_bdev_raid_delete_ctx destroy_req;
+@@ -1596,20 +1633,43 @@ run_seeded_rebuild(uint32_t window_size_kb, const struct raid_bdev_seed_range *s
  	pbdev->module_private = &num_blocks_processed;
  	pbdev->min_base_bdevs_operational = 0;
  
@@ -470,7 +470,7 @@ index f5a439b..11b46f2 100644
  
  	create_raid_bdev_delete_req(&destroy_req, "raid1", 0);
  	rpc_bdev_raid_delete(NULL, NULL);
-@@ -1628,6 +1688,40 @@ run_seeded_rebuild(uint32_t window_size_kb, const struct raid_bdev_seed_range *s
+@@ -1625,6 +1685,40 @@ run_seeded_rebuild(uint32_t window_size_kb, const struct raid_bdev_seed_range *s
  	return num_blocks_processed;
  }
  
@@ -511,7 +511,7 @@ index f5a439b..11b46f2 100644
  static void
  test_raid_process_seeded_copies_only_its_ranges(void)
  {
-@@ -2080,6 +2174,8 @@ main(int argc, char **argv)
+@@ -2077,6 +2171,8 @@ main(int argc, char **argv)
  	CU_ADD_TEST(suite, test_raid_process_seeded_copies_only_its_ranges);
  	CU_ADD_TEST(suite, test_raid_process_seeded_range_across_windows);
  	CU_ADD_TEST(suite, test_raid_process_seeded_skips_a_clean_span_without_a_window);

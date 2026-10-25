@@ -1,8 +1,8 @@
 diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
-index 0bd65e1..fbb86cb 100644
+index 1741cf8..ea4faa8 100644
 --- a/module/bdev/raid/bdev_raid.c
 +++ b/module/bdev/raid/bdev_raid.c
-@@ -5982,6 +5982,19 @@ raid_bdev_examine_cont(struct spdk_bdev *bdev, const struct raid_bdev_superblock
+@@ -6160,6 +6160,19 @@ raid_bdev_examine_cont(struct spdk_bdev *bdev, const struct raid_bdev_superblock
  	case 0:
  		/* valid superblock found */
  		SPDK_DEBUGLOG(bdev_raid, "raid superblock found on bdev %s\n", bdev->name);
@@ -23,10 +23,10 @@ index 0bd65e1..fbb86cb 100644
  		return;
  	case -EINVAL:
 diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
-index fc08614..e7b9d33 100644
+index d40e6cf..5480ada 100644
 --- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
 +++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
-@@ -3220,6 +3220,52 @@ test_raid_reassembled_from_a_stamped_superblock_keeps_its_view(void)
+@@ -3217,6 +3217,52 @@ test_raid_reassembled_from_a_stamped_superblock_keeps_its_view(void)
  	ut_view_teardown();
  }
  
@@ -69,7 +69,7 @@ index fc08614..e7b9d33 100644
 +	raid_bdev = raid_bdev_find_by_uuid(&sb->uuid);
 +	CU_ASSERT(raid_bdev != NULL);
 +	if (raid_bdev != NULL) {
-+		raid_bdev_delete(raid_bdev, NULL, NULL);
++		raid_bdev_delete(raid_bdev, false, NULL, NULL);
 +		poll_app_thread();
 +	}
 +
@@ -79,7 +79,7 @@ index fc08614..e7b9d33 100644
  /* Evariops 0054: fills the superblock the suite's stubbed init leaves empty, as
   * init writes it, at minor: each slot under its member, CONFIGURED or MISSING,
   * at the generation and epoch the raid holds for it. */
-@@ -3577,6 +3623,7 @@ main(int argc, char **argv)
+@@ -3574,6 +3620,7 @@ main(int argc, char **argv)
  	CU_ADD_TEST(suite, test_raid_create_with_declared_slots_leaves_the_slots_past_its_legs_empty);
  	CU_ADD_TEST(suite, test_raid_add_into_a_raid_of_a_lineage_checks_the_stamp);
  	CU_ADD_TEST(suite, test_raid_reassembled_from_a_stamped_superblock_keeps_its_view);

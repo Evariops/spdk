@@ -36,13 +36,13 @@ docker pull ghcr.io/evariops/spdk-debug:<tag>
 There is no `latest` tag. All exact tags are **immutable**.
 
 ```
-ghcr.io/evariops/spdk:v26.01.0   ← exact version, never changes
-ghcr.io/evariops/spdk:v26.01     ← floating, follows the latest patch
+ghcr.io/evariops/spdk:v26.09.0   ← exact version, never changes
+ghcr.io/evariops/spdk:v26.09     ← floating, follows the latest patch
 ```
 
 The version scheme is **`v<upstream>.<patch>`** where the patch number tracks our rebuilds (Dockerfile changes, dependency bumps) of the same upstream release.
 
-> Git tags follow the convention `spdk/v26.01.0`.
+> Git tags follow the convention `spdk/v26.09.0`.
 
 ---
 
