@@ -1,0 +1,197 @@
+diff --git a/lib/ublk/ublk.c b/lib/ublk/ublk.c
+index fc5762e..d09bf83 100644
+--- a/lib/ublk/ublk.c
++++ b/lib/ublk/ublk.c
+@@ -26,6 +26,13 @@
+ 
+ #define LINUX_SECTOR_SHIFT				9
+ #define UBLK_IO_MAX_BYTES				SPDK_BDEV_LARGE_BUF_MAX_SIZE
++/* Evariops 0058: with user copy, a request's data moves by a vectored read or
++ * write of the char device, so it need not fit one iobuf buffer. It is carried
++ * in up to UBLK_IO_MAX_IOVS buffers of UBLK_IO_IOV_BYTES: a large iobuf buffer
++ * (132 KiB by default) holds one with room to align it on 4 KiB. */
++#define UBLK_IO_IOV_BYTES				(128 * 1024)
++#define UBLK_IO_MAX_IOVS				8
++#define UBLK_USER_COPY_IO_MAX_BYTES			(UBLK_IO_IOV_BYTES * UBLK_IO_MAX_IOVS)
+ #define UBLK_DEV_MAX_QUEUES				32
+ #define UBLK_DEV_MAX_QUEUE_DEPTH			1024
+ #define UBLK_QUEUE_REQUEST				32
+@@ -77,8 +84,12 @@ static const char *ublk_op_name[64] = {
+ typedef void (*ublk_get_buf_cb)(struct ublk_io *io);
+ 
+ struct ublk_io {
++	/* The first buffer: the request's address when the driver copies (no user copy). */
+ 	void			*payload;
+-	void			*mpool_entry;
++	/* Evariops 0058: the request's buffers, and the iobuf entries to give back. */
++	struct iovec		iovs[UBLK_IO_MAX_IOVS];
++	void			*mpool_entries[UBLK_IO_MAX_IOVS];
++	int			iovcnt;
+ 	bool			need_data;
+ 	bool			user_copy;
+ 	uint16_t		tag;
+@@ -1125,20 +1136,18 @@ static void
+ ublk_queue_user_copy(struct ublk_io *io, bool is_write)
+ {
+ 	struct ublk_queue *q = io->q;
+-	const struct ublksrv_io_desc *iod = io->iod;
+ 	struct io_uring_sqe *sqe;
+ 	uint64_t pos;
+-	uint32_t nbytes;
+ 
+-	nbytes = iod->nr_sectors * (1ULL << LINUX_SECTOR_SHIFT);
+ 	pos = ublk_user_copy_pos(q->q_id, io->tag);
+ 	sqe = io_uring_get_sqe(&q->ring);
+ 	assert(sqe);
+ 
++	assert(io->iod->nr_sectors * (1ULL << LINUX_SECTOR_SHIFT) == io->payload_size);
+ 	if (is_write) {
+-		io_uring_prep_read(sqe, 0, io->payload, nbytes, pos);
++		io_uring_prep_readv(sqe, 0, io->iovs, io->iovcnt, pos);
+ 	} else {
+-		io_uring_prep_write(sqe, 0, io->payload, nbytes, pos);
++		io_uring_prep_writev(sqe, 0, io->iovs, io->iovcnt, pos);
+ 	}
+ 	io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
+ 	io_uring_sqe_set_data64(sqe, build_user_data(io->tag, 0));
+@@ -1189,40 +1198,77 @@ ublk_queue_io(struct ublk_io *io)
+ 	}
+ }
+ 
++/* Evariops 0058: the length of the request's buffer i. Every buffer but the last is full. */
++static inline uint64_t
++ublk_io_iov_len(const struct ublk_io *io, int i)
++{
++	return spdk_min(io->payload_size - (uint64_t)i * UBLK_IO_IOV_BYTES, UBLK_IO_IOV_BYTES);
++}
++
++static void
++ublk_io_add_buffer(struct ublk_io *io, void *buf)
++{
++	assert(io->iovcnt < UBLK_IO_MAX_IOVS);
++	io->mpool_entries[io->iovcnt] = buf;
++	io->iovs[io->iovcnt].iov_base = (void *)(uintptr_t)SPDK_ALIGN_CEIL((uintptr_t)buf, 4096ULL);
++	io->iovs[io->iovcnt].iov_len = ublk_io_iov_len(io, io->iovcnt);
++	io->iovcnt++;
++}
++
++static void ublk_io_get_buffer_cb(struct spdk_iobuf_entry *iobuf, void *buf);
++
++/* Takes the request's buffers one at a time: when the pool is dry, the entry
++ * waits for one, and the callback goes on from there. */
++static void
++ublk_io_get_next_buffer(struct ublk_io *io)
++{
++	struct spdk_iobuf_channel *iobuf_ch = &io->q->poll_group->iobuf_ch;
++	void *buf;
++
++	while ((uint64_t)io->iovcnt * UBLK_IO_IOV_BYTES < io->payload_size) {
++		buf = spdk_iobuf_get(iobuf_ch, ublk_io_iov_len(io, io->iovcnt), &io->iobuf,
++				     ublk_io_get_buffer_cb);
++		if (buf == NULL) {
++			return;
++		}
++		ublk_io_add_buffer(io, buf);
++	}
++
++	io->payload = io->iovs[0].iov_base;
++	io->get_buf_cb(io);
++}
++
+ static void
+ ublk_io_get_buffer_cb(struct spdk_iobuf_entry *iobuf, void *buf)
+ {
+ 	struct ublk_io *io = SPDK_CONTAINEROF(iobuf, struct ublk_io, iobuf);
+ 
+-	io->mpool_entry = buf;
+-	assert(io->payload == NULL);
+-	io->payload = (void *)(uintptr_t)SPDK_ALIGN_CEIL((uintptr_t)buf, 4096ULL);
+-	io->get_buf_cb(io);
++	ublk_io_add_buffer(io, buf);
++	ublk_io_get_next_buffer(io);
+ }
+ 
+ static void
+ ublk_io_get_buffer(struct ublk_io *io, struct spdk_iobuf_channel *iobuf_ch,
+ 		   ublk_get_buf_cb get_buf_cb)
+ {
+-	void *buf;
+-
++	assert(iobuf_ch == &io->q->poll_group->iobuf_ch);
++	assert(io->payload == NULL && io->iovcnt == 0);
+ 	io->payload_size = io->iod->nr_sectors * (1ULL << LINUX_SECTOR_SHIFT);
+ 	io->get_buf_cb = get_buf_cb;
+-	buf = spdk_iobuf_get(iobuf_ch, io->payload_size, &io->iobuf, ublk_io_get_buffer_cb);
+-
+-	if (buf != NULL) {
+-		ublk_io_get_buffer_cb(&io->iobuf, buf);
+-	}
++	ublk_io_get_next_buffer(io);
+ }
+ 
+ static void
+ ublk_io_put_buffer(struct ublk_io *io, struct spdk_iobuf_channel *iobuf_ch)
+ {
+-	if (io->payload) {
+-		spdk_iobuf_put(iobuf_ch, io->mpool_entry, io->payload_size);
+-		io->mpool_entry = NULL;
+-		io->payload = NULL;
++	int i;
++
++	for (i = 0; i < io->iovcnt; i++) {
++		spdk_iobuf_put(iobuf_ch, io->mpool_entries[i], io->iovs[i].iov_len);
++		io->mpool_entries[i] = NULL;
+ 	}
++	io->iovcnt = 0;
++	io->payload = NULL;
+ }
+ 
+ static void
+@@ -1248,10 +1294,12 @@ _ublk_submit_bdev_io(struct ublk_queue *q, struct ublk_io *io)
+ 		} else {
+ 			read_cb = ublk_io_done;
+ 		}
+-		rc = spdk_bdev_read_blocks(desc, ch, io->payload, offset_blocks, num_blocks, read_cb, io);
++		rc = spdk_bdev_readv_blocks(desc, ch, io->iovs, io->iovcnt, offset_blocks, num_blocks,
++					    read_cb, io);
+ 		break;
+ 	case UBLK_IO_OP_WRITE:
+-		rc = spdk_bdev_write_blocks(desc, ch, io->payload, offset_blocks, num_blocks, ublk_io_done, io);
++		rc = spdk_bdev_writev_blocks(desc, ch, io->iovs, io->iovcnt, offset_blocks, num_blocks,
++					     ublk_io_done, io);
+ 		break;
+ 	case UBLK_IO_OP_FLUSH:
+ 		rc = spdk_bdev_flush_blocks(desc, ch, 0, spdk_bdev_get_num_blocks(ublk->bdev), ublk_io_done, io);
+@@ -1669,6 +1717,14 @@ ublk_set_params(struct spdk_ublk_dev *ublk)
+ 	return rc;
+ }
+ 
++/* Evariops 0058: the largest request a disk takes. Without user copy the driver
++ * copies into the request's address, one buffer, so it stays at one iobuf buffer. */
++static uint32_t
++ublk_max_io_bytes(void)
++{
++	return g_ublk_tgt.user_copy ? UBLK_USER_COPY_IO_MAX_BYTES : UBLK_IO_MAX_BYTES;
++}
++
+ static void
+ ublk_dev_info_init(struct spdk_ublk_dev *ublk)
+ {
+@@ -1676,7 +1732,7 @@ ublk_dev_info_init(struct spdk_ublk_dev *ublk)
+ 		.queue_depth = ublk->queue_depth,
+ 		.nr_hw_queues = ublk->num_queues,
+ 		.dev_id = ublk->ublk_id,
+-		.max_io_buf_bytes = UBLK_IO_MAX_BYTES,
++		.max_io_buf_bytes = ublk_max_io_bytes(),
+ 		.ublksrv_pid = getpid(),
+ 		.flags = UBLK_F_URING_CMD_COMP_IN_TASK,
+ 	};
+@@ -1717,7 +1773,7 @@ ublk_info_param_init(struct spdk_ublk_dev *ublk)
+ 			.io_min_shift = spdk_u32log2(io_min_size),
+ 			.io_opt_shift = spdk_u32log2(io_opt_size),
+ 			.dev_sectors = num_blocks * sectors_per_block,
+-			.max_sectors = UBLK_IO_MAX_BYTES >> LINUX_SECTOR_SHIFT,
++			.max_sectors = ublk_max_io_bytes() >> LINUX_SECTOR_SHIFT,
+ 		}
+ 	};
+ 

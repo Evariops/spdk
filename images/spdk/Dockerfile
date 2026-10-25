@@ -115,10 +115,13 @@ RUN sed -i '/^DIRS-y += delay/s/$/ cbt tier/' module/bdev/Makefile && \
 #   bdev_uring  — io_uring bdev for modern kernels (>= 5.1), SATA SSDs
 #   bdev_aio    — Linux AIO bdev fallback for all block devices
 #   nvmf_tcp    — NVMe-oF TCP target
+#   ublk        — a volume served to its own node's kernel as a block device
+#                 (/dev/ublkb<id>), with no NVMe-oF in between; patches
+#                 0058-0061 (request size, claim, resize, planned restart)
 #
 # Modules REMOVED (unused attack surface):
 #   iscsi-initiator, vhost, virtio, fsdev (FUSE), daos, rbd (Ceph),
-#   ublk (userspace block), dpdk-compressdev
+#   dpdk-compressdev
 RUN SPDK_ARCH=$([ "${TARGETARCH}" = "arm64" ] && echo "armv8-a" || echo "nehalem") && \
     DEBUG_FLAG=$([ "${BUILD_TYPE}" = "debug" ] && echo "--enable-debug" || true) && \
     ./configure \
@@ -137,7 +140,6 @@ RUN SPDK_ARCH=$([ "${TARGETARCH}" = "arm64" ] && echo "armv8-a" || echo "nehalem
         --without-fsdev \
         --without-daos \
         --without-rbd \
-        --without-ublk \
         --without-dpdk-compressdev
 
 RUN make -j"$(nproc)"

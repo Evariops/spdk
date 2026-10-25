@@ -1,0 +1,106 @@
+diff --git a/lib/ublk/ublk.c b/lib/ublk/ublk.c
+index d09bf83..2e457e0 100644
+--- a/lib/ublk/ublk.c
++++ b/lib/ublk/ublk.c
+@@ -8,6 +8,7 @@
+ #include "spdk/stdinc.h"
+ #include "spdk/string.h"
+ #include "spdk/bdev.h"
++#include "spdk/bdev_module.h"
+ #include "spdk/endian.h"
+ #include "spdk/env.h"
+ #include "spdk/likely.h"
+@@ -1588,6 +1589,50 @@ ublk_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev,
+ 	}
+ }
+ 
++/* Evariops 0059: a ublk disk is its bdev's only writer. It claims the bdev, so a
++ * second writer (an NVMe-oF namespace, a raid member, another disk) is refused,
++ * and a disk cannot start over a bdev another writer already claimed. Upstream
++ * opened the bdev for write without a claim. */
++static struct spdk_bdev_module ublk_bdev_module = {
++	.name	= "ublk",
++};
++
++static int
++ublk_open_bdev(struct spdk_ublk_dev *ublk, const char *bdev_name)
++{
++	int rc;
++
++	rc = spdk_bdev_open_ext(bdev_name, true, ublk_bdev_event_cb, ublk, &ublk->bdev_desc);
++	if (rc != 0) {
++		SPDK_ERRLOG("could not open bdev %s, error=%d\n", bdev_name, rc);
++		return rc;
++	}
++
++	rc = spdk_bdev_module_claim_bdev(spdk_bdev_desc_get_bdev(ublk->bdev_desc), ublk->bdev_desc,
++					 &ublk_bdev_module);
++	if (rc != 0) {
++		SPDK_ERRLOG("could not claim bdev %s for ublk %d, error=%d (Evariops 0059)\n",
++			    bdev_name, ublk->ublk_id, rc);
++		spdk_bdev_close(ublk->bdev_desc);
++		ublk->bdev_desc = NULL;
++		return rc;
++	}
++
++	return 0;
++}
++
++static void
++ublk_close_bdev(struct spdk_ublk_dev *ublk)
++{
++	if (ublk->bdev_desc == NULL) {
++		return;
++	}
++
++	spdk_bdev_module_release_bdev(spdk_bdev_desc_get_bdev(ublk->bdev_desc));
++	spdk_bdev_close(ublk->bdev_desc);
++	ublk->bdev_desc = NULL;
++}
++
+ static void
+ ublk_dev_init_io_cmds(struct io_uring *r, uint32_t q_depth)
+ {
+@@ -1851,10 +1896,7 @@ ublk_free_dev(struct spdk_ublk_dev *ublk)
+ 	/* All of the buffers associated with the queues have been freed, so now
+ 	 * continue with releasing resources for the rest of the ublk device.
+ 	 */
+-	if (ublk->bdev_desc) {
+-		spdk_bdev_close(ublk->bdev_desc);
+-		ublk->bdev_desc = NULL;
+-	}
++	ublk_close_bdev(ublk);
+ 
+ 	ublk_dev_list_unregister(ublk);
+ 	SPDK_NOTICELOG("ublk dev %d stopped\n", ublk->ublk_id);
+@@ -1965,9 +2007,8 @@ ublk_start_disk(const char *bdev_name, uint32_t ublk_id,
+ 	UBLK_DEBUGLOG(ublk, "bdev %s num_queues %d queue_depth %d\n",
+ 		      bdev_name, num_queues, queue_depth);
+ 
+-	rc = spdk_bdev_open_ext(bdev_name, true, ublk_bdev_event_cb, ublk, &ublk->bdev_desc);
++	rc = ublk_open_bdev(ublk, bdev_name);
+ 	if (rc != 0) {
+-		SPDK_ERRLOG("could not open bdev %s, error=%d\n", bdev_name, rc);
+ 		free(ublk);
+ 		return rc;
+ 	}
+@@ -1998,7 +2039,7 @@ ublk_start_disk(const char *bdev_name, uint32_t ublk_id,
+ 	ublk_info_param_init(ublk);
+ 	rc = ublk_ios_init(ublk);
+ 	if (rc != 0) {
+-		spdk_bdev_close(ublk->bdev_desc);
++		ublk_close_bdev(ublk);
+ 		free(ublk);
+ 		return rc;
+ 	}
+@@ -2132,9 +2173,8 @@ ublk_start_disk_recovery(const char *bdev_name, uint32_t ublk_id, ublk_ctrl_cb c
+ 	ublk->cdev_fd = -1;
+ 	ublk->ublk_id = ublk_id;
+ 
+-	rc = spdk_bdev_open_ext(bdev_name, true, ublk_bdev_event_cb, ublk, &ublk->bdev_desc);
++	rc = ublk_open_bdev(ublk, bdev_name);
+ 	if (rc != 0) {
+-		SPDK_ERRLOG("could not open bdev %s, error=%d\n", bdev_name, rc);
+ 		free(ublk);
+ 		return rc;
+ 	}
