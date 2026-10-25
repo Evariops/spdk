@@ -4,7 +4,7 @@ Out-of-tree patches applied on top of upstream SPDK during the container build (
 
 ## Application order
 
-Patches are applied in **lexicographic order of filename** (`0001` … `0062`) — the Dockerfile globs `patches/*.patch` and `git apply`s each. The numeric prefix IS the contract; do not rely on any other ordering. Order matters:
+Patches are applied in **lexicographic order of filename** (`0001` … `0063`) — the Dockerfile globs `patches/*.patch` and `git apply`s each. The numeric prefix IS the contract; do not rely on any other ordering. Order matters:
 
 | # | Patch | Touches | Depends on |
 |--:|:------|:--------|:-----------|
@@ -68,6 +68,7 @@ Patches are applied in **lexicographic order of filename** (`0001` … `0062`) �
 | 0060 | a ublk disk follows its bdev's resize — upstream logged `SPDK_BDEV_EVENT_RESIZE` as unsupported, so an online expansion of the bdev (an lvol resized) never reached the kernel device. A disk created on a driver with `UBLK_F_UPDATE_SIZE` now sends `UBLK_U_CMD_UPDATE_SIZE`, retried while another control command is in flight | lib/ublk | 0059 |
 | 0061 | a planned restart quiesces its ublk disks and releases them — `ublk_quiesce_disk {ublk_id, timeout_ms}` (fork RPC) sends `UBLK_U_CMD_QUIESCE_DEV`: the kernel holds the new requests, lets the in-flight ones complete and cancels the fetch commands. Upstream answered those aborts by deleting the device (`UBLK_CMD_DEL_DEV`), under its filesystem; a quiesced disk is released to the kernel instead, `QUIESCED`, for `ublk_recover_disk` to take back in this process or the next, with nothing to replay. Answered once the disk is released (its id free, its claim dropped); -EBUSY when in-flight requests outlive the timeout, and the disk keeps serving. Disks are created with `UBLK_F_QUIESCE` where the driver has it | lib/ublk | 0060 |
 | 0062 | `bdev_lvol_quiesce {name, ttl_ms}` / `bdev_lvol_unquiesce {name}` — `spdk_bdev_quiesce` on an lvol, as the lvol module (the only caller the API admits): I/O submitted after it waits, and the answer comes once the I/O in flight has completed. For a group snapshot of a volume served by a ublk disk, which has no NVMe-oF subsystem to drain. The quiesce holds at most `ttl_ms` (default 10 s, at most 60 s): past it the lvol is unquiesced and the expiry logged, and a late unquiesce answers -ENOENT | module/bdev/lvol (adds `vbdev_lvol_quiesce_rpc.c`), test/unit/lib/bdev/vbdev_lvol.c | 0057 (the RPC stays outside the schema) |
+| 0063 | `ublk_recover_disk` answers once the recovery ends — upstream answered as soon as its first control command (`UBLK_CMD_GET_DEV_INFO`) was submitted, so its caller could not tell a disk recovered from one the kernel no longer held. It now answers as `ublk_start_disk` does, from the control path's callback: success once `UBLK_CMD_END_USER_RECOVERY` completes, the kernel's error otherwise (-ENODEV when the id names no device: after a host reboot the disk is started anew) | lib/ublk | 0061 |
 
 0005 `#include`s `vbdev_tier.h` and adds `-I module/bdev/tier` to the lvol module CFLAGS via its own Makefile hunk; the Dockerfile injects the module dirs before applying patches (copy-before-apply ordering matters).
 
