@@ -297,7 +297,7 @@ index 61dfd3c..48e958c 100644
  raid_bdev_parse_superblock(struct raid_bdev_read_sb_ctx *ctx)
  {
 diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
-index 62a023b..d40e6cf 100644
+index 970a988..3dee44f 100644
 --- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
 +++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
 @@ -215,6 +215,11 @@ DEFINE_STUB(spdk_bdev_notify_blockcnt_change, int, (struct spdk_bdev *bdev, uint

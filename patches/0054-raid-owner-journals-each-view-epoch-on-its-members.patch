@@ -188,7 +188,7 @@ index 96aa344..a8b074f 100644
   * brief:
   * params:
 diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
-index f9cc136..62a023b 100644
+index e17703d..970a988 100644
 --- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
 +++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
 @@ -352,7 +352,7 @@ spdk_bdev_get_data_block_size(const struct spdk_bdev *bdev)
@@ -258,8 +258,8 @@ index f9cc136..62a023b 100644
 +	cb(g_ut_sb_write_status, raid_bdev, cb_ctx);
  }
  
- void
-@@ -2495,6 +2535,8 @@ ut_view_teardown(void)
+ /* Evariops 0053: the superblock clears the raids ask for. */
+@@ -2500,6 +2540,8 @@ ut_view_teardown(void)
  	reset_globals();
  	ut_legs_reset();
  	g_ut_alloc_superblock = false;
@@ -268,7 +268,7 @@ index f9cc136..62a023b 100644
  	g_max_base_drives = g_ut_saved_max_base_drives;
  }
  
-@@ -2516,15 +2558,7 @@ ut_view_create_req(struct rpc_bdev_raid_create_ctx *r, uint64_t epoch)
+@@ -2521,15 +2563,7 @@ ut_view_create_req(struct rpc_bdev_raid_create_ctx *r, uint64_t epoch)
  static struct raid_bdev_superblock *
  ut_sb(const struct spdk_uuid *lineage, const char *owner, uint64_t epoch)
  {
@@ -285,7 +285,7 @@ index f9cc136..62a023b 100644
  
  	memcpy(sb->signature, RAID_BDEV_SB_SIG, sizeof(sb->signature));
  	sb->version.major = RAID_BDEV_SB_VERSION_MAJOR;
-@@ -3178,6 +3212,296 @@ test_raid_reassembled_from_a_stamped_superblock_keeps_its_view(void)
+@@ -3208,6 +3242,296 @@ test_raid_reassembled_from_a_stamped_superblock_keeps_its_view(void)
  	ut_view_teardown();
  }
  
@@ -582,7 +582,7 @@ index f9cc136..62a023b 100644
  static int
  test_new_thread_fn(struct spdk_thread *thread)
  {
-@@ -3245,6 +3569,11 @@ main(int argc, char **argv)
+@@ -3276,6 +3600,11 @@ main(int argc, char **argv)
  	CU_ADD_TEST(suite, test_raid_create_with_declared_slots_leaves_the_slots_past_its_legs_empty);
  	CU_ADD_TEST(suite, test_raid_add_into_a_raid_of_a_lineage_checks_the_stamp);
  	CU_ADD_TEST(suite, test_raid_reassembled_from_a_stamped_superblock_keeps_its_view);

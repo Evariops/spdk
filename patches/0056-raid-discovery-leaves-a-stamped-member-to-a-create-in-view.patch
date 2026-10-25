@@ -23,10 +23,10 @@ index 1741cf8..ea4faa8 100644
  		return;
  	case -EINVAL:
 diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
-index d40e6cf..5480ada 100644
+index 3dee44f..75d587e 100644
 --- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
 +++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
-@@ -3217,6 +3217,52 @@ test_raid_reassembled_from_a_stamped_superblock_keeps_its_view(void)
+@@ -3247,6 +3247,52 @@ test_raid_reassembled_from_a_stamped_superblock_keeps_its_view(void)
  	ut_view_teardown();
  }
  
@@ -79,7 +79,7 @@ index d40e6cf..5480ada 100644
  /* Evariops 0054: fills the superblock the suite's stubbed init leaves empty, as
   * init writes it, at minor: each slot under its member, CONFIGURED or MISSING,
   * at the generation and epoch the raid holds for it. */
-@@ -3574,6 +3620,7 @@ main(int argc, char **argv)
+@@ -3605,6 +3651,7 @@ main(int argc, char **argv)
  	CU_ADD_TEST(suite, test_raid_create_with_declared_slots_leaves_the_slots_past_its_legs_empty);
  	CU_ADD_TEST(suite, test_raid_add_into_a_raid_of_a_lineage_checks_the_stamp);
  	CU_ADD_TEST(suite, test_raid_reassembled_from_a_stamped_superblock_keeps_its_view);
