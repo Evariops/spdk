@@ -1,5 +1,5 @@
 diff --git a/lib/ublk/ublk.c b/lib/ublk/ublk.c
-index dd90743..d7e1a24 100644
+index 41e6946..9877746 100644
 --- a/lib/ublk/ublk.c
 +++ b/lib/ublk/ublk.c
 @@ -71,11 +71,13 @@ static int ublk_ctrl_start_recovery(struct spdk_ublk_dev *ublk);
@@ -17,7 +17,7 @@ index dd90743..d7e1a24 100644
  	[UBLK_CMD_GET_DEV_INFO] = "UBLK_CMD_GET_DEV_INFO",
  	[UBLK_CMD_ADD_DEV] =	"UBLK_CMD_ADD_DEV",
  	[UBLK_CMD_DEL_DEV] =	"UBLK_CMD_DEL_DEV",
-@@ -157,6 +159,9 @@ struct spdk_ublk_dev {
+@@ -170,6 +172,9 @@ struct spdk_ublk_dev {
  	uint32_t		ctrl_ops_in_progress;
  	bool			is_closing;
  	bool			is_recovering;
@@ -27,7 +27,7 @@ index dd90743..d7e1a24 100644
  
  	TAILQ_ENTRY(spdk_ublk_dev) tailq;
  	TAILQ_ENTRY(spdk_ublk_dev) wait_tailq;
-@@ -189,6 +194,8 @@ struct ublk_tgt {
+@@ -223,6 +228,8 @@ struct ublk_tgt {
  	bool			user_recovery;
  	/* Evariops 0060: `ublk_drv` supports UBLK_F_UPDATE_SIZE */
  	bool			update_size;
@@ -36,7 +36,7 @@ index dd90743..d7e1a24 100644
  };
  
  static TAILQ_HEAD(, spdk_ublk_dev) g_ublk_devs = TAILQ_HEAD_INITIALIZER(g_ublk_devs);
-@@ -254,6 +261,9 @@ ublk_set_sqe_cmd_op(struct io_uring_sqe *sqe, uint32_t cmd_op)
+@@ -288,6 +295,9 @@ ublk_set_sqe_cmd_op(struct io_uring_sqe *sqe, uint32_t cmd_op)
  		case UBLK_CMD_UPDATE_SIZE:
  			opc = UBLK_U_CMD_UPDATE_SIZE;
  			break;
@@ -46,7 +46,7 @@ index dd90743..d7e1a24 100644
  
  		/* io uring */
  		case UBLK_IO_FETCH_REQ:
-@@ -339,6 +349,12 @@ ublk_ctrl_cmd_error(struct spdk_ublk_dev *ublk, int32_t res)
+@@ -373,6 +383,12 @@ ublk_ctrl_cmd_error(struct spdk_ublk_dev *ublk, int32_t res)
  	case UBLK_CMD_UPDATE_SIZE:
  		/* Evariops 0060: the disk keeps serving at its former size. */
  		break;
@@ -59,7 +59,7 @@ index dd90743..d7e1a24 100644
  	default:
  		SPDK_ERRLOG("No match cmd operation,cmd_op = %d\n", ublk->current_cmd_op);
  		break;
-@@ -444,6 +460,12 @@ ublk_ctrl_process_cqe(struct io_uring_cqe *cqe)
+@@ -478,6 +494,12 @@ ublk_ctrl_process_cqe(struct io_uring_cqe *cqe)
  		SPDK_NOTICELOG("ublk %u resized to %" PRIu64 " sectors (Evariops 0060)\n",
  			       ublk->ublk_id, (uint64_t)ublk->dev_params.basic.dev_sectors);
  		break;
@@ -72,7 +72,7 @@ index dd90743..d7e1a24 100644
  	default:
  		SPDK_ERRLOG("No match cmd operation,cmd_op = %d\n", ublk->current_cmd_op);
  		break;
-@@ -538,6 +560,9 @@ ublk_ctrl_cmd_submit(struct spdk_ublk_dev *ublk, uint32_t cmd_op)
+@@ -572,6 +594,9 @@ ublk_ctrl_cmd_submit(struct spdk_ublk_dev *ublk, uint32_t cmd_op)
  	case UBLK_CMD_UPDATE_SIZE:
  		cmd->data[0] = ublk->dev_params.basic.dev_sectors;
  		break;
@@ -82,7 +82,7 @@ index dd90743..d7e1a24 100644
  	default:
  		SPDK_ERRLOG("No match cmd operation,cmd_op = %d\n", cmd_op);
  		return -EINVAL;
-@@ -604,6 +629,8 @@ ublk_ctrl_cmd_get_features(void)
+@@ -638,6 +663,8 @@ ublk_ctrl_cmd_get_features(void)
  		g_ublk_tgt.user_recovery = !!(g_ublk_tgt.features & UBLK_F_USER_RECOVERY);
  		g_ublk_tgt.update_size = g_ublk_tgt.ioctl_encode &&
  					 !!(g_ublk_tgt.features & UBLK_F_UPDATE_SIZE);
@@ -91,7 +91,7 @@ index dd90743..d7e1a24 100644
  		SPDK_NOTICELOG("User Copy %s\n", g_ublk_tgt.user_copy ? "enabled" : "disabled");
  		SPDK_NOTICELOG("ublk_drv features 0x%" PRIx64 "\n", g_ublk_tgt.features);
  	}
-@@ -792,6 +819,9 @@ _ublk_fini_done(void *args)
+@@ -846,6 +873,9 @@ _ublk_fini_done(void *args)
  	g_ublk_tgt.ioctl_encode = false;
  	g_ublk_tgt.user_copy = false;
  	g_ublk_tgt.user_recovery = false;
@@ -101,7 +101,7 @@ index dd90743..d7e1a24 100644
  
  	if (g_ublk_tgt.cb_fn) {
  		g_ublk_tgt.cb_fn(g_ublk_tgt.cb_arg);
-@@ -1026,6 +1056,18 @@ ublk_delete_dev(void *arg)
+@@ -1102,6 +1132,18 @@ ublk_delete_dev(void *arg)
  
  	if (ublk->cdev_fd >= 0) {
  		close(ublk->cdev_fd);
@@ -120,7 +120,7 @@ index dd90743..d7e1a24 100644
  	}
  
  	rc = ublk_ctrl_cmd_submit(ublk, UBLK_CMD_DEL_DEV);
-@@ -1120,6 +1162,51 @@ ublk_stop_disk(uint32_t ublk_id, ublk_ctrl_cb ctrl_cb, void *cb_arg)
+@@ -1196,6 +1238,51 @@ ublk_stop_disk(uint32_t ublk_id, ublk_ctrl_cb ctrl_cb, void *cb_arg)
  	return ublk_close_dev(ublk);
  }
  
@@ -172,7 +172,7 @@ index dd90743..d7e1a24 100644
  static inline void
  ublk_mark_io_done(struct ublk_io *io, int res)
  {
-@@ -1872,6 +1959,10 @@ ublk_dev_info_init(struct spdk_ublk_dev *ublk)
+@@ -2123,6 +2210,10 @@ ublk_dev_info_init(struct spdk_ublk_dev *ublk)
  		uinfo.flags |= UBLK_F_UPDATE_SIZE;
  	}
  
@@ -183,7 +183,7 @@ index dd90743..d7e1a24 100644
  	ublk->dev_info = uinfo;
  }
  
-@@ -1948,6 +2039,8 @@ ublk_free_dev(struct spdk_ublk_dev *ublk)
+@@ -2199,6 +2290,8 @@ ublk_free_dev(struct spdk_ublk_dev *ublk)
  {
  	struct ublk_queue *q;
  	uint32_t q_idx;
@@ -192,7 +192,7 @@ index dd90743..d7e1a24 100644
  
  	spdk_poller_unregister(&ublk->resize_poller);
  
-@@ -1982,7 +2075,14 @@ ublk_free_dev(struct spdk_ublk_dev *ublk)
+@@ -2233,7 +2326,14 @@ ublk_free_dev(struct spdk_ublk_dev *ublk)
  	ublk_dev_list_unregister(ublk);
  	SPDK_NOTICELOG("ublk dev %d stopped\n", ublk->ublk_id);
  
@@ -208,7 +208,7 @@ index dd90743..d7e1a24 100644
  
  static int
 diff --git a/lib/ublk/ublk_internal.h b/lib/ublk/ublk_internal.h
-index 68ffc4d..01c21b2 100644
+index 9db9354..5629ecd 100644
 --- a/lib/ublk/ublk_internal.h
 +++ b/lib/ublk/ublk_internal.h
 @@ -60,6 +60,8 @@ int ublk_start_disk(const char *bdev_name, uint32_t ublk_id,
@@ -221,10 +221,10 @@ index 68ffc4d..01c21b2 100644
  ublk_start_disk_recovery(const char *bdev_name, uint32_t ublk_id, ublk_ctrl_cb ctrl_cb,
  			 void *cb_arg);
 diff --git a/lib/ublk/ublk_rpc.c b/lib/ublk/ublk_rpc.c
-index 371e26b..29e5f84 100644
+index cffb567..3af9077 100644
 --- a/lib/ublk/ublk_rpc.c
 +++ b/lib/ublk/ublk_rpc.c
-@@ -274,3 +274,63 @@ rpc_ublk_recover_disk(struct spdk_jsonrpc_request *request,
+@@ -285,3 +285,63 @@ rpc_ublk_recover_disk(struct spdk_jsonrpc_request *request,
  }
  
  SPDK_RPC_REGISTER("ublk_recover_disk", rpc_ublk_recover_disk, SPDK_RPC_RUNTIME)

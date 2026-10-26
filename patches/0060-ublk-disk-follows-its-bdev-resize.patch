@@ -1,5 +1,5 @@
 diff --git a/lib/ublk/ublk.c b/lib/ublk/ublk.c
-index 2e457e0..dd90743 100644
+index a91a282..41e6946 100644
 --- a/lib/ublk/ublk.c
 +++ b/lib/ublk/ublk.c
 @@ -71,7 +71,11 @@ static int ublk_ctrl_start_recovery(struct spdk_ublk_dev *ublk);
@@ -14,7 +14,7 @@ index 2e457e0..dd90743 100644
  	[UBLK_CMD_GET_DEV_INFO] = "UBLK_CMD_GET_DEV_INFO",
  	[UBLK_CMD_ADD_DEV] =	"UBLK_CMD_ADD_DEV",
  	[UBLK_CMD_DEL_DEV] =	"UBLK_CMD_DEL_DEV",
-@@ -143,6 +147,8 @@ struct spdk_ublk_dev {
+@@ -156,6 +160,8 @@ struct spdk_ublk_dev {
  	struct ublk_queue	queues[UBLK_DEV_MAX_QUEUES];
  
  	struct spdk_poller	*retry_poller;
@@ -23,7 +23,7 @@ index 2e457e0..dd90743 100644
  	int			retry_count;
  	uint32_t		queues_closed;
  	ublk_ctrl_cb		ctrl_cb;
-@@ -181,6 +187,8 @@ struct ublk_tgt {
+@@ -215,6 +221,8 @@ struct ublk_tgt {
  	bool			user_copy;
  	/* `ublk_drv` supports UBLK_F_USER_RECOVERY */
  	bool			user_recovery;
@@ -32,7 +32,7 @@ index 2e457e0..dd90743 100644
  };
  
  static TAILQ_HEAD(, spdk_ublk_dev) g_ublk_devs = TAILQ_HEAD_INITIALIZER(g_ublk_devs);
-@@ -243,6 +251,9 @@ ublk_set_sqe_cmd_op(struct io_uring_sqe *sqe, uint32_t cmd_op)
+@@ -277,6 +285,9 @@ ublk_set_sqe_cmd_op(struct io_uring_sqe *sqe, uint32_t cmd_op)
  		case UBLK_CMD_END_USER_RECOVERY:
  			opc = _IOWR('u', UBLK_CMD_END_USER_RECOVERY, struct ublksrv_ctrl_cmd);
  			break;
@@ -42,7 +42,7 @@ index 2e457e0..dd90743 100644
  
  		/* io uring */
  		case UBLK_IO_FETCH_REQ:
-@@ -325,6 +336,9 @@ ublk_ctrl_cmd_error(struct spdk_ublk_dev *ublk, int32_t res)
+@@ -359,6 +370,9 @@ ublk_ctrl_cmd_error(struct spdk_ublk_dev *ublk, int32_t res)
  	case UBLK_CMD_STOP_DEV:
  	case UBLK_CMD_DEL_DEV:
  		break;
@@ -52,7 +52,7 @@ index 2e457e0..dd90743 100644
  	default:
  		SPDK_ERRLOG("No match cmd operation,cmd_op = %d\n", ublk->current_cmd_op);
  		break;
-@@ -426,6 +440,10 @@ ublk_ctrl_process_cqe(struct io_uring_cqe *cqe)
+@@ -460,6 +474,10 @@ ublk_ctrl_process_cqe(struct io_uring_cqe *cqe)
  		ublk->is_recovering = false;
  		goto cb_done;
  		break;
@@ -63,7 +63,7 @@ index 2e457e0..dd90743 100644
  	default:
  		SPDK_ERRLOG("No match cmd operation,cmd_op = %d\n", ublk->current_cmd_op);
  		break;
-@@ -517,6 +535,9 @@ ublk_ctrl_cmd_submit(struct spdk_ublk_dev *ublk, uint32_t cmd_op)
+@@ -551,6 +569,9 @@ ublk_ctrl_cmd_submit(struct spdk_ublk_dev *ublk, uint32_t cmd_op)
  	case UBLK_CMD_END_USER_RECOVERY:
  		cmd->data[0] = getpid();
  		break;
@@ -73,7 +73,7 @@ index 2e457e0..dd90743 100644
  	default:
  		SPDK_ERRLOG("No match cmd operation,cmd_op = %d\n", cmd_op);
  		return -EINVAL;
-@@ -581,7 +602,10 @@ ublk_ctrl_cmd_get_features(void)
+@@ -615,7 +636,10 @@ ublk_ctrl_cmd_get_features(void)
  		g_ublk_tgt.user_copy = !!(g_ublk_tgt.features & UBLK_F_USER_COPY);
  		g_ublk_tgt.user_copy &= !g_disable_user_copy;
  		g_ublk_tgt.user_recovery = !!(g_ublk_tgt.features & UBLK_F_USER_RECOVERY);
@@ -84,7 +84,7 @@ index 2e457e0..dd90743 100644
  	}
  	io_uring_cqe_seen(&g_ublk_tgt.ctrl_ring, cqe);
  
-@@ -1575,6 +1599,54 @@ ublk_bdev_hot_remove(struct spdk_ublk_dev *ublk)
+@@ -1826,6 +1850,54 @@ ublk_bdev_hot_remove(struct spdk_ublk_dev *ublk)
  	ublk_close_dev(ublk);
  }
  
@@ -139,7 +139,7 @@ index 2e457e0..dd90743 100644
  static void
  ublk_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev,
  		   void *event_ctx)
-@@ -1583,6 +1655,9 @@ ublk_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev,
+@@ -1834,6 +1906,9 @@ ublk_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev,
  	case SPDK_BDEV_EVENT_REMOVE:
  		ublk_bdev_hot_remove(event_ctx);
  		break;
@@ -149,7 +149,7 @@ index 2e457e0..dd90743 100644
  	default:
  		SPDK_NOTICELOG("Unsupported bdev event: type %d\n", type);
  		break;
-@@ -1793,6 +1868,10 @@ ublk_dev_info_init(struct spdk_ublk_dev *ublk)
+@@ -2044,6 +2119,10 @@ ublk_dev_info_init(struct spdk_ublk_dev *ublk)
  		uinfo.flags |= UBLK_F_USER_RECOVERY_REISSUE;
  	}
  
@@ -160,7 +160,7 @@ index 2e457e0..dd90743 100644
  	ublk->dev_info = uinfo;
  }
  
-@@ -1870,6 +1949,8 @@ ublk_free_dev(struct spdk_ublk_dev *ublk)
+@@ -2121,6 +2200,8 @@ ublk_free_dev(struct spdk_ublk_dev *ublk)
  	struct ublk_queue *q;
  	uint32_t q_idx;
  

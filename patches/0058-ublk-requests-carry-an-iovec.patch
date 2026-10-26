@@ -1,5 +1,5 @@
 diff --git a/lib/ublk/ublk.c b/lib/ublk/ublk.c
-index fc5762e..d09bf83 100644
+index fc5762e..7b28b88 100644
 --- a/lib/ublk/ublk.c
 +++ b/lib/ublk/ublk.c
 @@ -26,6 +26,13 @@
@@ -30,7 +30,143 @@ index fc5762e..d09bf83 100644
  	bool			need_data;
  	bool			user_copy;
  	uint16_t		tag;
-@@ -1125,20 +1136,18 @@ static void
+@@ -93,6 +104,13 @@ struct ublk_io {
+ 	/* for bdev io_wait */
+ 	struct spdk_bdev_io_wait_entry bdev_io_wait;
+ 	struct spdk_iobuf_entry	iobuf;
++	/* Evariops 0058: the request's place in its poll group's buffer queue, when it
++	 * asked for its buffers, whether it had to wait, and which of its buffers are
++	 * the poll group's reserve. */
++	TAILQ_ENTRY(ublk_io)	buf_tailq;
++	uint64_t		buf_wait_tsc;
++	bool			buf_waited;
++	uint8_t			reserve_mask;
+ 
+ 	TAILQ_ENTRY(ublk_io)	tailq;
+ };
+@@ -111,6 +129,12 @@ struct ublk_queue {
+ 	struct spdk_ublk_dev	*dev;
+ 	struct ublk_poll_group	*poll_group;
+ 	struct spdk_io_channel	*bdev_ch;
++	/* Evariops 0058: the queue's buffer waits, reported by ublk_get_disks. */
++	uint32_t		buf_waiting;
++	uint64_t		buf_waited;
++	uint64_t		buf_wait_max_us;
++	uint64_t		reserve_uses;
++	uint64_t		stalls;
+ 
+ 	TAILQ_ENTRY(ublk_queue)	tailq;
+ };
+@@ -149,8 +173,29 @@ struct ublk_poll_group {
+ 	struct spdk_poller		*ublk_poller;
+ 	struct spdk_iobuf_channel	iobuf_ch;
+ 	TAILQ_HEAD(, ublk_queue)	queue_list;
++	/* Evariops 0058: the poll group's requests acquire their buffers one at a time, in
++	 * arrival order: the head takes buffers, the others wait here holding none. */
++	TAILQ_HEAD(, ublk_io)		buf_waiters;
++	struct ublk_io			*buf_head;
++	/* Requests holding all their buffers: each gives them back when it completes. */
++	uint32_t			buf_holders;
++	/* The progress reserve: one maximum request's buffers, taken at start. */
++	void				*reserve_large[UBLK_IO_MAX_IOVS];
++	uint32_t			reserve_large_count;
++	void				*reserve_small;
++	bool				reserve_lent;
++	uint32_t			small_bufsize;
++	uint64_t			last_progress_tsc;
++	bool				stall_reported;
++	/* UBLK_POLL_GROUP_PENDING until its thread has set up its buffers, then READY or
++	 * FAILED: a poll group without its buffers serves no disk. */
++	int				buffers_state;
+ };
+ 
++#define UBLK_POLL_GROUP_PENDING	0
++#define UBLK_POLL_GROUP_READY	1
++#define UBLK_POLL_GROUP_FAILED	-1
++
+ struct ublk_tgt {
+ 	int			ctrl_fd;
+ 	bool			active;
+@@ -664,6 +709,10 @@ ublk_parse_core_mask(const char *mask)
+ 	return 0;
+ }
+ 
++/* Evariops 0058 */
++static bool ublk_reserve_take(struct ublk_poll_group *poll_group);
++static void ublk_reserve_release(struct ublk_poll_group *poll_group);
++
+ static void
+ ublk_poller_register(void *args)
+ {
+@@ -677,12 +726,28 @@ ublk_poller_register(void *args)
+ 	spdk_thread_bind(spdk_get_thread(), true);
+ 
+ 	TAILQ_INIT(&poll_group->queue_list);
++	TAILQ_INIT(&poll_group->buf_waiters);
+ 	poll_group->ublk_poller = SPDK_POLLER_REGISTER(ublk_poll, poll_group, 0);
+ 	rc = spdk_iobuf_channel_init(&poll_group->iobuf_ch, "ublk",
+ 				     UBLK_IOBUF_SMALL_CACHE_SIZE, UBLK_IOBUF_LARGE_CACHE_SIZE);
++	/* Evariops 0058: a thread without its buffers serves no disk. Upstream asserted, and a
++	 * build without asserts went on with a channel its error path had torn down. */
+ 	if (rc != 0) {
+-		assert(false);
++		SPDK_ERRLOG("ublk thread %s: no iobuf channel (%s): it serves no disk (Evariops 0058)\n",
++			    spdk_thread_get_name(spdk_get_thread()), spdk_strerror(-rc));
++		__atomic_store_n(&poll_group->buffers_state, UBLK_POLL_GROUP_FAILED, __ATOMIC_RELEASE);
++		return;
+ 	}
++	if (!ublk_reserve_take(poll_group)) {
++		SPDK_ERRLOG("ublk thread %s: the iobuf pool cannot give the progress reserve: it serves no disk "
++			    "(Evariops 0058)\n", spdk_thread_get_name(spdk_get_thread()));
++		ublk_reserve_release(poll_group);
++		spdk_iobuf_channel_fini(&poll_group->iobuf_ch);
++		__atomic_store_n(&poll_group->buffers_state, UBLK_POLL_GROUP_FAILED, __ATOMIC_RELEASE);
++		return;
++	}
++	poll_group->last_progress_tsc = spdk_get_ticks();
++	__atomic_store_n(&poll_group->buffers_state, UBLK_POLL_GROUP_READY, __ATOMIC_RELEASE);
+ }
+ 
+ int
+@@ -779,7 +844,10 @@ ublk_thread_exit(void *args)
+ 	for (i = 0; i < g_num_ublk_poll_groups; i++) {
+ 		if (g_ublk_tgt.poll_groups[i].ublk_thread == ublk_thread) {
+ 			spdk_poller_unregister(&g_ublk_tgt.poll_groups[i].ublk_poller);
+-			spdk_iobuf_channel_fini(&g_ublk_tgt.poll_groups[i].iobuf_ch);
++			if (g_ublk_tgt.poll_groups[i].buffers_state == UBLK_POLL_GROUP_READY) {
++				ublk_reserve_release(&g_ublk_tgt.poll_groups[i]);
++				spdk_iobuf_channel_fini(&g_ublk_tgt.poll_groups[i].iobuf_ch);
++			}
+ 			spdk_thread_bind(ublk_thread, false);
+ 			spdk_thread_exit(ublk_thread);
+ 		}
+@@ -906,6 +974,25 @@ ublk_dev_get_num_queues(struct spdk_ublk_dev *ublk)
+ 	return ublk->num_queues;
+ }
+ 
++/* Evariops 0058: read on the app thread while the queues' threads write them: each a
++ * counter, read whole, a snapshot good enough for a report. */
++void
++ublk_dev_get_buffer_waits(struct spdk_ublk_dev *ublk, struct ublk_buffer_waits *waits)
++{
++	struct ublk_queue *q;
++	uint32_t i;
++
++	memset(waits, 0, sizeof(*waits));
++	for (i = 0; i < ublk->num_queues; i++) {
++		q = &ublk->queues[i];
++		waits->waiting += q->buf_waiting;
++		waits->waited += q->buf_waited;
++		waits->max_wait_us = spdk_max(waits->max_wait_us, q->buf_wait_max_us);
++		waits->reserve_uses += q->reserve_uses;
++		waits->stalls += q->stalls;
++	}
++}
++
+ const char *
+ ublk_dev_get_bdev_name(struct spdk_ublk_dev *ublk)
+ {
+@@ -1125,20 +1212,18 @@ static void
  ublk_queue_user_copy(struct ublk_io *io, bool is_write)
  {
  	struct ublk_queue *q = io->q;
@@ -54,7 +190,7 @@ index fc5762e..d09bf83 100644
  	}
  	io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
  	io_uring_sqe_set_data64(sqe, build_user_data(io->tag, 0));
-@@ -1189,40 +1198,77 @@ ublk_queue_io(struct ublk_io *io)
+@@ -1189,40 +1274,248 @@ ublk_queue_io(struct ublk_io *io)
  	}
  }
  
@@ -77,10 +213,11 @@ index fc5762e..d09bf83 100644
 +
 +static void ublk_io_get_buffer_cb(struct spdk_iobuf_entry *iobuf, void *buf);
 +
-+/* Takes the request's buffers one at a time: when the pool is dry, the entry
-+ * waits for one, and the callback goes on from there. */
-+static void
-+ublk_io_get_next_buffer(struct ublk_io *io)
++/* Evariops 0058: takes the request's remaining buffers from the pool, one at a time.
++ * True once it holds them all; false when the pool is dry, the request then waiting
++ * in iobuf's queue for its next buffer. */
++static bool
++ublk_io_take_buffers(struct ublk_io *io)
 +{
 +	struct spdk_iobuf_channel *iobuf_ch = &io->q->poll_group->iobuf_ch;
 +	void *buf;
@@ -89,26 +226,71 @@ index fc5762e..d09bf83 100644
 +		buf = spdk_iobuf_get(iobuf_ch, ublk_io_iov_len(io, io->iovcnt), &io->iobuf,
 +				     ublk_io_get_buffer_cb);
 +		if (buf == NULL) {
-+			return;
++			if (!io->buf_waited) {
++				io->buf_waited = true;
++				io->q->buf_waited++;
++			}
++			return false;
 +		}
 +		ublk_io_add_buffer(io, buf);
 +	}
++	return true;
++}
 +
++/* The head holds all its buffers: it leaves the head and goes on. */
++static void
++ublk_io_buffers_ready(struct ublk_io *io)
++{
++	struct ublk_poll_group *poll_group = io->q->poll_group;
++	uint64_t waited_us;
++
++	assert(poll_group->buf_head == io);
++	poll_group->buf_head = NULL;
++	poll_group->buf_holders++;
++	poll_group->last_progress_tsc = spdk_get_ticks();
++	poll_group->stall_reported = false;
++	io->q->buf_waiting--;
++	waited_us = (poll_group->last_progress_tsc - io->buf_wait_tsc) * SPDK_SEC_TO_USEC / spdk_get_ticks_hz();
++	io->q->buf_wait_max_us = spdk_max(io->q->buf_wait_max_us, waited_us);
 +	io->payload = io->iovs[0].iov_base;
 +	io->get_buf_cb(io);
++}
++
++/* Evariops 0058: the poll group's requests acquire their buffers one at a time, in
++ * arrival order: the head takes buffers, the others wait holding none. Requests that
++ * each held part of what they need while the pool was dry could otherwise wait for
++ * one another for ever: iobuf serves a thread's waiters only with buffers given back
++ * on that thread, and a new request may pass them. */
++static void
++ublk_buffers_pump(struct ublk_poll_group *poll_group)
++{
++	struct ublk_io *io;
++
++	while (poll_group->buf_head == NULL && (io = TAILQ_FIRST(&poll_group->buf_waiters)) != NULL) {
++		TAILQ_REMOVE(&poll_group->buf_waiters, io, buf_tailq);
++		poll_group->buf_head = io;
++		if (!ublk_io_take_buffers(io)) {
++			return;
++		}
++		ublk_io_buffers_ready(io);
++	}
 +}
 +
  static void
  ublk_io_get_buffer_cb(struct spdk_iobuf_entry *iobuf, void *buf)
  {
  	struct ublk_io *io = SPDK_CONTAINEROF(iobuf, struct ublk_io, iobuf);
++	struct ublk_poll_group *poll_group = io->q->poll_group;
  
 -	io->mpool_entry = buf;
 -	assert(io->payload == NULL);
 -	io->payload = (void *)(uintptr_t)SPDK_ALIGN_CEIL((uintptr_t)buf, 4096ULL);
 -	io->get_buf_cb(io);
 +	ublk_io_add_buffer(io, buf);
-+	ublk_io_get_next_buffer(io);
++	if (ublk_io_take_buffers(io)) {
++		ublk_io_buffers_ready(io);
++		ublk_buffers_pump(poll_group);
++	}
  }
  
  static void
@@ -116,8 +298,9 @@ index fc5762e..d09bf83 100644
  		   ublk_get_buf_cb get_buf_cb)
  {
 -	void *buf;
--
-+	assert(iobuf_ch == &io->q->poll_group->iobuf_ch);
++	struct ublk_poll_group *poll_group = io->q->poll_group;
+ 
++	assert(iobuf_ch == &poll_group->iobuf_ch);
 +	assert(io->payload == NULL && io->iovcnt == 0);
  	io->payload_size = io->iod->nr_sectors * (1ULL << LINUX_SECTOR_SHIFT);
  	io->get_buf_cb = get_buf_cb;
@@ -125,8 +308,14 @@ index fc5762e..d09bf83 100644
 -
 -	if (buf != NULL) {
 -		ublk_io_get_buffer_cb(&io->iobuf, buf);
--	}
-+	ublk_io_get_next_buffer(io);
++	io->buf_wait_tsc = spdk_get_ticks();
++	io->buf_waited = poll_group->buf_head != NULL;
++	if (io->buf_waited) {
++		io->q->buf_waited++;
+ 	}
++	io->q->buf_waiting++;
++	TAILQ_INSERT_TAIL(&poll_group->buf_waiters, io, buf_tailq);
++	ublk_buffers_pump(poll_group);
  }
  
  static void
@@ -136,18 +325,134 @@ index fc5762e..d09bf83 100644
 -		spdk_iobuf_put(iobuf_ch, io->mpool_entry, io->payload_size);
 -		io->mpool_entry = NULL;
 -		io->payload = NULL;
++	struct ublk_poll_group *poll_group = io->q->poll_group;
 +	int i;
 +
-+	for (i = 0; i < io->iovcnt; i++) {
-+		spdk_iobuf_put(iobuf_ch, io->mpool_entries[i], io->iovs[i].iov_len);
-+		io->mpool_entries[i] = NULL;
++	if (io->iovcnt == 0) {
++		return;
  	}
++	assert(poll_group->buf_head != io);
++	for (i = 0; i < io->iovcnt; i++) {
++		if (io->reserve_mask & (1u << i)) {
++			/* The reserve's buffer goes back to the reserve. */
++			if (io->iovs[i].iov_len <= poll_group->small_bufsize) {
++				poll_group->reserve_small = io->mpool_entries[i];
++			} else {
++				poll_group->reserve_large[poll_group->reserve_large_count++] = io->mpool_entries[i];
++			}
++		} else {
++			spdk_iobuf_put(iobuf_ch, io->mpool_entries[i], io->iovs[i].iov_len);
++		}
++		io->mpool_entries[i] = NULL;
++	}
++	if (io->reserve_mask != 0) {
++		io->reserve_mask = 0;
++		poll_group->reserve_lent = false;
++	}
++	assert(poll_group->buf_holders > 0);
++	poll_group->buf_holders--;
++	poll_group->last_progress_tsc = spdk_get_ticks();
 +	io->iovcnt = 0;
 +	io->payload = NULL;
++}
++
++/* Evariops 0058: the poll group's progress reserve, one maximum request's buffers taken
++ * when the poll group starts. The head takes from it when nothing in flight on this
++ * thread can give a buffer back, so the poll group always moves, one request at a
++ * time at worst, whatever the other threads and modules hold. */
++#define UBLK_RESERVE_SMALL_BYTES	4096
++
++static bool
++ublk_reserve_take(struct ublk_poll_group *poll_group)
++{
++	struct spdk_iobuf_opts opts;
++
++	spdk_iobuf_get_opts(&opts, sizeof(opts));
++	poll_group->small_bufsize = opts.small_bufsize;
++	while (poll_group->reserve_large_count < UBLK_IO_MAX_IOVS) {
++		poll_group->reserve_large[poll_group->reserve_large_count] =
++			spdk_iobuf_get(&poll_group->iobuf_ch, UBLK_IO_IOV_BYTES, NULL, NULL);
++		if (poll_group->reserve_large[poll_group->reserve_large_count] == NULL) {
++			return false;
++		}
++		poll_group->reserve_large_count++;
++	}
++	poll_group->reserve_small = spdk_iobuf_get(&poll_group->iobuf_ch, UBLK_RESERVE_SMALL_BYTES, NULL, NULL);
++	return poll_group->reserve_small != NULL;
++}
++
++static void
++ublk_reserve_release(struct ublk_poll_group *poll_group)
++{
++	while (poll_group->reserve_large_count > 0) {
++		spdk_iobuf_put(&poll_group->iobuf_ch, poll_group->reserve_large[--poll_group->reserve_large_count],
++			       UBLK_IO_IOV_BYTES);
++	}
++	if (poll_group->reserve_small != NULL) {
++		spdk_iobuf_put(&poll_group->iobuf_ch, poll_group->reserve_small, UBLK_RESERVE_SMALL_BYTES);
++		poll_group->reserve_small = NULL;
++	}
++}
++
++/* Nothing in flight on this thread gives a buffer back, and the pool did not serve the
++ * head: the head completes its buffers from the reserve. */
++static void
++ublk_buffers_rescue(struct ublk_poll_group *poll_group)
++{
++	struct ublk_io *io = poll_group->buf_head;
++	uint64_t len;
++	void *buf;
++
++	if (io == NULL || poll_group->buf_holders > 0 || poll_group->reserve_lent) {
++		return;
++	}
++	spdk_iobuf_entry_abort(&poll_group->iobuf_ch, &io->iobuf, ublk_io_iov_len(io, io->iovcnt));
++	while ((uint64_t)io->iovcnt * UBLK_IO_IOV_BYTES < io->payload_size) {
++		len = ublk_io_iov_len(io, io->iovcnt);
++		if (len <= poll_group->small_bufsize) {
++			buf = poll_group->reserve_small;
++			poll_group->reserve_small = NULL;
++		} else {
++			buf = poll_group->reserve_large[--poll_group->reserve_large_count];
++		}
++		assert(buf != NULL);
++		io->reserve_mask |= 1u << io->iovcnt;
++		ublk_io_add_buffer(io, buf);
++	}
++	poll_group->reserve_lent = true;
++	io->q->reserve_uses++;
++	ublk_io_buffers_ready(io);
++	ublk_buffers_pump(poll_group);
++}
++
++/* A head that waited a second while nothing moved on its thread is reported once: the
++ * reserve makes this a defect to find, not a state to live in. Nothing fails. */
++static void
++ublk_buffers_watch(struct ublk_poll_group *poll_group)
++{
++	struct ublk_io *io = poll_group->buf_head;
++	uint64_t now, hz;
++
++	if (io == NULL || poll_group->stall_reported) {
++		return;
++	}
++	now = spdk_get_ticks();
++	hz = spdk_get_ticks_hz();
++	if (now - io->buf_wait_tsc < hz || now - poll_group->last_progress_tsc < hz) {
++		return;
++	}
++	poll_group->stall_reported = true;
++	io->q->stalls++;
++	SPDK_ERRLOG("ublk %u queue %u: a request has waited %" PRIu64 " ms for its buffers with nothing "
++		    "moving on its thread: %u holding buffers in flight, %d of its %" PRIu64 " bytes' "
++		    "buffers held, reserve %s (Evariops 0058)\n",
++		    io->q->dev->ublk_id, io->q->q_id, (now - io->buf_wait_tsc) * 1000 / hz,
++		    poll_group->buf_holders, io->iovcnt, io->payload_size,
++		    poll_group->reserve_lent ? "lent" : "free");
  }
  
  static void
-@@ -1248,10 +1294,12 @@ _ublk_submit_bdev_io(struct ublk_queue *q, struct ublk_io *io)
+@@ -1248,10 +1541,12 @@ _ublk_submit_bdev_io(struct ublk_queue *q, struct ublk_io *io)
  		} else {
  			read_cb = ublk_io_done;
  		}
@@ -162,7 +467,18 @@ index fc5762e..d09bf83 100644
  		break;
  	case UBLK_IO_OP_FLUSH:
  		rc = spdk_bdev_flush_blocks(desc, ch, 0, spdk_bdev_get_num_blocks(ublk->bdev), ublk_io_done, io);
-@@ -1669,6 +1717,14 @@ ublk_set_params(struct spdk_ublk_dev *ublk)
+@@ -1513,6 +1808,10 @@ ublk_poll(void *arg)
+ 		}
+ 		count += sent + received;
+ 	}
++	if (spdk_unlikely(poll_group->buf_head != NULL)) {
++		ublk_buffers_rescue(poll_group);
++		ublk_buffers_watch(poll_group);
++	}
+ 	if (count > 0) {
+ 		return SPDK_POLLER_BUSY;
+ 	} else {
+@@ -1669,6 +1968,14 @@ ublk_set_params(struct spdk_ublk_dev *ublk)
  	return rc;
  }
  
@@ -177,7 +493,7 @@ index fc5762e..d09bf83 100644
  static void
  ublk_dev_info_init(struct spdk_ublk_dev *ublk)
  {
-@@ -1676,7 +1732,7 @@ ublk_dev_info_init(struct spdk_ublk_dev *ublk)
+@@ -1676,7 +1983,7 @@ ublk_dev_info_init(struct spdk_ublk_dev *ublk)
  		.queue_depth = ublk->queue_depth,
  		.nr_hw_queues = ublk->num_queues,
  		.dev_id = ublk->ublk_id,
@@ -186,7 +502,7 @@ index fc5762e..d09bf83 100644
  		.ublksrv_pid = getpid(),
  		.flags = UBLK_F_URING_CMD_COMP_IN_TASK,
  	};
-@@ -1717,7 +1773,7 @@ ublk_info_param_init(struct spdk_ublk_dev *ublk)
+@@ -1717,7 +2024,7 @@ ublk_info_param_init(struct spdk_ublk_dev *ublk)
  			.io_min_shift = spdk_u32log2(io_min_size),
  			.io_opt_shift = spdk_u32log2(io_opt_size),
  			.dev_sectors = num_blocks * sectors_per_block,
@@ -195,3 +511,127 @@ index fc5762e..d09bf83 100644
  		}
  	};
  
+@@ -1869,6 +2176,27 @@ ublk_queue_run(void *arg1)
+ 	spdk_thread_send_msg(spdk_thread_get_app_thread(), ublk_queue_recovery_done, ublk);
+ }
+ 
++/* Evariops 0058: every poll group has its buffers and its reserve: 0; one still setting
++ * them up: -EAGAIN; one that could not: -ENOMEM. */
++static int
++ublk_poll_groups_ready(void)
++{
++	uint32_t i;
++	int state;
++
++	for (i = 0; i < g_num_ublk_poll_groups; i++) {
++		state = __atomic_load_n(&g_ublk_tgt.poll_groups[i].buffers_state, __ATOMIC_ACQUIRE);
++		if (state == UBLK_POLL_GROUP_FAILED) {
++			SPDK_ERRLOG("ublk thread %u has no buffers: no disk is served (Evariops 0058)\n", i);
++			return -ENOMEM;
++		}
++		if (state != UBLK_POLL_GROUP_READY) {
++			return -EAGAIN;
++		}
++	}
++	return 0;
++}
++
+ int
+ ublk_start_disk(const char *bdev_name, uint32_t ublk_id,
+ 		uint32_t num_queues, uint32_t queue_depth,
+@@ -1887,6 +2215,11 @@ ublk_start_disk(const char *bdev_name, uint32_t ublk_id,
+ 		return -ENODEV;
+ 	}
+ 
++	rc = ublk_poll_groups_ready();
++	if (rc != 0) {
++		return rc;
++	}
++
+ 	ublk = ublk_dev_find_by_id(ublk_id);
+ 	if (ublk != NULL) {
+ 		SPDK_DEBUGLOG(ublk, "ublk id %d is in use.\n", ublk_id);
+@@ -2056,6 +2389,11 @@ ublk_start_disk_recovery(const char *bdev_name, uint32_t ublk_id, ublk_ctrl_cb c
+ 		return -ENOTSUP;
+ 	}
+ 
++	rc = ublk_poll_groups_ready();
++	if (rc != 0) {
++		return rc;
++	}
++
+ 	ublk = ublk_dev_find_by_id(ublk_id);
+ 	if (ublk != NULL) {
+ 		SPDK_DEBUGLOG(ublk, "ublk id %d is in use.\n", ublk_id);
+diff --git a/lib/ublk/ublk_internal.h b/lib/ublk/ublk_internal.h
+index 68ffc4d..9db9354 100644
+--- a/lib/ublk/ublk_internal.h
++++ b/lib/ublk/ublk_internal.h
+@@ -71,6 +71,21 @@ struct spdk_ublk_dev *ublk_dev_next(struct spdk_ublk_dev *prev);
+ uint32_t ublk_dev_get_queue_depth(struct spdk_ublk_dev *ublk);
+ uint32_t ublk_dev_get_num_queues(struct spdk_ublk_dev *ublk);
+ 
++/* Evariops 0058: a disk's buffer waits, summed over its queues. */
++struct ublk_buffer_waits {
++	/* Requests waiting for their buffers now. */
++	uint32_t waiting;
++	/* Requests that had to wait for their buffers. */
++	uint64_t waited;
++	/* The longest a request waited for its buffers. */
++	uint64_t max_wait_us;
++	/* Requests served from their poll group's progress reserve. */
++	uint64_t reserve_uses;
++	/* Waits of a second with nothing moving on the thread. */
++	uint64_t stalls;
++};
++void ublk_dev_get_buffer_waits(struct spdk_ublk_dev *ublk, struct ublk_buffer_waits *waits);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/lib/ublk/ublk_rpc.c b/lib/ublk/ublk_rpc.c
+index 371e26b..cffb567 100644
+--- a/lib/ublk/ublk_rpc.c
++++ b/lib/ublk/ublk_rpc.c
+@@ -167,6 +167,7 @@ rpc_dump_ublk_info(struct spdk_json_write_ctx *w,
+ 		   struct spdk_ublk_dev *ublk)
+ {
+ 	char ublk_path[32];
++	struct ublk_buffer_waits waits;
+ 
+ 	snprintf(ublk_path, 32, "%s%u", "/dev/ublkb", ublk_dev_get_id(ublk));
+ 	spdk_json_write_object_begin(w);
+@@ -177,6 +178,16 @@ rpc_dump_ublk_info(struct spdk_json_write_ctx *w,
+ 	spdk_json_write_named_uint32(w, "num_queues", ublk_dev_get_num_queues(ublk));
+ 	spdk_json_write_named_string(w, "bdev_name", ublk_dev_get_bdev_name(ublk));
+ 
++	/* Evariops 0058 */
++	ublk_dev_get_buffer_waits(ublk, &waits);
++	spdk_json_write_named_object_begin(w, "buffer_waits");
++	spdk_json_write_named_uint32(w, "waiting", waits.waiting);
++	spdk_json_write_named_uint64(w, "waited", waits.waited);
++	spdk_json_write_named_uint64(w, "max_wait_us", waits.max_wait_us);
++	spdk_json_write_named_uint64(w, "reserve_uses", waits.reserve_uses);
++	spdk_json_write_named_uint64(w, "stalls", waits.stalls);
++	spdk_json_write_object_end(w);
++
+ 	spdk_json_write_object_end(w);
+ }
+ 
+diff --git a/schema/schema.yaml b/schema/schema.yaml
+index e1c5906..5d9758b 100644
+--- a/schema/schema.yaml
++++ b/schema/schema.yaml
+@@ -583,6 +583,12 @@ return_objects:
+       - name: bdev_name
+         type: string
+         description: Name of the bdev backing the ublk device
++      - name: buffer_waits
++        type: object
++        description: >-
++          Evariops: the device's waits for I/O buffers — waiting now, waited, longest wait in
++          microseconds, requests served from the poll group's progress reserve, and stalls (a wait
++          of a second with nothing moving on its thread)
+   - name: iscsi_get_initiator_groups_result
+     fields:
+       - name: tag

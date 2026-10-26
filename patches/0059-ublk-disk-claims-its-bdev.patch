@@ -1,5 +1,5 @@
 diff --git a/lib/ublk/ublk.c b/lib/ublk/ublk.c
-index d09bf83..2e457e0 100644
+index 7b28b88..a91a282 100644
 --- a/lib/ublk/ublk.c
 +++ b/lib/ublk/ublk.c
 @@ -8,6 +8,7 @@
@@ -10,7 +10,7 @@ index d09bf83..2e457e0 100644
  #include "spdk/endian.h"
  #include "spdk/env.h"
  #include "spdk/likely.h"
-@@ -1588,6 +1589,50 @@ ublk_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev,
+@@ -1839,6 +1840,50 @@ ublk_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev,
  	}
  }
  
@@ -61,7 +61,7 @@ index d09bf83..2e457e0 100644
  static void
  ublk_dev_init_io_cmds(struct io_uring *r, uint32_t q_depth)
  {
-@@ -1851,10 +1896,7 @@ ublk_free_dev(struct spdk_ublk_dev *ublk)
+@@ -2102,10 +2147,7 @@ ublk_free_dev(struct spdk_ublk_dev *ublk)
  	/* All of the buffers associated with the queues have been freed, so now
  	 * continue with releasing resources for the rest of the ublk device.
  	 */
@@ -73,7 +73,7 @@ index d09bf83..2e457e0 100644
  
  	ublk_dev_list_unregister(ublk);
  	SPDK_NOTICELOG("ublk dev %d stopped\n", ublk->ublk_id);
-@@ -1965,9 +2007,8 @@ ublk_start_disk(const char *bdev_name, uint32_t ublk_id,
+@@ -2242,9 +2284,8 @@ ublk_start_disk(const char *bdev_name, uint32_t ublk_id,
  	UBLK_DEBUGLOG(ublk, "bdev %s num_queues %d queue_depth %d\n",
  		      bdev_name, num_queues, queue_depth);
  
@@ -84,7 +84,7 @@ index d09bf83..2e457e0 100644
  		free(ublk);
  		return rc;
  	}
-@@ -1998,7 +2039,7 @@ ublk_start_disk(const char *bdev_name, uint32_t ublk_id,
+@@ -2275,7 +2316,7 @@ ublk_start_disk(const char *bdev_name, uint32_t ublk_id,
  	ublk_info_param_init(ublk);
  	rc = ublk_ios_init(ublk);
  	if (rc != 0) {
@@ -93,7 +93,7 @@ index d09bf83..2e457e0 100644
  		free(ublk);
  		return rc;
  	}
-@@ -2132,9 +2173,8 @@ ublk_start_disk_recovery(const char *bdev_name, uint32_t ublk_id, ublk_ctrl_cb c
+@@ -2414,9 +2455,8 @@ ublk_start_disk_recovery(const char *bdev_name, uint32_t ublk_id, ublk_ctrl_cb c
  	ublk->cdev_fd = -1;
  	ublk->ublk_id = ublk_id;
  

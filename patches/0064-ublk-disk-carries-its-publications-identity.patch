@@ -1,0 +1,236 @@
+diff --git a/lib/ublk/ublk.c b/lib/ublk/ublk.c
+index 9877746..44def42 100644
+--- a/lib/ublk/ublk.c
++++ b/lib/ublk/ublk.c
+@@ -175,6 +175,9 @@ struct spdk_ublk_dev {
+ 	/* Evariops 0061: quiesced to be left to the kernel for a later recovery, not deleted. */
+ 	bool			is_quiescing;
+ 	uint64_t		quiesce_timeout_ms;
++	/* Evariops 0064: the identity of the publication the disk serves, kept by the kernel
++	 * with the device (ublksrv_flags); for a recovery, the identity the device must carry. */
++	uint64_t		identity;
+ 
+ 	TAILQ_ENTRY(spdk_ublk_dev) tailq;
+ 	TAILQ_ENTRY(spdk_ublk_dev) wait_tailq;
+@@ -464,6 +467,22 @@ ublk_ctrl_process_cqe(struct io_uring_cqe *cqe)
+ 			goto cb_done;
+ 		}
+ 
++		/* Evariops 0064: the device the kernel holds under this id carries the identity of
++		 * the publication that started it. Another's is not recovered: its waiting requests
++		 * would land on this bdev, another volume's. The device is left as it is, to be
++		 * stopped by whoever owns it; only this recovery's own state goes. */
++		if (ublk->identity != 0 && ublk->dev_info.ublksrv_flags != ublk->identity) {
++			SPDK_ERRLOG("ublk %u belongs to another publication (identity %" PRIx64 ", expected %" PRIx64 "): "
++				    "not recovered (Evariops 0064)\n", ublk->ublk_id,
++				    (uint64_t)ublk->dev_info.ublksrv_flags, ublk->identity);
++			if (ublk->ctrl_cb) {
++				ublk->ctrl_cb(ublk->cb_arg, -EEXIST);
++				ublk->ctrl_cb = NULL;
++			}
++			ublk_free_dev(ublk);
++			return;
++		}
++
+ 		UBLK_DEBUGLOG(ublk, "Ublk %u device state %u\n", ublk->ublk_id, ublk->dev_info.state);
+ 		/* kernel ublk_drv driver returns -EBUSY if device state isn't UBLK_S_DEV_QUIESCED */
+ 		if ((ublk->dev_info.state != UBLK_S_DEV_QUIESCED) && (ublk->retry_count < 3)) {
+@@ -1029,6 +1048,13 @@ ublk_dev_get_num_queues(struct spdk_ublk_dev *ublk)
+ 	return ublk->num_queues;
+ }
+ 
++/* Evariops 0064 */
++uint64_t
++ublk_dev_get_identity(struct spdk_ublk_dev *ublk)
++{
++	return ublk->identity;
++}
++
+ /* Evariops 0058: read on the app thread while the queues' threads write them: each a
+  * counter, read whole, a snapshot good enough for a report. */
+ void
+@@ -1082,6 +1108,10 @@ spdk_ublk_write_config_json(struct spdk_json_write_ctx *w)
+ 		spdk_json_write_named_uint32(w, "ublk_id", ublk->ublk_id);
+ 		spdk_json_write_named_uint32(w, "num_queues", ublk->num_queues);
+ 		spdk_json_write_named_uint32(w, "queue_depth", ublk->queue_depth);
++		if (ublk->identity != 0) {
++			/* Evariops 0064 */
++			spdk_json_write_named_uint64(w, "identity", ublk->identity);
++		}
+ 		spdk_json_write_object_end(w);
+ 
+ 		spdk_json_write_object_end(w);
+@@ -2193,6 +2223,9 @@ ublk_dev_info_init(struct spdk_ublk_dev *ublk)
+ 		.max_io_buf_bytes = ublk_max_io_bytes(),
+ 		.ublksrv_pid = getpid(),
+ 		.flags = UBLK_F_URING_CMD_COMP_IN_TASK,
++		/* Evariops 0064: 64 bits the driver keeps for the server, untouched, returned by
++		 * UBLK_CMD_GET_DEV_INFO: they outlive this process, and a recovery reads them. */
++		.ublksrv_flags = ublk->identity,
+ 	};
+ 
+ 	if (g_ublk_tgt.user_copy) {
+@@ -2422,7 +2455,7 @@ ublk_poll_groups_ready(void)
+ 
+ int
+ ublk_start_disk(const char *bdev_name, uint32_t ublk_id,
+-		uint32_t num_queues, uint32_t queue_depth,
++		uint32_t num_queues, uint32_t queue_depth, uint64_t identity,
+ 		ublk_ctrl_cb ctrl_cb, void *cb_arg)
+ {
+ 	int			rc;
+@@ -2462,6 +2495,7 @@ ublk_start_disk(const char *bdev_name, uint32_t ublk_id,
+ 	ublk->cb_arg = cb_arg;
+ 	ublk->cdev_fd = -1;
+ 	ublk->ublk_id = ublk_id;
++	ublk->identity = identity;
+ 	UBLK_DEBUGLOG(ublk, "bdev %s num_queues %d queue_depth %d\n",
+ 		      bdev_name, num_queues, queue_depth);
+ 
+@@ -2591,7 +2625,7 @@ ublk_ctrl_start_recovery(struct spdk_ublk_dev *ublk)
+ }
+ 
+ int
+-ublk_start_disk_recovery(const char *bdev_name, uint32_t ublk_id, ublk_ctrl_cb ctrl_cb,
++ublk_start_disk_recovery(const char *bdev_name, uint32_t ublk_id, uint64_t identity, ublk_ctrl_cb ctrl_cb,
+ 			 void *cb_arg)
+ {
+ 	int			rc;
+@@ -2635,6 +2669,7 @@ ublk_start_disk_recovery(const char *bdev_name, uint32_t ublk_id, ublk_ctrl_cb c
+ 	ublk->cb_arg = cb_arg;
+ 	ublk->cdev_fd = -1;
+ 	ublk->ublk_id = ublk_id;
++	ublk->identity = identity;
+ 
+ 	rc = ublk_open_bdev(ublk, bdev_name);
+ 	if (rc != 0) {
+diff --git a/lib/ublk/ublk_internal.h b/lib/ublk/ublk_internal.h
+index 5629ecd..c953d44 100644
+--- a/lib/ublk/ublk_internal.h
++++ b/lib/ublk/ublk_internal.h
+@@ -56,16 +56,20 @@ typedef void (*ublk_ctrl_cb)(void *cb_arg, int result);
+ 
+ int ublk_create_target(const char *cpumask_str, bool disable_user_copy);
+ int ublk_destroy_target(spdk_ublk_fini_cb cb_fn, void *cb_arg);
++/* Evariops 0064: identity, the publication the disk serves (0: none), kept by the kernel with
++ * the device; a recovery refuses a device that carries another (-EEXIST). */
+ int ublk_start_disk(const char *bdev_name, uint32_t ublk_id,
+-		    uint32_t num_queues, uint32_t queue_depth,
++		    uint32_t num_queues, uint32_t queue_depth, uint64_t identity,
+ 		    ublk_ctrl_cb ctrl_cb, void *cb_arg);
+ int ublk_stop_disk(uint32_t ublk_id, ublk_ctrl_cb ctrl_cb, void *cb_arg);
+ /* Evariops 0061 */
+ int ublk_quiesce_disk(uint32_t ublk_id, uint64_t timeout_ms, ublk_ctrl_cb ctrl_cb, void *cb_arg);
+ int
+-ublk_start_disk_recovery(const char *bdev_name, uint32_t ublk_id, ublk_ctrl_cb ctrl_cb,
++ublk_start_disk_recovery(const char *bdev_name, uint32_t ublk_id, uint64_t identity, ublk_ctrl_cb ctrl_cb,
+ 			 void *cb_arg);
+ struct spdk_ublk_dev *ublk_dev_find_by_id(uint32_t ublk_id);
++/* Evariops 0064 */
++uint64_t ublk_dev_get_identity(struct spdk_ublk_dev *ublk);
+ uint32_t ublk_dev_get_id(struct spdk_ublk_dev *ublk);
+ const char *ublk_dev_get_bdev_name(struct spdk_ublk_dev *ublk);
+ struct spdk_ublk_dev *ublk_dev_first(void);
+diff --git a/lib/ublk/ublk_rpc.c b/lib/ublk/ublk_rpc.c
+index 0ee29c9..ffb2fee 100644
+--- a/lib/ublk/ublk_rpc.c
++++ b/lib/ublk/ublk_rpc.c
+@@ -108,7 +108,7 @@ rpc_ublk_start_disk(struct spdk_jsonrpc_request *request,
+ 		return;
+ 	}
+ 
+-	rc = ublk_start_disk(req->bdev_name, req->ublk_id, req->num_queues, req->queue_depth,
++	rc = ublk_start_disk(req->bdev_name, req->ublk_id, req->num_queues, req->queue_depth, req->identity,
+ 			     rpc_ublk_start_disk_done, req);
+ 	if (rc != 0) {
+ 		rpc_ublk_start_disk_done(req, rc);
+@@ -177,6 +177,8 @@ rpc_dump_ublk_info(struct spdk_json_write_ctx *w,
+ 	spdk_json_write_named_uint32(w, "queue_depth", ublk_dev_get_queue_depth(ublk));
+ 	spdk_json_write_named_uint32(w, "num_queues", ublk_dev_get_num_queues(ublk));
+ 	spdk_json_write_named_string(w, "bdev_name", ublk_dev_get_bdev_name(ublk));
++	/* Evariops 0064 */
++	spdk_json_write_named_uint64(w, "identity", ublk_dev_get_identity(ublk));
+ 
+ 	/* Evariops 0058 */
+ 	ublk_dev_get_buffer_waits(ublk, &waits);
+@@ -283,7 +285,7 @@ rpc_ublk_recover_disk(struct spdk_jsonrpc_request *request,
+ 	/* Evariops 0063: answered once the recovery ends, as ublk_start_disk is, not once its
+ 	 * first control command is submitted: a disk the kernel no longer holds (-ENODEV, a host
+ 	 * reboot) is then told apart from a disk recovered, and its caller starts it anew. */
+-	rc = ublk_start_disk_recovery(req->bdev_name, req->ublk_id, rpc_ublk_recover_disk_done, req);
++	rc = ublk_start_disk_recovery(req->bdev_name, req->ublk_id, req->identity, rpc_ublk_recover_disk_done, req);
+ 	if (rc != 0) {
+ 		rpc_ublk_recover_disk_done(req, rc);
+ 	}
+diff --git a/python/spdk/cli/ublk.py b/python/spdk/cli/ublk.py
+index 6e9653e..8f2be81 100644
+--- a/python/spdk/cli/ublk.py
++++ b/python/spdk/cli/ublk.py
+@@ -31,7 +31,8 @@ def add_parser(subparsers):
+                                        bdev_name=args.bdev_name,
+                                        ublk_id=args.ublk_id,
+                                        num_queues=args.num_queues,
+-                                       queue_depth=args.queue_depth))
++                                       queue_depth=args.queue_depth,
++                                       identity=args.identity))
+ 
+     p = subparsers.add_parser('ublk_start_disk',
+                               help='Export a bdev as a ublk device')
+@@ -39,6 +40,7 @@ def add_parser(subparsers):
+     p.add_argument('ublk_id', help='ublk device ID, used as the suffix in /dev/ublkb[id]', type=int)
+     p.add_argument('-q', '--num-queues', help='Number of queues to create on the device. Default: 1', type=int)
+     p.add_argument('-d', '--queue-depth', help='Per-queue depth. Default: 128', type=int)
++    p.add_argument('--identity', help='identity of the publication the disk serves (Evariops)', type=int)
+     p.set_defaults(func=ublk_start_disk)
+ 
+     def ublk_stop_disk(args):
+@@ -52,12 +54,14 @@ def add_parser(subparsers):
+     def ublk_recover_disk(args):
+         print_json(args.client.ublk_recover_disk(
+                                          bdev_name=args.bdev_name,
+-                                         ublk_id=args.ublk_id))
++                                         ublk_id=args.ublk_id,
++                                         identity=args.identity))
+ 
+     p = subparsers.add_parser('ublk_recover_disk',
+                               help='Recover ublk device')
+     p.add_argument('bdev_name', help='Name of the bdev backing the recovering ublk device')
+     p.add_argument('ublk_id', help='ID of the ublk device to recover', type=int)
++    p.add_argument('--identity', help='identity the device must carry (Evariops)', type=int)
+     p.set_defaults(func=ublk_recover_disk)
+ 
+     def ublk_get_disks(args):
+diff --git a/schema/schema.yaml b/schema/schema.yaml
+index 5d9758b..3776383 100644
+--- a/schema/schema.yaml
++++ b/schema/schema.yaml
+@@ -583,6 +583,9 @@ return_objects:
+       - name: bdev_name
+         type: string
+         description: Name of the bdev backing the ublk device
++      - name: identity
++        type: uint64
++        description: 'Evariops: the identity of the publication the disk serves; 0: none'
+       - name: buffer_waits
+         type: object
+         description: >-
+@@ -5169,6 +5172,9 @@ methods:
+       - name: num_queues
+         type: uint32
+         description: 'Number of queues to create on the device. Default: 1'
++      - name: identity
++        type: uint64
++        description: identity of the publication the disk serves (Evariops)
+   - name: ublk_recover_disk
+     description: Recover original UBLK device with ID and block device
+     result:
+@@ -5183,6 +5189,9 @@ methods:
+         type: uint32
+         required: true
+         description: ID of the ublk device to recover
++      - name: identity
++        type: uint64
++        description: identity the device must carry (Evariops)
+   - name: ublk_stop_disk
+     description: Delete a UBLK device
+     result:
