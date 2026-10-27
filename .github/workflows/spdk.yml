@@ -241,12 +241,12 @@ jobs:
   # Upstream has no unit suite for lib/ublk: the debug image serves disks
   # through the host's ublk_drv, and the script restarts, kills and starves
   # the process under a writer. A case the host's driver cannot serve
-  # prints SKIP. Non-gating until a hosted runner proves it loads the driver.
+  # prints SKIP. The hosted runner's kernel (6.17) loads the driver from
+  # linux-modules-extra and has every feature the series uses.
   ublk-functional:
     needs: [compute-tag, build]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
-    continue-on-error: true
     permissions:
       contents: read
       packages: read
@@ -433,7 +433,7 @@ jobs:
   # Une PR non autorisée saute build, et seul lint reste déterminant.
   ci-gate:
     name: ci-gate
-    needs: [lint, build]
+    needs: [lint, build, ublk-functional]
     if: always()
     runs-on: ubuntu-24.04
     steps:
