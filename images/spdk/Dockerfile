@@ -156,8 +156,8 @@ RUN make -j"$(nproc)"
 # (the container's termination log). Linked against the libc spdk_tgt already needs.
 RUN { echo spdk; \
       grep -q "^CONFIG_UBLK?=y" mk/config.mk && echo ublk; \
-      compgen -G "/build/patches/0064-*" > /dev/null && echo ublk-identity; \
-      compgen -G "/build/patches/0065-*" > /dev/null && echo ublk-target-report; \
+      test -n "$(find /build/patches -name '0064-*.patch')" && echo ublk-identity; \
+      test -n "$(find /build/patches -name '0065-*.patch')" && echo ublk-target-report; \
       true; } > /build/features.txt && \
     { printf '#include <stdio.h>\nstatic const char features[] =\n'; \
       sed 's/.*/"&\\n"/' /build/features.txt; \
