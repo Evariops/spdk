@@ -1,8 +1,8 @@
 diff --git a/lib/ublk/ublk.c b/lib/ublk/ublk.c
-index 9877746..240a484 100644
+index 334b0bf..ca431dc 100644
 --- a/lib/ublk/ublk.c
 +++ b/lib/ublk/ublk.c
-@@ -175,6 +175,9 @@ struct spdk_ublk_dev {
+@@ -178,6 +178,9 @@ struct spdk_ublk_dev {
  	/* Evariops 0061: quiesced to be left to the kernel for a later recovery, not deleted. */
  	bool			is_quiescing;
  	uint64_t		quiesce_timeout_ms;
@@ -12,7 +12,7 @@ index 9877746..240a484 100644
  
  	TAILQ_ENTRY(spdk_ublk_dev) tailq;
  	TAILQ_ENTRY(spdk_ublk_dev) wait_tailq;
-@@ -464,6 +467,27 @@ ublk_ctrl_process_cqe(struct io_uring_cqe *cqe)
+@@ -468,6 +471,27 @@ ublk_ctrl_process_cqe(struct io_uring_cqe *cqe)
  			goto cb_done;
  		}
  
@@ -40,7 +40,7 @@ index 9877746..240a484 100644
  		UBLK_DEBUGLOG(ublk, "Ublk %u device state %u\n", ublk->ublk_id, ublk->dev_info.state);
  		/* kernel ublk_drv driver returns -EBUSY if device state isn't UBLK_S_DEV_QUIESCED */
  		if ((ublk->dev_info.state != UBLK_S_DEV_QUIESCED) && (ublk->retry_count < 3)) {
-@@ -1029,6 +1053,13 @@ ublk_dev_get_num_queues(struct spdk_ublk_dev *ublk)
+@@ -1037,6 +1061,13 @@ ublk_dev_get_num_queues(struct spdk_ublk_dev *ublk)
  	return ublk->num_queues;
  }
  
@@ -54,7 +54,7 @@ index 9877746..240a484 100644
  /* Evariops 0058: read on the app thread while the queues' threads write them: each a
   * counter, read whole, a snapshot good enough for a report. */
  void
-@@ -1082,6 +1113,10 @@ spdk_ublk_write_config_json(struct spdk_json_write_ctx *w)
+@@ -1090,6 +1121,10 @@ spdk_ublk_write_config_json(struct spdk_json_write_ctx *w)
  		spdk_json_write_named_uint32(w, "ublk_id", ublk->ublk_id);
  		spdk_json_write_named_uint32(w, "num_queues", ublk->num_queues);
  		spdk_json_write_named_uint32(w, "queue_depth", ublk->queue_depth);
@@ -65,7 +65,7 @@ index 9877746..240a484 100644
  		spdk_json_write_object_end(w);
  
  		spdk_json_write_object_end(w);
-@@ -2193,6 +2228,9 @@ ublk_dev_info_init(struct spdk_ublk_dev *ublk)
+@@ -2218,6 +2253,9 @@ ublk_dev_info_init(struct spdk_ublk_dev *ublk)
  		.max_io_buf_bytes = ublk_max_io_bytes(),
  		.ublksrv_pid = getpid(),
  		.flags = UBLK_F_URING_CMD_COMP_IN_TASK,
@@ -75,7 +75,7 @@ index 9877746..240a484 100644
  	};
  
  	if (g_ublk_tgt.user_copy) {
-@@ -2422,7 +2460,7 @@ ublk_poll_groups_ready(void)
+@@ -2447,7 +2485,7 @@ ublk_poll_groups_ready(void)
  
  int
  ublk_start_disk(const char *bdev_name, uint32_t ublk_id,
@@ -84,7 +84,7 @@ index 9877746..240a484 100644
  		ublk_ctrl_cb ctrl_cb, void *cb_arg)
  {
  	int			rc;
-@@ -2462,6 +2500,7 @@ ublk_start_disk(const char *bdev_name, uint32_t ublk_id,
+@@ -2487,6 +2525,7 @@ ublk_start_disk(const char *bdev_name, uint32_t ublk_id,
  	ublk->cb_arg = cb_arg;
  	ublk->cdev_fd = -1;
  	ublk->ublk_id = ublk_id;
@@ -92,7 +92,7 @@ index 9877746..240a484 100644
  	UBLK_DEBUGLOG(ublk, "bdev %s num_queues %d queue_depth %d\n",
  		      bdev_name, num_queues, queue_depth);
  
-@@ -2591,7 +2630,7 @@ ublk_ctrl_start_recovery(struct spdk_ublk_dev *ublk)
+@@ -2616,7 +2655,7 @@ ublk_ctrl_start_recovery(struct spdk_ublk_dev *ublk)
  }
  
  int
@@ -101,7 +101,7 @@ index 9877746..240a484 100644
  			 void *cb_arg)
  {
  	int			rc;
-@@ -2635,6 +2674,7 @@ ublk_start_disk_recovery(const char *bdev_name, uint32_t ublk_id, ublk_ctrl_cb c
+@@ -2660,6 +2699,7 @@ ublk_start_disk_recovery(const char *bdev_name, uint32_t ublk_id, ublk_ctrl_cb c
  	ublk->cb_arg = cb_arg;
  	ublk->cdev_fd = -1;
  	ublk->ublk_id = ublk_id;

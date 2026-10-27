@@ -1,5 +1,5 @@
 diff --git a/module/bdev/uring/bdev_uring.c b/module/bdev/uring/bdev_uring.c
-index bf9f520..aad7814 100644
+index bf9f520..902f051 100644
 --- a/module/bdev/uring/bdev_uring.c
 +++ b/module/bdev/uring/bdev_uring.c
 @@ -19,7 +19,9 @@
@@ -122,8 +122,8 @@ index bf9f520..aad7814 100644
  	spdk_json_write_object_end(w);
  }
  
-+/* Evariops 0068: the ublk-zc memory domain, while the ublk target serves requests with no copy:
-+ * a bdev registered meanwhile (and an lvol over it) takes a request's pages as they are. */
++/* Evariops 0068: the ublk-zc memory domain, which the ublk library creates when the application
++ * starts, before any bdev: a bdev (and an lvol over it) takes a request's pages as they are. */
 +static int
 +bdev_uring_get_memory_domains(void *ctx, struct spdk_memory_domain **domains, int array_size)
 +{

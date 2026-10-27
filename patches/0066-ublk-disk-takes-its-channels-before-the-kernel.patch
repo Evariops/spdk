@@ -1,8 +1,8 @@
 diff --git a/lib/ublk/ublk.c b/lib/ublk/ublk.c
-index 0dec342..3c4d6a8 100644
+index bbab0ad..f243ea7 100644
 --- a/lib/ublk/ublk.c
 +++ b/lib/ublk/ublk.c
-@@ -178,6 +178,15 @@ struct spdk_ublk_dev {
+@@ -181,6 +181,15 @@ struct spdk_ublk_dev {
  	/* Evariops 0064: the identity of the publication the disk serves, kept by the kernel
  	 * with the device (ublksrv_flags); for a recovery, the identity the device must carry. */
  	uint64_t		identity;
@@ -18,7 +18,7 @@ index 0dec342..3c4d6a8 100644
  
  	TAILQ_ENTRY(spdk_ublk_dev) tailq;
  	TAILQ_ENTRY(spdk_ublk_dev) wait_tailq;
-@@ -205,6 +214,9 @@ struct ublk_poll_group {
+@@ -208,6 +217,9 @@ struct ublk_poll_group {
  	/* UBLK_POLL_GROUP_PENDING until its thread has set up its buffers, then READY or
  	 * FAILED: a poll group without its buffers serves no disk. */
  	int				buffers_state;
@@ -28,7 +28,7 @@ index 0dec342..3c4d6a8 100644
  };
  
  #define UBLK_POLL_GROUP_PENDING	0
-@@ -1124,6 +1136,8 @@ ublk_dump_target_json(struct spdk_json_write_ctx *w)
+@@ -1132,6 +1144,8 @@ ublk_dump_target_json(struct spdk_json_write_ctx *w)
  					     state == UBLK_POLL_GROUP_FAILED ? "failed" : "pending");
  		spdk_json_write_named_uint32(w, "holders", poll_group->buf_holders);
  		spdk_json_write_named_bool(w, "reserve_lent", poll_group->reserve_lent);
@@ -37,7 +37,7 @@ index 0dec342..3c4d6a8 100644
  		spdk_json_write_object_end(w);
  	}
  	spdk_json_write_array_end(w);
-@@ -2397,6 +2411,12 @@ free_buffers(void *arg)
+@@ -2422,6 +2436,12 @@ free_buffers(void *arg)
  	}
  	free(q->ios);
  	q->ios = NULL;
@@ -50,7 +50,7 @@ index 0dec342..3c4d6a8 100644
  	spdk_thread_send_msg(spdk_thread_get_app_thread(), _ublk_free_dev, q->dev);
  }
  
-@@ -2407,6 +2427,7 @@ ublk_free_dev(struct spdk_ublk_dev *ublk)
+@@ -2432,6 +2452,7 @@ ublk_free_dev(struct spdk_ublk_dev *ublk)
  	uint32_t q_idx;
  	ublk_ctrl_cb cb;
  	void *cb_arg;
@@ -58,7 +58,7 @@ index 0dec342..3c4d6a8 100644
  
  	spdk_poller_unregister(&ublk->resize_poller);
  
-@@ -2442,12 +2463,15 @@ ublk_free_dev(struct spdk_ublk_dev *ublk)
+@@ -2467,12 +2488,15 @@ ublk_free_dev(struct spdk_ublk_dev *ublk)
  	SPDK_NOTICELOG("ublk dev %d stopped\n", ublk->ublk_id);
  
  	/* Evariops 0061: a quiesce is answered once the disk is gone from this
@@ -77,7 +77,7 @@ index 0dec342..3c4d6a8 100644
  	}
  }
  
-@@ -2506,7 +2530,8 @@ ublk_queue_run(void *arg1)
+@@ -2531,7 +2555,8 @@ ublk_queue_run(void *arg1)
  	struct ublk_poll_group *poll_group = q->poll_group;
  
  	assert(spdk_get_thread() == poll_group->ublk_thread);
@@ -87,7 +87,7 @@ index 0dec342..3c4d6a8 100644
  	/* Queues must be filled with IO in the io pthread */
  	ublk_dev_queue_io_init(q);
  
-@@ -2535,6 +2560,11 @@ ublk_poll_groups_ready(void)
+@@ -2560,6 +2585,11 @@ ublk_poll_groups_ready(void)
  	return 0;
  }
  
@@ -99,7 +99,7 @@ index 0dec342..3c4d6a8 100644
  int
  ublk_start_disk(const char *bdev_name, uint32_t ublk_id,
  		uint32_t num_queues, uint32_t queue_depth, uint64_t identity,
-@@ -2623,13 +2653,10 @@ ublk_start_disk(const char *bdev_name, uint32_t ublk_id,
+@@ -2648,13 +2678,10 @@ ublk_start_disk(const char *bdev_name, uint32_t ublk_id,
  
  	/* Add ublk_dev to the end of disk list */
  	ublk_dev_list_register(ublk);
@@ -116,7 +116,7 @@ index 0dec342..3c4d6a8 100644
  }
  
  static int
-@@ -2664,18 +2691,114 @@ ublk_start_dev(struct spdk_ublk_dev *ublk, bool is_recovering)
+@@ -2689,18 +2716,114 @@ ublk_start_dev(struct spdk_ublk_dev *ublk, bool is_recovering)
  		}
  	}
  
@@ -235,7 +235,7 @@ index 0dec342..3c4d6a8 100644
  }
  
  static int
-@@ -2702,8 +2825,9 @@ ublk_ctrl_start_recovery(struct spdk_ublk_dev *ublk)
+@@ -2727,8 +2850,9 @@ ublk_ctrl_start_recovery(struct spdk_ublk_dev *ublk)
  		return rc;
  	}
  
