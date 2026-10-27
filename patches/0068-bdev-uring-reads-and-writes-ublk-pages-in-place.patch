@@ -1,0 +1,165 @@
+diff --git a/module/bdev/uring/bdev_uring.c b/module/bdev/uring/bdev_uring.c
+index bf9f520..aad7814 100644
+--- a/module/bdev/uring/bdev_uring.c
++++ b/module/bdev/uring/bdev_uring.c
+@@ -19,7 +19,9 @@
+ #include "spdk/file.h"
+ 
+ #include "spdk/log.h"
++#include "spdk/dma.h"
+ #include "spdk_internal/uring.h"
++#include "spdk_internal/ublk_zc.h"
+ 
+ #ifdef SPDK_CONFIG_URING_ZNS
+ #include <linux/blkzoned.h>
+@@ -73,6 +75,12 @@ struct bdev_uring_task {
+ 	uint64_t			len;
+ 	struct bdev_uring_io_channel	*ch;
+ 	TAILQ_ENTRY(bdev_uring_task)	link;
++	/* Evariops 0068: an I/O on a ublk request's registered pages (the ublk-zc memory
++	 * domain): one fixed operation per iovec, on the request's ring, done once all are. */
++	struct spdk_ublk_zc_op		zc_op;
++	uint32_t			zc_pending;
++	uint64_t			zc_done;
++	bool				zc_failed;
+ };
+ 
+ struct bdev_uring {
+@@ -714,6 +722,79 @@ bdev_uring_check_zoned_support(struct bdev_uring *uring, const char *name, const
+ }
+ #endif
+ 
++/*
++ * Evariops 0068: a read or write on a ublk request's registered pages (the ublk-zc memory domain,
++ * see spdk_internal/ublk_zc.h) moves with no copy: one fixed read or write of the file per
++ * iovec, prepared on the request's ring, which ublk submits and whose completions it calls back,
++ * on this thread. The I/O succeeds once every operation moved all its bytes; a short one fails
++ * it, so no byte the file did not give is declared to the request. The ring full, the bdev layer
++ * retries the I/O.
++ */
++static void
++bdev_uring_zc_done(struct spdk_ublk_zc_op *op, int32_t res)
++{
++	struct bdev_uring_task *task = SPDK_CONTAINEROF(op, struct bdev_uring_task, zc_op);
++	struct spdk_bdev_io *bdev_io = spdk_bdev_io_from_ctx(task);
++
++	if (res < 0) {
++		task->zc_failed = true;
++	} else {
++		task->zc_done += (uint64_t)res;
++	}
++	if (--task->zc_pending > 0) {
++		return;
++	}
++
++	if (spdk_unlikely(task->zc_failed || task->zc_done != task->len)) {
++		URING_ERRLOG(uring_from_bdev(bdev_io->bdev), "zero copy %s of %" PRIu64 " bytes moved %" PRIu64 "%s\n",
++			     bdev_io->type == SPDK_BDEV_IO_TYPE_READ ? "read" : "write", task->len, task->zc_done,
++			     task->zc_failed ? ", an operation failed" : "");
++		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
++		return;
++	}
++	spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
++}
++
++static void
++bdev_uring_zc_rw(struct spdk_bdev_io *bdev_io)
++{
++	struct bdev_uring *uring = uring_from_bdev(bdev_io->bdev);
++	struct bdev_uring_task *task = (struct bdev_uring_task *)bdev_io->driver_ctx;
++	struct spdk_ublk_zc_ctx *ctx = bdev_io->u.bdev.memory_domain_ctx;
++	bool write = bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE;
++	uint64_t offset = bdev_io->u.bdev.offset_blocks * bdev_io->bdev->blocklen;
++	struct io_uring_sqe *sqe;
++	struct iovec *iov;
++	int i;
++
++	if (spdk_ublk_zc_ring_space(ctx) < (unsigned)bdev_io->u.bdev.iovcnt) {
++		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_NOMEM);
++		return;
++	}
++
++	task->zc_op.cb = bdev_uring_zc_done;
++	task->zc_pending = bdev_io->u.bdev.iovcnt;
++	task->zc_done = 0;
++	task->zc_failed = false;
++	task->len = bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen;
++	for (i = 0; i < bdev_io->u.bdev.iovcnt; i++) {
++		iov = &bdev_io->u.bdev.iovs[i];
++		sqe = spdk_ublk_zc_prep_rw(ctx, write, uring->fd, iov->iov_base, iov->iov_len, offset,
++					   &task->zc_op);
++		assert(sqe != NULL);
++		offset += iov->iov_len;
++	}
++	URING_DEBUGLOG(uring, "zero copy %s of %d iovs, %" PRIu64 " bytes\n", write ? "write" : "read",
++		       bdev_io->u.bdev.iovcnt, task->len);
++}
++
++static bool
++bdev_uring_io_is_zero_copy(struct spdk_bdev_io *bdev_io)
++{
++	return bdev_io->u.bdev.memory_domain != NULL &&
++	       spdk_memory_domain_get_dma_device_type(bdev_io->u.bdev.memory_domain) == SPDK_UBLK_ZC_DMA_DEVICE_TYPE;
++}
++
+ static int
+ _bdev_uring_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
+ {
+@@ -728,6 +809,12 @@ _bdev_uring_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev
+ 	 * get the aligned buffer from the pool by calling spdk_bdev_io_get_buf. */
+ 	case SPDK_BDEV_IO_TYPE_READ:
+ 	case SPDK_BDEV_IO_TYPE_WRITE:
++		/* Evariops 0068: a ublk request's pages are read and written where they are. Any
++		 * other domain is bounced through a buffer, as before. */
++		if (bdev_uring_io_is_zero_copy(bdev_io)) {
++			bdev_uring_zc_rw(bdev_io);
++			return 0;
++		}
+ 		spdk_bdev_io_get_buf(bdev_io, bdev_uring_get_buf_cb,
+ 				     bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen);
+ 		return 0;
+@@ -821,6 +908,34 @@ bdev_uring_write_json_config(struct spdk_bdev *bdev, struct spdk_json_write_ctx
+ 	spdk_json_write_object_end(w);
+ }
+ 
++/* Evariops 0068: the ublk-zc memory domain, while the ublk target serves requests with no copy:
++ * a bdev registered meanwhile (and an lvol over it) takes a request's pages as they are. */
++static int
++bdev_uring_get_memory_domains(void *ctx, struct spdk_memory_domain **domains, int array_size)
++{
++	struct spdk_memory_domain *domain = spdk_memory_domain_get_first(SPDK_UBLK_ZC_DMA_DEVICE_ID);
++
++	if (domain == NULL) {
++		return 0;
++	}
++	if (domains != NULL && array_size >= 1) {
++		domains[0] = domain;
++	}
++	return 1;
++}
++
++static int
++bdev_uring_get_memory_domain_types(void *ctx, enum spdk_dma_device_type *types, uint32_t array_size)
++{
++	if (spdk_memory_domain_get_first(SPDK_UBLK_ZC_DMA_DEVICE_ID) == NULL) {
++		return 0;
++	}
++	if (types != NULL && array_size >= 1) {
++		types[0] = SPDK_UBLK_ZC_DMA_DEVICE_TYPE;
++	}
++	return 1;
++}
++
+ static const struct spdk_bdev_fn_table uring_fn_table = {
+ 	.destruct		= bdev_uring_destruct,
+ 	.submit_request		= bdev_uring_submit_request,
+@@ -828,6 +943,9 @@ static const struct spdk_bdev_fn_table uring_fn_table = {
+ 	.get_io_channel		= bdev_uring_get_io_channel,
+ 	.dump_info_json		= bdev_uring_dump_info_json,
+ 	.write_config_json	= bdev_uring_write_json_config,
++	/* Evariops 0068 */
++	.get_memory_domains	= bdev_uring_get_memory_domains,
++	.get_memory_domain_types = bdev_uring_get_memory_domain_types,
+ };
+ 
+ static void

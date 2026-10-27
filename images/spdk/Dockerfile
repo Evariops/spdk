@@ -158,6 +158,7 @@ RUN { echo spdk; \
       grep -q "^CONFIG_UBLK?=y" mk/config.mk && echo ublk; \
       test -n "$(find /build/patches -name '0064-*.patch')" && echo ublk-identity; \
       test -n "$(find /build/patches -name '0065-*.patch')" && echo ublk-target-report; \
+      test -n "$(find /build/patches -name '0067-*.patch')" && echo ublk-zero-copy; \
       true; } > /build/features.txt && \
     { printf '#include <stdio.h>\nstatic const char features[] =\n'; \
       sed 's/.*/"&\\n"/' /build/features.txt; \
