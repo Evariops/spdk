@@ -1,0 +1,249 @@
+diff --git a/lib/ublk/ublk.c b/lib/ublk/ublk.c
+index d1991b8..6666c25 100644
+--- a/lib/ublk/ublk.c
++++ b/lib/ublk/ublk.c
+@@ -178,6 +178,15 @@ struct spdk_ublk_dev {
+ 	/* Evariops 0064: the identity of the publication the disk serves, kept by the kernel
+ 	 * with the device (ublksrv_flags); for a recovery, the identity the device must carry. */
+ 	uint64_t		identity;
++	/* Evariops 0066: each queue takes its bdev channel, on its poll group's thread, before
++	 * the kernel is asked for anything; channels_next then goes on with the start or the
++	 * recovery. A queue that gets none fails it, with nothing done in the kernel. */
++	uint32_t		channels_pending;
++	uint32_t		channels_failed;
++	void			(*channels_next)(struct spdk_ublk_dev *ublk);
++	/* Evariops 0066: what a start or a recovery that went no further answers, once the
++	 * disk is gone from this process. */
++	int			failed_rc;
+ 
+ 	TAILQ_ENTRY(spdk_ublk_dev) tailq;
+ 	TAILQ_ENTRY(spdk_ublk_dev) wait_tailq;
+@@ -205,6 +214,9 @@ struct ublk_poll_group {
+ 	/* UBLK_POLL_GROUP_PENDING until its thread has set up its buffers, then READY or
+ 	 * FAILED: a poll group without its buffers serves no disk. */
+ 	int				buffers_state;
++	/* Evariops 0066: starts and recoveries refused because a queue could not get a
++	 * channel on its bdev on this thread. */
++	uint64_t			channel_failures;
+ };
+ 
+ #define UBLK_POLL_GROUP_PENDING	0
+@@ -1119,6 +1131,8 @@ ublk_dump_target_json(struct spdk_json_write_ctx *w)
+ 					     state == UBLK_POLL_GROUP_FAILED ? "failed" : "pending");
+ 		spdk_json_write_named_uint32(w, "holders", poll_group->buf_holders);
+ 		spdk_json_write_named_bool(w, "reserve_lent", poll_group->reserve_lent);
++		/* Evariops 0066 */
++		spdk_json_write_named_uint64(w, "channel_failures", poll_group->channel_failures);
+ 		spdk_json_write_object_end(w);
+ 	}
+ 	spdk_json_write_array_end(w);
+@@ -2392,6 +2406,12 @@ free_buffers(void *arg)
+ 	}
+ 	free(q->ios);
+ 	q->ios = NULL;
++	/* Evariops 0066: the channel of a start or recovery that failed before its queue ran
++	 * (a running queue puts its own when it closes). */
++	if (q->bdev_ch != NULL) {
++		spdk_put_io_channel(q->bdev_ch);
++		q->bdev_ch = NULL;
++	}
+ 	spdk_thread_send_msg(spdk_thread_get_app_thread(), _ublk_free_dev, q->dev);
+ }
+ 
+@@ -2402,6 +2422,7 @@ ublk_free_dev(struct spdk_ublk_dev *ublk)
+ 	uint32_t q_idx;
+ 	ublk_ctrl_cb cb;
+ 	void *cb_arg;
++	int rc;
+ 
+ 	spdk_poller_unregister(&ublk->resize_poller);
+ 
+@@ -2437,12 +2458,15 @@ ublk_free_dev(struct spdk_ublk_dev *ublk)
+ 	SPDK_NOTICELOG("ublk dev %d stopped\n", ublk->ublk_id);
+ 
+ 	/* Evariops 0061: a quiesce is answered once the disk is gone from this
+-	 * process, its id free and its bdev released, so a recovery may follow. */
+-	cb = ublk->is_quiescing ? ublk->ctrl_cb : NULL;
++	 * process, its id free and its bdev released, so a recovery may follow.
++	 * Evariops 0066: so is a start or recovery that went no further, with its error:
++	 * a retry then finds the id free. */
++	cb = ublk->is_quiescing || ublk->failed_rc != 0 ? ublk->ctrl_cb : NULL;
+ 	cb_arg = ublk->cb_arg;
++	rc = ublk->failed_rc;
+ 	free(ublk);
+ 	if (cb != NULL) {
+-		cb(cb_arg, 0);
++		cb(cb_arg, rc);
+ 	}
+ }
+ 
+@@ -2501,7 +2525,8 @@ ublk_queue_run(void *arg1)
+ 	struct ublk_poll_group *poll_group = q->poll_group;
+ 
+ 	assert(spdk_get_thread() == poll_group->ublk_thread);
+-	q->bdev_ch = spdk_bdev_get_io_channel(ublk->bdev_desc);
++	/* Evariops 0066: the queue took its bdev channel before the kernel was asked for
++	 * anything (ublk_dev_get_channels). */
+ 	/* Queues must be filled with IO in the io pthread */
+ 	ublk_dev_queue_io_init(q);
+ 
+@@ -2530,6 +2555,11 @@ ublk_poll_groups_ready(void)
+ 	return 0;
+ }
+ 
++/* Evariops 0066 */
++static void ublk_dev_get_channels(struct spdk_ublk_dev *ublk,
++				  void (*next)(struct spdk_ublk_dev *ublk));
++static void ublk_dev_add(struct spdk_ublk_dev *ublk);
++
+ int
+ ublk_start_disk(const char *bdev_name, uint32_t ublk_id,
+ 		uint32_t num_queues, uint32_t queue_depth, uint64_t identity,
+@@ -2618,13 +2648,10 @@ ublk_start_disk(const char *bdev_name, uint32_t ublk_id,
+ 
+ 	/* Add ublk_dev to the end of disk list */
+ 	ublk_dev_list_register(ublk);
+-	rc = ublk_ctrl_cmd_submit(ublk, UBLK_CMD_ADD_DEV);
+-	if (rc < 0) {
+-		SPDK_ERRLOG("UBLK can't add dev %d, rc %s\n", ublk->ublk_id, spdk_strerror(-rc));
+-		ublk_free_dev(ublk);
+-	}
++	/* Evariops 0066: UBLK_CMD_ADD_DEV once every queue has its bdev channel. */
++	ublk_dev_get_channels(ublk, ublk_dev_add);
+ 
+-	return rc;
++	return 0;
+ }
+ 
+ static int
+@@ -2659,18 +2686,114 @@ ublk_start_dev(struct spdk_ublk_dev *ublk, bool is_recovering)
+ 		}
+ 	}
+ 
+-	/* Send queue to different spdk_threads for load balance */
++	/* Evariops 0066: each queue runs on the poll group whose thread holds its bdev
++	 * channel (ublk_dev_get_channels spread them). */
+ 	for (q_id = 0; q_id < ublk->num_queues; q_id++) {
+-		ublk->queues[q_id].poll_group = &g_ublk_tgt.poll_groups[g_next_ublk_poll_group];
+-		ublk_thread = g_ublk_tgt.poll_groups[g_next_ublk_poll_group].ublk_thread;
++		ublk_thread = ublk->queues[q_id].poll_group->ublk_thread;
+ 		spdk_thread_send_msg(ublk_thread, ublk_queue_run, &ublk->queues[q_id]);
++	}
++
++	return 0;
++}
++
++/* Evariops 0066: upstream took a queue's bdev channel when the queue ran, after
++ * UBLK_CMD_START_DEV (or START_USER_RECOVERY) was sent, and asserted that it had one.
++ * Creating a channel takes buffers (the bdev and accel caches of that thread, on its
++ * first channel), and a thread short of them gets none: the process aborted, and a
++ * build without asserts served the disk through a NULL channel. Each queue now takes
++ * its channel first, on its poll group's thread; a queue that gets none fails the
++ * start or recovery with -ENOMEM before the kernel is asked for anything: a new disk
++ * is not added, and a quiesced one stays as it is, its requests held, for a retry. */
++static void ublk_dev_channels_got(void *arg);
++
++static void
++ublk_queue_get_channel(void *arg)
++{
++	struct ublk_queue *q = arg;
++
++	assert(spdk_get_thread() == q->poll_group->ublk_thread);
++	q->bdev_ch = spdk_bdev_get_io_channel(q->dev->bdev_desc);
++	if (q->bdev_ch == NULL) {
++		q->poll_group->channel_failures++;
++		SPDK_ERRLOG("ublk %u queue %u: no channel on bdev %s on thread %s (Evariops 0066)\n",
++			    q->dev->ublk_id, q->q_id, spdk_bdev_get_name(q->dev->bdev),
++			    spdk_thread_get_name(spdk_get_thread()));
++	}
++	spdk_thread_send_msg(spdk_thread_get_app_thread(), ublk_dev_channels_got, q);
++}
++
++static void
++ublk_dev_channels_got(void *arg)
++{
++	struct ublk_queue *q = arg;
++	struct spdk_ublk_dev *ublk = q->dev;
++
++	assert(spdk_thread_is_app_thread(NULL));
++	if (q->bdev_ch == NULL) {
++		ublk->channels_failed++;
++	}
++	if (--ublk->channels_pending > 0) {
++		return;
++	}
++	if (ublk->channels_failed > 0) {
++		/* The queues' channels are put, and their buffers freed, on their threads
++		 * (free_buffers); the caller is answered once the disk is gone. */
++		ublk->failed_rc = -ENOMEM;
++		ublk_free_dev(ublk);
++		return;
++	}
++	ublk->channels_next(ublk);
++}
++
++static void
++ublk_dev_get_channels(struct spdk_ublk_dev *ublk, void (*next)(struct spdk_ublk_dev *ublk))
++{
++	struct ublk_queue *q;
++	uint32_t q_id;
++
++	ublk->channels_pending = ublk->num_queues;
++	ublk->channels_failed = 0;
++	ublk->channels_next = next;
++	/* Send queue to different spdk_threads for load balance */
++	for (q_id = 0; q_id < ublk->num_queues; q_id++) {
++		q = &ublk->queues[q_id];
++		q->poll_group = &g_ublk_tgt.poll_groups[g_next_ublk_poll_group];
+ 		g_next_ublk_poll_group++;
+ 		if (g_next_ublk_poll_group == g_num_ublk_poll_groups) {
+ 			g_next_ublk_poll_group = 0;
+ 		}
++		spdk_thread_send_msg(q->poll_group->ublk_thread, ublk_queue_get_channel, q);
+ 	}
++}
+ 
+-	return 0;
++static void
++ublk_dev_add(struct spdk_ublk_dev *ublk)
++{
++	int rc;
++
++	rc = ublk_ctrl_cmd_submit(ublk, UBLK_CMD_ADD_DEV);
++	if (rc < 0) {
++		SPDK_ERRLOG("UBLK can't add dev %d, rc %s\n", ublk->ublk_id, spdk_strerror(-rc));
++		ublk->failed_rc = rc;
++		ublk_free_dev(ublk);
++	}
++}
++
++static void
++ublk_dev_start_user_recovery(struct spdk_ublk_dev *ublk)
++{
++	int rc;
++
++	ublk->is_recovering = true;
++	rc = ublk_ctrl_cmd_submit(ublk, UBLK_CMD_START_USER_RECOVERY);
++	if (rc < 0) {
++		/* As upstream, when its recovery could not be started. */
++		ublk_delete_dev(ublk);
++		if (ublk->ctrl_cb) {
++			ublk->ctrl_cb(ublk->cb_arg, rc);
++			ublk->ctrl_cb = NULL;
++		}
++	}
+ }
+ 
+ static int
+@@ -2697,8 +2820,9 @@ ublk_ctrl_start_recovery(struct spdk_ublk_dev *ublk)
+ 		return rc;
+ 	}
+ 
+-	ublk->is_recovering = true;
+-	return ublk_ctrl_cmd_submit(ublk, UBLK_CMD_START_USER_RECOVERY);
++	/* Evariops 0066: UBLK_CMD_START_USER_RECOVERY once every queue has its bdev channel. */
++	ublk_dev_get_channels(ublk, ublk_dev_start_user_recovery);
++	return 0;
+ }
+ 
+ int
