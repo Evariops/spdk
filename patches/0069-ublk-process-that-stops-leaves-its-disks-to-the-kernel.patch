@@ -1,0 +1,98 @@
+diff --git a/lib/ublk/ublk.c b/lib/ublk/ublk.c
+index 10aafae..1673c48 100644
+--- a/lib/ublk/ublk.c
++++ b/lib/ublk/ublk.c
+@@ -213,6 +213,8 @@ struct spdk_ublk_dev {
+ 	/* Evariops 0067: the disk serves its large requests with no copy: the device was created
+ 	 * with UBLK_F_SUPPORT_ZERO_COPY, and its bdev serves the ublk-zc memory domain. */
+ 	bool			zero_copy;
++	/* Evariops 0069: quiesces asked of the disk as the application stops. */
++	uint32_t		fini_quiesces;
+ 
+ 	TAILQ_ENTRY(spdk_ublk_dev) tailq;
+ 	TAILQ_ENTRY(spdk_ublk_dev) wait_tailq;
+@@ -275,6 +277,9 @@ struct ublk_tgt {
+ 	 * target serves none (not asked for, or the driver lacks UBLK_F_SUPPORT_ZERO_COPY). */
+ 	struct spdk_memory_domain	*zc_domain;
+ 	uint32_t		zc_min_bytes;
++	/* Evariops 0069: the target stops because ublk_destroy_target asked: its disks are
++	 * stopped, not released to the kernel. */
++	bool			delete_on_fini;
+ };
+ 
+ static TAILQ_HEAD(, spdk_ublk_dev) g_ublk_devs = TAILQ_HEAD_INITIALIZER(g_ublk_devs);
+@@ -1002,6 +1007,8 @@ _ublk_fini_done(void *args)
+ 	/* Evariops 0060, 0061 */
+ 	g_ublk_tgt.update_size = false;
+ 	g_ublk_tgt.quiesce = false;
++	/* Evariops 0069 */
++	g_ublk_tgt.delete_on_fini = false;
+ 	/* Evariops 0067: every disk is gone, and no I/O carries the domain. */
+ 	if (g_ublk_tgt.zc_domain != NULL) {
+ 		spdk_memory_domain_destroy(g_ublk_tgt.zc_domain);
+@@ -1058,13 +1065,51 @@ ublk_close_dev(struct spdk_ublk_dev *ublk)
+ 	return rc;
+ }
+ 
++/* Evariops 0069: a process that stops leaves its ublk disks to the kernel. */
++#define UBLK_FINI_QUIESCE_TIMEOUT_MS	5000
++#define UBLK_FINI_QUIESCE_ATTEMPTS	3
++
++/*
++ * Evariops 0069: upstream stopped every disk when the application stopped, which deletes each
++ * kernel device under its filesystem: a target that receives SIGTERM with nobody having released
++ * its disks first (a container stopped by its runtime, a probe's restart) cut every consumer. A
++ * disk is now released as a planned restart releases it (ublk_quiesce_disk, 0061): the kernel
++ * holds its requests, QUIESCED, for the next process to recover. A disk that cannot be quiesced
++ * (no UBLK_F_QUIESCE, or in-flight requests outliving the timeout three times) is stopped, as
++ * upstream did. ublk_destroy_target, asked for, still stops every disk.
++ */
++static void
++ublk_fini_release_or_close(struct spdk_ublk_dev *ublk)
++{
++	int rc;
++
++	if (ublk->is_closing) {
++		return;
++	}
++	if (!g_ublk_tgt.delete_on_fini && (ublk->dev_info.flags & UBLK_F_QUIESCE) &&
++	    ublk->fini_quiesces < UBLK_FINI_QUIESCE_ATTEMPTS) {
++		rc = ublk_quiesce_disk(ublk->ublk_id, UBLK_FINI_QUIESCE_TIMEOUT_MS, NULL, NULL);
++		if (rc == 0) {
++			ublk->fini_quiesces++;
++			SPDK_NOTICELOG("ublk %u released to the kernel as the application stops (Evariops 0069)\n",
++				       ublk->ublk_id);
++			return;
++		}
++		if (rc == -EBUSY) {
++			/* A command in flight, a recovery not finished: the next pass asks again. */
++			return;
++		}
++	}
++	ublk_close_dev(ublk);
++}
++
+ static void
+ _ublk_fini(void *args)
+ {
+ 	struct spdk_ublk_dev	*ublk, *ublk_tmp;
+ 
+ 	TAILQ_FOREACH_SAFE(ublk, &g_ublk_devs, tailq, ublk_tmp) {
+-		ublk_close_dev(ublk);
++		ublk_fini_release_or_close(ublk);
+ 	}
+ 
+ 	/* Check if all ublks closed */
+@@ -1112,7 +1157,12 @@ ublk_destroy_target(spdk_ublk_fini_cb cb_fn, void *cb_arg)
+ 		return -ENOENT;
+ 	}
+ 
++	/* Evariops 0069: asked for, the target stops its disks. */
++	g_ublk_tgt.delete_on_fini = true;
+ 	rc = spdk_ublk_fini(cb_fn, cb_arg);
++	if (rc != 0) {
++		g_ublk_tgt.delete_on_fini = false;
++	}
+ 
+ 	return rc;
+ }
