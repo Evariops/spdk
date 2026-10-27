@@ -279,7 +279,8 @@ jobs:
         env:
           IMAGE: ghcr.io/evariops/spdk-debug:${{ needs.compute-tag.outputs.tag }}-amd64
         run: |
-          docker run --rm --privileged -v /dev:/dev \
+          # The image runs as 1000; /dev/ublk-control is root's, as on a node.
+          docker run --rm --privileged --user 0:0 -v /dev:/dev \
             -v "$PWD/images/spdk/ublk-functional.sh:/ublk-functional.sh:ro" \
             --entrypoint bash "$IMAGE" /ublk-functional.sh
 

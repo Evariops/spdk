@@ -54,8 +54,9 @@ digest() { sha256sum | cut -d' ' -f1; }
 
 start() { # $1: extra arguments
 	rm -f "$SOCK"
+	# No trace file: a killed process would leave it in the host's /dev/shm.
 	# shellcheck disable=SC2086
-	setsid "$TGT" --no-huge -s 1024 -m 0x1 -r "$SOCK" $1 >> "$WORK/tgt.log" 2>&1 < /dev/null &
+	setsid "$TGT" --no-huge -s 1024 -m 0x1 -r "$SOCK" --num-trace-entries 0 $1 >> "$WORK/tgt.log" 2>&1 < /dev/null &
 	PID=$!
 	disown "$PID"
 	for _ in $(seq 100); do
@@ -193,10 +194,12 @@ stop_term
 echo "=== 0067, 0068: zero copy over bdev_uring"
 truncate -s 512M "$WORK/uring.img"
 start ""
-target '{"zero_copy":true}'
+# The bdevs register before the target: the bdev layer reads their domains then, as it does for
+# the lvols a restarted process loads from their store.
 R bdev_uring_create "{\"filename\":\"$WORK/uring.img\",\"name\":\"u0\",\"block_size\":4096}" > /dev/null || fail "bdev_uring_create"
 R bdev_lvol_create_lvstore '{"bdev_name":"u0","lvs_name":"lvsu","cluster_sz":1048576}' > /dev/null
 R bdev_lvol_create '{"lvol_name":"lv","size_in_mib":64,"lvs_name":"lvsu","thin_provision":true}' > /dev/null
+target '{"zero_copy":true}'
 R ublk_start_disk "{\"bdev_name\":\"lvsu/lv\",\"ublk_id\":$ID}" > /dev/null || fail "zero copy start"
 wait_dev
 if has support_zero_copy; then
