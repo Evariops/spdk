@@ -1,5 +1,5 @@
 diff --git a/lib/ublk/ublk.c b/lib/ublk/ublk.c
-index 9877746..44def42 100644
+index 9877746..240a484 100644
 --- a/lib/ublk/ublk.c
 +++ b/lib/ublk/ublk.c
 @@ -175,6 +175,9 @@ struct spdk_ublk_dev {
@@ -12,15 +12,18 @@ index 9877746..44def42 100644
  
  	TAILQ_ENTRY(spdk_ublk_dev) tailq;
  	TAILQ_ENTRY(spdk_ublk_dev) wait_tailq;
-@@ -464,6 +467,22 @@ ublk_ctrl_process_cqe(struct io_uring_cqe *cqe)
+@@ -464,6 +467,27 @@ ublk_ctrl_process_cqe(struct io_uring_cqe *cqe)
  			goto cb_done;
  		}
  
 +		/* Evariops 0064: the device the kernel holds under this id carries the identity of
 +		 * the publication that started it. Another's is not recovered: its waiting requests
 +		 * would land on this bdev, another volume's. The device is left as it is, to be
-+		 * stopped by whoever owns it; only this recovery's own state goes. */
-+		if (ublk->identity != 0 && ublk->dev_info.ublksrv_flags != ublk->identity) {
++		 * stopped by whoever owns it; only this recovery's own state goes. A device that
++		 * carries none (started by a process before this patch) is recovered as upstream
++		 * did: there is nothing to compare. */
++		if (ublk->identity != 0 && ublk->dev_info.ublksrv_flags != 0 &&
++		    ublk->dev_info.ublksrv_flags != ublk->identity) {
 +			SPDK_ERRLOG("ublk %u belongs to another publication (identity %" PRIx64 ", expected %" PRIx64 "): "
 +				    "not recovered (Evariops 0064)\n", ublk->ublk_id,
 +				    (uint64_t)ublk->dev_info.ublksrv_flags, ublk->identity);
@@ -31,11 +34,13 @@ index 9877746..44def42 100644
 +			ublk_free_dev(ublk);
 +			return;
 +		}
++		/* The disk reports what the kernel holds: the driver keeps the flags of ADD_DEV. */
++		ublk->identity = ublk->dev_info.ublksrv_flags;
 +
  		UBLK_DEBUGLOG(ublk, "Ublk %u device state %u\n", ublk->ublk_id, ublk->dev_info.state);
  		/* kernel ublk_drv driver returns -EBUSY if device state isn't UBLK_S_DEV_QUIESCED */
  		if ((ublk->dev_info.state != UBLK_S_DEV_QUIESCED) && (ublk->retry_count < 3)) {
-@@ -1029,6 +1048,13 @@ ublk_dev_get_num_queues(struct spdk_ublk_dev *ublk)
+@@ -1029,6 +1053,13 @@ ublk_dev_get_num_queues(struct spdk_ublk_dev *ublk)
  	return ublk->num_queues;
  }
  
@@ -49,7 +54,7 @@ index 9877746..44def42 100644
  /* Evariops 0058: read on the app thread while the queues' threads write them: each a
   * counter, read whole, a snapshot good enough for a report. */
  void
-@@ -1082,6 +1108,10 @@ spdk_ublk_write_config_json(struct spdk_json_write_ctx *w)
+@@ -1082,6 +1113,10 @@ spdk_ublk_write_config_json(struct spdk_json_write_ctx *w)
  		spdk_json_write_named_uint32(w, "ublk_id", ublk->ublk_id);
  		spdk_json_write_named_uint32(w, "num_queues", ublk->num_queues);
  		spdk_json_write_named_uint32(w, "queue_depth", ublk->queue_depth);
@@ -60,7 +65,7 @@ index 9877746..44def42 100644
  		spdk_json_write_object_end(w);
  
  		spdk_json_write_object_end(w);
-@@ -2193,6 +2223,9 @@ ublk_dev_info_init(struct spdk_ublk_dev *ublk)
+@@ -2193,6 +2228,9 @@ ublk_dev_info_init(struct spdk_ublk_dev *ublk)
  		.max_io_buf_bytes = ublk_max_io_bytes(),
  		.ublksrv_pid = getpid(),
  		.flags = UBLK_F_URING_CMD_COMP_IN_TASK,
@@ -70,7 +75,7 @@ index 9877746..44def42 100644
  	};
  
  	if (g_ublk_tgt.user_copy) {
-@@ -2422,7 +2455,7 @@ ublk_poll_groups_ready(void)
+@@ -2422,7 +2460,7 @@ ublk_poll_groups_ready(void)
  
  int
  ublk_start_disk(const char *bdev_name, uint32_t ublk_id,
@@ -79,7 +84,7 @@ index 9877746..44def42 100644
  		ublk_ctrl_cb ctrl_cb, void *cb_arg)
  {
  	int			rc;
-@@ -2462,6 +2495,7 @@ ublk_start_disk(const char *bdev_name, uint32_t ublk_id,
+@@ -2462,6 +2500,7 @@ ublk_start_disk(const char *bdev_name, uint32_t ublk_id,
  	ublk->cb_arg = cb_arg;
  	ublk->cdev_fd = -1;
  	ublk->ublk_id = ublk_id;
@@ -87,7 +92,7 @@ index 9877746..44def42 100644
  	UBLK_DEBUGLOG(ublk, "bdev %s num_queues %d queue_depth %d\n",
  		      bdev_name, num_queues, queue_depth);
  
-@@ -2591,7 +2625,7 @@ ublk_ctrl_start_recovery(struct spdk_ublk_dev *ublk)
+@@ -2591,7 +2630,7 @@ ublk_ctrl_start_recovery(struct spdk_ublk_dev *ublk)
  }
  
  int
@@ -96,7 +101,7 @@ index 9877746..44def42 100644
  			 void *cb_arg)
  {
  	int			rc;
-@@ -2635,6 +2669,7 @@ ublk_start_disk_recovery(const char *bdev_name, uint32_t ublk_id, ublk_ctrl_cb c
+@@ -2635,6 +2674,7 @@ ublk_start_disk_recovery(const char *bdev_name, uint32_t ublk_id, ublk_ctrl_cb c
  	ublk->cb_arg = cb_arg;
  	ublk->cdev_fd = -1;
  	ublk->ublk_id = ublk_id;

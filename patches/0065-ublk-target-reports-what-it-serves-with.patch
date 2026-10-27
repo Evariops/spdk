@@ -61,10 +61,10 @@ index bebdadd..f5bb8b3 100644
  	# internal functions in spdk_internal/thread.h
  	spdk_poller_get_name;
 diff --git a/lib/ublk/ublk.c b/lib/ublk/ublk.c
-index 44def42..d1991b8 100644
+index 240a484..0dec342 100644
 --- a/lib/ublk/ublk.c
 +++ b/lib/ublk/ublk.c
-@@ -1055,6 +1055,83 @@ ublk_dev_get_identity(struct spdk_ublk_dev *ublk)
+@@ -1060,6 +1060,83 @@ ublk_dev_get_identity(struct spdk_ublk_dev *ublk)
  	return ublk->identity;
  }
  
