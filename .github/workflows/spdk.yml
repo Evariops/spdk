@@ -236,6 +236,54 @@ jobs:
           echo "✓ Published: ${IMAGE}:${TAG}"
 
   # ────────────────────────────────────────────────────────────────
+  # 3b. ublk functional — the ublk patches on the runner's kernel
+  # ────────────────────────────────────────────────────────────────
+  # Upstream has no unit suite for lib/ublk: the debug image serves disks
+  # through the host's ublk_drv, and the script restarts, kills and starves
+  # the process under a writer. A case the host's driver cannot serve
+  # prints SKIP. Non-gating until a hosted runner proves it loads the driver.
+  ublk-functional:
+    needs: [compute-tag, build]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: images/spdk/ublk-functional.sh
+
+      - name: Load ublk_drv
+        run: |
+          set -euo pipefail
+          uname -r
+          if ! sudo modprobe ublk_drv; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q "linux-modules-extra-$(uname -r)"
+            sudo modprobe ublk_drv
+          fi
+          ls -l /dev/ublk-control
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Serve, restart, kill and starve ublk disks
+        env:
+          IMAGE: ghcr.io/evariops/spdk-debug:${{ needs.compute-tag.outputs.tag }}-amd64
+        run: |
+          docker run --rm --privileged -v /dev:/dev \
+            -v "$PWD/images/spdk/ublk-functional.sh:/ublk-functional.sh:ro" \
+            --entrypoint bash "$IMAGE" /ublk-functional.sh
+
+  # ────────────────────────────────────────────────────────────────
   # 4b. Release publish — multi-arch manifest + Sign + SBOM + Attest
   # ────────────────────────────────────────────────────────────────
   publish:
