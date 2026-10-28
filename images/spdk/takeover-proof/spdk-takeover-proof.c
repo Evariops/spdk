@@ -127,7 +127,13 @@ report(const char *result)
 }
 
 static void tgt_kill(void);
+static void stop_served(void);
 
+static int g_failing;
+
+/* A failed phase ends its pod (restartPolicy Never): no later phase, and no last clean, runs. The
+ * proof's disks this process serves are stopped first, so that none is left to the kernel
+ * waiting for a server until the next proof's clean. */
 static void __attribute__((noreturn, format(printf, 1, 2)))
 fail(const char *fmt, ...)
 {
@@ -138,6 +144,10 @@ fail(const char *fmt, ...)
 	vsnprintf(why, sizeof(why), fmt, ap);
 	va_end(ap);
 	note("%s", why);
+	if (!g_failing) {
+		g_failing = 1;
+		stop_served();
+	}
 	tgt_kill();
 	exit(report("failed"));
 }
@@ -652,6 +662,29 @@ stop_disk(unsigned id)
 	snprintf(params, sizeof(params), "{\"ublk_id\":%u}", id);
 	rpc_must("ublk_stop_disk", params);
 	wait_gone(id);
+}
+
+/* On a failure, best effort: a disk this process does not serve answers an error, and the
+ * kernel's is left to the next clean. */
+static void
+stop_served(void)
+{
+	unsigned ids[2] = { g_id_a, g_id_b };
+	char params[64];
+	int i;
+
+	if (g_sock < 0 || !tgt_alive()) {
+		return;
+	}
+	for (i = 0; i < 2; i++) {
+		if (!device_held(ids[i])) {
+			continue;
+		}
+		snprintf(params, sizeof(params), "{\"ublk_id\":%u}", ids[i]);
+		if (rpc("ublk_stop_disk", params) == 0) {
+			note("ublk %u stopped", ids[i]);
+		}
+	}
 }
 
 /* ── the phases ───────────────────────────────────────────────────────────────────────── */
