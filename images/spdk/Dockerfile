@@ -167,6 +167,7 @@ RUN { echo spdk; \
       test -n "$(find /build/patches -name '0064-*.patch')" && echo ublk-identity; \
       test -n "$(find /build/patches -name '0065-*.patch')" && echo ublk-target-report; \
       test -n "$(find /build/patches -name '0067-*.patch')" && echo ublk-zero-copy; \
+      test -n "$(find /build/patches -name '0070-*.patch')" && echo ublk-offset; \
       test -x /build/spdk-takeover-proof && echo takeover-proof; \
       true; } > /build/features.txt && \
     { printf '#include <stdio.h>\nstatic const char features[] =\n'; \
