@@ -1,0 +1,341 @@
+diff --git a/lib/ublk/ublk.c b/lib/ublk/ublk.c
+index 54342a8..e010be2 100644
+--- a/lib/ublk/ublk.c
++++ b/lib/ublk/ublk.c
+@@ -100,6 +100,8 @@ static const char *ublk_op_name[64] = {
+ 	[UBLK_CMD_SET_PARAMS] =	"UBLK_CMD_SET_PARAMS",
+ 	[UBLK_CMD_START_USER_RECOVERY] = "UBLK_CMD_START_USER_RECOVERY",
+ 	[UBLK_CMD_END_USER_RECOVERY] = "UBLK_CMD_END_USER_RECOVERY",
++	/* Evariops 0070 */
++	[UBLK_CMD_GET_PARAMS] =	"UBLK_CMD_GET_PARAMS",
+ };
+ 
+ typedef void (*ublk_get_buf_cb)(struct ublk_io *io);
+@@ -204,6 +206,10 @@ struct spdk_ublk_dev {
+ 	/* Evariops 0064: the identity of the publication the disk serves, kept by the kernel
+ 	 * with the device (ublksrv_flags); for a recovery, the identity the device must carry. */
+ 	uint64_t		identity;
++	/* Evariops 0070: the disk serves its bdev from this block on, and is that much smaller.
++	 * A volume whose head holds a raid superblock, as a nexus lays it out, then reads the
++	 * same data through ublk as through the raid. */
++	uint64_t		offset_blocks;
+ 	/* Evariops 0066: each queue takes its bdev channel, on its poll group's thread, before
+ 	 * the kernel is asked for anything; channels_next then goes on with the start or the
+ 	 * recovery. A queue that gets none fails it, with nothing done in the kernel. */
+@@ -326,6 +332,10 @@ ublk_set_sqe_cmd_op(struct io_uring_sqe *sqe, uint32_t cmd_op)
+ 		case UBLK_CMD_GET_DEV_INFO:
+ 			opc = _IOR('u', UBLK_CMD_GET_DEV_INFO, struct ublksrv_ctrl_cmd);
+ 			break;
++		/* Evariops 0070 */
++		case UBLK_CMD_GET_PARAMS:
++			opc = _IOR('u', UBLK_CMD_GET_PARAMS, struct ublksrv_ctrl_cmd);
++			break;
+ 		case UBLK_CMD_ADD_DEV:
+ 			opc = _IOWR('u', UBLK_CMD_ADD_DEV, struct ublksrv_ctrl_cmd);
+ 			break;
+@@ -443,6 +453,8 @@ ublk_ctrl_cmd_error(struct spdk_ublk_dev *ublk, int32_t res)
+ 		ublk_close_dev(ublk);
+ 		break;
+ 	case UBLK_CMD_GET_DEV_INFO:
++	/* Evariops 0070: a recovery that could not read the device's size touched nothing. */
++	case UBLK_CMD_GET_PARAMS:
+ 		ublk_free_dev(ublk);
+ 		break;
+ 	case UBLK_CMD_STOP_DEV:
+@@ -562,12 +574,43 @@ ublk_ctrl_process_cqe(struct io_uring_cqe *cqe)
+ 			return;
+ 		}
+ 
++		/* Evariops 0070: the size the kernel holds, before anything is recovered. */
++		rc = ublk_ctrl_cmd_submit(ublk, UBLK_CMD_GET_PARAMS);
++		if (rc < 0) {
++			ublk_free_dev(ublk);
++			goto cb_done;
++		}
++		break;
++	case UBLK_CMD_GET_PARAMS: {
++		/* Evariops 0070: the device was started with an offset, which the kernel does not keep;
++		 * its size tells it. A device of another size than this recovery's offset leaves of the
++		 * bdev was started with another offset: recovered, its requests would land that much
++		 * off, on blocks of another file of the volume. It is left as it is (-EINVAL), as 0064
++		 * leaves another publication's. The bdev only grows through this process, and the disk
++		 * follows it at once (0060): a size that differs means a layout that differs. */
++		uint64_t served = (spdk_bdev_get_num_blocks(ublk->bdev) - ublk->offset_blocks) <<
++				  ublk->sector_per_block_shift;
++
++		if (ublk->dev_params.basic.dev_sectors != served) {
++			SPDK_ERRLOG("ublk %u holds %" PRIu64 " sectors, bdev %s serves %" PRIu64 " from block %"
++				    PRIu64 ": started with another offset, not recovered (Evariops 0070)\n",
++				    ublk->ublk_id, (uint64_t)ublk->dev_params.basic.dev_sectors,
++				    spdk_bdev_get_name(ublk->bdev), served, ublk->offset_blocks);
++			if (ublk->ctrl_cb) {
++				ublk->ctrl_cb(ublk->cb_arg, -EINVAL);
++				ublk->ctrl_cb = NULL;
++			}
++			ublk_free_dev(ublk);
++			return;
++		}
++
+ 		rc = ublk_ctrl_start_recovery(ublk);
+ 		if (rc < 0) {
+ 			ublk_delete_dev(ublk);
+ 			goto cb_done;
+ 		}
+ 		break;
++	}
+ 	case UBLK_CMD_START_USER_RECOVERY:
+ 		rc = ublk_start_dev(ublk, true);
+ 		if (rc < 0) {
+@@ -673,6 +716,13 @@ ublk_ctrl_cmd_submit(struct spdk_ublk_dev *ublk, uint32_t cmd_op)
+ 		cmd->addr = (__u64)(uintptr_t)&ublk->dev_params;
+ 		cmd->len = sizeof(ublk->dev_params);
+ 		break;
++	/* Evariops 0070: the driver reads the buffer's own len first, and copies that much. */
++	case UBLK_CMD_GET_PARAMS:
++		memset(&ublk->dev_params, 0, sizeof(ublk->dev_params));
++		ublk->dev_params.len = sizeof(ublk->dev_params);
++		cmd->addr = (__u64)(uintptr_t)&ublk->dev_params;
++		cmd->len = sizeof(ublk->dev_params);
++		break;
+ 	case UBLK_CMD_START_DEV:
+ 		cmd->data[0] = getpid();
+ 		break;
+@@ -1972,7 +2022,8 @@ _ublk_submit_bdev_io(struct ublk_queue *q, struct ublk_io *io)
+ 	const struct ublksrv_io_desc *iod = io->iod;
+ 
+ 	ublk_op = ublksrv_get_op(iod);
+-	offset_blocks = iod->start_sector >> ublk->sector_per_block_shift;
++	/* Evariops 0070: the disk's sector 0 is the bdev's block offset_blocks. */
++	offset_blocks = (iod->start_sector >> ublk->sector_per_block_shift) + ublk->offset_blocks;
+ 	num_blocks = iod->nr_sectors >> ublk->sector_per_block_shift;
+ 
+ 	/* Evariops 0067: the request's registered pages, as the ublk-zc domain: the bdev reads into
+@@ -2563,7 +2614,7 @@ ublk_bdev_resize(struct spdk_ublk_dev *ublk)
+ {
+ 	int rc;
+ 
+-	ublk->dev_params.basic.dev_sectors = spdk_bdev_get_num_blocks(ublk->bdev) <<
++	ublk->dev_params.basic.dev_sectors = (spdk_bdev_get_num_blocks(ublk->bdev) - ublk->offset_blocks) <<
+ 					     ublk->sector_per_block_shift;
+ 	if (!g_ublk_tgt.update_size) {
+ 		SPDK_WARNLOG("ublk %u: bdev %s resized, which ublk_drv cannot follow (Evariops 0060)\n",
+@@ -2890,7 +2941,8 @@ ublk_info_param_init(struct spdk_ublk_dev *ublk)
+ 	uint32_t blk_size = spdk_bdev_get_data_block_size(bdev);
+ 	uint32_t pblk_size = spdk_bdev_get_physical_block_size(bdev);
+ 	uint32_t io_opt_blocks = spdk_bdev_get_optimal_io_boundary(bdev);
+-	uint64_t num_blocks = spdk_bdev_get_num_blocks(bdev);
++	/* Evariops 0070: what the disk serves, from its offset on. */
++	uint64_t num_blocks = spdk_bdev_get_num_blocks(bdev) - ublk->offset_blocks;
+ 	uint8_t sectors_per_block = blk_size >> LINUX_SECTOR_SHIFT;
+ 	uint32_t io_min_size = blk_size;
+ 	uint32_t io_opt_size = spdk_max(io_opt_blocks * blk_size, io_min_size);
+@@ -3110,9 +3162,31 @@ static void ublk_dev_get_channels(struct spdk_ublk_dev *ublk,
+ 				  void (*next)(struct spdk_ublk_dev *ublk));
+ static void ublk_dev_add(struct spdk_ublk_dev *ublk);
+ 
++/* Evariops 0070: a whole number of the bdev's blocks, short of its end. */
++static int
++ublk_dev_set_offset(struct spdk_ublk_dev *ublk, uint64_t offset_bytes)
++{
++	uint32_t blk_size = spdk_bdev_get_data_block_size(ublk->bdev);
++
++	if (offset_bytes % blk_size != 0 || offset_bytes / blk_size >= spdk_bdev_get_num_blocks(ublk->bdev)) {
++		SPDK_ERRLOG("ublk %u: offset %" PRIu64 " is not a whole number of %s's %u-byte blocks "
++			    "short of its end (Evariops 0070)\n", ublk->ublk_id, offset_bytes,
++			    spdk_bdev_get_name(ublk->bdev), blk_size);
++		return -EINVAL;
++	}
++	ublk->offset_blocks = offset_bytes / blk_size;
++	return 0;
++}
++
++uint64_t
++ublk_dev_get_offset_bytes(struct spdk_ublk_dev *ublk)
++{
++	return ublk->offset_blocks * spdk_bdev_get_data_block_size(ublk->bdev);
++}
++
+ int
+ ublk_start_disk(const char *bdev_name, uint32_t ublk_id,
+-		uint32_t num_queues, uint32_t queue_depth, uint64_t identity,
++		uint32_t num_queues, uint32_t queue_depth, uint64_t identity, uint64_t offset_bytes,
+ 		ublk_ctrl_cb ctrl_cb, void *cb_arg)
+ {
+ 	int			rc;
+@@ -3166,6 +3240,13 @@ ublk_start_disk(const char *bdev_name, uint32_t ublk_id,
+ 	ublk->bdev = bdev;
+ 	sector_per_block = spdk_bdev_get_data_block_size(ublk->bdev) >> LINUX_SECTOR_SHIFT;
+ 	ublk->sector_per_block_shift = spdk_u32log2(sector_per_block);
++	/* Evariops 0070 */
++	rc = ublk_dev_set_offset(ublk, offset_bytes);
++	if (rc != 0) {
++		ublk_close_bdev(ublk);
++		free(ublk);
++		return rc;
++	}
+ 
+ 	ublk->queues_closed = 0;
+ 	ublk->num_queues = num_queues;
+@@ -3382,8 +3463,8 @@ ublk_ctrl_start_recovery(struct spdk_ublk_dev *ublk)
+ }
+ 
+ int
+-ublk_start_disk_recovery(const char *bdev_name, uint32_t ublk_id, uint64_t identity, ublk_ctrl_cb ctrl_cb,
+-			 void *cb_arg)
++ublk_start_disk_recovery(const char *bdev_name, uint32_t ublk_id, uint64_t identity, uint64_t offset_bytes,
++			 ublk_ctrl_cb ctrl_cb, void *cb_arg)
+ {
+ 	int			rc;
+ 	struct spdk_bdev	*bdev;
+@@ -3438,6 +3519,13 @@ ublk_start_disk_recovery(const char *bdev_name, uint32_t ublk_id, uint64_t ident
+ 	ublk->bdev = bdev;
+ 	sector_per_block = spdk_bdev_get_data_block_size(ublk->bdev) >> LINUX_SECTOR_SHIFT;
+ 	ublk->sector_per_block_shift = spdk_u32log2(sector_per_block);
++	/* Evariops 0070: the offset the device was started with; GET_PARAMS checks its size. */
++	rc = ublk_dev_set_offset(ublk, offset_bytes);
++	if (rc != 0) {
++		ublk_close_bdev(ublk);
++		free(ublk);
++		return rc;
++	}
+ 
+ 	SPDK_NOTICELOG("Recovering ublk %d with bdev %s\n", ublk->ublk_id, bdev_name);
+ 
+diff --git a/lib/ublk/ublk_internal.h b/lib/ublk/ublk_internal.h
+index d0bcfd5..36f2042 100644
+--- a/lib/ublk/ublk_internal.h
++++ b/lib/ublk/ublk_internal.h
+@@ -79,19 +79,24 @@ typedef void (*ublk_ctrl_cb)(void *cb_arg, int result);
+ int ublk_create_target(const char *cpumask_str, bool disable_user_copy);
+ int ublk_destroy_target(spdk_ublk_fini_cb cb_fn, void *cb_arg);
+ /* Evariops 0064: identity, the publication the disk serves (0: none), kept by the kernel with
+- * the device; a recovery refuses a device that carries another (-EEXIST). */
++ * the device; a recovery refuses a device that carries another (-EEXIST).
++ * Evariops 0070: offset_bytes, where in the bdev the disk's sector 0 lies (a whole number of
++ * blocks); the disk is that much smaller. A recovery refuses a device larger than its offset
++ * leaves (-EINVAL): it was started with another. */
+ int ublk_start_disk(const char *bdev_name, uint32_t ublk_id,
+-		    uint32_t num_queues, uint32_t queue_depth, uint64_t identity,
++		    uint32_t num_queues, uint32_t queue_depth, uint64_t identity, uint64_t offset_bytes,
+ 		    ublk_ctrl_cb ctrl_cb, void *cb_arg);
+ int ublk_stop_disk(uint32_t ublk_id, ublk_ctrl_cb ctrl_cb, void *cb_arg);
+ /* Evariops 0061 */
+ int ublk_quiesce_disk(uint32_t ublk_id, uint64_t timeout_ms, ublk_ctrl_cb ctrl_cb, void *cb_arg);
+ int
+-ublk_start_disk_recovery(const char *bdev_name, uint32_t ublk_id, uint64_t identity, ublk_ctrl_cb ctrl_cb,
+-			 void *cb_arg);
++ublk_start_disk_recovery(const char *bdev_name, uint32_t ublk_id, uint64_t identity, uint64_t offset_bytes,
++			 ublk_ctrl_cb ctrl_cb, void *cb_arg);
+ struct spdk_ublk_dev *ublk_dev_find_by_id(uint32_t ublk_id);
+ /* Evariops 0064 */
+ uint64_t ublk_dev_get_identity(struct spdk_ublk_dev *ublk);
++/* Evariops 0070 */
++uint64_t ublk_dev_get_offset_bytes(struct spdk_ublk_dev *ublk);
+ uint32_t ublk_dev_get_id(struct spdk_ublk_dev *ublk);
+ const char *ublk_dev_get_bdev_name(struct spdk_ublk_dev *ublk);
+ struct spdk_ublk_dev *ublk_dev_first(void);
+diff --git a/lib/ublk/ublk_rpc.c b/lib/ublk/ublk_rpc.c
+index 9b59679..d3063e5 100644
+--- a/lib/ublk/ublk_rpc.c
++++ b/lib/ublk/ublk_rpc.c
+@@ -111,7 +111,7 @@ rpc_ublk_start_disk(struct spdk_jsonrpc_request *request,
+ 	}
+ 
+ 	rc = ublk_start_disk(req->bdev_name, req->ublk_id, req->num_queues, req->queue_depth, req->identity,
+-			     rpc_ublk_start_disk_done, req);
++			     req->offset_bytes, rpc_ublk_start_disk_done, req);
+ 	if (rc != 0) {
+ 		rpc_ublk_start_disk_done(req, rc);
+ 	}
+@@ -182,6 +182,8 @@ rpc_dump_ublk_info(struct spdk_json_write_ctx *w,
+ 	spdk_json_write_named_string(w, "bdev_name", ublk_dev_get_bdev_name(ublk));
+ 	/* Evariops 0064 */
+ 	spdk_json_write_named_uint64(w, "identity", ublk_dev_get_identity(ublk));
++	/* Evariops 0070 */
++	spdk_json_write_named_uint64(w, "offset_bytes", ublk_dev_get_offset_bytes(ublk));
+ 
+ 	/* Evariops 0058 */
+ 	ublk_dev_get_buffer_waits(ublk, &waits);
+@@ -297,7 +299,8 @@ rpc_ublk_recover_disk(struct spdk_jsonrpc_request *request,
+ 	/* Evariops 0063: answered once the recovery ends, as ublk_start_disk is, not once its
+ 	 * first control command is submitted: a disk the kernel no longer holds (-ENODEV, a host
+ 	 * reboot) is then told apart from a disk recovered, and its caller starts it anew. */
+-	rc = ublk_start_disk_recovery(req->bdev_name, req->ublk_id, req->identity, rpc_ublk_recover_disk_done, req);
++	rc = ublk_start_disk_recovery(req->bdev_name, req->ublk_id, req->identity, req->offset_bytes,
++				      rpc_ublk_recover_disk_done, req);
+ 	if (rc != 0) {
+ 		rpc_ublk_recover_disk_done(req, rc);
+ 	}
+diff --git a/python/spdk/cli/ublk.py b/python/spdk/cli/ublk.py
+index 1c884b6..7e2931b 100644
+--- a/python/spdk/cli/ublk.py
++++ b/python/spdk/cli/ublk.py
+@@ -37,7 +37,8 @@ def add_parser(subparsers):
+                                        ublk_id=args.ublk_id,
+                                        num_queues=args.num_queues,
+                                        queue_depth=args.queue_depth,
+-                                       identity=args.identity))
++                                       identity=args.identity,
++                                       offset_bytes=args.offset_bytes))
+ 
+     p = subparsers.add_parser('ublk_start_disk',
+                               help='Export a bdev as a ublk device')
+@@ -46,6 +47,7 @@ def add_parser(subparsers):
+     p.add_argument('-q', '--num-queues', help='Number of queues to create on the device. Default: 1', type=int)
+     p.add_argument('-d', '--queue-depth', help='Per-queue depth. Default: 128', type=int)
+     p.add_argument('--identity', help='identity of the publication the disk serves (Evariops)', type=int)
++    p.add_argument('--offset-bytes', help='where in the bdev the disk\'s sector 0 lies (Evariops)', type=int)
+     p.set_defaults(func=ublk_start_disk)
+ 
+     def ublk_stop_disk(args):
+@@ -60,13 +62,15 @@ def add_parser(subparsers):
+         print_json(args.client.ublk_recover_disk(
+                                          bdev_name=args.bdev_name,
+                                          ublk_id=args.ublk_id,
+-                                         identity=args.identity))
++                                         identity=args.identity,
++                                         offset_bytes=args.offset_bytes))
+ 
+     p = subparsers.add_parser('ublk_recover_disk',
+                               help='Recover ublk device')
+     p.add_argument('bdev_name', help='Name of the bdev backing the recovering ublk device')
+     p.add_argument('ublk_id', help='ID of the ublk device to recover', type=int)
+     p.add_argument('--identity', help='identity the device must carry (Evariops)', type=int)
++    p.add_argument('--offset-bytes', help='the offset the device was started with (Evariops)', type=int)
+     p.set_defaults(func=ublk_recover_disk)
+ 
+     def ublk_get_disks(args):
+diff --git a/schema/schema.yaml b/schema/schema.yaml
+index 26aed6d..98bc445 100644
+--- a/schema/schema.yaml
++++ b/schema/schema.yaml
+@@ -586,6 +586,9 @@ return_objects:
+       - name: identity
+         type: uint64
+         description: 'Evariops: the identity of the publication the disk serves; 0: none'
++      - name: offset_bytes
++        type: uint64
++        description: 'Evariops: where in the bdev the disk''s sector 0 lies'
+       - name: buffer_waits
+         type: object
+         description: >-
+@@ -5186,6 +5189,9 @@ methods:
+       - name: identity
+         type: uint64
+         description: identity of the publication the disk serves (Evariops)
++      - name: offset_bytes
++        type: uint64
++        description: 'where in the bdev the disk''s sector 0 lies (Evariops)'
+   - name: ublk_recover_disk
+     description: Recover original UBLK device with ID and block device
+     result:
+@@ -5203,6 +5209,9 @@ methods:
+       - name: identity
+         type: uint64
+         description: identity the device must carry (Evariops)
++      - name: offset_bytes
++        type: uint64
++        description: the offset the device was started with (Evariops)
+   - name: ublk_stop_disk
+     description: Delete a UBLK device
+     result:
