@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The ublk patches (0058-0069) on a real kernel: run inside the debug image, privileged, with the
+# The ublk patches (0058-0070) on a real kernel: run inside the debug image, privileged, with the
 # host's /dev mounted and ublk_drv loaded on the host. Each case prints PASS, or SKIP when the
 # host's driver lacks the feature it needs; the script exits non-zero on the first failure.
 # Upstream has no unit suite for lib/ublk nor bdev_uring: this is where their behaviour is pinned.
@@ -191,6 +191,34 @@ kill -0 "$PID" && pass "0066 the process is up" || fail "0066 the process died"
 [ -e /sys/class/ublk-char/ublkc$ID ] && fail "0066 a device was added" || pass "0066 nothing was added in the kernel"
 stop_term
 
+echo "=== 0070: a disk served from an offset, as a nexus lays a volume out"
+start ""
+target
+aio
+LV_BYTES=$(R bdev_get_bdevs '{"name":"lvs/lv"}' | python3 -c 'import json,sys; b=json.load(sys.stdin)[0]; print(b["num_blocks"]*b["block_size"])')
+R ublk_start_disk "{\"bdev_name\":\"lvs/lv\",\"ublk_id\":$ID,\"identity\":4661,\"offset_bytes\":1048577}" > /dev/null 2>&1 &&
+	fail "0070 an offset that is no whole number of blocks was taken" || pass "0070 an offset off the block grain is refused"
+R ublk_start_disk "{\"bdev_name\":\"lvs/lv\",\"ublk_id\":$ID,\"identity\":4661,\"offset_bytes\":1048576}" > /dev/null || fail "0070 start with an offset"
+wait_dev
+[ $(( $(cat /sys/block/ublkb$ID/size) * 512 )) = $(( LV_BYTES - 1048576 )) ] && pass "0070 the disk is its offset smaller than the lvol" || fail "0070 size"
+[[ $(R ublk_get_disks) == *'"offset_bytes": 1048576'* ]] && pass "0070 the disk reports its offset" || fail "0070 offset reported"
+dd if="$WORK/pattern" of="$(dev)" bs=1M oflag=direct conv=nocreat status=none
+if has user_recovery && has user_recovery_reissue; then
+	restart stop_kill
+	R ublk_recover_disk "{\"bdev_name\":\"lvs/lv\",\"ublk_id\":$ID,\"identity\":4661}" > /dev/null 2>&1 &&
+		fail "0070 a device started with an offset was recovered without it" || pass "0070 a recovery with another offset is refused"
+	[ -e /sys/class/ublk-char/ublkc$ID ] && pass "0070 the refused device is left in the kernel" || fail "0070 the refused device was deleted"
+	R ublk_recover_disk "{\"bdev_name\":\"lvs/lv\",\"ublk_id\":$ID,\"identity\":4661,\"offset_bytes\":1048576}" > /dev/null || fail "0070 recover with its offset"
+	[ "$(dd if="$(dev)" bs=1M count=8 iflag=direct status=none | digest)" = "$PATTERN" ] && pass "0070 recovered, it reads what it wrote" || fail "0070 read back after recovery"
+fi
+R ublk_stop_disk "{\"ublk_id\":$ID}" > /dev/null
+for _ in $(seq 50); do [ -e "$(dev)" ] || break; sleep 0.1; done
+R ublk_start_disk "{\"bdev_name\":\"lvs/lv\",\"ublk_id\":$ID}" > /dev/null || fail "0070 start at 0"
+wait_dev
+[ "$(dd if="$(dev)" bs=1M skip=1 count=8 iflag=direct status=none | digest)" = "$PATTERN" ] && pass "0070 the data lie 1 MiB into the lvol" || fail "0070 the data are not 1 MiB in"
+R ublk_stop_disk "{\"ublk_id\":$ID}" > /dev/null
+stop_term
+
 echo "=== 0067, 0068: zero copy over bdev_uring"
 truncate -s 512M "$WORK/uring.img"
 start ""
@@ -210,6 +238,19 @@ if has support_zero_copy; then
 		pass "0067 a hole reads as zeros (memzero)" || fail "0067 hole"
 	R ublk_get_disks | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)[0]["zero_copy"]["zero_copy"] > 0 else 1)' &&
 		pass "0067 requests went with no copy" || fail "0067 no request went with no copy"
+	# 0070 with no copy: the registered pages land at the offset as the copied ones do.
+	R ublk_stop_disk "{\"ublk_id\":$ID}" > /dev/null
+	for _ in $(seq 50); do [ -e "$(dev)" ] || break; sleep 0.1; done
+	R ublk_start_disk "{\"bdev_name\":\"lvsu/lv\",\"ublk_id\":$ID,\"offset_bytes\":1048576}" > /dev/null || fail "0070 zero copy start with an offset"
+	wait_dev
+	head -c 8388608 /dev/urandom > "$WORK/pattern2"
+	dd if="$WORK/pattern2" of="$(dev)" bs=1M oflag=direct conv=nocreat status=none
+	R ublk_stop_disk "{\"ublk_id\":$ID}" > /dev/null
+	for _ in $(seq 50); do [ -e "$(dev)" ] || break; sleep 0.1; done
+	R ublk_start_disk "{\"bdev_name\":\"lvsu/lv\",\"ublk_id\":$ID}" > /dev/null || fail "0070 zero copy start at 0"
+	wait_dev
+	[ "$(dd if="$(dev)" bs=1M skip=1 count=8 iflag=direct status=none | digest)" = "$(digest < "$WORK/pattern2")" ] &&
+		pass "0070 with no copy, the data lie 1 MiB into the lvol" || fail "0070 zero copy offset"
 else
 	skip "0067 zero copy"
 fi
