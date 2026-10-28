@@ -219,4 +219,24 @@ R ublk_destroy_target > /dev/null
 sleep 1
 [ -e /sys/class/ublk-char/ublkc$ID ] && fail "the device outlived ublk_destroy_target" || pass "ublk_destroy_target deleted the device"
 stop_term
+
+echo "=== spdk-takeover-proof: this image against itself"
+PROOF=$(dirname "$TGT")/spdk-takeover-proof
+if [ -x "$PROOF" ]; then
+	PD=$WORK/proof
+	mkdir -p "$PD"
+	"$PROOF" install "$PD" --report "$PD/install.json" 2> /dev/null || fail "proof install: $(cat "$PD/install.json")"
+	for phase in clean start create takeover return; do
+		extra=""
+		[ "$phase" = takeover ] && has support_zero_copy && extra=--zero-copy
+		# shellcheck disable=SC2086
+		"$PD/spdk-takeover-proof" "$phase" --tgt "$TGT" --dir "$PD" --core 0 --report "$PD/$phase.json" $extra 2> /dev/null
+		said=$(python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(r["result"], "-", r["detail"])' "$PD/$phase.json")
+		[ "${said%% *}" = ok ] && pass "proof $phase: ${said#* - }" || fail "proof $phase: $said"
+	done
+	[ -e /sys/class/ublk-char/ublkc1048064 ] || [ -e /sys/class/ublk-char/ublkc1048065 ] &&
+		fail "the proof left a device in the kernel" || pass "the proof left nothing in the kernel"
+else
+	echo "SKIP the takeover proof: this image has none"
+fi
 echo "ALL PASSED"

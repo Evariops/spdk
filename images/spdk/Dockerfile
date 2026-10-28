@@ -83,7 +83,7 @@ RUN ./scripts/pkgdep.sh -d
 ENV PATH="/var/spdk/dependencies/pip/bin:${PATH}"
 
 # Ensure io_uring and AIO dependencies are present (pkgdep.sh may not install them)
-RUN dnf install -y --setopt=install_weak_deps=False --nodocs liburing-devel libaio-devel && \
+RUN dnf install -y --setopt=install_weak_deps=False --nodocs liburing-devel libaio-devel glibc-static && \
     dnf clean all && rm -rf /var/cache/dnf
 
 # ── Inject CBT + tier modules and patches ──
@@ -149,6 +149,14 @@ RUN SPDK_ARCH=$([ "${TARGETARCH}" = "arm64" ] && echo "armv8-a" || echo "nehalem
 
 RUN make -j"$(nproc)"
 
+# The takeover proof: drives this image's spdk_tgt, or another image's, through a ublk disk's
+# creation, release, recovery and return, on the node it runs on. Linked statically, so that it
+# runs in the container of an image that does not carry it. Without arguments it prints its
+# usage and exits 2.
+COPY images/spdk/takeover-proof/ /build/takeover-proof/
+RUN gcc -static -O2 -Wall -Wextra -Werror -o /build/spdk-takeover-proof /build/takeover-proof/spdk-takeover-proof.c && \
+    { /build/spdk-takeover-proof 2> /dev/null; test $? -eq 2; }
+
 # What this image was built with, for a client that cannot run a shell in it (the
 # release image is FROM scratch): the operator's image warmer runs it on each node
 # before a rollout, and a node that serves ublk disks is not rolled onto an image
@@ -159,6 +167,7 @@ RUN { echo spdk; \
       test -n "$(find /build/patches -name '0064-*.patch')" && echo ublk-identity; \
       test -n "$(find /build/patches -name '0065-*.patch')" && echo ublk-target-report; \
       test -n "$(find /build/patches -name '0067-*.patch')" && echo ublk-zero-copy; \
+      test -x /build/spdk-takeover-proof && echo takeover-proof; \
       true; } > /build/features.txt && \
     { printf '#include <stdio.h>\nstatic const char features[] =\n'; \
       sed 's/.*/"&\\n"/' /build/features.txt; \
@@ -213,6 +222,7 @@ RUN set -euo pipefail && \
     # ── Binary ──
     cp build/bin/spdk_tgt /rt/usr/local/bin/ && \
     cp /build/spdk-features /rt/usr/local/bin/ && \
+    cp /build/spdk-takeover-proof /rt/usr/local/bin/ && \
     \
     # ── Shared libs: copy ONLY the .so files ldd reports ──
     ldd build/bin/spdk_tgt | awk '/=>/{print $3}' | sort -u > /tmp/libs.txt && \
@@ -288,6 +298,7 @@ RUN dnf install -y --setopt=install_weak_deps=False --nodocs \
 # unit-tests stage, so the debug image too is built only once its suites pass.
 COPY --from=unit-tests /build/spdk/build/bin/spdk_tgt /usr/local/bin/spdk_tgt
 COPY --from=unit-tests /build/spdk-features /usr/local/bin/spdk-features
+COPY --from=unit-tests /build/spdk-takeover-proof /usr/local/bin/spdk-takeover-proof
 
 # spdk_dd is the raid5f bench's full-stripe writer: raid5f only accepts full-stripe
 # writes, and remote initiators are MDTS-bounded, so the writer must run INSIDE the
