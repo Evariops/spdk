@@ -1,0 +1,95 @@
+diff --git a/lib/nvme/nvme.c b/lib/nvme/nvme.c
+index 7b975b7..5643426 100644
+--- a/lib/nvme/nvme.c
++++ b/lib/nvme/nvme.c
+@@ -296,13 +296,34 @@ error:
+ 	return -ECANCELED;
+ }
+ 
++/*
++ * Evariops 0074: the synchronous waits on an admin queue. A process that is also an NVMe-oF target
++ * answers nobody while it waits; since 0072 and 0073 none is reachable while the process serves.
++ * Each is counted, and the first ones (then one in 1024) logged with their caller, so a wait that
++ * an upstream change brings back shows in a test and in the logs, not as a freeze.
++ */
++static uint64_t g_nvme_sync_admin_waits;
++
++uint64_t
++nvme_sync_admin_wait_count(void)
++{
++	return __atomic_load_n(&g_nvme_sync_admin_waits, __ATOMIC_RELAXED);
++}
++
+ int
+ nvme_wait_for_adminq_completion(struct spdk_nvme_ctrlr *ctrlr,
+ 				struct nvme_completion_poll_status *status, bool release)
+ {
+ 	uint64_t timeout_in_usecs = ctrlr->opts.admin_timeout_ms * 1000;
++	uint64_t waits;
+ 	int rc;
+ 
++	waits = __atomic_add_fetch(&g_nvme_sync_admin_waits, 1, __ATOMIC_RELAXED);
++	if (waits <= 16 || waits % 1024 == 0) {
++		NVME_CTRLR_WARNLOG(ctrlr, "synchronous wait #%" PRIu64 " on the admin queue, called "
++				   "from %p (Evariops 0074)\n", waits, __builtin_return_address(0));
++	}
++
+ 	if (timeout_in_usecs) {
+ 		status->timeout_tsc = spdk_get_ticks() + timeout_in_usecs *
+ 				      spdk_get_ticks_hz() / SPDK_SEC_TO_USEC;
+diff --git a/lib/nvme/nvme_internal.h b/lib/nvme/nvme_internal.h
+index 85a3e7b..54af550 100644
+--- a/lib/nvme/nvme_internal.h
++++ b/lib/nvme/nvme_internal.h
+@@ -1537,6 +1537,8 @@ void	nvme_ns_set_id_desc_list_data(struct spdk_nvme_ns *ns, const uint8_t *buf,
+ void	nvme_ns_free_iocs_specific_data(struct spdk_nvme_ns *ns);
+ bool	nvme_ns_has_supported_iocs_specific_data(struct spdk_nvme_ns *ns);
+ int	nvme_ns_identify(struct spdk_nvme_ns *ns);
++/* Evariops 0074: how many synchronous waits on an admin queue this process made. */
++uint64_t	nvme_sync_admin_wait_count(void);
+ /* Evariops 0072: nvme_ns_identify with no wait; cb_fn is invoked once, when 0 is returned. */
+ int	nvme_ns_identify_async(struct spdk_nvme_ns *ns, nvme_ns_async_cb_fn cb_fn, void *cb_arg);
+ void	nvme_ns_mark_inactive(struct spdk_nvme_ns *ns);
+diff --git a/test/unit/lib/nvme/nvme.c/nvme_ut.c b/test/unit/lib/nvme/nvme.c/nvme_ut.c
+index 1d7a639..056e101 100644
+--- a/test/unit/lib/nvme/nvme.c/nvme_ut.c
++++ b/test/unit/lib/nvme/nvme.c/nvme_ut.c
+@@ -1440,6 +1440,30 @@ test_nvme_wait_for_completion(void)
+ 	CU_ASSERT(rc == 0);
+ }
+ 
++/* Evariops 0074: every synchronous wait on an admin queue is counted, whatever its outcome. */
++static void
++test_nvme_sync_admin_waits_are_counted(void)
++{
++	struct spdk_nvme_qpair qpair = {};
++	struct spdk_nvme_ctrlr ctrlr = {.adminq = &qpair, .trid = {.trtype = SPDK_NVME_TRANSPORT_PCIE}};
++	uint64_t before;
++
++	qpair.ctrlr = &ctrlr;
++	before = nvme_sync_admin_wait_count();
++
++	memset(&g_status, 0, sizeof(g_status));
++	completion_delay_us = 1000000;
++	ctrlr.opts.admin_timeout_ms = 2000;
++	CU_ASSERT(nvme_wait_for_adminq_completion(&ctrlr, &g_status, false) == 0);
++	CU_ASSERT(nvme_sync_admin_wait_count() == before + 1);
++
++	memset(&g_status, 0, sizeof(g_status));
++	completion_delay_us = 2000000;
++	ctrlr.opts.admin_timeout_ms = 1000;
++	CU_ASSERT(nvme_wait_for_adminq_completion(&ctrlr, &g_status, false) == -ECANCELED);
++	CU_ASSERT(nvme_sync_admin_wait_count() == before + 2);
++}
++
+ static void
+ test_nvme_ctrlr_probe_internal(void)
+ {
+@@ -1699,6 +1723,7 @@ main(int argc, char **argv)
+ 	CU_ADD_TEST(suite, test_nvme_robust_mutex_init_shared);
+ 	CU_ADD_TEST(suite, test_nvme_request_check_timeout);
+ 	CU_ADD_TEST(suite, test_nvme_wait_for_completion);
++	CU_ADD_TEST(suite, test_nvme_sync_admin_waits_are_counted);
+ 	CU_ADD_TEST(suite, test_spdk_nvme_parse_func);
+ 	CU_ADD_TEST(suite, test_spdk_nvme_detach_async);
+ 	CU_ADD_TEST(suite, test_nvme_parse_addr);

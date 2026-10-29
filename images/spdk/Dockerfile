@@ -169,6 +169,7 @@ RUN { echo spdk; \
       test -n "$(find /build/patches -name '0067-*.patch')" && echo ublk-zero-copy; \
       test -n "$(find /build/patches -name '0070-*.patch')" && echo ublk-offset; \
       test -x /build/spdk-takeover-proof && echo takeover-proof; \
+      test -n "$(find /build/patches -name '0073-*.patch')" && echo nvme-async-aen; \
       true; } > /build/features.txt && \
     { printf '#include <stdio.h>\nstatic const char features[] =\n'; \
       sed 's/.*/"&\\n"/' /build/features.txt; \
