@@ -275,6 +275,21 @@ if has support_zero_copy; then
 		pass "0067 8 MiB with no copy through a tier composite read back" || fail "0067 read back through a composite"
 	R ublk_get_disks | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)[0]["zero_copy"]["zero_copy"] > 0 else 1)' &&
 		pass "0067 requests went with no copy through a tier composite" || fail "0067 no request went with no copy through a composite"
+	# 0075: a restore larger than its snapshot. A clone of the composite's lvol, grown past its
+	# snapshot, read with no copy: the part past the snapshot is zeroed by the domain. memset
+	# into those pages killed the process at the kernel's first read of the device's end.
+	R ublk_stop_disk "{\"ublk_id\":$ID}" > /dev/null
+	for _ in $(seq 50); do [ -e "$(dev)" ] || break; sleep 0.1; done
+	R bdev_lvol_snapshot '{"lvol_name":"lvst/lv","snapshot_name":"snap"}' > /dev/null || fail "0075 snapshot"
+	R bdev_lvol_clone '{"snapshot_name":"lvst/snap","clone_name":"cl"}' > /dev/null || fail "0075 clone"
+	R bdev_lvol_resize '{"name":"lvst/cl","size_in_mib":96}' > /dev/null || fail "0075 the clone grown"
+	R ublk_start_disk "{\"bdev_name\":\"lvst/cl\",\"ublk_id\":$ID}" > /dev/null || fail "0075 start over the grown clone"
+	wait_dev
+	[ "$(dd if="$(dev)" bs=1M count=8 iflag=direct status=none | digest)" = "$PATTERN" ] &&
+		pass "0075 the grown clone reads its snapshot with no copy" || fail "0075 the grown clone does not read its snapshot"
+	[ "$(dd if="$(dev)" bs=1M skip=80 count=16 iflag=direct status=none | digest)" = "$(head -c 16777216 /dev/zero | digest)" ] &&
+		pass "0075 past the snapshot it reads zeros, zeroed by the domain" || fail "0075 past the snapshot"
+	kill -0 "$PID" 2> /dev/null || fail "0075 the process died reading past the snapshot"
 	# A band without the domain (bdev_aio declares none): the composite declares none, and its
 	# disk is served with copies, as before.
 	R ublk_stop_disk "{\"ublk_id\":$ID}" > /dev/null
