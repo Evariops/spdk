@@ -17,6 +17,8 @@
 lib/bdev/                   lib/bdev/bdev.c lib/bdev/mt/bdev.c lib/bdev/part.c
 lib/blob/                   lib/blob/blob.c lib/blob/blob_bdev.c
 lib/jsonrpc/                lib/jsonrpc/jsonrpc_server.c
+lib/nvme/nvme_ctrlr.c       lib/nvme/nvme_ctrlr.c
+lib/nvme/nvme_ns.c          lib/nvme/nvme_ns.c
 lib/nvme/nvme_tcp.c         lib/nvme/nvme_tcp.c
 lib/nvmf/subsystem.c        lib/nvmf/subsystem.c
 lib/nvmf/nvmf_rpc.c         -
