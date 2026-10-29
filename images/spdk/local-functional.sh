@@ -243,10 +243,63 @@ wait "$inflight"
 [ "$(T write F 0 1 13)" = "$CONFLICT" ] || fail "F, preempted, still writes"
 T2 call bdev_nvme_detach_controller '{"name":"Y"}' > /dev/null || fail "detach Y"
 R bdev_nvme_detach_controller '{"name":"F"}' > /dev/null || fail "detach F"
+pass "preempt-and-abort: it lands ${waited} ms later, once the LOCAL write in flight is done"
+
+# ── The resize storm (0072-0074): two processes, each the initiator of the other, resized together ──
+# Each expansion is a namespace event on the other side. An event that waited on its admin queue
+# would hold a reactor the other process needs to answer it. The verdict is 0074's count of such
+# waits, not a freeze: two waits hold each other only when both start before either answers, a
+# window of a few hundred microseconds that the storm does not reach reliably (in a lab, 200 rounds
+# sent back-to-back on a target without 0072 froze neither process).
+S6=nqn.2026-10.io.evariops:storm-6
+S7=nqn.2026-10.io.evariops:storm-7
+TCP2='"trtype":"TCP","adrfam":"IPv4","traddr":"127.0.0.1","trsvcid":"4421"'
+TCP1='"trtype":"TCP","adrfam":"IPv4","traddr":"127.0.0.1","trsvcid":"4420"'
+R bdev_null_create '{"name":"N7","num_blocks":16384,"block_size":4096}' > /dev/null || fail "null"
+R nvmf_create_subsystem "{\"nqn\":\"$S7\",\"allow_any_host\":true}" > /dev/null || fail "subsystem"
+ns N7 7 "$S7" || fail "namespace"
+R nvmf_subsystem_add_listener "{\"nqn\":\"$S7\",\"listen_address\":{$TCP1}}" > /dev/null || fail "listener"
+T2 call nvmf_create_transport '{"trtype":"TCP"}' > /dev/null || fail "TCP transport in the second process"
+T2 call bdev_null_create '{"name":"N6","num_blocks":16384,"block_size":4096}' > /dev/null || fail "null"
+T2 call nvmf_create_subsystem "{\"nqn\":\"$S6\",\"allow_any_host\":true}" > /dev/null || fail "subsystem"
+T2 call nvmf_subsystem_add_ns "{\"nqn\":\"$S6\",\"namespace\":{\"bdev_name\":\"N6\",\"uuid\":\"0b7a1f3e-1111-4c2d-9e8f-000000000006\",\"nguid\":\"0B7A1F3E11114C2D9E8F000000000006\"}}" > /dev/null || fail "namespace"
+T2 call nvmf_subsystem_add_listener "{\"nqn\":\"$S6\",\"listen_address\":{$TCP2}}" > /dev/null || fail "listener"
+R bdev_nvme_attach_controller "{\"name\":\"G\",$TCP2,\"subnqn\":\"$S6\",\"hostnqn\":\"$HA\"}" > /dev/null || fail "attach G"
+T2 call bdev_nvme_attach_controller "{\"name\":\"H\",$TCP1,\"subnqn\":\"$S7\",\"hostnqn\":\"$HC\"}" > /dev/null || fail "attach H"
+# The count counts: a discovery attach reads the discovery log with a synchronous wait, by design
+# (in the second process, over TCP: the first one answers it).
+R nvmf_subsystem_add_listener "{\"nqn\":\"nqn.2014-08.org.nvmexpress.discovery\",\"listen_address\":{$TCP1}}" > /dev/null || fail "discovery listener"
+T2 call bdev_nvme_attach_controller "{\"name\":\"Q\",$TCP1,\"subnqn\":\"nqn.2014-08.org.nvmexpress.discovery\"}" > /dev/null || fail "discovery attach"
+counted() { grep -q 'synchronous wait #' "$WORK/tgt2.log"; }
+until_true 5 counted || fail "0074 did not count the discovery's synchronous wait"
+waits1=$(grep -c 'synchronous wait #' "$WORK/tgt.log")
+waits2=$(grep -c 'synchronous wait #' "$WORK/tgt2.log")
+blocks2() { T2 call bdev_get_bdevs "{\"name\":\"$1\"}" 2> /dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["num_blocks"])'; }
+seen() { [ "$(blocks Gn1)" = "$1" ] && [ "$(blocks2 Hn1)" = "$1" ]; }
+slowest=0
+for round in $(seq 1 20); do
+	mib=$((64 + round * 4))
+	start=$(date +%s%N)
+	R bdev_null_resize "{\"name\":\"N7\",\"new_size\":$mib}" > /dev/null &
+	r1=$!
+	T2 call bdev_null_resize "{\"name\":\"N6\",\"new_size\":$mib}" > /dev/null || fail "resize N6"
+	wait "$r1" || fail "resize N7"
+	until_true 10 seen $((mib * 256)) || fail "round $round: an initiator did not see the other's expansion"
+	# Each side still answers I/O at once.
+	[ "$(T write G 0 1 14)" = "$OK" ] && [ "$(T2 write H 0 1 15)" = "$OK" ] || fail "round $round: a write"
+	took=$((($(date +%s%N) - start) / 1000000))
+	((took > slowest)) && slowest=$took
+done
+((slowest < 5000)) || fail "the slowest round took ${slowest} ms"
+[ "$(grep -c 'synchronous wait #' "$WORK/tgt.log")" = "$waits1" ] || fail "a synchronous admin wait in the storm: $(grep 'synchronous wait #' "$WORK/tgt.log" | tail -1)"
+[ "$(grep -c 'synchronous wait #' "$WORK/tgt2.log")" = "$waits2" ] || fail "a synchronous admin wait in the storm: $(grep 'synchronous wait #' "$WORK/tgt2.log" | tail -1)"
+T2 call bdev_nvme_detach_controller '{"name":"Q"}' > /dev/null 2>&1 || true
+T2 call bdev_nvme_detach_controller '{"name":"H"}' > /dev/null || fail "detach H"
+R bdev_nvme_detach_controller '{"name":"G"}' > /dev/null || fail "detach G"
 kill -TERM "$PID2"
 wait "$PID2"
 PID2=
-pass "preempt-and-abort: it lands ${waited} ms later, once the LOCAL write in flight is done"
+pass "resize storm: 20 rounds of crossed expansions, each seen and answered (slowest ${slowest} ms); 0074 counts a discovery's wait, and none in the storm"
 
 # ── L-6: the subsystem's pause holds the LOCAL controllers' I/O ──
 token=$(R nvmf_subsystem_pause "{\"nqn\":\"$S1\",\"ttl_ms\":30000}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])') || fail "pause"
