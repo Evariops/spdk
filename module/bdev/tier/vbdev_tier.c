@@ -26,6 +26,7 @@
 #include "spdk/likely.h"
 #include "spdk/crc32.h"
 #include "spdk/uuid.h"
+#include "spdk/dma.h"
 
 static int vbdev_tier_init(void);
 static void vbdev_tier_finish(void);
@@ -974,6 +975,67 @@ vbdev_tier_write_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx 
 	/* The CSI control-plane replays create/add_band from CRD; no per-bdev config emitted. */
 }
 
+/* The memory domains every band of the composite declares. A read or write reaches the one band
+ * it lands on with its domain and context unchanged (tier_init_ext_io_opts), and the composite
+ * never touches its data, so a band that serves a domain serves it through the composite: an lvol
+ * over the composite then declares it too, and a ublk disk over that lvol serves its requests
+ * with no copy. Without this the lvol declared no domain and every ublk request was copied. A
+ * band declaring none leaves the composite with none: its requests are copied in host memory
+ * first, as before. The md region is mirrored to two bands, but only the blobstore's own
+ * metadata, in host memory, lands there. No band joins after register (add_band refuses it), so
+ * what the bdev layer read when the composite registered stays true. */
+static int
+tier_common_memory_domains(struct vbdev_tier *t, struct spdk_memory_domain **out, int array_size)
+{
+	struct spdk_memory_domain *common[TIER_MAX_MEMORY_DOMAINS];
+	struct spdk_memory_domain *own[TIER_MAX_MEMORY_DOMAINS];
+	struct tier_band *b;
+	int ncommon = -1, nown, i;
+
+	TAILQ_FOREACH(b, &t->bands, link) {
+		if (b->state == TIER_BAND_RETIRED || b->desc == NULL) {
+			continue;	/* a hole, or a disk gone: no request reaches it */
+		}
+		nown = spdk_bdev_get_memory_domains(spdk_bdev_desc_get_bdev(b->desc), own,
+						    SPDK_COUNTOF(own));
+		if (nown <= 0 || nown > (int)SPDK_COUNTOF(own)) {
+			return 0;
+		}
+		if (ncommon < 0) {
+			memcpy(common, own, (size_t)nown * sizeof(own[0]));
+			ncommon = nown;
+		} else {
+			ncommon = tier_memory_domains_intersect(common, ncommon, own, nown);
+		}
+	}
+	if (ncommon <= 0) {
+		return 0;
+	}
+	for (i = 0; out != NULL && i < spdk_min(ncommon, array_size); i++) {
+		out[i] = common[i];
+	}
+	return ncommon;
+}
+
+static int
+vbdev_tier_get_memory_domains(void *ctx, struct spdk_memory_domain **domains, int array_size)
+{
+	return tier_common_memory_domains(ctx, domains, array_size);
+}
+
+static int
+vbdev_tier_get_memory_domain_types(void *ctx, enum spdk_dma_device_type *types, uint32_t array_size)
+{
+	struct spdk_memory_domain *domains[TIER_MAX_MEMORY_DOMAINS];
+	int count, i;
+
+	count = tier_common_memory_domains(ctx, domains, SPDK_COUNTOF(domains));
+	for (i = 0; types != NULL && i < spdk_min(count, (int)array_size); i++) {
+		types[i] = spdk_memory_domain_get_dma_device_type(domains[i]);
+	}
+	return count;
+}
+
 static const struct spdk_bdev_fn_table vbdev_tier_fn_table = {
 	.destruct		= vbdev_tier_destruct,
 	.submit_request		= vbdev_tier_submit_request,
@@ -981,6 +1043,8 @@ static const struct spdk_bdev_fn_table vbdev_tier_fn_table = {
 	.get_io_channel		= vbdev_tier_get_io_channel,
 	.dump_info_json		= vbdev_tier_dump_info_json,
 	.write_config_json	= vbdev_tier_write_config_json,
+	.get_memory_domains	= vbdev_tier_get_memory_domains,
+	.get_memory_domain_types = vbdev_tier_get_memory_domain_types,
 };
 
 /* --------------------------------------------------------------------------
@@ -1998,6 +2062,20 @@ vbdev_tier_register(struct vbdev_tier *t)
 
 	t->bdev.blocklen = t->blocklen;
 	t->bdev.blockcnt = t->total_num_blocks;
+	/* The strictest buffer alignment of the bands. A request in host memory is aligned once,
+	 * here, rather than by the band; one served with no copy brings the kernel's own pages to
+	 * the band, so the ublk disk over an lvol of this composite asks the kernel for them aligned
+	 * as the band needs (an O_DIRECT file over a 4 KiB disk). The lvol takes it from here. */
+	{
+		struct tier_band *ab;
+
+		TAILQ_FOREACH(ab, &t->bands, link) {
+			if (ab->state != TIER_BAND_RETIRED && ab->desc != NULL) {
+				t->bdev.required_alignment = spdk_max(t->bdev.required_alignment,
+								      spdk_bdev_desc_get_bdev(ab->desc)->required_alignment);
+			}
+		}
+	}
 
 	spdk_io_device_register(t, tier_ch_create_cb, tier_ch_destroy_cb,
 				sizeof(struct tier_io_channel), t->bdev.name);

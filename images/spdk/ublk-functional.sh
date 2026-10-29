@@ -251,6 +251,43 @@ if has support_zero_copy; then
 	wait_dev
 	[ "$(dd if="$(dev)" bs=1M skip=1 count=8 iflag=direct status=none | digest)" = "$(digest < "$WORK/pattern2")" ] &&
 		pass "0070 with no copy, the data lie 1 MiB into the lvol" || fail "0070 zero copy offset"
+	# Through a tier composite, as a Local volume is served: an lvol over the composite, over
+	# bdev_uring bands. The composite declares the domains every band declares.
+	R ublk_stop_disk "{\"ublk_id\":$ID}" > /dev/null
+	for _ in $(seq 50); do [ -e "$(dev)" ] || break; sleep 0.1; done
+	truncate -s 256M "$WORK/band0.img" "$WORK/band1.img" "$WORK/band2.img" "$WORK/band3.img"
+	tier() { # $1: composite, $2: lvol store, $3 $4: its bands
+		R bdev_tier_create "{\"name\":\"$1\",\"md_num_blocks\":4096,\"cluster_blocks\":256}" > /dev/null || fail "bdev_tier_create $1"
+		R bdev_tier_add_band "{\"name\":\"$1\",\"base_bdev_name\":\"$3\",\"tier\":1}" > /dev/null || fail "add $3 to $1"
+		R bdev_tier_add_band "{\"name\":\"$1\",\"base_bdev_name\":\"$4\",\"tier\":2}" > /dev/null || fail "add $4 to $1"
+		R bdev_tier_register "{\"name\":\"$1\"}" > /dev/null || fail "bdev_tier_register $1"
+		R bdev_lvol_create_lvstore "{\"bdev_name\":\"$1\",\"lvs_name\":\"$2\",\"cluster_sz\":1048576}" > /dev/null || fail "lvol store on $1"
+		R bdev_lvol_create "{\"lvol_name\":\"lv\",\"size_in_mib\":64,\"lvs_name\":\"$2\",\"thin_provision\":true}" > /dev/null || fail "lvol on $1"
+	}
+	R bdev_uring_create "{\"filename\":\"$WORK/band0.img\",\"name\":\"ub0\",\"block_size\":4096}" > /dev/null || fail "band ub0"
+	R bdev_uring_create "{\"filename\":\"$WORK/band1.img\",\"name\":\"ub1\",\"block_size\":4096}" > /dev/null || fail "band ub1"
+	tier tc lvst ub0 ub1
+	R ublk_start_disk "{\"bdev_name\":\"lvst/lv\",\"ublk_id\":$ID}" > /dev/null || fail "zero copy start over a composite"
+	wait_dev
+	[[ $(R ublk_get_disks) == *'"enabled": true'* ]] || fail "0067 a disk over a tier composite does not serve with no copy"
+	dd if="$WORK/pattern" of="$(dev)" bs=1M oflag=direct conv=nocreat status=none
+	[ "$(dd if="$(dev)" bs=1M count=8 iflag=direct status=none | digest)" = "$PATTERN" ] &&
+		pass "0067 8 MiB with no copy through a tier composite read back" || fail "0067 read back through a composite"
+	R ublk_get_disks | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)[0]["zero_copy"]["zero_copy"] > 0 else 1)' &&
+		pass "0067 requests went with no copy through a tier composite" || fail "0067 no request went with no copy through a composite"
+	# A band without the domain (bdev_aio declares none): the composite declares none, and its
+	# disk is served with copies, as before.
+	R ublk_stop_disk "{\"ublk_id\":$ID}" > /dev/null
+	for _ in $(seq 50); do [ -e "$(dev)" ] || break; sleep 0.1; done
+	R bdev_uring_create "{\"filename\":\"$WORK/band2.img\",\"name\":\"ub2\",\"block_size\":4096}" > /dev/null || fail "band ub2"
+	R bdev_aio_create "{\"filename\":\"$WORK/band3.img\",\"name\":\"ab3\",\"block_size\":4096}" > /dev/null || fail "band ab3"
+	tier tm lvsm ub2 ab3
+	R ublk_start_disk "{\"bdev_name\":\"lvsm/lv\",\"ublk_id\":$ID}" > /dev/null || fail "start over a mixed composite"
+	wait_dev
+	[[ $(R ublk_get_disks) == *'"enabled": false'* ]] || fail "0067 a composite with a band lacking the domain declared it"
+	dd if="$WORK/pattern" of="$(dev)" bs=1M oflag=direct conv=nocreat status=none
+	[ "$(dd if="$(dev)" bs=1M count=8 iflag=direct status=none | digest)" = "$PATTERN" ] &&
+		pass "0067 a composite with a band lacking the domain is served with copies" || fail "0067 read back through a mixed composite"
 else
 	skip "0067 zero copy"
 fi
