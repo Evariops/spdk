@@ -343,7 +343,7 @@ rpc_bdev_tier_get_bands(struct spdk_jsonrpc_request *request, const struct spdk_
 		spdk_json_write_object_begin(w);
 		spdk_json_write_named_uint32(w, "band_id", b->band_id);
 		spdk_json_write_named_uint32(w, "tier", b->tier);
-		spdk_json_write_named_uint32(w, "state", b->state);
+		spdk_json_write_named_uint32(w, "state", tier_band_state(b));
 		spdk_json_write_named_string(w, "base_bdev_name", b->base_bdev_name);
 		spdk_json_write_named_string(w, "wwn", b->wwn);
 		spdk_json_write_named_string(w, "serial", b->serial);
@@ -674,7 +674,9 @@ rpc_evariops_get_capabilities(struct spdk_jsonrpc_request *request,
 	spdk_json_write_named_string(w, "boot_id", g_tier_boot_id);
 	spdk_json_write_named_uint32(w, "tier_sb_version", TIER_SB_VERSION);
 	spdk_json_write_named_uint32(w, "capabilities_schema", 1);
-	spdk_json_write_named_bool(w, "single_reactor_assumed", true);
+	/* Several reactors are served (0077, 0078, the band state's atomics): the key stays for
+	 * the clients that read it. */
+	spdk_json_write_named_bool(w, "single_reactor_assumed", false);
 	spdk_json_write_named_array_begin(w, "methods");
 	for (i = 0; i < SPDK_COUNTOF(g_evariops_methods); i++) {
 		uint32_t state_mask;

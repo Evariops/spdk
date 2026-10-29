@@ -9,6 +9,7 @@
  *   container build.
  */
 
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -240,9 +241,68 @@ test_memory_domains_intersect(void)
 	CHECK(tier_memory_domains_intersect(common, 1, NULL, 0) == 0);
 }
 
+/* ---- tier_band_degrade: ACTIVE to DEGRADED once, whichever reactor fails ---------- */
+
+struct degrade_race {
+	struct tier_band	*band;
+	int			*start;
+	int			wins;
+};
+
+static void *
+degrade_race_thread(void *arg)
+{
+	struct degrade_race *r = arg;
+	int i;
+
+	while (!__atomic_load_n(r->start, __ATOMIC_ACQUIRE)) {
+	}
+	for (i = 0; i < 1000; i++) {
+		r->wins += tier_band_degrade(&r->band[i]);
+	}
+	return NULL;
+}
+
+static void
+test_band_degrade_once(void)
+{
+	static struct tier_band bands[1000];
+	struct degrade_race races[2];
+	pthread_t threads[2];
+	int start = 0, i;
+
+	/* Only an ACTIVE band degrades, and only once. */
+	tier_band_set_state(&bands[0], TIER_BAND_ACTIVE);
+	CHECK(tier_band_degrade(&bands[0]));
+	CHECK(tier_band_state(&bands[0]) == TIER_BAND_DEGRADED);
+	CHECK(!tier_band_degrade(&bands[0]));
+	tier_band_set_state(&bands[0], TIER_BAND_RETIRED);
+	CHECK(!tier_band_degrade(&bands[0]));
+	CHECK(tier_band_state(&bands[0]) == TIER_BAND_RETIRED);
+
+	/* Two threads failing on the same 1000 legs at once: each leg degrades for exactly one,
+	 * the one that logs and persists. */
+	for (i = 0; i < 1000; i++) {
+		tier_band_set_state(&bands[i], TIER_BAND_ACTIVE);
+	}
+	for (i = 0; i < 2; i++) {
+		races[i] = (struct degrade_race) { .band = bands, .start = &start };
+		pthread_create(&threads[i], NULL, degrade_race_thread, &races[i]);
+	}
+	__atomic_store_n(&start, 1, __ATOMIC_RELEASE);
+	for (i = 0; i < 2; i++) {
+		pthread_join(threads[i], NULL);
+	}
+	CHECK(races[0].wins + races[1].wins == 1000);
+	for (i = 0; i < 1000; i++) {
+		CHECK(tier_band_state(&bands[i]) == TIER_BAND_DEGRADED);
+	}
+}
+
 int
 main(void)
 {
+	test_band_degrade_once();
 	test_part_uuid_parse_grammar();
 	test_part_uuid_hex_roundtrip();
 	test_ranges_overlap();

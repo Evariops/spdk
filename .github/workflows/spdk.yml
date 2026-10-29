@@ -255,7 +255,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          sparse-checkout: images/spdk/ublk-functional.sh
+          sparse-checkout: |
+            images/spdk/ublk-functional.sh
+            images/spdk/multireactor-functional.sh
 
       - name: Load ublk_drv
         run: |
@@ -283,6 +285,16 @@ jobs:
           docker run --rm --privileged --user 0:0 -v /dev:/dev \
             -v "$PWD/images/spdk/ublk-functional.sh:/ublk-functional.sh:ro" \
             --entrypoint bash "$IMAGE" /ublk-functional.sh
+
+      # Two reactors under load: a two-queue ublk disk over a raid1 whose members
+      # are reached through LOCAL, while a member's target goes away and comes back.
+      - name: Two reactors under load
+        env:
+          IMAGE: ghcr.io/evariops/spdk-debug:${{ needs.compute-tag.outputs.tag }}-amd64
+        run: |
+          docker run --rm --privileged --user 0:0 -v /dev:/dev \
+            -v "$PWD/images/spdk/multireactor-functional.sh:/multireactor-functional.sh:ro" \
+            --entrypoint bash "$IMAGE" /multireactor-functional.sh
 
   # ────────────────────────────────────────────────────────────────
   # 3c. LOCAL functional — the in-memory transport pair (0076)

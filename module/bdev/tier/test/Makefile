@@ -6,6 +6,8 @@ CFLAGS  ?= -O1 -g
 CFLAGS  += -std=gnu11 -Wall -Wextra -Werror -Wno-unused-function
 CFLAGS  += -fsanitize=address,undefined -fno-sanitize-recover=all
 CFLAGS  += -Imock -I..
+# test_tier_units races two threads on a band's state.
+CFLAGS  += -pthread
 
 BIN := test_tier_sb
 BIN_UNITS := test_tier_units

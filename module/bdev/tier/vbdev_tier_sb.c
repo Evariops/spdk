@@ -45,7 +45,7 @@ tier_sb_serialize(struct vbdev_tier *t, struct tier_band *self, uint64_t seq,
 		}
 		sb->bands[i].band_id = b->band_id;
 		sb->bands[i].tier = b->tier;
-		sb->bands[i].state = b->state;
+		sb->bands[i].state = tier_band_state(b);
 		sb->bands[i].lba_start = b->lba_start;
 		sb->bands[i].num_blocks = b->num_blocks;
 		snprintf(sb->bands[i].wwn, sizeof(sb->bands[i].wwn), "%s", b->wwn);
@@ -270,7 +270,7 @@ tier_sb_write_start(struct vbdev_tier *t)
 		int rc;
 
 		/* ACTIVE bands only. */
-		if (b->state != TIER_BAND_ACTIVE || b->desc == NULL) {
+		if (tier_band_state(b) != TIER_BAND_ACTIVE || b->desc == NULL) {
 			continue;
 		}
 		bw = calloc(1, sizeof(*bw));

@@ -8,7 +8,13 @@ Terms. A **tier** is a composite bdev built from **bands**, fixed-geometry exten
 
 ## Global assumptions
 
-- **Single reactor (`-m 0x1`).** The standing-pause registry (patch 0003), `g_relocate_inflight` (patch 0005), `band->state` and the heat counters assume all RPC handlers run on one reactor, lock-free; `nvmf_subsystem_pause` logs an error if it sees more than one. Widening the CPU mask requires a concurrency pass first. `evariops_get_capabilities` reports `single_reactor_assumed: true`.
+- **Several reactors.** The concurrency pass is done, and `evariops_get_capabilities` reports `single_reactor_assumed: false`.
+  - The standing-pause registry (patch 0003) and `g_relocate_inflight` (patch 0005) belong to the app thread whatever the CPU mask, and assert it (0078). The RPC handlers run there, a pause's or a resume's completion runs on its subsystem's thread (the RPC's), and a relocation completes on the thread that started it.
+  - A tier band's state is read with an acquire load. A failed metadata write degrades a leg by compare-and-swap from any reactor, and only the winner logs and persists.
+  - The superblock persist state is the composite's thread's.
+  - The raid's heat sketch is freed only after a grace period over every channel. Its counts may lose an increment between reactors, and it is an estimate anyway.
+  - A thread waiting for an iobuf buffer is served by buffers returned on another (0077).
+  - `images/spdk/multireactor-functional.sh` plays `-m 0x3` under load: a two-queue ublk disk over a raid1 whose members are reached through LOCAL, over a tier composite, while a member's target goes away and comes back.
 - **The LOCAL transport pair (patch 0076)** joins an NVMe initiator (`bdev_nvme_attach_controller -t LOCAL -a <addr> -s <svc>`) and an NVMe-oF listener of the same process (`nvmf_create_transport -t LOCAL`, then `nvmf_subsystem_add_listener -t LOCAL`). The image reports `nvmf-local` (`spdk-features`). Before using it:
   - every initiator controller of one process presents its host ID (bdev_nvme takes the driver's, generated at each start), so two LOCAL controllers of one process are one host to reservations;
   - a namespace that a bdev_nvme of the same process attaches needs a UUID and an NGUID of its own (`nvmf_subsystem_add_ns` `uuid`, `nguid`): otherwise the nvme bdev's UUID alias collides with the namespace's own bdev, and the nvme bdev is not registered;
