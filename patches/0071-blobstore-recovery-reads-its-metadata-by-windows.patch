@@ -1,0 +1,294 @@
+diff --git a/lib/blob/blobstore.c b/lib/blob/blobstore.c
+index 3dd1734..626e6be 100644
+--- a/lib/blob/blobstore.c
++++ b/lib/blob/blobstore.c
+@@ -4001,6 +4001,15 @@ struct spdk_bs_load_ctx {
+ 	uint32_t			page_index;
+ 	uint32_t			cur_page;
+ 	struct spdk_blob_md_page	*page;
++	/* Evariops 0071: a recovery reads the metadata region by windows of md_window_pages pages,
++	 * md_window_len of them read from md_window_start on, and parses each page from there.
++	 * NULL: page by page, as upstream. */
++	uint8_t				*md_window;
++	uint32_t			md_window_pages;
++	uint32_t			md_window_start;
++	uint32_t			md_window_len;
++	uint32_t			md_window_reads;
++	uint32_t			md_window_served;
+ 
+ 	uint64_t			num_extent_pages;
+ 	uint32_t			*extent_page_num;
+@@ -4456,6 +4465,7 @@ bs_load_ctx_fail(struct spdk_bs_load_ctx *ctx, int bserrno)
+ 	assert(bserrno != 0);
+ 
+ 	spdk_free(ctx->mask);
++	spdk_free(ctx->md_window);
+ 	spdk_free(ctx->super);
+ 	bs_sequence_finish(ctx->seq, bserrno);
+ 	bs_free(ctx->bs);
+@@ -4891,6 +4901,14 @@ bs_load_replay_md_chain_cpl(struct spdk_bs_load_ctx *ctx)
+ 		}
+ 		ctx->bs->num_free_clusters -= num_md_clusters;
+ 		spdk_free(ctx->page);
++		if (ctx->md_window != NULL) {
++			SPDK_NOTICELOG("Recovery read %" PRIu32 " metadata pages in %" PRIu32
++				       " windows of up to %" PRIu32 " (Evariops 0071)\n",
++				       ctx->super->md_len, ctx->md_window_reads,
++				       ctx->md_window_pages);
++			spdk_free(ctx->md_window);
++			ctx->md_window = NULL;
++		}
+ 		bs_load_write_used_md(ctx);
+ 	}
+ }
+@@ -5004,12 +5022,78 @@ bs_load_replay_md_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+ 	bs_load_replay_md_chain_cpl(ctx);
+ }
+ 
++/*
++ * Evariops 0071: a recovery reads the metadata region by windows of this many bytes, not one page
++ * at a time. It parses every page of the region: page by page, at one 4 KiB read in flight, a
++ * region of 885k pages took 13 s on an NVMe disk and 55 s on a SATA one, while the volumes on the
++ * store waited. Read by windows, the same region is bound by the disk's throughput. The parse is
++ * unchanged, and so is what the recovery finds.
++ */
++static uint32_t g_bs_recover_md_window_bytes = 4 * 1024 * 1024;
++
++/* A page served from the window leads to the next one on the same stack: every this many pages,
++ * the next goes through a message, so the stack never holds more pages than that. */
++#define BS_RECOVER_MD_WINDOW_PAGES_PER_STACK 64
++
++static void
++bs_load_replay_window_page(void *arg)
++{
++	struct spdk_bs_load_ctx *ctx = arg;
++	uint64_t offset = (uint64_t)(ctx->cur_page - ctx->md_window_start) * ctx->bs->md_page_size;
++
++	memcpy(ctx->page, ctx->md_window + offset, ctx->bs->md_page_size);
++	bs_load_replay_md_cpl(ctx->seq, ctx, 0);
++}
++
++static void
++bs_load_replay_md_window_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
++{
++	struct spdk_bs_load_ctx *ctx = cb_arg;
++
++	if (bserrno != 0) {
++		bs_load_ctx_fail(ctx, bserrno);
++		return;
++	}
++	ctx->md_window_reads++;
++	bs_load_replay_window_page(ctx);
++}
++
+ static void
+ bs_load_replay_cur_md_page(struct spdk_bs_load_ctx *ctx)
+ {
+ 	uint64_t lba;
++	uint64_t bytes;
++	int rc;
+ 
+ 	assert(ctx->cur_page < ctx->super->md_len);
++	if (ctx->md_window != NULL) {
++		if (ctx->md_window_len != 0 && ctx->cur_page >= ctx->md_window_start &&
++		    ctx->cur_page - ctx->md_window_start < ctx->md_window_len) {
++			if (++ctx->md_window_served % BS_RECOVER_MD_WINDOW_PAGES_PER_STACK == 0) {
++				rc = spdk_thread_send_msg(spdk_get_thread(),
++							  bs_load_replay_window_page, ctx);
++				if (rc == 0) {
++					return;
++				}
++				/* A message that cannot be sent costs one more page on the stack. */
++			}
++			bs_load_replay_window_page(ctx);
++			return;
++		}
++		if (!ctx->in_page_chain) {
++			/* The scan left the window: the next one starts at this page. */
++			ctx->md_window_start = ctx->cur_page;
++			ctx->md_window_len = spdk_min(ctx->md_window_pages,
++						      ctx->super->md_len - ctx->cur_page);
++			lba = bs_md_page_to_lba(ctx->bs, ctx->md_window_start);
++			bytes = (uint64_t)ctx->md_window_len * ctx->bs->md_page_size;
++			bs_sequence_read_dev(ctx->seq, ctx->md_window, lba,
++					     bs_byte_to_lba(ctx->bs, bytes),
++					     bs_load_replay_md_window_cpl, ctx);
++			return;
++		}
++		/* A chain's page outside the window is read alone; the scan stays in the window. */
++	}
+ 	lba = bs_md_page_to_lba(ctx->bs, ctx->cur_page);
+ 	bs_sequence_read_dev(ctx->seq, ctx->page, lba,
+ 			     bs_byte_to_lba(ctx->bs, ctx->super->md_page_size),
+@@ -5027,6 +5111,17 @@ bs_load_replay_md(struct spdk_bs_load_ctx *ctx)
+ 		bs_load_ctx_fail(ctx, -ENOMEM);
+ 		return;
+ 	}
++	/* Evariops 0071: a window of more than one page, or page by page when none can be had. */
++	ctx->md_window_pages = spdk_min(g_bs_recover_md_window_bytes / ctx->bs->md_page_size,
++					ctx->super->md_len);
++	if (ctx->md_window_pages > 1) {
++		ctx->md_window = spdk_zmalloc((uint64_t)ctx->md_window_pages * ctx->bs->md_page_size,
++					      0x1000, NULL, SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_DMA);
++		if (ctx->md_window == NULL) {
++			SPDK_NOTICELOG("Recovery reads its metadata page by page, no window of %"
++				       PRIu32 " pages (Evariops 0071)\n", ctx->md_window_pages);
++		}
++	}
+ 	bs_load_replay_cur_md_page(ctx);
+ }
+ 
+diff --git a/test/unit/lib/blob/blob.c/blob_ut.c b/test/unit/lib/blob/blob.c/blob_ut.c
+index f86c880..2afc597 100644
+--- a/test/unit/lib/blob/blob.c/blob_ut.c
++++ b/test/unit/lib/blob/blob.c/blob_ut.c
+@@ -2726,6 +2726,141 @@ bs_load_custom_cluster_size(void)
+ 	g_bs = NULL;
+ }
+ 
++/* Evariops 0071: the reads of a load, and the largest. */
++static uint64_t g_ut_md_window_reads;
++static uint64_t g_ut_md_window_largest_read;
++
++static void
++ut_dev_read_counted(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
++		    uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
++{
++	g_ut_md_window_reads++;
++	g_ut_md_window_largest_read = spdk_max(g_ut_md_window_largest_read,
++					       (uint64_t)lba_count * dev->blocklen);
++	dev_read(dev, channel, payload, lba, lba_count, cb_args);
++}
++
++/*
++ * Evariops 0071: a dirty load reads the metadata region by windows, not page by page, and finds
++ * what page by page finds: the blobs, a deleted one gone, xattrs on chained pages, the clusters
++ * and the free count. A window of four pages takes many windows, and a chain leaves its window;
++ * the default window reads the whole region at once, in place of a read per page.
++ */
++static void
++bs_dirty_load_reads_md_by_windows(void)
++{
++	struct spdk_blob_store *bs = g_bs;
++	struct spdk_bs_dev *dev;
++	struct spdk_blob_opts opts;
++	struct spdk_blob *blob;
++	spdk_blob_id blobids[8];
++	size_t large_len = 4072 - sizeof(struct spdk_blob_md_descriptor_xattr) - strlen("large");
++	char *large;
++	const void *value;
++	size_t value_len;
++	uint32_t windows[3], default_window = g_bs_recover_md_window_bytes;
++	uint64_t free_clusters, reads[3], largest[3];
++	uint32_t md_len;
++	unsigned int i, w;
++	int rc;
++
++	large = malloc(large_len);
++	SPDK_CU_ASSERT_FATAL(large != NULL);
++	memset(large, 0x5a, large_len);
++
++	for (i = 0; i < SPDK_COUNTOF(blobids); i++) {
++		ut_spdk_blob_opts_init(&opts);
++		opts.num_clusters = i + 1;
++		blob = ut_blob_create_and_open(bs, &opts);
++		blobids[i] = spdk_blob_get_id(blob);
++		spdk_blob_close(blob, blob_op_complete, NULL);
++		poll_threads();
++		CU_ASSERT(g_bserrno == 0);
++	}
++	/* The fourth blob's pages freed, the next chain may take them, before the last blob's. */
++	spdk_bs_delete_blob(bs, blobids[3], blob_op_complete, NULL);
++	poll_threads();
++	CU_ASSERT(g_bserrno == 0);
++	/* A large xattr chains a page to the first blob and to the last. */
++	for (i = 0; i < SPDK_COUNTOF(blobids); i += SPDK_COUNTOF(blobids) - 1) {
++		spdk_bs_open_blob(bs, blobids[i], blob_op_with_handle_complete, NULL);
++		poll_threads();
++		CU_ASSERT(g_bserrno == 0);
++		SPDK_CU_ASSERT_FATAL(g_blob != NULL);
++		blob = g_blob;
++		rc = spdk_blob_set_xattr(blob, "large", large, large_len);
++		CU_ASSERT(rc == 0);
++		spdk_blob_sync_md(blob, blob_op_complete, NULL);
++		poll_threads();
++		CU_ASSERT(g_bserrno == 0);
++		spdk_blob_close(blob, blob_op_complete, NULL);
++		poll_threads();
++		CU_ASSERT(g_bserrno == 0);
++	}
++	free_clusters = spdk_bs_free_cluster_count(bs);
++	md_len = bs->md_len;
++	SPDK_CU_ASSERT_FATAL(md_len <= default_window / bs->md_page_size);
++
++	/* Page by page, by windows of four pages, by the default window. */
++	windows[0] = 0;
++	windows[1] = 4 * bs->md_page_size;
++	windows[2] = default_window;
++	for (w = 0; w < SPDK_COUNTOF(windows); w++) {
++		g_bs_recover_md_window_bytes = windows[w];
++		/* A dirty shutdown, then a load whose reads are counted. */
++		bs_free(bs);
++		dev = init_dev();
++		dev->read = ut_dev_read_counted;
++		reads[w] = g_ut_md_window_reads;
++		g_ut_md_window_largest_read = 0;
++		spdk_bs_load(dev, NULL, bs_op_with_handle_complete, NULL);
++		poll_threads();
++		reads[w] = g_ut_md_window_reads - reads[w];
++		largest[w] = g_ut_md_window_largest_read;
++		g_bs_recover_md_window_bytes = default_window;
++		CU_ASSERT(g_bserrno == 0);
++		SPDK_CU_ASSERT_FATAL(g_bs != NULL);
++		bs = g_bs;
++
++		CU_ASSERT(spdk_bs_free_cluster_count(bs) == free_clusters);
++		for (i = 0; i < SPDK_COUNTOF(blobids); i++) {
++			g_blob = NULL;
++			spdk_bs_open_blob(bs, blobids[i], blob_op_with_handle_complete, NULL);
++			poll_threads();
++			if (i == 3) {
++				CU_ASSERT(g_bserrno == -ENOENT);
++				continue;
++			}
++			CU_ASSERT(g_bserrno == 0);
++			SPDK_CU_ASSERT_FATAL(g_blob != NULL);
++			blob = g_blob;
++			CU_ASSERT(spdk_blob_get_num_clusters(blob) == i + 1);
++			rc = spdk_blob_get_xattr_value(blob, "large", &value, &value_len);
++			if (i == 0 || i == SPDK_COUNTOF(blobids) - 1) {
++				CU_ASSERT(rc == 0);
++				CU_ASSERT(value_len == large_len);
++				CU_ASSERT(value != NULL && memcmp(value, large, large_len) == 0);
++			} else {
++				CU_ASSERT(rc == -ENOENT);
++			}
++			spdk_blob_close(blob, blob_op_complete, NULL);
++			poll_threads();
++			CU_ASSERT(g_bserrno == 0);
++		}
++	}
++	/* Page by page reads a page at a time; a window of four pages four at a time, and the
++	 * default window the whole region at once. Extent pages are read apart, in every case. */
++	CU_ASSERT(largest[0] == bs->md_page_size);
++	CU_ASSERT(largest[1] == 4 * bs->md_page_size);
++	CU_ASSERT(largest[2] == (uint64_t)md_len * bs->md_page_size);
++	CU_ASSERT(reads[1] < reads[0]);
++	CU_ASSERT(reads[2] < reads[1]);
++
++	g_bs = bs;
++	g_blob = NULL;
++	free(large);
++}
++
+ static void
+ bs_load_after_failed_grow(void)
+ {
+@@ -10827,6 +10962,7 @@ main(int argc, char **argv)
+ 		CU_ADD_TEST(suite_bs, blob_parse_md);
+ 		CU_ADD_TEST(suite, bs_load);
+ 		CU_ADD_TEST(suite_bs, bs_load_pending_removal);
++		CU_ADD_TEST(suite_bs, bs_dirty_load_reads_md_by_windows);
+ 		CU_ADD_TEST(suite, bs_load_custom_cluster_size);
+ 		CU_ADD_TEST(suite, bs_load_after_failed_grow);
+ 		CU_ADD_TEST(suite, bs_load_error);

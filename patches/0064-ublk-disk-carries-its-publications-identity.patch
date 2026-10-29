@@ -1,5 +1,5 @@
 diff --git a/lib/ublk/ublk.c b/lib/ublk/ublk.c
-index 334b0bf..ca431dc 100644
+index 334b0bf..7c6bf6b 100644
 --- a/lib/ublk/ublk.c
 +++ b/lib/ublk/ublk.c
 @@ -178,6 +178,9 @@ struct spdk_ublk_dev {
@@ -24,7 +24,7 @@ index 334b0bf..ca431dc 100644
 +		 * did: there is nothing to compare. */
 +		if (ublk->identity != 0 && ublk->dev_info.ublksrv_flags != 0 &&
 +		    ublk->dev_info.ublksrv_flags != ublk->identity) {
-+			SPDK_ERRLOG("ublk %u belongs to another publication (identity %" PRIx64 ", expected %" PRIx64 "): "
++			SPDK_ERRLOG("ublk %u belongs to another publication (identity %" PRIu64 ", expected %" PRIu64 "): "
 +				    "not recovered (Evariops 0064)\n", ublk->ublk_id,
 +				    (uint64_t)ublk->dev_info.ublksrv_flags, ublk->identity);
 +			if (ublk->ctrl_cb) {
