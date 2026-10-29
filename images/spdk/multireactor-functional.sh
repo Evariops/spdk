@@ -4,8 +4,9 @@
 #   - over a raid1 whose two members are reached through the LOCAL pair (0076);
 #   - over two lvols of one tier composite (its band state, 0078's registries, iobuf, 0077).
 # Writers fill regions of the disk while the second member's subsystem is paused and resumed
-# and both members' controllers are reset. Then every region reads back, both mirrors hold
-# the same data, both reactors served I/O, and the process is alive. Each case prints PASS;
+# and each member's target goes away and comes back. Then every region reads back, reads at queue depth
+# one go to the member named to win the ties (0079), both mirrors hold the same data, both
+# reactors served I/O, and the process is alive. Each case prints PASS;
 # the script exits non-zero on the first failure. Run it inside the debug image, privileged,
 # with the host's /dev and ublk_drv loaded, as ublk-functional.sh.
 set -uo pipefail
@@ -161,6 +162,32 @@ for i in $(seq 0 $((REGIONS - 1))); do
 		fail "region $i reads back wrong through the raid"
 done
 pass "every region reads back through the raid"
+
+# ── The member the control plane names wins the reads it ties on (0079) ──
+# At queue depth one every read ties: without a preference they all go to slot 0.
+reads_of() { R bdev_get_iostat "{\"names\":[\"$1\"]}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["bdevs"][0]["num_read_ops"])'; }
+# Sets ON0 and ON1: how many of 256 reads at queue depth one each member served.
+qd1_reads() {
+	local b0 b1 a0 a1
+	b0=$(reads_of L0n1) && b1=$(reads_of L1n1) || fail "the members' iostat"
+	dd if="$(dev $ID)" of=/dev/null bs=4k count=256 iflag=direct status=none || fail "reads at queue depth one"
+	a0=$(reads_of L0n1) && a1=$(reads_of L1n1) || fail "the members' iostat"
+	ON0=$((a0 - b0))
+	ON1=$((a1 - b1))
+}
+R bdev_raid_set_read_preference '{"name":"r0","base_bdev":"L1n1"}' > /dev/null || fail "read preference on L1n1"
+R bdev_raid_get_bdevs '{"category":"all"}' | python3 -c '
+import json, sys
+members = {m["name"]: m["read_preferred"] for m in json.load(sys.stdin)[0]["base_bdevs_list"]}
+sys.exit(0 if members == {"L0n1": False, "L1n1": True} else 1)' || fail "the raid does not report L1n1 alone as preferred"
+qd1_reads
+[ "$ON0" = 0 ] && [ "$ON1" -ge 256 ] || fail "with L1n1 preferred, $ON0 reads went to L0n1 and $ON1 to L1n1"
+R bdev_raid_set_read_preference '{"name":"r0"}' > /dev/null || fail "clear the read preference"
+qd1_reads
+[ "$ON0" -ge 256 ] && [ "$ON1" = 0 ] || fail "without a preference, $ON0 reads went to L0n1 and $ON1 to L1n1"
+R bdev_raid_set_read_preference '{"name":"r0","base_bdev":"L9n1"}' > /dev/null 2>&1 && fail "a preference for a bdev that is no member was taken"
+pass "at queue depth one every read goes to the member named, and to slot 0 without one"
+
 R ublk_stop_disk "{\"ublk_id\":$ID}" > /dev/null || fail "stop the raid's disk"
 gone_dev $ID
 R bdev_raid_delete '{"name":"r0"}' > /dev/null || fail "raid delete"

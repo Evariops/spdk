@@ -1,0 +1,367 @@
+diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
+index ea4faa8..a611fc3 100644
+--- a/module/bdev/raid/bdev_raid.c
++++ b/module/bdev/raid/bdev_raid.c
+@@ -488,6 +488,8 @@ raid_bdev_deconfigure_base_bdev(struct raid_base_bdev_info *base_info)
+ 	base_info->write_only = false;
+ 	base_info->read_excluded = false;
+ 	base_info->write_only_pending = false;
++	/* Evariops 0079: the next member in this slot may be served from elsewhere. */
++	__atomic_store_n(&base_info->read_preferred, false, __ATOMIC_RELAXED);
+ }
+ 
+ /*
+@@ -1305,6 +1307,9 @@ raid_bdev_write_info_json(struct raid_bdev *raid_bdev, struct spdk_json_write_ct
+ 		/* Evariops 0033: the member carries its own failed-removal errno;
+ 		 * 0 means no removal has failed. */
+ 		spdk_json_write_named_int32(w, "remove_error", base_info->remove_error);
++		/* Evariops 0079 */
++		spdk_json_write_named_bool(w, "read_preferred",
++					   __atomic_load_n(&base_info->read_preferred, __ATOMIC_RELAXED));
+ 		spdk_json_write_named_uint64(w, "content_generation",
+ 					     base_info->content_generation);
+ 		spdk_json_write_named_uint64(w, "view_epoch", base_info->view_epoch);
+@@ -5401,6 +5406,43 @@ raid_bdev_journal_view_epoch(struct raid_bdev *raid_bdev, uint64_t epoch,
+ 	return 0;
+ }
+ 
++/* Evariops 0079: a raid1 reads from the member with the fewest read blocks in
++ * flight, and on a tie from the lowest slot: at queue depth one, always slot 0,
++ * which is the member served in this process only by the accident of the
++ * create's order, and not after that member is replaced. The control plane
++ * names the member to win the ties instead; under load the balance is the
++ * same. Kept in memory: a reassembly is named again by its agent. */
++int
++raid_bdev_set_read_preference(struct raid_bdev *raid_bdev, const char *base_bdev_name)
++{
++	struct raid_base_bdev_info *base_info, *preferred = NULL;
++
++	assert(spdk_get_thread() == spdk_thread_get_app_thread());
++
++	if (raid_bdev->level != SPDK_BDEV_RAID_LEVEL_RAID1) {
++		return -ENOTSUP;
++	}
++
++	if (base_bdev_name != NULL) {
++		RAID_FOR_EACH_BASE_BDEV(raid_bdev, base_info) {
++			if (base_info->is_configured && base_info->name != NULL &&
++			    strcmp(base_info->name, base_bdev_name) == 0) {
++				preferred = base_info;
++				break;
++			}
++		}
++		if (preferred == NULL) {
++			return -ENODEV;
++		}
++	}
++
++	RAID_FOR_EACH_BASE_BDEV(raid_bdev, base_info) {
++		__atomic_store_n(&base_info->read_preferred, base_info == preferred, __ATOMIC_RELAXED);
++	}
++
++	return 0;
++}
++
+ static void raid_bdev_examine_sb(const struct raid_bdev_superblock *sb, struct spdk_bdev *bdev,
+ 				 raid_bdev_action_cb cb_fn, void *cb_ctx);
+ 
+diff --git a/module/bdev/raid/bdev_raid.h b/module/bdev/raid/bdev_raid.h
+index 6154f11..1baed42 100644
+--- a/module/bdev/raid/bdev_raid.h
++++ b/module/bdev/raid/bdev_raid.h
+@@ -109,6 +109,13 @@ struct raid_base_bdev_info {
+ 	 * completion or with the membership. */
+ 	bool			read_excluded;
+ 
++	/* Evariops 0079: the raid1 read selection gives this member every read it
++	 * ties on — the member served in this process, named by the control plane.
++	 * Set on the app thread and read on every I/O thread, hence relaxed atomic
++	 * accesses: a stale read costs one read's locality, never its data. Cleared
++	 * with the membership. */
++	bool			read_preferred;
++
+ 	/* Evariops 0013: write_only attach done, seeded rebuild not completed. The
+ 	 * superblock slot must stay un-promoted: never CONFIGURED while the data
+ 	 * region may still be stale. */
+@@ -797,6 +804,11 @@ int raid_bdev_sb_restamp_copied_member(struct raid_bdev_superblock *sb,
+ int raid_bdev_journal_view_epoch(struct raid_bdev *raid_bdev, uint64_t epoch,
+ 				 const struct spdk_uuid *lineage, raid_bdev_write_sb_cb cb, void *cb_ctx);
+ 
++/* Evariops 0079: names the member of a raid1 that wins the reads it ties on, the
++ * others losing the preference; NULL clears it. -ENOTSUP for another level,
++ * -ENODEV for a name that is not a configured member. */
++int raid_bdev_set_read_preference(struct raid_bdev *raid_bdev, const char *base_bdev_name);
++
+ struct spdk_raid_bdev_opts {
+ 	/* Size of the background process window in KiB */
+ 	uint32_t process_window_size_kb;
+diff --git a/module/bdev/raid/bdev_raid_rpc.c b/module/bdev/raid/bdev_raid_rpc.c
+index aea9ecc..5eee293 100644
+--- a/module/bdev/raid/bdev_raid_rpc.c
++++ b/module/bdev/raid/bdev_raid_rpc.c
+@@ -528,6 +528,55 @@ cleanup:
+ }
+ SPDK_RPC_REGISTER("bdev_raid_journal_view_epoch", rpc_bdev_raid_journal_view_epoch, SPDK_RPC_RUNTIME)
+ 
++/* Evariops 0079: bdev_raid_set_read_preference {name, base_bdev?} — the member of
++ * a raid1 that wins the reads it ties on; without base_bdev, none does. */
++struct rpc_bdev_raid_set_read_preference {
++	char	*name;
++	char	*base_bdev;
++};
++
++static const struct spdk_json_object_decoder rpc_bdev_raid_set_read_preference_decoders[] = {
++	{"name", offsetof(struct rpc_bdev_raid_set_read_preference, name), spdk_json_decode_string},
++	{"base_bdev", offsetof(struct rpc_bdev_raid_set_read_preference, base_bdev), spdk_json_decode_string, true},
++};
++
++static void
++rpc_bdev_raid_set_read_preference(struct spdk_jsonrpc_request *request,
++				  const struct spdk_json_val *params)
++{
++	struct rpc_bdev_raid_set_read_preference req = {};
++	struct raid_bdev *raid_bdev;
++	int rc;
++
++	if (spdk_json_decode_object(params, rpc_bdev_raid_set_read_preference_decoders,
++				    SPDK_COUNTOF(rpc_bdev_raid_set_read_preference_decoders), &req)) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
++						 "Invalid parameters");
++		goto cleanup;
++	}
++
++	raid_bdev = raid_bdev_find_by_name(req.name);
++	if (raid_bdev == NULL) {
++		spdk_jsonrpc_send_error_response_fmt(request, -ENODEV, "No such raid bdev: %s", req.name);
++		goto cleanup;
++	}
++
++	rc = raid_bdev_set_read_preference(raid_bdev, req.base_bdev);
++	if (rc != 0) {
++		spdk_jsonrpc_send_error_response_fmt(request, rc,
++						     "raid bdev %s: no read preference for %s: %s", req.name,
++						     req.base_bdev != NULL ? req.base_bdev : "(none)",
++						     spdk_strerror(-rc));
++		goto cleanup;
++	}
++
++	spdk_jsonrpc_send_bool_response(request, true);
++cleanup:
++	free(req.name);
++	free(req.base_bdev);
++}
++SPDK_RPC_REGISTER("bdev_raid_set_read_preference", rpc_bdev_raid_set_read_preference, SPDK_RPC_RUNTIME)
++
+ /*
+  * brief:
+  * params:
+diff --git a/module/bdev/raid/raid1.c b/module/bdev/raid/raid1.c
+index fda3647..63f0bfc 100644
+--- a/module/bdev/raid/raid1.c
++++ b/module/bdev/raid/raid1.c
+@@ -244,13 +244,22 @@ raid1_channel_next_read_base_bdev(struct raid_bdev *raid_bdev, struct raid_bdev_
+ 	uint8_t i;
+ 
+ 	for (i = 0; i < raid_bdev->num_base_bdevs; i++) {
++		uint64_t read_blocks;
++
+ 		/* Evariops 0013: a write_only-attached member has a channel and takes
+ 		 * writes, but serves no reads until its seeded rebuild completes. This
+ 		 * also keeps the rebuild's own source reads off the joining member. */
+-		if (raid_bdev_channel_get_base_channel(raid_ch, i) != NULL &&
+-		    !raid_bdev->base_bdev_info[i].read_excluded &&
+-		    raid1_ch->read_blocks_outstanding[i] < read_blocks_min) {
+-			read_blocks_min = raid1_ch->read_blocks_outstanding[i];
++		if (raid_bdev_channel_get_base_channel(raid_ch, i) == NULL ||
++		    raid_bdev->base_bdev_info[i].read_excluded) {
++			continue;
++		}
++
++		/* Evariops 0079: the preferred member wins the ties. */
++		read_blocks = raid1_ch->read_blocks_outstanding[i];
++		if (read_blocks < read_blocks_min ||
++		    (read_blocks == read_blocks_min &&
++		     __atomic_load_n(&raid_bdev->base_bdev_info[i].read_preferred, __ATOMIC_RELAXED))) {
++			read_blocks_min = read_blocks;
+ 			idx = i;
+ 		}
+ 	}
+diff --git a/scripts/genrpc.py b/scripts/genrpc.py
+index 6173659..6537894 100755
+--- a/scripts/genrpc.py
++++ b/scripts/genrpc.py
+@@ -124,6 +124,7 @@ def lint_c_code(schema: Dict[str, Any]) -> None:
+         "bdev_raid_journal_view_epoch",
+         "bdev_raid_restamp_copied_member",
+         "bdev_raid_set_envelopes",
++        "bdev_raid_set_read_preference",
+         "bdev_raid_start_seeded_rebuild",
+         "bdev_raid_start_seeded_rebuild_from_epoch",
+         "ublk_get_target",
+diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+index 75d587e..45d1c20 100644
+--- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
++++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+@@ -3583,6 +3583,70 @@ test_raid_journaled_epoch_refuses_a_create_from_an_older_view(void)
+ 	ut_view_teardown();
+ }
+ 
++/* Evariops 0079: the read preference names one configured member of a raid1, and
++ * leaves with it. The suite's own module stands in for raid1. */
++static void
++test_raid1_read_preference_names_one_configured_member(void)
++{
++	struct rpc_bdev_raid_create_ctx req;
++	struct rpc_bdev_raid_delete_ctx destroy_req;
++	struct raid_base_bdev_info *base_info;
++	struct raid_bdev *pbdev;
++	uint8_t i;
++
++	set_globals();
++	CU_ASSERT(raid_bdev_init() == 0);
++	create_raid_bdev_create_req(&req, "raid1", 0, true, 0, false);
++	rpc_bdev_raid_create(NULL, NULL);
++	CU_ASSERT(g_rpc_err == 0);
++	free_test_req(&req);
++
++	pbdev = raid_bdev_find_by_name("raid1");
++	SPDK_CU_ASSERT_FATAL(pbdev != NULL);
++
++	/* another level has no read selection to steer */
++	CU_ASSERT(raid_bdev_set_read_preference(pbdev, pbdev->base_bdev_info[1].name) == -ENOTSUP);
++
++	pbdev->level = SPDK_BDEV_RAID_LEVEL_RAID1;
++	pbdev->min_base_bdevs_operational = 1;
++
++	CU_ASSERT(raid_bdev_set_read_preference(pbdev, pbdev->base_bdev_info[1].name) == 0);
++	for (i = 0; i < pbdev->num_base_bdevs; i++) {
++		CU_ASSERT(pbdev->base_bdev_info[i].read_preferred == (i == 1));
++	}
++
++	/* naming another member takes it from the first */
++	CU_ASSERT(raid_bdev_set_read_preference(pbdev, pbdev->base_bdev_info[0].name) == 0);
++	for (i = 0; i < pbdev->num_base_bdevs; i++) {
++		CU_ASSERT(pbdev->base_bdev_info[i].read_preferred == (i == 0));
++	}
++
++	/* a name that is no member is refused, and changes nothing */
++	CU_ASSERT(raid_bdev_set_read_preference(pbdev, "NoSuchBdev") == -ENODEV);
++	CU_ASSERT(pbdev->base_bdev_info[0].read_preferred);
++
++	CU_ASSERT(raid_bdev_set_read_preference(pbdev, NULL) == 0);
++	for (i = 0; i < pbdev->num_base_bdevs; i++) {
++		CU_ASSERT(!pbdev->base_bdev_info[i].read_preferred);
++	}
++
++	/* the slot a preferred member frees comes back without the preference */
++	base_info = &pbdev->base_bdev_info[0];
++	CU_ASSERT(raid_bdev_set_read_preference(pbdev, base_info->name) == 0);
++	CU_ASSERT(raid_bdev_remove_base_bdev(spdk_bdev_desc_get_bdev(base_info->desc), NULL,
++					     NULL, NULL) == 0);
++	poll_app_thread();
++	CU_ASSERT(!base_info->is_configured);
++	CU_ASSERT(!base_info->read_preferred);
++
++	create_raid_bdev_delete_req(&destroy_req, "raid1", 0);
++	rpc_bdev_raid_delete(NULL, NULL);
++	CU_ASSERT(g_rpc_err == 0);
++	raid_bdev_exit();
++	base_bdevs_cleanup();
++	reset_globals();
++}
++
+ static int
+ test_new_thread_fn(struct spdk_thread *thread)
+ {
+@@ -3657,6 +3721,7 @@ main(int argc, char **argv)
+ 	CU_ADD_TEST(suite, test_raid_journal_joins_a_raid_created_outside_the_view);
+ 	CU_ADD_TEST(suite, test_raid_journal_reports_a_failed_write);
+ 	CU_ADD_TEST(suite, test_raid_journaled_epoch_refuses_a_create_from_an_older_view);
++	CU_ADD_TEST(suite, test_raid1_read_preference_names_one_configured_member);
+ 
+ 	spdk_thread_lib_init(test_new_thread_fn, 0);
+ 	g_app_thread = spdk_thread_create("app_thread", NULL);
+diff --git a/test/unit/lib/bdev/raid/raid1.c/raid1_ut.c b/test/unit/lib/bdev/raid/raid1.c/raid1_ut.c
+index c5f2bca..bfcfc16 100644
+--- a/test/unit/lib/bdev/raid/raid1.c/raid1_ut.c
++++ b/test/unit/lib/bdev/raid/raid1.c/raid1_ut.c
+@@ -339,6 +339,71 @@ test_raid1_read_balancing(void)
+ 	run_for_each_raid1_config(_test_raid1_read_balancing);
+ }
+ 
++/* Evariops 0079 */
++static void
++_test_raid1_read_preference(struct raid_bdev *raid_bdev, struct raid_bdev_io_channel *raid_ch)
++{
++	struct raid1_info *r1_info = raid_bdev->module_private;
++	struct raid1_io_channel *raid1_ch = raid_bdev_channel_get_module_ctx(raid_ch);
++	struct raid_base_bdev_info *preferred_info;
++	const uint64_t io_blocks = 4;
++	const uint8_t preferred = raid_bdev->num_base_bdevs - 1;
++	struct raid_bdev_io *raid_io;
++	uint8_t i;
++	int n;
++
++	preferred_info = &raid_bdev->base_bdev_info[preferred];
++	__atomic_store_n(&preferred_info->read_preferred, true, __ATOMIC_RELAXED);
++
++	/* at queue depth one every read ties, and the preferred member takes them all,
++	 * not slot 0 */
++	for (n = 0; n < 3; n++) {
++		raid_io = get_raid_io(r1_info, raid_ch, SPDK_BDEV_IO_TYPE_READ, io_blocks);
++		raid1_submit_read_request(raid_io);
++		CU_ASSERT(raid_io->base_bdev_io_submitted == preferred);
++		raid1_channel_dec_read_counters(raid_ch, raid_io->base_bdev_io_submitted, io_blocks);
++		put_raid_io(raid_io);
++	}
++
++	/* under load it wins the ties only: the reads still spread evenly */
++	for (n = 0; n < 3; n++) {
++		for (i = 0; i < raid_bdev->num_base_bdevs; i++) {
++			raid_io = get_raid_io(r1_info, raid_ch, SPDK_BDEV_IO_TYPE_READ, io_blocks);
++			raid1_submit_read_request(raid_io);
++			CU_ASSERT(raid_io->base_bdev_io_submitted == (i == 0 ? preferred : i - 1));
++			put_raid_io(raid_io);
++		}
++	}
++
++	for (i = 0; i < raid_bdev->num_base_bdevs; i++) {
++		CU_ASSERT(raid1_ch->read_blocks_outstanding[i] == n * io_blocks);
++		raid1_ch->read_blocks_outstanding[i] = 0;
++	}
++
++	/* a member kept out of reads is not read for its preference */
++	preferred_info->read_excluded = true;
++	raid_io = get_raid_io(r1_info, raid_ch, SPDK_BDEV_IO_TYPE_READ, io_blocks);
++	raid1_submit_read_request(raid_io);
++	CU_ASSERT(raid_io->base_bdev_io_submitted == 0);
++	raid1_channel_dec_read_counters(raid_ch, raid_io->base_bdev_io_submitted, io_blocks);
++	put_raid_io(raid_io);
++	preferred_info->read_excluded = false;
++
++	/* without a preference, slot 0 again */
++	__atomic_store_n(&preferred_info->read_preferred, false, __ATOMIC_RELAXED);
++	raid_io = get_raid_io(r1_info, raid_ch, SPDK_BDEV_IO_TYPE_READ, io_blocks);
++	raid1_submit_read_request(raid_io);
++	CU_ASSERT(raid_io->base_bdev_io_submitted == 0);
++	raid1_channel_dec_read_counters(raid_ch, raid_io->base_bdev_io_submitted, io_blocks);
++	put_raid_io(raid_io);
++}
++
++static void
++test_raid1_read_preference(void)
++{
++	run_for_each_raid1_config(_test_raid1_read_preference);
++}
++
+ static int
+ ut_member_of(struct raid_bdev *raid_bdev, struct spdk_bdev_desc *desc)
+ {
+@@ -837,6 +902,7 @@ main(int argc, char **argv)
+ 	suite = CU_add_suite("raid1", test_setup, test_cleanup);
+ 	CU_ADD_TEST(suite, test_raid1_start);
+ 	CU_ADD_TEST(suite, test_raid1_read_balancing);
++	CU_ADD_TEST(suite, test_raid1_read_preference);
+ 	CU_ADD_TEST(suite, test_raid1_process_window_in_parts);
+ 	CU_ADD_TEST(suite, test_raid1_process_zero_part_written_as_zeroes);
+ 	CU_ADD_TEST(suite, test_raid1_write_error);

@@ -91,6 +91,16 @@ A raid1 write to a **thin** member that is full returns NVMe `CAPACITY_EXCEEDED`
 - **Extended superblock**, minor version 0 → 1, carved from reserved bytes, so a minor-0 superblock reads back as generation 0 and epoch 0. Per member, `content_generation`: survivors increment it in the **same** superblock transaction that records a member's ejection, and a member completing a rebuild or a `skip_rebuild` promotion adopts the survivors' maximum generation in the same transaction as its CONFIGURED flip, so a lagging generation is durable proof of staleness for cold recovery. `view_epoch` is persisted here too. Reassembly restores both fields for **all** slots: a FAILED slot keeps its stale generation.
 - **Per-member observation.** `bdev_get_bdevs` → `driver_specific.raid.base_bdevs_list[]` carries `state` (derived, precedence `failed > write_only > configured > configuring > absent`), `since` (unix seconds of the last observable state flip — the anti-flap input), `content_generation`, `view_epoch`, and, when the member is a cbt bdev tracking a live epoch, `epoch_nonce`, `epoch_state` and `truncated` (absent otherwise). Those cbt facts come from the most recently opened live epoch; closed epochs leave the list.
 
+## Read preference (patch 0079)
+
+`bdev_raid_set_read_preference {name, base_bdev?}` names the raid1 member that wins the reads it ties on, the member served in-process; without `base_bdev`, none does. Idempotent, app thread, in memory only:
+- a restart or a reassembly loses it: the caller names the member again after each create, adoption and add;
+- a member leaving its slot takes the preference with it;
+- `-ENOTSUP` on a level other than raid1, `-ENODEV` for a name that is not a configured member;
+- `bdev_raid_get_bdevs` reports `read_preferred` per member.
+
+The balance under load is unchanged: the preferred member wins the ties only. At queue depth one, every read ties.
+
 ## Envelopes (patch 0021)
 
 `bdev_raid_set_envelopes {rebuild|verify|relocate}_{nominal|maintenance}_mb_sec, max_concurrent_rebuilds, regime?` and `bdev_raid_get_envelopes`.
