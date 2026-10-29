@@ -1,0 +1,974 @@
+diff --git a/include/spdk_internal/ublk_zc.h b/include/spdk_internal/ublk_zc.h
+new file mode 100644
+index 0000000..7f08810
+--- /dev/null
++++ b/include/spdk_internal/ublk_zc.h
+@@ -0,0 +1,99 @@
++/*   SPDX-License-Identifier: BSD-3-Clause
++ *   Copyright (C) 2026 Evariops.
++ *   All rights reserved.
++ */
++
++/** \file
++ * Evariops: a ublk request's pages as a memory domain, served with no copy.
++ *
++ * With UBLK_F_SUPPORT_ZERO_COPY, ublk registers a request's pages in its queue's io_uring
++ * (UBLK_U_IO_REGISTER_IO_BUF), at the request's tag in the ring's buffer table. Its bdev I/O
++ * then carries the pages as this memory domain: the iovecs are addresses in the request's
++ * buffer, and the context names the ring and the index. A bdev that declares the domain's type
++ * reads and writes the pages with fixed operations prepared on that ring, from the ring's own
++ * thread (the queue's poll group submits the bdev I/O); ublk submits them and calls back each
++ * completion. Any other layer that needs the data in hand goes through the domain's pull, push
++ * and memzero, which copy through the ublk char device.
++ */
++
++#ifndef SPDK_INTERNAL_UBLK_ZC_H
++#define SPDK_INTERNAL_UBLK_ZC_H
++
++#include "spdk/stdinc.h"
++#include "spdk/dma.h"
++
++#include <liburing.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/** The domain's type: a vendor type, so that a bdev says by type that it serves it. */
++#define SPDK_UBLK_ZC_DMA_DEVICE_TYPE \
++	((enum spdk_dma_device_type)(SPDK_DMA_DEVICE_VENDOR_SPECIFIC_TYPE_START + 81))
++
++#define SPDK_UBLK_ZC_DMA_DEVICE_ID "ublk-zc"
++
++/**
++ * The address of a request's buffer in the domain: an iovec's base minus it is the offset in the
++ * buffer. Not NULL, since a NULL iovec asks a bdev to allocate one, and aligned for any bdev.
++ */
++#define SPDK_UBLK_ZC_ADDR_BASE (1ULL << 46)
++
++/** An operation a bdev prepared on the request's ring: ublk calls cb with its completion's result. */
++struct spdk_ublk_zc_op {
++	void (*cb)(struct spdk_ublk_zc_op *op, int32_t res);
++};
++
++/** The completions of such operations carry this bit, and the operation's address. */
++#define SPDK_UBLK_ZC_OP_FLAG (1ULL << 63)
++
++/** The domain context of a request's bdev I/O. */
++struct spdk_ublk_zc_ctx {
++	/** The queue's ring, owned by the calling thread. */
++	struct io_uring	*ring;
++	/** The index of the request's pages in the ring's buffer table. */
++	uint16_t	buf_index;
++};
++
++/**
++ * Prepares, on the request's ring, a fixed read (or write) of \b len bytes of the request's
++ * buffer at domain address \b addr, from (or to) \b fd at \b offset. Its completion calls
++ * \b op->cb. NULL when the ring has no free entry: the caller retries later.
++ */
++static inline struct io_uring_sqe *
++spdk_ublk_zc_prep_rw(struct spdk_ublk_zc_ctx *ctx, bool write, int fd, void *addr, uint32_t len,
++		     uint64_t offset, struct spdk_ublk_zc_op *op)
++{
++	struct io_uring_sqe *sqe;
++	uint64_t buf_offset = (uint64_t)(uintptr_t)addr - SPDK_UBLK_ZC_ADDR_BASE;
++
++	sqe = io_uring_get_sqe(ctx->ring);
++	if (sqe == NULL) {
++		return NULL;
++	}
++
++	/* The ring takes 128-byte entries for ublk's commands: none of a command's bytes is left. */
++	memset(sqe, 0, 2 * sizeof(*sqe));
++	if (write) {
++		io_uring_prep_write_fixed(sqe, fd, (void *)(uintptr_t)buf_offset, len, offset, ctx->buf_index);
++	} else {
++		io_uring_prep_read_fixed(sqe, fd, (void *)(uintptr_t)buf_offset, len, offset, ctx->buf_index);
++	}
++	io_uring_sqe_set_data64(sqe, (uint64_t)(uintptr_t)op | SPDK_UBLK_ZC_OP_FLAG);
++
++	return sqe;
++}
++
++/** Free entries of the request's ring. */
++static inline unsigned
++spdk_ublk_zc_ring_space(struct spdk_ublk_zc_ctx *ctx)
++{
++	return io_uring_sq_space_left(ctx->ring);
++}
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* SPDK_INTERNAL_UBLK_ZC_H */
+diff --git a/lib/ublk/ublk.c b/lib/ublk/ublk.c
+index f243ea7..661f930 100644
+--- a/lib/ublk/ublk.c
++++ b/lib/ublk/ublk.c
+@@ -19,6 +19,8 @@
+ #include "spdk/ublk.h"
+ #include "spdk/thread.h"
+ #include "spdk/file.h"
++#include "spdk/dma.h"
++#include "spdk_internal/ublk_zc.h"
+ 
+ #include "ublk_internal.h"
+ 
+@@ -54,6 +56,17 @@ static uint32_t g_next_ublk_poll_group = 0;
+ static uint32_t g_ublks_max = UBLK_DEFAULT_MAX_SUPPORTED_DEVS;
+ static struct spdk_cpuset g_core_mask;
+ static bool g_disable_user_copy = false;
++/* Evariops 0067: asked for by ublk_set_zero_copy, for the next target. */
++static bool g_zero_copy_requested = false;
++static uint32_t g_zero_copy_min_bytes = 0;
++
++/* Evariops 0067: the smallest request served with no copy, unless the target says otherwise. A
++ * copy of a few pages costs less than the round trip that registers them. */
++#define UBLK_ZC_DEFAULT_MIN_BYTES			(64 * 1024)
++/* Evariops 0067: ring entries per tag with zero copy: the command, the registration and its
++ * removal, the bdev's fixed operations (a request split at the bdev's largest I/O), and the
++ * domain's copies. */
++#define UBLK_ZC_RING_ENTRIES_PER_TAG			16
+ 
+ struct ublk_queue;
+ struct ublk_poll_group;
+@@ -119,6 +132,11 @@ struct ublk_io {
+ 	uint64_t		buf_wait_tsc;
+ 	bool			buf_waited;
+ 	uint8_t			reserve_mask;
++	/* Evariops 0067: the request's pages are registered in the queue's ring at index tag,
++	 * and its bdev I/O carries them as the ublk-zc memory domain (zc_ctx), one iovec. */
++	bool			zc_registered;
++	struct spdk_ublk_zc_ctx	zc_ctx;
++	struct iovec		zc_iov;
+ 
+ 	TAILQ_ENTRY(ublk_io)	tailq;
+ };
+@@ -145,6 +163,11 @@ struct ublk_queue {
+ 	uint64_t		buf_wait_max_us;
+ 	uint64_t		reserve_uses;
+ 	uint64_t		stalls;
++	/* Evariops 0067: the queue's requests served with no copy, through a copy, and fallen
++	 * back to a copy, reported by ublk_get_disks. */
++	uint64_t		zc_ios;
++	uint64_t		copied_ios;
++	uint64_t		zc_fallbacks;
+ 
+ 	TAILQ_ENTRY(ublk_queue)	tailq;
+ };
+@@ -190,6 +213,9 @@ struct spdk_ublk_dev {
+ 	/* Evariops 0066: what a start or a recovery that went no further answers, once the
+ 	 * disk is gone from this process. */
+ 	int			failed_rc;
++	/* Evariops 0067: the disk serves its large requests with no copy: the device was created
++	 * with UBLK_F_SUPPORT_ZERO_COPY, and its bdev serves the ublk-zc memory domain. */
++	bool			zero_copy;
+ 
+ 	TAILQ_ENTRY(spdk_ublk_dev) tailq;
+ 	TAILQ_ENTRY(spdk_ublk_dev) wait_tailq;
+@@ -248,6 +274,12 @@ struct ublk_tgt {
+ 	bool			update_size;
+ 	/* Evariops 0061: `ublk_drv` supports UBLK_F_QUIESCE */
+ 	bool			quiesce;
++	/* Evariops 0067: the memory domain of requests served with no copy, from spdk_ublk_init
++	 * to the end of the process; zero_copy says whether the target serves with it (asked
++	 * for, and the driver has UBLK_F_SUPPORT_ZERO_COPY). */
++	struct spdk_memory_domain	*zc_domain;
++	bool			zero_copy;
++	uint32_t		zc_min_bytes;
+ };
+ 
+ static TAILQ_HEAD(, spdk_ublk_dev) g_ublk_devs = TAILQ_HEAD_INITIALIZER(g_ublk_devs);
+@@ -327,6 +359,13 @@ ublk_set_sqe_cmd_op(struct io_uring_sqe *sqe, uint32_t cmd_op)
+ 		case UBLK_IO_NEED_GET_DATA:
+ 			opc = _IOWR('u', UBLK_IO_NEED_GET_DATA, struct ublksrv_io_cmd);
+ 			break;
++		/* Evariops 0067 */
++		case UBLK_IO_REGISTER_IO_BUF:
++			opc = UBLK_U_IO_REGISTER_IO_BUF;
++			break;
++		case UBLK_IO_UNREGISTER_IO_BUF:
++			opc = UBLK_U_IO_UNREGISTER_IO_BUF;
++			break;
+ 		default:
+ 			break;
+ 		}
+@@ -362,6 +401,8 @@ ublk_user_copy_pos(uint16_t q_id, uint16_t tag)
+ 				uint64_t)tag) << UBLK_TAG_OFF));
+ }
+ 
++static void ublk_zc_domain_create(void);
++
+ void
+ spdk_ublk_init(void)
+ {
+@@ -369,6 +410,10 @@ spdk_ublk_init(void)
+ 
+ 	g_ublk_tgt.ctrl_fd = -1;
+ 	g_ublk_tgt.ctrl_ring.ring_fd = -1;
++	/* Evariops 0067 */
++	if (g_ublk_tgt.zc_domain == NULL) {
++		ublk_zc_domain_create();
++	}
+ }
+ 
+ static void
+@@ -846,6 +891,68 @@ ublk_poller_register(void *args)
+ 	__atomic_store_n(&poll_group->buffers_state, UBLK_POLL_GROUP_READY, __ATOMIC_RELEASE);
+ }
+ 
++/* Evariops 0067 */
++static int ublk_zc_pull(struct spdk_memory_domain *src_domain, void *src_domain_ctx,
++			struct iovec *src_iov, uint32_t src_iovcnt, struct iovec *dst_iov, uint32_t dst_iovcnt,
++			spdk_memory_domain_data_cpl_cb cpl_cb, void *cpl_cb_arg);
++static int ublk_zc_push(struct spdk_memory_domain *dst_domain, void *dst_domain_ctx,
++			struct iovec *dst_iov, uint32_t dst_iovcnt, struct iovec *src_iov, uint32_t src_iovcnt,
++			spdk_memory_domain_data_cpl_cb cpl_cb, void *cpl_cb_arg);
++static int ublk_zc_memzero(struct spdk_memory_domain *domain, void *domain_ctx, struct iovec *iov,
++			   uint32_t iovcnt, spdk_memory_domain_data_cpl_cb cpl_cb, void *cpl_cb_arg);
++
++void
++ublk_set_zero_copy(bool enable, uint32_t min_bytes)
++{
++	g_zero_copy_requested = enable;
++	g_zero_copy_min_bytes = min_bytes;
++}
++
++/* Evariops 0067: the domain of requests served with no copy. A bdev declares it by type; its
++ * data, when a layer needs it in hand, moves through the char device, as with user copy. It
++ * exists before any bdev: the bdev layer reads a bdev's domains once, when the bdev registers,
++ * and an lvol declares the domains of its base bdev. Created with the target, it would be
++ * missing from every bdev registered before, whose requests would then be bounced through
++ * buffers, and fail above a buffer's size. */
++static void
++ublk_zc_domain_create(void)
++{
++	int rc;
++
++	rc = spdk_memory_domain_create(&g_ublk_tgt.zc_domain, SPDK_UBLK_ZC_DMA_DEVICE_TYPE, NULL,
++				       SPDK_UBLK_ZC_DMA_DEVICE_ID);
++	if (rc != 0) {
++		SPDK_ERRLOG("ublk-zc memory domain not created: %s; every request will be copied "
++			    "(Evariops 0067)\n", spdk_strerror(-rc));
++		g_ublk_tgt.zc_domain = NULL;
++		return;
++	}
++	spdk_memory_domain_set_pull(g_ublk_tgt.zc_domain, ublk_zc_pull);
++	spdk_memory_domain_set_push(g_ublk_tgt.zc_domain, ublk_zc_push);
++	spdk_memory_domain_set_memzero(g_ublk_tgt.zc_domain, ublk_zc_memzero);
++}
++
++/* Evariops 0067: the target serves with no copy when asked for and the driver registers request
++ * pages (UBLK_F_SUPPORT_ZERO_COPY, which only exists with ioctl-encoded commands). */
++static void
++ublk_zero_copy_decide(void)
++{
++	g_ublk_tgt.zero_copy = false;
++	if (!g_zero_copy_requested) {
++		return;
++	}
++	if (g_ublk_tgt.zc_domain == NULL || !g_ublk_tgt.ioctl_encode || !g_ublk_tgt.user_copy ||
++	    !(g_ublk_tgt.features & UBLK_F_SUPPORT_ZERO_COPY)) {
++		SPDK_WARNLOG("zero copy asked for, and ublk_drv cannot register request pages: every request is "
++			     "copied (Evariops 0067)\n");
++		return;
++	}
++	g_ublk_tgt.zero_copy = true;
++	g_ublk_tgt.zc_min_bytes = g_zero_copy_min_bytes != 0 ? g_zero_copy_min_bytes : UBLK_ZC_DEFAULT_MIN_BYTES;
++	SPDK_NOTICELOG("zero copy for requests of %" PRIu32 " bytes and more (Evariops 0067)\n",
++		       g_ublk_tgt.zc_min_bytes);
++}
++
+ int
+ ublk_create_target(const char *cpumask_str, bool disable_user_copy)
+ {
+@@ -881,6 +988,7 @@ ublk_create_target(const char *cpumask_str, bool disable_user_copy)
+ 	}
+ 
+ 	spdk_iobuf_register_module("ublk");
++	ublk_zero_copy_decide();
+ 
+ 	SPDK_ENV_FOREACH_CORE(i) {
+ 		if (!spdk_cpuset_get_cpu(&g_core_mask, i)) {
+@@ -920,6 +1028,9 @@ _ublk_fini_done(void *args)
+ 	/* Evariops 0060, 0061 */
+ 	g_ublk_tgt.update_size = false;
+ 	g_ublk_tgt.quiesce = false;
++	/* Evariops 0067: the domain stays, as long as the process: a bdev keeps the domains it
++	 * declared when it registered, past this target and into the next. */
++	g_ublk_tgt.zero_copy = false;
+ 
+ 	if (g_ublk_tgt.cb_fn) {
+ 		g_ublk_tgt.cb_fn(g_ublk_tgt.cb_arg);
+@@ -1178,6 +1289,23 @@ ublk_dev_get_buffer_waits(struct spdk_ublk_dev *ublk, struct ublk_buffer_waits *
+ 	}
+ }
+ 
++/* Evariops 0067: read on the app thread while the queues' threads write them, as above. */
++void
++ublk_dev_get_zero_copy(struct spdk_ublk_dev *ublk, struct ublk_zero_copy_stats *stats)
++{
++	struct ublk_queue *q;
++	uint32_t i;
++
++	memset(stats, 0, sizeof(*stats));
++	stats->enabled = ublk->zero_copy;
++	for (i = 0; i < ublk->num_queues; i++) {
++		q = &ublk->queues[i];
++		stats->zero_copy += q->zc_ios;
++		stats->copied += q->copied_ios;
++		stats->fallbacks += q->zc_fallbacks;
++	}
++}
++
+ const char *
+ ublk_dev_get_bdev_name(struct spdk_ublk_dev *ublk)
+ {
+@@ -1797,6 +1925,25 @@ _ublk_submit_bdev_io(struct ublk_queue *q, struct ublk_io *io)
+ 	offset_blocks = iod->start_sector >> ublk->sector_per_block_shift;
+ 	num_blocks = iod->nr_sectors >> ublk->sector_per_block_shift;
+ 
++	/* Evariops 0067: the request's registered pages, as the ublk-zc domain: the bdev reads into
++	 * them, or writes from them, with no copy, and the read is committed as is. */
++	if (io->zc_registered) {
++		struct spdk_bdev_ext_io_opts opts = {
++			.size = sizeof(opts),
++			.memory_domain = g_ublk_tgt.zc_domain,
++			.memory_domain_ctx = &io->zc_ctx,
++		};
++
++		if (ublk_op == UBLK_IO_OP_READ) {
++			rc = spdk_bdev_readv_blocks_ext(desc, ch, &io->zc_iov, 1, offset_blocks, num_blocks,
++							ublk_io_done, io, &opts);
++		} else {
++			rc = spdk_bdev_writev_blocks_ext(desc, ch, &io->zc_iov, 1, offset_blocks, num_blocks,
++							 ublk_io_done, io, &opts);
++		}
++		goto submitted;
++	}
++
+ 	switch (ublk_op) {
+ 	case UBLK_IO_OP_READ:
+ 		if (g_ublk_tgt.user_copy) {
+@@ -1824,6 +1971,7 @@ _ublk_submit_bdev_io(struct ublk_queue *q, struct ublk_io *io)
+ 		rc = -1;
+ 	}
+ 
++submitted:
+ 	if (rc < 0) {
+ 		if (rc == -ENOMEM) {
+ 			SPDK_INFOLOG(ublk, "No memory, start to queue io.\n");
+@@ -1848,7 +1996,7 @@ user_copy_write_get_buffer_done(struct ublk_io *io)
+ }
+ 
+ static void
+-ublk_submit_bdev_io(struct ublk_queue *q, struct ublk_io *io)
++ublk_submit_bdev_io_copied(struct ublk_queue *q, struct ublk_io *io)
+ {
+ 	struct spdk_iobuf_channel *iobuf_ch = &q->poll_group->iobuf_ch;
+ 	const struct ublksrv_io_desc *iod = io->iod;
+@@ -1858,9 +2006,11 @@ ublk_submit_bdev_io(struct ublk_queue *q, struct ublk_io *io)
+ 	ublk_op = ublksrv_get_op(iod);
+ 	switch (ublk_op) {
+ 	case UBLK_IO_OP_READ:
++		q->copied_ios++;
+ 		ublk_io_get_buffer(io, iobuf_ch, read_get_buffer_done);
+ 		break;
+ 	case UBLK_IO_OP_WRITE:
++		q->copied_ios++;
+ 		if (g_ublk_tgt.user_copy) {
+ 			ublk_io_get_buffer(io, iobuf_ch, user_copy_write_get_buffer_done);
+ 		} else {
+@@ -1873,6 +2023,230 @@ ublk_submit_bdev_io(struct ublk_queue *q, struct ublk_io *io)
+ 	}
+ }
+ 
++/*
++ * Evariops 0067: zero copy. A read or write of at least zc_min_bytes on a disk that serves it has
++ * its pages registered in the queue's ring at index tag (UBLK_IO_REGISTER_IO_BUF, one command,
++ * answered as the ring is entered); its bdev I/O then carries them as the ublk-zc memory domain,
++ * one iovec, and the bdev reads or writes them with fixed operations on the same ring. Once the
++ * bdev I/O has completed, every operation on the pages has: they are unregistered, then the
++ * request is committed, in one submission. A registration that fails falls back to a copy, as
++ * does every request below the size, every other command, and every request of a disk whose
++ * bdev does not serve the domain. No iobuf buffer is taken: the copy path's buffers (U-20)
++ * are not on the way.
++ */
++static bool
++ublk_zc_queue_buf_cmd(struct ublk_queue *q, struct ublk_io *io, uint32_t cmd_op)
++{
++	struct ublksrv_io_cmd *cmd;
++	struct io_uring_sqe *sqe;
++
++	sqe = io_uring_get_sqe(&q->ring);
++	if (spdk_unlikely(sqe == NULL)) {
++		return false;
++	}
++
++	/* The entry may last have held another operation: none of its bytes is left. */
++	memset(sqe, 0, 2 * sizeof(*sqe));
++	cmd = (struct ublksrv_io_cmd *)ublk_get_sqe_cmd(sqe);
++	ublk_set_sqe_cmd_op(sqe, cmd_op);
++	sqe->fd = 0;
++	sqe->opcode = IORING_OP_URING_CMD;
++	sqe->flags = IOSQE_FIXED_FILE;
++	cmd->q_id = q->q_id;
++	cmd->tag = io->tag;
++	/* The index in the ring's buffer table. */
++	cmd->addr = io->tag;
++	io_uring_sqe_set_data64(sqe, build_user_data(io->tag, cmd_op));
++
++	return true;
++}
++
++static void
++ublk_zc_registered(struct ublk_queue *q, struct ublk_io *io, int32_t res)
++{
++	if (spdk_unlikely(res != 0)) {
++		SPDK_DEBUGLOG(ublk_io, "(qid %d tag %u) pages not registered (%d): copied\n",
++			      q->q_id, io->tag, res);
++		q->zc_fallbacks++;
++		ublk_submit_bdev_io_copied(q, io);
++		return;
++	}
++
++	io->zc_registered = true;
++	io->zc_ctx.ring = &q->ring;
++	io->zc_ctx.buf_index = io->tag;
++	io->zc_iov.iov_base = (void *)(uintptr_t)SPDK_UBLK_ZC_ADDR_BASE;
++	io->zc_iov.iov_len = io->result;
++	q->zc_ios++;
++	_ublk_submit_bdev_io(q, io);
++}
++
++static void
++ublk_submit_bdev_io(struct ublk_queue *q, struct ublk_io *io)
++{
++	const struct ublksrv_io_desc *iod = io->iod;
++	uint8_t ublk_op = ublksrv_get_op(iod);
++
++	io->result = iod->nr_sectors * (1ULL << LINUX_SECTOR_SHIFT);
++	if (q->dev->zero_copy && (ublk_op == UBLK_IO_OP_READ || ublk_op == UBLK_IO_OP_WRITE) &&
++	    (uint32_t)io->result >= g_ublk_tgt.zc_min_bytes) {
++		if (ublk_zc_queue_buf_cmd(q, io, UBLK_IO_REGISTER_IO_BUF)) {
++			/* ublk_zc_registered goes on, from the registration's completion. */
++			return;
++		}
++		q->zc_fallbacks++;
++	}
++	ublk_submit_bdev_io_copied(q, io);
++}
++
++/* Evariops 0067: a copy between a request's pages and local memory, through the char device as
++ * user copy moves them, for a layer that needs the data in hand: the ublk-zc domain's pull,
++ * push and memzero. One vectored read or write of the char device per domain iovec, on the
++ * request's ring; answered once all have completed with all their bytes. */
++#define UBLK_ZC_COPY_MAX_IOVS	64
++#define UBLK_ZC_ZEROES_BYTES	(64 * 1024)
++
++static uint8_t g_ublk_zeroes[UBLK_ZC_ZEROES_BYTES] __attribute__((aligned(4096)));
++
++struct ublk_zc_copy {
++	struct spdk_ublk_zc_op		op;
++	spdk_memory_domain_data_cpl_cb	cpl_cb;
++	void				*cpl_cb_arg;
++	uint32_t			pending;
++	int				rc;
++	uint64_t			expected;
++	uint64_t			done;
++	/* The local side of each domain iovec, sliced: segment i is iovs[start[i]..start[i+1]). */
++	struct iovec			iovs[UBLK_ZC_COPY_MAX_IOVS];
++	uint32_t			start[UBLK_ZC_COPY_MAX_IOVS + 1];
++};
++
++static void
++ublk_zc_copy_done(struct spdk_ublk_zc_op *op, int32_t res)
++{
++	struct ublk_zc_copy *copy = SPDK_CONTAINEROF(op, struct ublk_zc_copy, op);
++	spdk_memory_domain_data_cpl_cb cpl_cb;
++	void *cpl_cb_arg;
++	int rc;
++
++	if (res < 0) {
++		copy->rc = res;
++	} else {
++		copy->done += (uint64_t)res;
++	}
++	if (--copy->pending > 0) {
++		return;
++	}
++
++	rc = copy->rc != 0 ? copy->rc : (copy->done == copy->expected ? 0 : -EIO);
++	cpl_cb = copy->cpl_cb;
++	cpl_cb_arg = copy->cpl_cb_arg;
++	free(copy);
++	cpl_cb(cpl_cb_arg, rc);
++}
++
++/* Slices the local iovecs (or, with local NULL, the zero buffer) along the domain iovecs, then
++ * prepares the reads (pages to local) or writes (local to pages) of the char device. Nothing is
++ * prepared unless all can be. */
++static int
++ublk_zc_copy(void *domain_ctx, bool to_pages, struct iovec *dom_iov, uint32_t dom_iovcnt,
++	     struct iovec *local_iov, uint32_t local_iovcnt, spdk_memory_domain_data_cpl_cb cpl_cb,
++	     void *cpl_cb_arg)
++{
++	struct ublk_io *io = SPDK_CONTAINEROF(domain_ctx, struct ublk_io, zc_ctx);
++	struct ublk_queue *q = io->q;
++	struct ublk_zc_copy *copy;
++	struct io_uring_sqe *sqe;
++	uint32_t d, used = 0, local_idx = 0;
++	uint64_t local_off = 0, len, n, avail, pos;
++
++	if (dom_iovcnt == 0 || dom_iovcnt > UBLK_ZC_COPY_MAX_IOVS ||
++	    io_uring_sq_space_left(&q->ring) < dom_iovcnt) {
++		return -ENOMEM;
++	}
++	copy = calloc(1, sizeof(*copy));
++	if (copy == NULL) {
++		return -ENOMEM;
++	}
++
++	for (d = 0; d < dom_iovcnt; d++) {
++		copy->start[d] = used;
++		len = dom_iov[d].iov_len;
++		copy->expected += len;
++		while (len > 0) {
++			if (used == UBLK_ZC_COPY_MAX_IOVS) {
++				free(copy);
++				return -ENOMEM;
++			}
++			if (local_iov == NULL) {
++				n = spdk_min(len, (uint64_t)UBLK_ZC_ZEROES_BYTES);
++				copy->iovs[used].iov_base = g_ublk_zeroes;
++			} else {
++				if (local_idx == local_iovcnt) {
++					free(copy);
++					return -EINVAL;
++				}
++				avail = local_iov[local_idx].iov_len - local_off;
++				n = spdk_min(len, avail);
++				copy->iovs[used].iov_base = (uint8_t *)local_iov[local_idx].iov_base + local_off;
++				local_off += n;
++				if (local_off == local_iov[local_idx].iov_len) {
++					local_idx++;
++					local_off = 0;
++				}
++			}
++			copy->iovs[used].iov_len = n;
++			used++;
++			len -= n;
++		}
++	}
++	copy->start[dom_iovcnt] = used;
++	copy->op.cb = ublk_zc_copy_done;
++	copy->cpl_cb = cpl_cb;
++	copy->cpl_cb_arg = cpl_cb_arg;
++	copy->pending = dom_iovcnt;
++
++	for (d = 0; d < dom_iovcnt; d++) {
++		pos = ublk_user_copy_pos(q->q_id, io->tag) +
++		      ((uint64_t)(uintptr_t)dom_iov[d].iov_base - SPDK_UBLK_ZC_ADDR_BASE);
++		sqe = io_uring_get_sqe(&q->ring);
++		assert(sqe != NULL);
++		memset(sqe, 0, 2 * sizeof(*sqe));
++		if (to_pages) {
++			io_uring_prep_writev(sqe, 0, &copy->iovs[copy->start[d]], copy->start[d + 1] - copy->start[d], pos);
++		} else {
++			io_uring_prep_readv(sqe, 0, &copy->iovs[copy->start[d]], copy->start[d + 1] - copy->start[d], pos);
++		}
++		io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
++		io_uring_sqe_set_data64(sqe, (uint64_t)(uintptr_t)&copy->op | SPDK_UBLK_ZC_OP_FLAG);
++	}
++
++	return 0;
++}
++
++static int
++ublk_zc_pull(struct spdk_memory_domain *src_domain, void *src_domain_ctx,
++	     struct iovec *src_iov, uint32_t src_iovcnt, struct iovec *dst_iov, uint32_t dst_iovcnt,
++	     spdk_memory_domain_data_cpl_cb cpl_cb, void *cpl_cb_arg)
++{
++	return ublk_zc_copy(src_domain_ctx, false, src_iov, src_iovcnt, dst_iov, dst_iovcnt, cpl_cb, cpl_cb_arg);
++}
++
++static int
++ublk_zc_push(struct spdk_memory_domain *dst_domain, void *dst_domain_ctx,
++	     struct iovec *dst_iov, uint32_t dst_iovcnt, struct iovec *src_iov, uint32_t src_iovcnt,
++	     spdk_memory_domain_data_cpl_cb cpl_cb, void *cpl_cb_arg)
++{
++	return ublk_zc_copy(dst_domain_ctx, true, dst_iov, dst_iovcnt, src_iov, src_iovcnt, cpl_cb, cpl_cb_arg);
++}
++
++static int
++ublk_zc_memzero(struct spdk_memory_domain *domain, void *domain_ctx, struct iovec *iov,
++		uint32_t iovcnt, spdk_memory_domain_data_cpl_cb cpl_cb, void *cpl_cb_arg)
++{
++	return ublk_zc_copy(domain_ctx, true, iov, iovcnt, NULL, 0, cpl_cb, cpl_cb_arg);
++}
++
+ static inline void
+ ublksrv_queue_io_cmd(struct ublk_queue *q,
+ 		     struct ublk_io *io, unsigned tag)
+@@ -1921,10 +2295,12 @@ ublk_io_xmit(struct ublk_queue *q)
+ {
+ 	TAILQ_HEAD(, ublk_io) buffer_free_list;
+ 	struct spdk_iobuf_channel *iobuf_ch;
+-	int rc = 0, count = 0;
++	int rc = 0;
+ 	struct ublk_io *io;
+ 
+-	if (TAILQ_EMPTY(&q->completed_io_list)) {
++	/* Evariops 0067: a bdev's fixed operations, a registration or a domain copy may be ready on
++	 * the ring with no request completed. */
++	if (TAILQ_EMPTY(&q->completed_io_list) && io_uring_sq_ready(&q->ring) == 0) {
+ 		return 0;
+ 	}
+ 
+@@ -1932,6 +2308,11 @@ ublk_io_xmit(struct ublk_queue *q)
+ 	while (!TAILQ_EMPTY(&q->completed_io_list)) {
+ 		io = TAILQ_FIRST(&q->completed_io_list);
+ 		assert(io != NULL);
++		/* Evariops 0067: the pages are unregistered before the commit, in the same
++		 * submission; with no room for both, the request waits for the next one. */
++		if (io->zc_registered && io_uring_sq_space_left(&q->ring) < 2) {
++			break;
++		}
+ 		/*
+ 		 * Remove IO from list now assuming it will be completed. It will be inserted
+ 		 * back to the head if it cannot be completed. This approach is specifically
+@@ -1942,17 +2323,23 @@ ublk_io_xmit(struct ublk_queue *q)
+ 			if (!io->need_data) {
+ 				TAILQ_INSERT_TAIL(&buffer_free_list, io, tailq);
+ 			}
++			if (io->zc_registered) {
++				ublk_zc_queue_buf_cmd(q, io, UBLK_IO_UNREGISTER_IO_BUF);
++				io->zc_registered = false;
++			}
+ 			ublksrv_queue_io_cmd(q, io, io->tag);
+ 		}
+-		count++;
+ 	}
+ 
+-	q->cmd_inflight += count;
++	/* Evariops 0067: everything ready on the ring goes, the commands and user copies of the
++	 * requests above and the operations prepared since the last submission. */
+ 	rc = io_uring_submit(&q->ring);
+-	if (rc != count) {
+-		SPDK_ERRLOG("could not submit all commands\n");
++	if (rc < 0) {
++		SPDK_ERRLOG("could not submit all commands: %s\n", spdk_strerror(-rc));
+ 		assert(false);
++		rc = 0;
+ 	}
++	q->cmd_inflight += rc;
+ 
+ 	/* Note: for READ io, ublk will always copy the data out of
+ 	 * the buffers in the io_uring_submit context.  Since we
+@@ -1998,13 +2385,38 @@ ublk_io_recv(struct ublk_queue *q)
+ 
+ 	iobuf_ch = &q->poll_group->iobuf_ch;
+ 	io_uring_for_each_cqe(&q->ring, head, cqe) {
++		q->cmd_inflight--;
++
++		/* Evariops 0067: an operation on a request's registered pages, prepared by a bdev or
++		 * by the domain's copies, calls back; the request itself is in flight meanwhile. */
++		if (cqe->user_data & SPDK_UBLK_ZC_OP_FLAG) {
++			struct spdk_ublk_zc_op *op = (struct spdk_ublk_zc_op *)(uintptr_t)(cqe->user_data &
++						     ~SPDK_UBLK_ZC_OP_FLAG);
++
++			op->cb(op, cqe->res);
++			goto next;
++		}
++
+ 		tag = user_data_to_tag(cqe->user_data);
+ 		io = &q->ios[tag];
+ 
+ 		SPDK_DEBUGLOG(ublk_io, "res %d qid %d tag %u, user copy %u, cmd_op %u\n",
+ 			      cqe->res, q->q_id, tag, io->user_copy, user_data_to_op(cqe->user_data));
+ 
+-		q->cmd_inflight--;
++		/* Evariops 0067: the registration of a request's pages, or their removal before its
++		 * commit. */
++		if (user_data_to_op(cqe->user_data) == UBLK_IO_REGISTER_IO_BUF) {
++			ublk_zc_registered(q, io, cqe->res);
++			goto next;
++		}
++		if (user_data_to_op(cqe->user_data) == UBLK_IO_UNREGISTER_IO_BUF) {
++			if (spdk_unlikely(cqe->res != 0)) {
++				SPDK_ERRLOG("ublk %u qid %d tag %u: pages not unregistered (%d): the request waits for "
++					    "its commit (Evariops 0067)\n", q->dev->ublk_id, q->q_id, tag, cqe->res);
++			}
++			goto next;
++		}
++
+ 		TAILQ_INSERT_TAIL(&q->inflight_io_list, io, tailq);
+ 
+ 		if (!io->user_copy) {
+@@ -2046,6 +2458,7 @@ ublk_io_recv(struct ublk_queue *q)
+ 				}
+ 			}
+ 		}
++next:
+ 		count += 1;
+ 		if (count == UBLK_QUEUE_REQUEST) {
+ 			break;
+@@ -2239,7 +2652,9 @@ ublk_dev_queue_init(struct ublk_queue *q)
+ 		q->ios[j].iod = &q->io_cmd_buf[j];
+ 	}
+ 
+-	rc = ublk_setup_ring(q->q_depth, &q->ring, IORING_SETUP_SQE128);
++	/* Evariops 0067: with zero copy a tag has more than its command on the ring. */
++	rc = ublk_setup_ring(ublk->zero_copy ? q->q_depth * UBLK_ZC_RING_ENTRIES_PER_TAG : q->q_depth,
++			     &q->ring, IORING_SETUP_SQE128);
+ 	if (rc < 0) {
+ 		SPDK_ERRLOG("Failed at setup uring: %s\n", spdk_strerror(-rc));
+ 		munmap(q->io_cmd_buf, ublk_queue_cmd_buf_sz(q->q_depth));
+@@ -2248,6 +2663,13 @@ ublk_dev_queue_init(struct ublk_queue *q)
+ 	}
+ 
+ 	rc = io_uring_register_files(&q->ring, &ublk->cdev_fd, 1);
++	if (rc == 0 && ublk->zero_copy) {
++		/* Evariops 0067: the request at tag t has its pages registered at index t. */
++		rc = io_uring_register_buffers_sparse(&q->ring, q->q_depth);
++		if (rc != 0) {
++			io_uring_unregister_files(&q->ring);
++		}
++	}
+ 	if (rc != 0) {
+ 		SPDK_ERRLOG("Failed at uring register files: %s\n", spdk_strerror(-rc));
+ 		io_uring_queue_exit(&q->ring);
+@@ -2368,9 +2790,48 @@ ublk_dev_info_init(struct spdk_ublk_dev *ublk)
+ 		uinfo.flags |= UBLK_F_QUIESCE;
+ 	}
+ 
++	/* Evariops 0067: the driver lets the server register a request's pages. It changes
++	 * nothing else: fetches and commits stay as with user copy, so a process that copies
++	 * every request (one before this patch) still serves, and recovers, the device. */
++	if (ublk->zero_copy) {
++		uinfo.flags |= UBLK_F_SUPPORT_ZERO_COPY;
++	}
++
+ 	ublk->dev_info = uinfo;
+ }
+ 
++/* Evariops 0067: a bdev serves the ublk-zc domain when it declares its type (bdev_uring, and an
++ * lvol over it): its I/O then reads and writes a request's registered pages with no copy. */
++static bool
++ublk_bdev_serves_zero_copy(struct spdk_bdev *bdev)
++{
++	enum spdk_dma_device_type types[16];
++	bool declared = false;
++	int count, i;
++
++	if (!g_ublk_tgt.zero_copy) {
++		return false;
++	}
++	count = spdk_bdev_get_memory_domain_types(bdev, types, SPDK_COUNTOF(types));
++	for (i = 0; i < spdk_min(count, (int)SPDK_COUNTOF(types)); i++) {
++		if (types[i] == SPDK_UBLK_ZC_DMA_DEVICE_TYPE) {
++			declared = true;
++		}
++	}
++	if (!declared) {
++		return false;
++	}
++	/* What the bdev layer does with a request carrying a domain was decided when the bdev
++	 * registered. A bdev that declares the domain only since would still have each request
++	 * bounced through a buffer, and one larger than a buffer would fail. */
++	if (!bdev->memory_domains_supported) {
++		SPDK_WARNLOG("bdev %s declares the ublk-zc domain only since it registered: its requests "
++			     "are copied (Evariops 0067)\n", spdk_bdev_get_name(bdev));
++		return false;
++	}
++	return true;
++}
++
+ /* Set ublk device parameters based on bdev */
+ static void
+ ublk_info_param_init(struct spdk_ublk_dev *ublk)
+@@ -2414,6 +2875,15 @@ ublk_info_param_init(struct spdk_ublk_dev *ublk)
+ 		}
+ 	}
+ 
++#ifdef UBLK_PARAM_TYPE_DMA_ALIGN
++	/* Evariops 0067: the bdev reads and writes the request's own pages, so they are aligned
++	 * as its buffers must be (a file opened with O_DIRECT). */
++	if (ublk->zero_copy && spdk_bdev_get_buf_align(bdev) > 512) {
++		uparams.types |= UBLK_PARAM_TYPE_DMA_ALIGN;
++		uparams.dma.alignment = spdk_bdev_get_buf_align(bdev) - 1;
++	}
++#endif
++
+ 	ublk->dev_params = uparams;
+ }
+ 
+@@ -2664,6 +3134,8 @@ ublk_start_disk(const char *bdev_name, uint32_t ublk_id,
+ 		ublk->queues[i].ring.ring_fd = -1;
+ 	}
+ 
++	/* Evariops 0067 */
++	ublk->zero_copy = ublk_bdev_serves_zero_copy(bdev);
+ 	ublk_dev_info_init(ublk);
+ 	ublk_info_param_init(ublk);
+ 	rc = ublk_ios_init(ublk);
+@@ -2844,6 +3316,10 @@ ublk_ctrl_start_recovery(struct spdk_ublk_dev *ublk)
+ 		ublk->queues[i].ring.ring_fd = -1;
+ 	}
+ 
++	/* Evariops 0067: the device lets its pages be registered only if it was created so; a
++	 * device created without it is served with copies, as by the process that created it. */
++	ublk->zero_copy = (ublk->dev_info.flags & UBLK_F_SUPPORT_ZERO_COPY) &&
++			  ublk_bdev_serves_zero_copy(ublk->bdev);
+ 	ublk_info_param_init(ublk);
+ 	rc = ublk_ios_init(ublk);
+ 	if (rc != 0) {
+diff --git a/lib/ublk/ublk_internal.h b/lib/ublk/ublk_internal.h
+index ffa306c..d0bcfd5 100644
+--- a/lib/ublk/ublk_internal.h
++++ b/lib/ublk/ublk_internal.h
+@@ -44,6 +44,28 @@
+ #define UBLK_QID_OFF		(UBLK_TAG_OFF + UBLK_TAG_BITS)
+ #endif
+ 
++/* Evariops 0067 */
++#ifndef UBLK_F_SUPPORT_ZERO_COPY
++#define UBLK_F_SUPPORT_ZERO_COPY	(1ULL << 0)
++#endif
++
++#ifndef UBLK_U_IO_REGISTER_IO_BUF
++#define UBLK_U_IO_REGISTER_IO_BUF	_IOWR('u', 0x23, struct ublksrv_io_cmd)
++#endif
++
++#ifndef UBLK_U_IO_UNREGISTER_IO_BUF
++#define UBLK_U_IO_UNREGISTER_IO_BUF	_IOWR('u', 0x24, struct ublksrv_io_cmd)
++#endif
++
++/* The io commands' numbers, as build_user_data carries them. */
++#ifndef UBLK_IO_REGISTER_IO_BUF
++#define UBLK_IO_REGISTER_IO_BUF		0x23
++#endif
++
++#ifndef UBLK_IO_UNREGISTER_IO_BUF
++#define UBLK_IO_UNREGISTER_IO_BUF	0x24
++#endif
++
+ 
+ #define UBLK_DEV_QUEUE_DEPTH	128
+ #define UBLK_DEV_NUM_QUEUE	1
+@@ -95,6 +117,25 @@ void ublk_dev_get_buffer_waits(struct spdk_ublk_dev *ublk, struct ublk_buffer_wa
+ /* Evariops 0065: the target as ublk_get_target reports it. */
+ void ublk_dump_target_json(struct spdk_json_write_ctx *w);
+ 
++/* Evariops 0067: the disks started after this call serve their large requests with no copy when
++ * the driver can (UBLK_F_SUPPORT_ZERO_COPY) and their bdev serves the ublk-zc memory domain;
++ * min_bytes is the smallest request served so (0: the default). Called before
++ * ublk_create_target, which creates the domain. */
++void ublk_set_zero_copy(bool enable, uint32_t min_bytes);
++
++/* Evariops 0067: a disk's zero copy, summed over its queues. */
++struct ublk_zero_copy_stats {
++	/* The disk was started with zero copy. */
++	bool enabled;
++	/* Requests served with no copy. */
++	uint64_t zero_copy;
++	/* Reads and writes served through a copy: below the size, or fallen back. */
++	uint64_t copied;
++	/* Requests whose pages could not be registered: served through a copy. */
++	uint64_t fallbacks;
++};
++void ublk_dev_get_zero_copy(struct spdk_ublk_dev *ublk, struct ublk_zero_copy_stats *stats);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/lib/ublk/ublk_rpc.c b/lib/ublk/ublk_rpc.c
+index 540d497..9b59679 100644
+--- a/lib/ublk/ublk_rpc.c
++++ b/lib/ublk/ublk_rpc.c
+@@ -27,6 +27,8 @@ rpc_ublk_create_target(struct spdk_jsonrpc_request *request, const struct spdk_j
+ 			goto invalid;
+ 		}
+ 	}
++	/* Evariops 0067 */
++	ublk_set_zero_copy(req.zero_copy, req.zero_copy_min_bytes);
+ 	rc = ublk_create_target(req.cpumask, req.disable_user_copy);
+ 	if (rc != 0) {
+ 		goto invalid;
+@@ -168,6 +170,7 @@ rpc_dump_ublk_info(struct spdk_json_write_ctx *w,
+ {
+ 	char ublk_path[32];
+ 	struct ublk_buffer_waits waits;
++	struct ublk_zero_copy_stats zero_copy;
+ 
+ 	snprintf(ublk_path, 32, "%s%u", "/dev/ublkb", ublk_dev_get_id(ublk));
+ 	spdk_json_write_object_begin(w);
+@@ -190,6 +193,15 @@ rpc_dump_ublk_info(struct spdk_json_write_ctx *w,
+ 	spdk_json_write_named_uint64(w, "stalls", waits.stalls);
+ 	spdk_json_write_object_end(w);
+ 
++	/* Evariops 0067 */
++	ublk_dev_get_zero_copy(ublk, &zero_copy);
++	spdk_json_write_named_object_begin(w, "zero_copy");
++	spdk_json_write_named_bool(w, "enabled", zero_copy.enabled);
++	spdk_json_write_named_uint64(w, "zero_copy", zero_copy.zero_copy);
++	spdk_json_write_named_uint64(w, "copied", zero_copy.copied);
++	spdk_json_write_named_uint64(w, "fallbacks", zero_copy.fallbacks);
++	spdk_json_write_object_end(w);
++
+ 	spdk_json_write_object_end(w);
+ }
+ 
+diff --git a/python/spdk/cli/ublk.py b/python/spdk/cli/ublk.py
+index 8f2be81..1c884b6 100644
+--- a/python/spdk/cli/ublk.py
++++ b/python/spdk/cli/ublk.py
+@@ -13,11 +13,16 @@ def add_parser(subparsers):
+     def ublk_create_target(args):
+         args.client.ublk_create_target(
+                                     cpumask=args.cpumask,
+-                                    disable_user_copy=args.disable_user_copy)
++                                    disable_user_copy=args.disable_user_copy,
++                                    zero_copy=args.zero_copy,
++                                    zero_copy_min_bytes=args.zero_copy_min_bytes)
+     p = subparsers.add_parser('ublk_create_target',
+                               help='Create spdk ublk target for ublk dev')
+     p.add_argument('-m', '--cpumask', help="CPU mask for the ublk target's I/O threads")
+     p.add_argument('--disable-user-copy', help='Disable the ublk user-copy feature. Default: false', action='store_true')
++    p.add_argument('--zero-copy', help='serve large requests with no copy when the driver and the bdev can (Evariops)',
++                   action='store_true')
++    p.add_argument('--zero-copy-min-bytes', help='smallest request served with no copy, 0 for 65536 (Evariops)', type=int)
+     p.set_defaults(func=ublk_create_target)
+ 
+     def ublk_destroy_target(args):
+diff --git a/schema/schema.yaml b/schema/schema.yaml
+index 3776383..26aed6d 100644
+--- a/schema/schema.yaml
++++ b/schema/schema.yaml
+@@ -592,6 +592,11 @@ return_objects:
+           Evariops: the device's waits for I/O buffers — waiting now, waited, longest wait in
+           microseconds, requests served from the poll group's progress reserve, and stalls (a wait
+           of a second with nothing moving on its thread)
++      - name: zero_copy
++        type: object
++        description: >-
++          Evariops: whether the device serves large requests with no copy, and its reads and
++          writes served with no copy, through a copy, and fallen back to a copy
+   - name: iscsi_get_initiator_groups_result
+     fields:
+       - name: tag
+@@ -5146,6 +5151,12 @@ methods:
+       - name: disable_user_copy
+         type: boolean
+         description: 'Disable the ublk user-copy feature. Default: false'
++      - name: zero_copy
++        type: boolean
++        description: serve large requests with no copy when the driver and the bdev can (Evariops)
++      - name: zero_copy_min_bytes
++        type: uint32
++        description: smallest request served with no copy, 0 for 65536 (Evariops)
+   - name: ublk_destroy_target
+     description: Release all UBLK devices and destroy ublk target.
+     result:

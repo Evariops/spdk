@@ -216,6 +216,32 @@ tier_ranges_overlap(uint64_t a_start, uint64_t a_len, uint64_t b_start, uint64_t
 	return a_start < b_start + b_len && b_start < a_start + a_len;
 }
 
+/* At most this many memory domains are kept per band; a band declaring more counts as declaring
+ * none, so the composite declares none either. */
+#define TIER_MAX_MEMORY_DOMAINS	8
+
+struct spdk_memory_domain;
+
+/* Keeps in common[0, ncommon) the domains also found in own[0, nown), in their order, and
+ * returns how many are left: the composite declares the domains EVERY band declares, since a
+ * request reaches the one band it lands on with its domain unchanged. */
+static inline int
+tier_memory_domains_intersect(struct spdk_memory_domain **common, int ncommon,
+			      struct spdk_memory_domain *const *own, int nown)
+{
+	int i, j, kept = 0;
+
+	for (i = 0; i < ncommon; i++) {
+		for (j = 0; j < nown; j++) {
+			if (common[i] == own[j]) {
+				common[kept++] = common[i];
+				break;
+			}
+		}
+	}
+	return kept;
+}
+
 /* The contract admits exactly two unit-identity encodings: all-zero part_uuid +
  * 0/0 geometry (whole disk) or a non-zero part_uuid + its real geometry on the
  * parent device (partition). Anything else is a tuple the reassembly contract

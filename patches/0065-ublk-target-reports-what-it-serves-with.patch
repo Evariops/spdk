@@ -1,0 +1,282 @@
+diff --git a/include/spdk/thread.h b/include/spdk/thread.h
+index 5d90866..f83adc8 100644
+--- a/include/spdk/thread.h
++++ b/include/spdk/thread.h
+@@ -1322,6 +1322,16 @@ typedef void (*spdk_iobuf_get_stats_cb)(struct spdk_iobuf_module_stats *modules,
+  */
+ int spdk_iobuf_get_stats(spdk_iobuf_get_stats_cb cb_fn, void *cb_arg);
+ 
++/**
++ * Evariops: the free buffers of the iobuf pools, summed over NUMA nodes, read without
++ * stopping anyone: what a waiting request could still be given. Buffers in the modules'
++ * per-thread caches are not counted.
++ *
++ * \param small Free small buffers.
++ * \param large Free large buffers.
++ */
++void spdk_iobuf_get_pool_free(uint64_t *small, uint64_t *large);
++
+ typedef void (*spdk_post_poller_fn)(void *fn_arg);
+ 
+ /**
+diff --git a/lib/thread/iobuf.c b/lib/thread/iobuf.c
+index ff1fd92..2a1680e 100644
+--- a/lib/thread/iobuf.c
++++ b/lib/thread/iobuf.c
+@@ -898,6 +898,24 @@ iobuf_get_channel_stats(struct spdk_io_channel_iter *iter)
+ 	spdk_for_each_channel_continue(iter, 0);
+ }
+ 
++/* Evariops 0065 */
++void
++spdk_iobuf_get_pool_free(uint64_t *small, uint64_t *large)
++{
++	int32_t i;
++
++	*small = 0;
++	*large = 0;
++	IOBUF_FOREACH_NUMA_ID(i) {
++		if (g_iobuf.node[i].small_pool != NULL) {
++			*small += spdk_ring_count(g_iobuf.node[i].small_pool);
++		}
++		if (g_iobuf.node[i].large_pool != NULL) {
++			*large += spdk_ring_count(g_iobuf.node[i].large_pool);
++		}
++	}
++}
++
+ int
+ spdk_iobuf_get_stats(spdk_iobuf_get_stats_cb cb_fn, void *cb_arg)
+ {
+diff --git a/lib/thread/spdk_thread.map b/lib/thread/spdk_thread.map
+index bebdadd..f5bb8b3 100644
+--- a/lib/thread/spdk_thread.map
++++ b/lib/thread/spdk_thread.map
+@@ -84,6 +84,7 @@
+ 	spdk_iobuf_get;
+ 	spdk_iobuf_put;
+ 	spdk_iobuf_get_stats;
++	spdk_iobuf_get_pool_free;
+ 
+ 	# internal functions in spdk_internal/thread.h
+ 	spdk_poller_get_name;
+diff --git a/lib/ublk/ublk.c b/lib/ublk/ublk.c
+index ca431dc..bbab0ad 100644
+--- a/lib/ublk/ublk.c
++++ b/lib/ublk/ublk.c
+@@ -1068,6 +1068,83 @@ ublk_dev_get_identity(struct spdk_ublk_dev *ublk)
+ 	return ublk->identity;
+ }
+ 
++/* Evariops 0065: the driver's features, by name, as UBLK_U_CMD_GET_FEATURES reports them. */
++static const struct {
++	uint64_t	flag;
++	const char	*name;
++} g_ublk_feature_names[] = {
++	{ UBLK_F_SUPPORT_ZERO_COPY, "support_zero_copy" },
++	{ UBLK_F_URING_CMD_COMP_IN_TASK, "uring_cmd_comp_in_task" },
++	{ UBLK_F_NEED_GET_DATA, "need_get_data" },
++	{ UBLK_F_USER_RECOVERY, "user_recovery" },
++	{ UBLK_F_USER_RECOVERY_REISSUE, "user_recovery_reissue" },
++	{ UBLK_F_UNPRIVILEGED_DEV, "unprivileged_dev" },
++	{ UBLK_F_CMD_IOCTL_ENCODE, "cmd_ioctl_encode" },
++	{ UBLK_F_USER_COPY, "user_copy" },
++	{ UBLK_F_UPDATE_SIZE, "update_size" },
++	{ UBLK_F_QUIESCE, "quiesce" },
++#ifdef UBLK_F_USER_RECOVERY_FAIL_IO
++	{ UBLK_F_USER_RECOVERY_FAIL_IO, "user_recovery_fail_io" },
++#endif
++#ifdef UBLK_F_AUTO_BUF_REG
++	{ UBLK_F_AUTO_BUF_REG, "auto_buf_reg" },
++#endif
++#ifdef UBLK_F_PER_IO_DAEMON
++	{ UBLK_F_PER_IO_DAEMON, "per_io_daemon" },
++#endif
++#ifdef UBLK_F_BUF_REG_OFF_DAEMON
++	{ UBLK_F_BUF_REG_OFF_DAEMON, "buf_reg_off_daemon" },
++#endif
++};
++
++/* Evariops 0065: what the target serves with, read on the app thread: the driver's
++ * features, each poll group's buffers, and what the iobuf pools still hold. A client
++ * decides from it whether the node serves ublk disks at all. */
++void
++ublk_dump_target_json(struct spdk_json_write_ctx *w)
++{
++	struct ublk_poll_group *poll_group;
++	uint64_t small_free, large_free;
++	uint32_t i;
++	int state;
++
++	spdk_json_write_object_begin(w);
++	spdk_json_write_named_bool(w, "active", g_ublk_tgt.active);
++	spdk_json_write_named_string(w, "cpumask", spdk_cpuset_fmt(&g_core_mask));
++	spdk_json_write_named_uint64(w, "features", g_ublk_tgt.features);
++	spdk_json_write_named_array_begin(w, "features_found");
++	for (i = 0; i < SPDK_COUNTOF(g_ublk_feature_names); i++) {
++		if (g_ublk_tgt.features & g_ublk_feature_names[i].flag) {
++			spdk_json_write_string(w, g_ublk_feature_names[i].name);
++		}
++	}
++	spdk_json_write_array_end(w);
++	spdk_json_write_named_bool(w, "user_copy", g_ublk_tgt.user_copy);
++
++	spdk_json_write_named_array_begin(w, "poll_groups");
++	for (i = 0; i < g_num_ublk_poll_groups; i++) {
++		poll_group = &g_ublk_tgt.poll_groups[i];
++		state = __atomic_load_n(&poll_group->buffers_state, __ATOMIC_ACQUIRE);
++		spdk_json_write_object_begin(w);
++		spdk_json_write_named_string(w, "thread", poll_group->ublk_thread != NULL ?
++					     spdk_thread_get_name(poll_group->ublk_thread) : "");
++		spdk_json_write_named_string(w, "buffers", state == UBLK_POLL_GROUP_READY ? "ready" :
++					     state == UBLK_POLL_GROUP_FAILED ? "failed" : "pending");
++		spdk_json_write_named_uint32(w, "holders", poll_group->buf_holders);
++		spdk_json_write_named_bool(w, "reserve_lent", poll_group->reserve_lent);
++		spdk_json_write_object_end(w);
++	}
++	spdk_json_write_array_end(w);
++
++	spdk_iobuf_get_pool_free(&small_free, &large_free);
++	spdk_json_write_named_object_begin(w, "iobuf");
++	spdk_json_write_named_uint64(w, "small_free", small_free);
++	spdk_json_write_named_uint64(w, "large_free", large_free);
++	spdk_json_write_object_end(w);
++
++	spdk_json_write_object_end(w);
++}
++
+ /* Evariops 0058: read on the app thread while the queues' threads write them: each a
+  * counter, read whole, a snapshot good enough for a report. */
+ void
+diff --git a/lib/ublk/ublk_internal.h b/lib/ublk/ublk_internal.h
+index c953d44..ffa306c 100644
+--- a/lib/ublk/ublk_internal.h
++++ b/lib/ublk/ublk_internal.h
+@@ -92,6 +92,9 @@ struct ublk_buffer_waits {
+ };
+ void ublk_dev_get_buffer_waits(struct spdk_ublk_dev *ublk, struct ublk_buffer_waits *waits);
+ 
++/* Evariops 0065: the target as ublk_get_target reports it. */
++void ublk_dump_target_json(struct spdk_json_write_ctx *w);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/lib/ublk/ublk_rpc.c b/lib/ublk/ublk_rpc.c
+index ffb2fee..540d497 100644
+--- a/lib/ublk/ublk_rpc.c
++++ b/lib/ublk/ublk_rpc.c
+@@ -352,3 +352,24 @@ rpc_ublk_quiesce_disk(struct spdk_jsonrpc_request *request,
+ }
+ 
+ SPDK_RPC_REGISTER("ublk_quiesce_disk", rpc_ublk_quiesce_disk, SPDK_RPC_RUNTIME)
++
++/* Evariops 0065: ublk_get_target {} reports what the target serves with: the driver's
++ * features by name, each poll group's buffers, and the iobuf pools' free buffers. A fork
++ * RPC, outside the schema (Evariops 0057). */
++static void
++rpc_ublk_get_target(struct spdk_jsonrpc_request *request, const struct spdk_json_val *params)
++{
++	struct spdk_json_write_ctx *w;
++
++	if (params != NULL) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
++						 "ublk_get_target takes no parameters");
++		return;
++	}
++
++	w = spdk_jsonrpc_begin_result(request);
++	ublk_dump_target_json(w);
++	spdk_jsonrpc_end_result(request, w);
++}
++
++SPDK_RPC_REGISTER("ublk_get_target", rpc_ublk_get_target, SPDK_RPC_RUNTIME)
+diff --git a/scripts/genrpc.py b/scripts/genrpc.py
+index 0670b4d..6173659 100755
+--- a/scripts/genrpc.py
++++ b/scripts/genrpc.py
+@@ -126,6 +126,7 @@ def lint_c_code(schema: Dict[str, Any]) -> None:
+         "bdev_raid_set_envelopes",
+         "bdev_raid_start_seeded_rebuild",
+         "bdev_raid_start_seeded_rebuild_from_epoch",
++        "ublk_get_target",
+         "ublk_quiesce_disk",
+     }
+     fork_decoder_names = {f"rpc_{name}_decoders" for name in fork_rpcs}
+diff --git a/test/unit/lib/thread/iobuf.c/iobuf_ut.c b/test/unit/lib/thread/iobuf.c/iobuf_ut.c
+index c9416e5..2406659 100644
+--- a/test/unit/lib/thread/iobuf.c/iobuf_ut.c
++++ b/test/unit/lib/thread/iobuf.c/iobuf_ut.c
+@@ -704,6 +704,64 @@ iobuf_priority(void)
+ 	free_cores();
+ }
+ 
++/* Evariops 0065: the pools' free buffers, as ublk_get_target reports them. */
++static void
++iobuf_pool_free(void)
++{
++	struct spdk_iobuf_opts opts = {
++		.small_pool_count = 2,
++		.large_pool_count = 2,
++		.small_bufsize = SMALL_BUFSIZE,
++		.large_bufsize = LARGE_BUFSIZE,
++	};
++	struct spdk_iobuf_channel iobuf_ch;
++	uint64_t small, large;
++	void *small_buf, *large_buf;
++	int rc, finish = 0;
++
++	allocate_cores(1);
++	allocate_threads(1);
++
++	set_thread(0);
++
++	g_iobuf.opts = opts;
++	rc = spdk_iobuf_initialize();
++	CU_ASSERT_EQUAL(rc, 0);
++	rc = spdk_iobuf_register_module("ut_module");
++	CU_ASSERT_EQUAL(rc, 0);
++	rc = spdk_iobuf_channel_init(&iobuf_ch, "ut_module", 0, 0);
++	CU_ASSERT_EQUAL(rc, 0);
++
++	spdk_iobuf_get_pool_free(&small, &large);
++	CU_ASSERT_EQUAL(small, 2);
++	CU_ASSERT_EQUAL(large, 2);
++
++	small_buf = spdk_iobuf_get(&iobuf_ch, SMALL_BUFSIZE, NULL, NULL);
++	CU_ASSERT_PTR_NOT_NULL(small_buf);
++	large_buf = spdk_iobuf_get(&iobuf_ch, LARGE_BUFSIZE, NULL, NULL);
++	CU_ASSERT_PTR_NOT_NULL(large_buf);
++	spdk_iobuf_get_pool_free(&small, &large);
++	CU_ASSERT_EQUAL(small, 1);
++	CU_ASSERT_EQUAL(large, 1);
++
++	spdk_iobuf_put(&iobuf_ch, small_buf, SMALL_BUFSIZE);
++	spdk_iobuf_put(&iobuf_ch, large_buf, LARGE_BUFSIZE);
++	spdk_iobuf_get_pool_free(&small, &large);
++	CU_ASSERT_EQUAL(small, 2);
++	CU_ASSERT_EQUAL(large, 2);
++
++	spdk_iobuf_channel_fini(&iobuf_ch);
++	poll_threads();
++
++	spdk_iobuf_finish(ut_iobuf_finish_cb, &finish);
++	poll_threads();
++
++	CU_ASSERT_EQUAL(finish, 1);
++
++	free_threads();
++	free_cores();
++}
++
+ int
+ main(int argc, char **argv)
+ {
+@@ -716,6 +774,7 @@ main(int argc, char **argv)
+ 	CU_ADD_TEST(suite, iobuf);
+ 	CU_ADD_TEST(suite, iobuf_cache);
+ 	CU_ADD_TEST(suite, iobuf_priority);
++	CU_ADD_TEST(suite, iobuf_pool_free);
+ 
+ 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
+ 	CU_cleanup_registry();

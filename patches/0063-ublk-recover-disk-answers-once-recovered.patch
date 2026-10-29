@@ -1,0 +1,20 @@
+diff --git a/lib/ublk/ublk_rpc.c b/lib/ublk/ublk_rpc.c
+index 3af9077..0ee29c9 100644
+--- a/lib/ublk/ublk_rpc.c
++++ b/lib/ublk/ublk_rpc.c
+@@ -280,8 +280,13 @@ rpc_ublk_recover_disk(struct spdk_jsonrpc_request *request,
+ 		return;
+ 	}
+ 
+-	rc = ublk_start_disk_recovery(req->bdev_name, req->ublk_id, NULL, NULL);
+-	rpc_ublk_recover_disk_done(req, rc);
++	/* Evariops 0063: answered once the recovery ends, as ublk_start_disk is, not once its
++	 * first control command is submitted: a disk the kernel no longer holds (-ENODEV, a host
++	 * reboot) is then told apart from a disk recovered, and its caller starts it anew. */
++	rc = ublk_start_disk_recovery(req->bdev_name, req->ublk_id, rpc_ublk_recover_disk_done, req);
++	if (rc != 0) {
++		rpc_ublk_recover_disk_done(req, rc);
++	}
+ }
+ 
+ SPDK_RPC_REGISTER("ublk_recover_disk", rpc_ublk_recover_disk, SPDK_RPC_RUNTIME)

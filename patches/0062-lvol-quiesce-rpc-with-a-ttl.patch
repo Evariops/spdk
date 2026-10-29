@@ -1,0 +1,318 @@
+diff --git a/module/bdev/lvol/Makefile b/module/bdev/lvol/Makefile
+index 3ac9d52..9283c00 100644
+--- a/module/bdev/lvol/Makefile
++++ b/module/bdev/lvol/Makefile
+@@ -10,7 +10,7 @@ SO_VER := 8
+ SO_MINOR := 0
+ 
+ CFLAGS += -I$(SPDK_ROOT_DIR)/module/bdev/tier
+-C_SRCS = vbdev_lvol.c vbdev_lvol_rpc.c vbdev_lvol_ranges_rpc.c vbdev_lvol_tier_rpc.c
++C_SRCS = vbdev_lvol.c vbdev_lvol_rpc.c vbdev_lvol_ranges_rpc.c vbdev_lvol_tier_rpc.c vbdev_lvol_quiesce_rpc.c
+ LIBNAME = bdev_lvol
+ 
+ SPDK_MAP_FILE = $(SPDK_ROOT_DIR)/mk/spdk_blank.map
+diff --git a/module/bdev/lvol/vbdev_lvol.c b/module/bdev/lvol/vbdev_lvol.c
+index b03f5a7..bc1d246 100644
+--- a/module/bdev/lvol/vbdev_lvol.c
++++ b/module/bdev/lvol/vbdev_lvol.c
+@@ -2243,4 +2243,13 @@ vbdev_lvol_set_external_parent(struct spdk_lvol *lvol, const char *esnap_name,
+ 	spdk_bdev_close(desc);
+ }
+ 
++/* Evariops 0062 */
++int
++vbdev_lvol_quiesce_bdev(struct spdk_bdev *bdev, bool unquiesce,
++			spdk_bdev_quiesce_cb cb_fn, void *cb_arg)
++{
++	return unquiesce ? spdk_bdev_unquiesce(bdev, &g_lvol_if, cb_fn, cb_arg) :
++	       spdk_bdev_quiesce(bdev, &g_lvol_if, cb_fn, cb_arg);
++}
++
+ SPDK_LOG_REGISTER_COMPONENT(vbdev_lvol)
+diff --git a/module/bdev/lvol/vbdev_lvol.h b/module/bdev/lvol/vbdev_lvol.h
+index 288bc3d..963d181 100644
+--- a/module/bdev/lvol/vbdev_lvol.h
++++ b/module/bdev/lvol/vbdev_lvol.h
+@@ -146,4 +146,11 @@ int vbdev_lvol_shallow_copy(struct spdk_lvol *lvol, const char *bdev_name,
+ void vbdev_lvol_set_external_parent(struct spdk_lvol *lvol, const char *esnap_name,
+ 				    spdk_lvol_op_complete cb_fn, void *cb_arg);
+ 
++/**
++ * Evariops 0062: quiesce (or unquiesce) an lvol bdev as the module that registered
++ * it, which spdk_bdev_quiesce requires. See vbdev_lvol_quiesce_rpc.c.
++ */
++int vbdev_lvol_quiesce_bdev(struct spdk_bdev *bdev, bool unquiesce,
++			    spdk_bdev_quiesce_cb cb_fn, void *cb_arg);
++
+ #endif /* SPDK_VBDEV_LVOL_H */
+diff --git a/module/bdev/lvol/vbdev_lvol_quiesce_rpc.c b/module/bdev/lvol/vbdev_lvol_quiesce_rpc.c
+new file mode 100644
+index 0000000..908987a
+--- /dev/null
++++ b/module/bdev/lvol/vbdev_lvol_quiesce_rpc.c
+@@ -0,0 +1,237 @@
++/*   SPDX-License-Identifier: BSD-3-Clause
++ *   Copyright (C) 2026 Evariops.
++ *   All rights reserved.
++ */
++
++/*
++ * Evariops 0062: bdev_lvol_quiesce {name, ttl_ms} and bdev_lvol_unquiesce {name}.
++ *
++ * A group snapshot cuts every member volume at one instant. A volume behind an
++ * NVMe-oF subsystem is drained at its subsystem; one served to its node's kernel
++ * by a ublk disk has no subsystem, so it is quiesced at its lvol: I/O submitted
++ * after the quiesce waits, and the answer comes once the I/O in flight has
++ * completed. spdk_bdev_quiesce is a C API only, callable by the module that
++ * registered the bdev (vbdev_lvol_quiesce_bdev).
++ *
++ * A quiesce holds at most ttl_ms: a caller that dies between the quiesce and the
++ * unquiesce must not leave the volume's I/O waiting forever. Past it the lvol is
++ * unquiesced, and the expiry is logged; the unquiesce that comes late answers
++ * -ENOENT, which tells the caller its cut may not hold.
++ */
++
++#include "spdk/rpc.h"
++#include "spdk/util.h"
++#include "spdk/string.h"
++#include "spdk/bdev.h"
++#include "spdk/log.h"
++#include "spdk/thread.h"
++#include "vbdev_lvol.h"
++
++#define LVOL_QUIESCE_TTL_DEFAULT_MS	10000
++#define LVOL_QUIESCE_TTL_MAX_MS		60000
++
++struct lvol_quiesce {
++	char				*name;
++	struct spdk_poller		*ttl_poller;
++	uint32_t			ttl_ms;
++	struct spdk_jsonrpc_request	*request;
++	bool				held;
++	TAILQ_ENTRY(lvol_quiesce)	link;
++};
++
++static TAILQ_HEAD(, lvol_quiesce) g_lvol_quiesces = TAILQ_HEAD_INITIALIZER(g_lvol_quiesces);
++
++static struct lvol_quiesce *
++lvol_quiesce_find(const char *name)
++{
++	struct lvol_quiesce *q;
++
++	TAILQ_FOREACH(q, &g_lvol_quiesces, link) {
++		if (strcmp(q->name, name) == 0) {
++			return q;
++		}
++	}
++	return NULL;
++}
++
++static void
++lvol_quiesce_free(struct lvol_quiesce *q)
++{
++	TAILQ_REMOVE(&g_lvol_quiesces, q, link);
++	spdk_poller_unregister(&q->ttl_poller);
++	free(q->name);
++	free(q);
++}
++
++static void
++lvol_quiesce_expired_done(void *ctx, int status)
++{
++	struct lvol_quiesce *q = ctx;
++
++	if (status != 0) {
++		SPDK_ERRLOG("lvol %s: unquiesce at the end of its ttl failed: %s (Evariops 0062)\n",
++			    q->name, spdk_strerror(-status));
++	}
++	lvol_quiesce_free(q);
++}
++
++static int
++lvol_quiesce_expired(void *ctx)
++{
++	struct lvol_quiesce *q = ctx;
++	struct spdk_bdev *bdev;
++	int rc;
++
++	spdk_poller_unregister(&q->ttl_poller);
++	SPDK_WARNLOG("lvol %s: quiesce held past its ttl of %u ms, unquiescing (Evariops 0062)\n",
++		     q->name, q->ttl_ms);
++
++	bdev = spdk_bdev_get_by_name(q->name);
++	if (bdev == NULL) {
++		lvol_quiesce_free(q);
++		return SPDK_POLLER_BUSY;
++	}
++
++	q->held = false;
++	rc = vbdev_lvol_quiesce_bdev(bdev, true, lvol_quiesce_expired_done, q);
++	if (rc != 0) {
++		lvol_quiesce_expired_done(q, rc);
++	}
++	return SPDK_POLLER_BUSY;
++}
++
++struct rpc_lvol_quiesce {
++	char		*name;
++	uint32_t	ttl_ms;
++};
++
++static const struct spdk_json_object_decoder rpc_bdev_lvol_quiesce_decoders[] = {
++	{"name", offsetof(struct rpc_lvol_quiesce, name), spdk_json_decode_string},
++	{"ttl_ms", offsetof(struct rpc_lvol_quiesce, ttl_ms), spdk_json_decode_uint32, true},
++};
++
++static void
++rpc_bdev_lvol_quiesce_done(void *ctx, int status)
++{
++	struct lvol_quiesce *q = ctx;
++	struct spdk_jsonrpc_request *request = q->request;
++
++	q->request = NULL;
++	if (status != 0) {
++		spdk_jsonrpc_send_error_response(request, status, spdk_strerror(-status));
++		lvol_quiesce_free(q);
++		return;
++	}
++
++	q->held = true;
++	q->ttl_poller = SPDK_POLLER_REGISTER(lvol_quiesce_expired, q, (uint64_t)q->ttl_ms * 1000);
++	spdk_jsonrpc_send_bool_response(request, true);
++}
++
++static void
++rpc_bdev_lvol_quiesce(struct spdk_jsonrpc_request *request, const struct spdk_json_val *params)
++{
++	struct rpc_lvol_quiesce req = { .ttl_ms = LVOL_QUIESCE_TTL_DEFAULT_MS };
++	struct lvol_quiesce *q;
++	struct spdk_bdev *bdev;
++	int rc;
++
++	if (spdk_json_decode_object(params, rpc_bdev_lvol_quiesce_decoders,
++				    SPDK_COUNTOF(rpc_bdev_lvol_quiesce_decoders), &req)) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
++						 "spdk_json_decode_object failed");
++		goto cleanup;
++	}
++	if (req.ttl_ms == 0 || req.ttl_ms > LVOL_QUIESCE_TTL_MAX_MS) {
++		spdk_jsonrpc_send_error_response_fmt(request, -EINVAL, "ttl_ms must be in 1..%u",
++						     LVOL_QUIESCE_TTL_MAX_MS);
++		goto cleanup;
++	}
++
++	bdev = spdk_bdev_get_by_name(req.name);
++	if (bdev == NULL || vbdev_lvol_get_from_bdev(bdev) == NULL) {
++		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
++		goto cleanup;
++	}
++	if (lvol_quiesce_find(spdk_bdev_get_name(bdev)) != NULL) {
++		spdk_jsonrpc_send_error_response(request, -EALREADY, "lvol is already quiesced");
++		goto cleanup;
++	}
++
++	q = calloc(1, sizeof(*q));
++	if (q == NULL || (q->name = strdup(spdk_bdev_get_name(bdev))) == NULL) {
++		free(q);
++		spdk_jsonrpc_send_error_response(request, -ENOMEM, spdk_strerror(ENOMEM));
++		goto cleanup;
++	}
++	q->ttl_ms = req.ttl_ms;
++	q->request = request;
++	TAILQ_INSERT_TAIL(&g_lvol_quiesces, q, link);
++
++	rc = vbdev_lvol_quiesce_bdev(bdev, false, rpc_bdev_lvol_quiesce_done, q);
++	if (rc != 0) {
++		rpc_bdev_lvol_quiesce_done(q, rc);
++	}
++
++cleanup:
++	free(req.name);
++}
++SPDK_RPC_REGISTER("bdev_lvol_quiesce", rpc_bdev_lvol_quiesce, SPDK_RPC_RUNTIME)
++
++struct rpc_lvol_unquiesce {
++	char	*name;
++};
++
++static const struct spdk_json_object_decoder rpc_bdev_lvol_unquiesce_decoders[] = {
++	{"name", offsetof(struct rpc_lvol_unquiesce, name), spdk_json_decode_string},
++};
++
++static void
++rpc_bdev_lvol_unquiesce_done(void *ctx, int status)
++{
++	struct lvol_quiesce *q = ctx;
++	struct spdk_jsonrpc_request *request = q->request;
++
++	if (status != 0) {
++		spdk_jsonrpc_send_error_response(request, status, spdk_strerror(-status));
++	} else {
++		spdk_jsonrpc_send_bool_response(request, true);
++	}
++	lvol_quiesce_free(q);
++}
++
++static void
++rpc_bdev_lvol_unquiesce(struct spdk_jsonrpc_request *request, const struct spdk_json_val *params)
++{
++	struct rpc_lvol_unquiesce req = {};
++	struct lvol_quiesce *q;
++	struct spdk_bdev *bdev;
++	int rc;
++
++	if (spdk_json_decode_object(params, rpc_bdev_lvol_unquiesce_decoders,
++				    SPDK_COUNTOF(rpc_bdev_lvol_unquiesce_decoders), &req)) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
++						 "spdk_json_decode_object failed");
++		goto cleanup;
++	}
++
++	bdev = spdk_bdev_get_by_name(req.name);
++	q = bdev != NULL ? lvol_quiesce_find(spdk_bdev_get_name(bdev)) : NULL;
++	if (q == NULL || !q->held) {
++		/* Never quiesced, still quiescing, or released at the end of its ttl. */
++		spdk_jsonrpc_send_error_response(request, -ENOENT, "lvol is not quiesced");
++		goto cleanup;
++	}
++
++	spdk_poller_unregister(&q->ttl_poller);
++	q->held = false;
++	q->request = request;
++	rc = vbdev_lvol_quiesce_bdev(bdev, true, rpc_bdev_lvol_unquiesce_done, q);
++	if (rc != 0) {
++		rpc_bdev_lvol_unquiesce_done(q, rc);
++	}
++
++cleanup:
++	free(req.name);
++}
++SPDK_RPC_REGISTER("bdev_lvol_unquiesce", rpc_bdev_lvol_unquiesce, SPDK_RPC_RUNTIME)
+diff --git a/scripts/genrpc.py b/scripts/genrpc.py
+index ebdec94..0670b4d 100755
+--- a/scripts/genrpc.py
++++ b/scripts/genrpc.py
+@@ -111,6 +111,7 @@ def lint_c_code(schema: Dict[str, Any]) -> None:
+     fork_rpc_files = {
+         "lib/nvmf/nvmf_pause_rpc.c",
+         "module/bdev/cbt/vbdev_cbt_rpc.c",
++        "module/bdev/lvol/vbdev_lvol_quiesce_rpc.c",
+         "module/bdev/lvol/vbdev_lvol_ranges_rpc.c",
+         "module/bdev/lvol/vbdev_lvol_tier_rpc.c",
+         "module/bdev/tier/vbdev_tier_rpc.c",
+diff --git a/test/unit/lib/bdev/vbdev_lvol.c/vbdev_lvol_ut.c b/test/unit/lib/bdev/vbdev_lvol.c/vbdev_lvol_ut.c
+index b3d8750..f958cad 100644
+--- a/test/unit/lib/bdev/vbdev_lvol.c/vbdev_lvol_ut.c
++++ b/test/unit/lib/bdev/vbdev_lvol.c/vbdev_lvol_ut.c
+@@ -72,6 +72,11 @@ DEFINE_STUB_V(vbdev_tier_set_usage_provider, (struct vbdev_tier *t, vbdev_tier_u
+ DEFINE_STUB_V(vbdev_tier_clear_usage_provider, (struct vbdev_tier *t));
+ DEFINE_STUB(spdk_bs_count_allocated_clusters_in_lba_range, uint64_t,
+ 	    (struct spdk_blob_store *bs, uint64_t lba_start, uint64_t lba_count), 0);
++/* Evariops 0062: vbdev_lvol_quiesce_bdev, exercised through its RPC on a live target. */
++DEFINE_STUB(spdk_bdev_quiesce, int, (struct spdk_bdev *bdev, struct spdk_bdev_module *module,
++				     spdk_bdev_quiesce_cb cb_fn, void *cb_arg), 0);
++DEFINE_STUB(spdk_bdev_unquiesce, int, (struct spdk_bdev *bdev, struct spdk_bdev_module *module,
++				       spdk_bdev_quiesce_cb cb_fn, void *cb_arg), 0);
+ 
+ struct spdk_blob {
+ 	uint64_t	id;

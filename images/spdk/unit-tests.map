@@ -22,6 +22,8 @@ lib/nvmf/subsystem.c        lib/nvmf/subsystem.c
 lib/nvmf/nvmf_rpc.c         -
 lib/nvmf/nvmf_pause_rpc.c   -
 lib/rpc/                    lib/rpc/rpc.c
+lib/thread/iobuf.c          lib/thread/iobuf.c
+lib/ublk/                   -
 lib/util/bit_array.c        lib/util/bit_array.c
 module/bdev/lvol/           lib/bdev/vbdev_lvol.c
 module/bdev/nvme/           lib/bdev/nvme/bdev_nvme.c

@@ -200,6 +200,46 @@ test_sb_read_answer(void)
 	CHECK(tier_sb_read_answer(NULL, 0) == TIER_SB_READ_FAILED);
 }
 
+/* ---- tier_memory_domains_intersect: the composite declares what every band does ---- */
+
+static void
+test_memory_domains_intersect(void)
+{
+	/* Opaque domains: only their identity matters. */
+	static char d0, d1, d2;
+	struct spdk_memory_domain *a = (struct spdk_memory_domain *)&d0;
+	struct spdk_memory_domain *b = (struct spdk_memory_domain *)&d1;
+	struct spdk_memory_domain *c = (struct spdk_memory_domain *)&d2;
+	struct spdk_memory_domain *common[TIER_MAX_MEMORY_DOMAINS];
+	struct spdk_memory_domain *own_ab[] = { a, b };
+	struct spdk_memory_domain *own_ba[] = { b, a };
+	struct spdk_memory_domain *own_b[] = { b };
+	struct spdk_memory_domain *own_c[] = { c };
+
+	/* Every band declares the same domain: it stays. */
+	common[0] = a;
+	CHECK(tier_memory_domains_intersect(common, 1, own_ab, 2) == 1);
+	CHECK(common[0] == a);
+
+	/* Order of a band's list does not matter; the composite's order is kept. */
+	common[0] = a;
+	common[1] = b;
+	CHECK(tier_memory_domains_intersect(common, 2, own_ba, 2) == 2);
+	CHECK(common[0] == a && common[1] == b);
+
+	/* A band lacking one: only the shared one stays, moved to the front. */
+	common[0] = a;
+	common[1] = b;
+	CHECK(tier_memory_domains_intersect(common, 2, own_b, 1) == 1);
+	CHECK(common[0] == b);
+
+	/* A band with another domain, or with none: nothing stays. */
+	common[0] = a;
+	CHECK(tier_memory_domains_intersect(common, 1, own_c, 1) == 0);
+	common[0] = a;
+	CHECK(tier_memory_domains_intersect(common, 1, NULL, 0) == 0);
+}
+
 int
 main(void)
 {
@@ -209,6 +249,7 @@ main(void)
 	test_identity_conflict();
 	test_identity_tuple_validate();
 	test_sb_read_answer();
+	test_memory_domains_intersect();
 
 	if (g_failures != 0) {
 		fprintf(stderr, "test_tier_units: %d FAILURE(S)\n", g_failures);

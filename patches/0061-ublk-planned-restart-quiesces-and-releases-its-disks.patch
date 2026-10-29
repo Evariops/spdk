@@ -1,0 +1,364 @@
+diff --git a/lib/ublk/ublk.c b/lib/ublk/ublk.c
+index 41e6946..334b0bf 100644
+--- a/lib/ublk/ublk.c
++++ b/lib/ublk/ublk.c
+@@ -61,6 +61,7 @@ struct ublk_io;
+ static void _ublk_submit_bdev_io(struct ublk_queue *q, struct ublk_io *io);
+ static void ublk_dev_queue_fini(struct ublk_queue *q);
+ static int ublk_poll(void *arg);
++static void ublk_queue_quiesced(void *arg);
+ 
+ static int ublk_set_params(struct spdk_ublk_dev *ublk);
+ static int ublk_start_dev(struct spdk_ublk_dev *ublk, bool is_recovering);
+@@ -71,11 +72,13 @@ static int ublk_ctrl_start_recovery(struct spdk_ublk_dev *ublk);
+ 
+ static int ublk_ctrl_cmd_submit(struct spdk_ublk_dev *ublk, uint32_t cmd_op);
+ 
+-/* Evariops 0060: control commands the driver has only in their ioctl encoding. */
++/* Evariops 0060, 0061: control commands the driver has only in their ioctl encoding. */
+ #define UBLK_CMD_UPDATE_SIZE		_IOC_NR(UBLK_U_CMD_UPDATE_SIZE)
++#define UBLK_CMD_QUIESCE_DEV		_IOC_NR(UBLK_U_CMD_QUIESCE_DEV)
+ 
+ static const char *ublk_op_name[64] = {
+ 	[UBLK_CMD_UPDATE_SIZE] = "UBLK_CMD_UPDATE_SIZE",
++	[UBLK_CMD_QUIESCE_DEV] = "UBLK_CMD_QUIESCE_DEV",
+ 	[UBLK_CMD_GET_DEV_INFO] = "UBLK_CMD_GET_DEV_INFO",
+ 	[UBLK_CMD_ADD_DEV] =	"UBLK_CMD_ADD_DEV",
+ 	[UBLK_CMD_DEL_DEV] =	"UBLK_CMD_DEL_DEV",
+@@ -128,6 +131,8 @@ struct ublk_queue {
+ 	TAILQ_HEAD(, ublk_io)	inflight_io_list;
+ 	uint32_t		cmd_inflight;
+ 	bool			is_stopping;
++	/* Evariops 0061: the disk is quiesced (ublk_queue_quiesced). */
++	bool			quiesced;
+ 	struct ublksrv_io_desc	*io_cmd_buf;
+ 	/* ring depth == dev_info->queue_depth. */
+ 	struct io_uring		ring;
+@@ -170,6 +175,9 @@ struct spdk_ublk_dev {
+ 	uint32_t		ctrl_ops_in_progress;
+ 	bool			is_closing;
+ 	bool			is_recovering;
++	/* Evariops 0061: quiesced to be left to the kernel for a later recovery, not deleted. */
++	bool			is_quiescing;
++	uint64_t		quiesce_timeout_ms;
+ 
+ 	TAILQ_ENTRY(spdk_ublk_dev) tailq;
+ 	TAILQ_ENTRY(spdk_ublk_dev) wait_tailq;
+@@ -223,6 +231,8 @@ struct ublk_tgt {
+ 	bool			user_recovery;
+ 	/* Evariops 0060: `ublk_drv` supports UBLK_F_UPDATE_SIZE */
+ 	bool			update_size;
++	/* Evariops 0061: `ublk_drv` supports UBLK_F_QUIESCE */
++	bool			quiesce;
+ };
+ 
+ static TAILQ_HEAD(, spdk_ublk_dev) g_ublk_devs = TAILQ_HEAD_INITIALIZER(g_ublk_devs);
+@@ -288,6 +298,9 @@ ublk_set_sqe_cmd_op(struct io_uring_sqe *sqe, uint32_t cmd_op)
+ 		case UBLK_CMD_UPDATE_SIZE:
+ 			opc = UBLK_U_CMD_UPDATE_SIZE;
+ 			break;
++		case UBLK_CMD_QUIESCE_DEV:
++			opc = UBLK_U_CMD_QUIESCE_DEV;
++			break;
+ 
+ 		/* io uring */
+ 		case UBLK_IO_FETCH_REQ:
+@@ -373,6 +386,12 @@ ublk_ctrl_cmd_error(struct spdk_ublk_dev *ublk, int32_t res)
+ 	case UBLK_CMD_UPDATE_SIZE:
+ 		/* Evariops 0060: the disk keeps serving at its former size. */
+ 		break;
++	case UBLK_CMD_QUIESCE_DEV:
++		/* Evariops 0061: not quiesced (in-flight I/O outlived the timeout): the
++		 * disk keeps serving, and the caller was told. */
++		ublk->is_quiescing = false;
++		ublk->is_closing = false;
++		break;
+ 	default:
+ 		SPDK_ERRLOG("No match cmd operation,cmd_op = %d\n", ublk->current_cmd_op);
+ 		break;
+@@ -403,6 +422,7 @@ static void
+ ublk_ctrl_process_cqe(struct io_uring_cqe *cqe)
+ {
+ 	struct spdk_ublk_dev *ublk;
++	uint32_t q_idx;
+ 	int rc = 0;
+ 
+ 	ublk = (struct spdk_ublk_dev *)cqe->user_data;
+@@ -478,6 +498,16 @@ ublk_ctrl_process_cqe(struct io_uring_cqe *cqe)
+ 		SPDK_NOTICELOG("ublk %u resized to %" PRIu64 " sectors (Evariops 0060)\n",
+ 			       ublk->ublk_id, (uint64_t)ublk->dev_params.basic.dev_sectors);
+ 		break;
++	case UBLK_CMD_QUIESCE_DEV:
++		/* Evariops 0061: no request in flight, and the kernel has cancelled the
++		 * fetch commands: the queues close on their aborts, and the disk is
++		 * released, not deleted (ublk_delete_dev). The caller is answered then. */
++		SPDK_NOTICELOG("ublk %u quiesced (Evariops 0061)\n", ublk->ublk_id);
++		for (q_idx = 0; q_idx < ublk->num_queues; q_idx++) {
++			spdk_thread_send_msg(ublk->queues[q_idx].poll_group->ublk_thread, ublk_queue_quiesced,
++					     &ublk->queues[q_idx]);
++		}
++		break;
+ 	default:
+ 		SPDK_ERRLOG("No match cmd operation,cmd_op = %d\n", ublk->current_cmd_op);
+ 		break;
+@@ -572,6 +602,9 @@ ublk_ctrl_cmd_submit(struct spdk_ublk_dev *ublk, uint32_t cmd_op)
+ 	case UBLK_CMD_UPDATE_SIZE:
+ 		cmd->data[0] = ublk->dev_params.basic.dev_sectors;
+ 		break;
++	case UBLK_CMD_QUIESCE_DEV:
++		cmd->data[0] = ublk->quiesce_timeout_ms;
++		break;
+ 	default:
+ 		SPDK_ERRLOG("No match cmd operation,cmd_op = %d\n", cmd_op);
+ 		return -EINVAL;
+@@ -638,6 +671,8 @@ ublk_ctrl_cmd_get_features(void)
+ 		g_ublk_tgt.user_recovery = !!(g_ublk_tgt.features & UBLK_F_USER_RECOVERY);
+ 		g_ublk_tgt.update_size = g_ublk_tgt.ioctl_encode &&
+ 					 !!(g_ublk_tgt.features & UBLK_F_UPDATE_SIZE);
++		g_ublk_tgt.quiesce = g_ublk_tgt.ioctl_encode && g_ublk_tgt.user_recovery &&
++				     !!(g_ublk_tgt.features & UBLK_F_QUIESCE);
+ 		SPDK_NOTICELOG("User Copy %s\n", g_ublk_tgt.user_copy ? "enabled" : "disabled");
+ 		SPDK_NOTICELOG("ublk_drv features 0x%" PRIx64 "\n", g_ublk_tgt.features);
+ 	}
+@@ -846,6 +881,9 @@ _ublk_fini_done(void *args)
+ 	g_ublk_tgt.ioctl_encode = false;
+ 	g_ublk_tgt.user_copy = false;
+ 	g_ublk_tgt.user_recovery = false;
++	/* Evariops 0060, 0061 */
++	g_ublk_tgt.update_size = false;
++	g_ublk_tgt.quiesce = false;
+ 
+ 	if (g_ublk_tgt.cb_fn) {
+ 		g_ublk_tgt.cb_fn(g_ublk_tgt.cb_arg);
+@@ -1102,6 +1140,18 @@ ublk_delete_dev(void *arg)
+ 
+ 	if (ublk->cdev_fd >= 0) {
+ 		close(ublk->cdev_fd);
++		ublk->cdev_fd = -1;
++	}
++
++	/* Evariops 0061: a quiesced disk is left to the kernel, not deleted. With its
++	 * queues closed and its char device released, the device waits, QUIESCED,
++	 * holding the requests that arrive, for a server to recover it
++	 * (ublk_recover_disk), in this process or the next. */
++	if (ublk->is_quiescing) {
++		SPDK_NOTICELOG("ublk %u released quiesced, for a recovery (Evariops 0061)\n",
++			       ublk->ublk_id);
++		ublk_free_dev(ublk);
++		return;
+ 	}
+ 
+ 	rc = ublk_ctrl_cmd_submit(ublk, UBLK_CMD_DEL_DEV);
+@@ -1150,6 +1200,22 @@ ublk_try_close_dev(void *arg)
+ 	}
+ }
+ 
++/* Evariops 0061: the kernel aborts the fetch commands it holds when it quiesces the disk. A
++ * commit and fetch that reaches it meanwhile commits the last request, which lets the quiesce
++ * finish, and arms its fetch after the aborts: nothing completes that command, and a queue
++ * that waits for every command never closes (seen in about one stop in five under writes). A
++ * quiesced queue closes with no request in flight nor waiting to commit; the commands still
++ * in the kernel are cancelled when its ring exits (ublk_delete_dev), as when a process dies.
++ * Sent by the app thread before anything that frees the queue. */
++static void
++ublk_queue_quiesced(void *arg)
++{
++	struct ublk_queue *q = arg;
++
++	q->quiesced = true;
++	q->is_stopping = true;
++}
++
+ static void
+ ublk_try_close_queue(struct ublk_queue *q)
+ {
+@@ -1158,7 +1224,8 @@ ublk_try_close_queue(struct ublk_queue *q)
+ 	/* Close queue until no I/O is submitted to bdev in flight,
+ 	 * no I/O is waiting to commit result, and all I/Os are aborted back.
+ 	 */
+-	if (!TAILQ_EMPTY(&q->inflight_io_list) || !TAILQ_EMPTY(&q->completed_io_list) || q->cmd_inflight) {
++	if (!TAILQ_EMPTY(&q->inflight_io_list) || !TAILQ_EMPTY(&q->completed_io_list) ||
++	    (q->cmd_inflight && !q->quiesced)) {
+ 		/* wait for next retry */
+ 		return;
+ 	}
+@@ -1196,6 +1263,51 @@ ublk_stop_disk(uint32_t ublk_id, ublk_ctrl_cb ctrl_cb, void *cb_arg)
+ 	return ublk_close_dev(ublk);
+ }
+ 
++/* Evariops 0061: quiesces a disk for a planned restart (UBLK_U_CMD_QUIESCE_DEV): the
++ * kernel holds the new requests, lets the in-flight ones complete, then cancels the
++ * fetch commands, and the disk is released to the kernel instead of deleted. The
++ * next process recovers it (ublk_recover_disk) with nothing to replay. Upstream
++ * could only stop a disk, which deletes the kernel device under its filesystem.
++ * ctrl_cb is called once the disk is released, or with the error that kept it
++ * serving (-EBUSY: in-flight requests outlived timeout_ms, 0 waits forever). */
++int
++ublk_quiesce_disk(uint32_t ublk_id, uint64_t timeout_ms, ublk_ctrl_cb ctrl_cb, void *cb_arg)
++{
++	struct spdk_ublk_dev *ublk;
++	int rc;
++
++	assert(spdk_thread_is_app_thread(NULL));
++
++	ublk = ublk_dev_find_by_id(ublk_id);
++	if (ublk == NULL) {
++		SPDK_ERRLOG("no ublk dev with ublk_id=%u\n", ublk_id);
++		return -ENODEV;
++	}
++	if (!(ublk->dev_info.flags & UBLK_F_QUIESCE)) {
++		SPDK_ERRLOG("ublk %u was created without UBLK_F_QUIESCE (Evariops 0061)\n", ublk_id);
++		return -ENOTSUP;
++	}
++	if (ublk->is_closing || ublk->is_recovering || ublk->ctrl_cb != NULL ||
++	    ublk->ctrl_ops_in_progress > 0 || ublk->online_num_queues < ublk->num_queues) {
++		SPDK_WARNLOG("ublk %u is busy, not quiesced (Evariops 0061)\n", ublk_id);
++		return -EBUSY;
++	}
++
++	ublk->ctrl_cb = ctrl_cb;
++	ublk->cb_arg = cb_arg;
++	ublk->is_closing = true;
++	ublk->is_quiescing = true;
++	ublk->quiesce_timeout_ms = timeout_ms;
++	rc = ublk_ctrl_cmd_submit(ublk, UBLK_CMD_QUIESCE_DEV);
++	if (rc < 0) {
++		ublk->ctrl_cb = NULL;
++		ublk->is_closing = false;
++		ublk->is_quiescing = false;
++	}
++
++	return rc;
++}
++
+ static inline void
+ ublk_mark_io_done(struct ublk_io *io, int res)
+ {
+@@ -2123,6 +2235,10 @@ ublk_dev_info_init(struct spdk_ublk_dev *ublk)
+ 		uinfo.flags |= UBLK_F_UPDATE_SIZE;
+ 	}
+ 
++	if (g_ublk_tgt.quiesce) {
++		uinfo.flags |= UBLK_F_QUIESCE;
++	}
++
+ 	ublk->dev_info = uinfo;
+ }
+ 
+@@ -2199,6 +2315,8 @@ ublk_free_dev(struct spdk_ublk_dev *ublk)
+ {
+ 	struct ublk_queue *q;
+ 	uint32_t q_idx;
++	ublk_ctrl_cb cb;
++	void *cb_arg;
+ 
+ 	spdk_poller_unregister(&ublk->resize_poller);
+ 
+@@ -2233,7 +2351,14 @@ ublk_free_dev(struct spdk_ublk_dev *ublk)
+ 	ublk_dev_list_unregister(ublk);
+ 	SPDK_NOTICELOG("ublk dev %d stopped\n", ublk->ublk_id);
+ 
++	/* Evariops 0061: a quiesce is answered once the disk is gone from this
++	 * process, its id free and its bdev released, so a recovery may follow. */
++	cb = ublk->is_quiescing ? ublk->ctrl_cb : NULL;
++	cb_arg = ublk->cb_arg;
+ 	free(ublk);
++	if (cb != NULL) {
++		cb(cb_arg, 0);
++	}
+ }
+ 
+ static int
+diff --git a/lib/ublk/ublk_internal.h b/lib/ublk/ublk_internal.h
+index 9db9354..5629ecd 100644
+--- a/lib/ublk/ublk_internal.h
++++ b/lib/ublk/ublk_internal.h
+@@ -60,6 +60,8 @@ int ublk_start_disk(const char *bdev_name, uint32_t ublk_id,
+ 		    uint32_t num_queues, uint32_t queue_depth,
+ 		    ublk_ctrl_cb ctrl_cb, void *cb_arg);
+ int ublk_stop_disk(uint32_t ublk_id, ublk_ctrl_cb ctrl_cb, void *cb_arg);
++/* Evariops 0061 */
++int ublk_quiesce_disk(uint32_t ublk_id, uint64_t timeout_ms, ublk_ctrl_cb ctrl_cb, void *cb_arg);
+ int
+ ublk_start_disk_recovery(const char *bdev_name, uint32_t ublk_id, ublk_ctrl_cb ctrl_cb,
+ 			 void *cb_arg);
+diff --git a/lib/ublk/ublk_rpc.c b/lib/ublk/ublk_rpc.c
+index cffb567..3af9077 100644
+--- a/lib/ublk/ublk_rpc.c
++++ b/lib/ublk/ublk_rpc.c
+@@ -285,3 +285,63 @@ rpc_ublk_recover_disk(struct spdk_jsonrpc_request *request,
+ }
+ 
+ SPDK_RPC_REGISTER("ublk_recover_disk", rpc_ublk_recover_disk, SPDK_RPC_RUNTIME)
++
++/* Evariops 0061: ublk_quiesce_disk {ublk_id, timeout_ms} quiesces a disk for a planned
++ * restart and releases it to the kernel, which holds its requests until a recovery
++ * (ublk_recover_disk). Answered once the disk is released. A fork RPC, outside the
++ * schema (Evariops 0057). */
++struct rpc_ublk_quiesce_disk {
++	uint32_t ublk_id;
++	uint64_t timeout_ms;
++	struct spdk_jsonrpc_request *request;
++};
++
++static const struct spdk_json_object_decoder rpc_ublk_quiesce_disk_decoders[] = {
++	{"ublk_id", offsetof(struct rpc_ublk_quiesce_disk, ublk_id), spdk_json_decode_uint32},
++	{"timeout_ms", offsetof(struct rpc_ublk_quiesce_disk, timeout_ms), spdk_json_decode_uint64, true},
++};
++
++static void
++rpc_ublk_quiesce_disk_done(void *cb_arg, int rc)
++{
++	struct rpc_ublk_quiesce_disk *req = cb_arg;
++
++	if (rc == 0) {
++		spdk_jsonrpc_send_bool_response(req->request, true);
++	} else {
++		spdk_jsonrpc_send_error_response(req->request, rc, spdk_strerror(-rc));
++	}
++	free(req);
++}
++
++static void
++rpc_ublk_quiesce_disk(struct spdk_jsonrpc_request *request,
++		      const struct spdk_json_val *params)
++{
++	struct rpc_ublk_quiesce_disk *req;
++	int rc;
++
++	req = calloc(1, sizeof(*req));
++	if (req == NULL) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR, "Out of memory");
++		return;
++	}
++	req->request = request;
++	req->timeout_ms = 30000;
++
++	if (spdk_json_decode_object(params, rpc_ublk_quiesce_disk_decoders,
++				    SPDK_COUNTOF(rpc_ublk_quiesce_disk_decoders), req)) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
++						 "spdk_json_decode_object failed");
++		free(req);
++		return;
++	}
++
++	rc = ublk_quiesce_disk(req->ublk_id, req->timeout_ms, rpc_ublk_quiesce_disk_done, req);
++	if (rc != 0) {
++		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
++		free(req);
++	}
++}
++
++SPDK_RPC_REGISTER("ublk_quiesce_disk", rpc_ublk_quiesce_disk, SPDK_RPC_RUNTIME)
+diff --git a/scripts/genrpc.py b/scripts/genrpc.py
+index 6255b39..ebdec94 100755
+--- a/scripts/genrpc.py
++++ b/scripts/genrpc.py
+@@ -125,6 +125,7 @@ def lint_c_code(schema: Dict[str, Any]) -> None:
+         "bdev_raid_set_envelopes",
+         "bdev_raid_start_seeded_rebuild",
+         "bdev_raid_start_seeded_rebuild_from_epoch",
++        "ublk_quiesce_disk",
+     }
+     fork_decoder_names = {f"rpc_{name}_decoders" for name in fork_rpcs}
+     c_code_methods = dict()

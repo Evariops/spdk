@@ -115,10 +115,16 @@ RUN sed -i '/^DIRS-y += delay/s/$/ cbt tier/' module/bdev/Makefile && \
 #   bdev_uring  — io_uring bdev for modern kernels (>= 5.1), SATA SSDs
 #   bdev_aio    — Linux AIO bdev fallback for all block devices
 #   nvmf_tcp    — NVMe-oF TCP target
+#   ublk        — a volume served to its own node's kernel as a block device
+#                 (/dev/ublkb<id>), with no NVMe-oF in between; patches
+#                 0058-0061 (request size, claim, resize, planned restart)
 #
 # Modules REMOVED (unused attack surface):
 #   iscsi-initiator, vhost, virtio, fsdev (FUSE), daos, rbd (Ceph),
-#   ublk (userspace block), dpdk-compressdev
+#   dpdk-compressdev
+#
+# ublk is built only when asked for (--with-ublk), and the configure is checked
+# for it: without the flag the image built, silently, with no ublk at all.
 RUN SPDK_ARCH=$([ "${TARGETARCH}" = "arm64" ] && echo "armv8-a" || echo "nehalem") && \
     DEBUG_FLAG=$([ "${BUILD_TYPE}" = "debug" ] && echo "--enable-debug" || true) && \
     ./configure \
@@ -137,10 +143,31 @@ RUN SPDK_ARCH=$([ "${TARGETARCH}" = "arm64" ] && echo "armv8-a" || echo "nehalem
         --without-fsdev \
         --without-daos \
         --without-rbd \
-        --without-ublk \
-        --without-dpdk-compressdev
+        --with-ublk \
+        --without-dpdk-compressdev && \
+    grep -q "^CONFIG_UBLK?=y" mk/config.mk
 
 RUN make -j"$(nproc)"
+
+# What this image was built with, for a client that cannot run a shell in it (the
+# release image is FROM scratch): the operator's image warmer runs it on each node
+# before a rollout, and a node that serves ublk disks is not rolled onto an image
+# without ublk. One feature per line, also written to the file named as argument
+# (the container's termination log). Linked against the libc spdk_tgt already needs.
+RUN { echo spdk; \
+      grep -q "^CONFIG_UBLK?=y" mk/config.mk && echo ublk; \
+      test -n "$(find /build/patches -name '0064-*.patch')" && echo ublk-identity; \
+      test -n "$(find /build/patches -name '0065-*.patch')" && echo ublk-target-report; \
+      test -n "$(find /build/patches -name '0067-*.patch')" && echo ublk-zero-copy; \
+      test -n "$(find /build/patches -name '0070-*.patch')" && echo ublk-offset; \
+      true; } > /build/features.txt && \
+    { printf '#include <stdio.h>\nstatic const char features[] =\n'; \
+      sed 's/.*/"&\\n"/' /build/features.txt; \
+      printf ';\nint main(int argc, char **argv)\n{\n\tFILE *out;\n\n\tfputs(features, stdout);\n'; \
+      printf '\tif (argc > 1) {\n\t\tout = fopen(argv[1], "w");\n\t\tif (out == NULL) {\n\t\t\treturn 1;\n\t\t}\n'; \
+      printf '\t\tfputs(features, out);\n\t\tfclose(out);\n\t}\n\treturn 0;\n}\n'; } > /build/spdk-features.c && \
+    gcc -O2 -Wall -Werror -o /build/spdk-features /build/spdk-features.c && \
+    /build/spdk-features
 
 # Strip debug symbols in release mode (~30-40% binary size reduction)
 # Debug builds keep symbols for perf top, perf record, gdb attach
@@ -186,6 +213,7 @@ RUN set -euo pipefail && \
     \
     # ── Binary ──
     cp build/bin/spdk_tgt /rt/usr/local/bin/ && \
+    cp /build/spdk-features /rt/usr/local/bin/ && \
     \
     # ── Shared libs: copy ONLY the .so files ldd reports ──
     ldd build/bin/spdk_tgt | awk '/=>/{print $3}' | sort -u > /tmp/libs.txt && \
@@ -260,6 +288,7 @@ RUN dnf install -y --setopt=install_weak_deps=False --nodocs \
 # Binary only (runtime .so provided by Fedora packages above). Copied from the
 # unit-tests stage, so the debug image too is built only once its suites pass.
 COPY --from=unit-tests /build/spdk/build/bin/spdk_tgt /usr/local/bin/spdk_tgt
+COPY --from=unit-tests /build/spdk-features /usr/local/bin/spdk-features
 
 # spdk_dd is the raid5f bench's full-stripe writer: raid5f only accepts full-stripe
 # writes, and remote initiators are MDTS-bounded, so the writer must run INSIDE the
