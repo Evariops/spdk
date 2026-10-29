@@ -1,0 +1,220 @@
+diff --git a/lib/thread/iobuf.c b/lib/thread/iobuf.c
+index 2a1680e..879449c 100644
+--- a/lib/thread/iobuf.c
++++ b/lib/thread/iobuf.c
+@@ -24,6 +24,7 @@
+ #define IOBUF_DEFAULT_LARGE_BUFSIZE	(132 * 1024)
+ #define IOBUF_MAX_CHANNELS		64
+ #define IOBUF_POPULATE_BATCH_SIZE	64
++#define IOBUF_RETRY_PERIOD_US		100
+ 
+ SPDK_STATIC_ASSERT(sizeof(struct spdk_iobuf_buffer) <= IOBUF_MIN_SMALL_BUFSIZE,
+ 		   "Invalid data offset");
+@@ -38,6 +39,8 @@ struct iobuf_channel_node {
+ struct iobuf_channel {
+ 	struct iobuf_channel_node	node[SPDK_CONFIG_MAX_NUMA_NODES];
+ 	struct spdk_iobuf_channel	*channels[IOBUF_MAX_CHANNELS];
++	/* Evariops 0077: takes buffers from the central pools while requests of this thread wait. */
++	struct spdk_poller		*retry_poller;
+ };
+ 
+ struct iobuf_module {
+@@ -111,6 +114,8 @@ iobuf_channel_destroy_cb(void *io_device, void *ctx)
+ 		assert(STAILQ_EMPTY(&node->small_queue));
+ 		assert(STAILQ_EMPTY(&node->large_queue));
+ 	}
++
++	spdk_poller_unregister(&ch->retry_poller);
+ }
+ 
+ static int
+@@ -724,6 +729,71 @@ spdk_iobuf_entry_abort(struct spdk_iobuf_channel *ch, struct spdk_iobuf_entry *e
+ 
+ #define IOBUF_BATCH_SIZE 32
+ 
++/*
++ * Evariops 0077: a request waiting for a buffer was served only by a buffer returned on its own
++ * thread. Buffers returned on another thread go to that thread's cache, then to the central pool,
++ * and woke nobody: a thread whose buffers another thread holds waited until it returned one itself,
++ * possibly never (a second reactor, a second ublk thread). While a thread has requests waiting, a
++ * poller of its own takes buffers from the central pools for them, in their order, and stops once
++ * none waits. A buffer returned on the waiting thread still goes to its first request at once.
++ */
++static uint32_t
++iobuf_serve_from_pool(spdk_iobuf_entry_stailq_t *queue, struct spdk_ring *pool)
++{
++	struct spdk_iobuf_entry *entry;
++	uint32_t served = 0;
++	void *buf;
++
++	while (!STAILQ_EMPTY(queue) && spdk_ring_dequeue(pool, &buf, 1) == 1) {
++		entry = STAILQ_FIRST(queue);
++		STAILQ_REMOVE_HEAD(queue, stailq);
++		entry->cb_fn(entry, buf);
++		served++;
++		/* As in spdk_iobuf_put(): a callback that asked again went to the tail, and keeps
++		 * its place at the head. */
++		if (spdk_unlikely(entry == STAILQ_LAST(queue, spdk_iobuf_entry, stailq))) {
++			STAILQ_REMOVE(queue, entry, spdk_iobuf_entry, stailq);
++			STAILQ_INSERT_HEAD(queue, entry, stailq);
++		}
++	}
++
++	return served;
++}
++
++static int
++iobuf_retry_poll(void *ctx)
++{
++	struct iobuf_channel *ch = ctx;
++	struct iobuf_channel_node *node;
++	uint32_t served = 0;
++	bool waiting = false;
++	int32_t i;
++
++	IOBUF_FOREACH_NUMA_ID(i) {
++		node = &ch->node[i];
++		served += iobuf_serve_from_pool(&node->small_queue, g_iobuf.node[i].small_pool);
++		served += iobuf_serve_from_pool(&node->large_queue, g_iobuf.node[i].large_pool);
++		waiting |= !STAILQ_EMPTY(&node->small_queue) || !STAILQ_EMPTY(&node->large_queue);
++	}
++
++	if (!waiting) {
++		spdk_poller_unregister(&ch->retry_poller);
++	}
++
++	return served > 0 ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
++}
++
++static void
++iobuf_retry_start(struct spdk_iobuf_channel *ch)
++{
++	struct iobuf_channel *iobuf_ch = spdk_io_channel_get_ctx(ch->parent);
++
++	if (iobuf_ch->retry_poller == NULL) {
++		iobuf_ch->retry_poller = SPDK_POLLER_REGISTER(iobuf_retry_poll, iobuf_ch,
++					 IOBUF_RETRY_PERIOD_US);
++	}
++}
++
+ void *
+ spdk_iobuf_get(struct spdk_iobuf_channel *ch, uint64_t len,
+ 	       struct spdk_iobuf_entry *entry, spdk_iobuf_get_cb cb_fn)
+@@ -761,6 +831,7 @@ spdk_iobuf_get(struct spdk_iobuf_channel *ch, uint64_t len,
+ 				entry->module = ch->module;
+ 				entry->cb_fn = cb_fn;
+ 				pool->stats.retry++;
++				iobuf_retry_start(ch);
+ 			}
+ 
+ 			return NULL;
+diff --git a/test/unit/lib/thread/iobuf.c/iobuf_ut.c b/test/unit/lib/thread/iobuf.c/iobuf_ut.c
+index 2406659..3245d25 100644
+--- a/test/unit/lib/thread/iobuf.c/iobuf_ut.c
++++ b/test/unit/lib/thread/iobuf.c/iobuf_ut.c
+@@ -762,6 +762,97 @@ iobuf_pool_free(void)
+ 	free_cores();
+ }
+ 
++/* Evariops 0077: a thread whose requests wait is served by the buffers another thread returns. */
++static void
++iobuf_served_across_threads(void)
++{
++	struct spdk_iobuf_opts opts = {
++		.small_pool_count = 2,
++		.large_pool_count = 2,
++		.small_bufsize = SMALL_BUFSIZE,
++		.large_bufsize = LARGE_BUFSIZE,
++	};
++	struct spdk_iobuf_channel ch[2];
++	struct ut_iobuf_entry waiting[3] = {};
++	struct iobuf_channel *iobuf_ch0;
++	void *held[2];
++	int rc, finish = 0, i;
++
++	allocate_cores(2);
++	allocate_threads(2);
++
++	set_thread(0);
++	g_iobuf.opts = opts;
++	rc = spdk_iobuf_initialize();
++	CU_ASSERT_EQUAL(rc, 0);
++	rc = spdk_iobuf_register_module("ut_module");
++	CU_ASSERT_EQUAL(rc, 0);
++	rc = spdk_iobuf_channel_init(&ch[0], "ut_module", 0, 0);
++	CU_ASSERT_EQUAL(rc, 0);
++	set_thread(1);
++	rc = spdk_iobuf_channel_init(&ch[1], "ut_module", 0, 0);
++	CU_ASSERT_EQUAL(rc, 0);
++
++	/* Thread 1 holds every large buffer. */
++	for (i = 0; i < 2; i++) {
++		held[i] = spdk_iobuf_get(&ch[1], LARGE_BUFSIZE, NULL, NULL);
++		CU_ASSERT_PTR_NOT_NULL(held[i]);
++	}
++
++	/* Thread 0 waits for three. */
++	set_thread(0);
++	iobuf_ch0 = spdk_io_channel_get_ctx(ch[0].parent);
++	for (i = 0; i < 3; i++) {
++		waiting[i].buf = spdk_iobuf_get(&ch[0], LARGE_BUFSIZE, &waiting[i].iobuf,
++						ut_iobuf_get_buf_cb);
++		CU_ASSERT_PTR_NULL(waiting[i].buf);
++	}
++	CU_ASSERT_PTR_NOT_NULL(iobuf_ch0->retry_poller);
++
++	/* Thread 1 returns one: it goes to the central pool, and thread 0's first request gets it
++	 * at thread 0's next poll. Upstream left it in the pool. */
++	set_thread(1);
++	spdk_iobuf_put(&ch[1], held[0], LARGE_BUFSIZE);
++	spdk_delay_us(IOBUF_RETRY_PERIOD_US);
++	poll_threads();
++	CU_ASSERT_PTR_EQUAL(waiting[0].buf, held[0]);
++	CU_ASSERT_PTR_NULL(waiting[1].buf);
++	CU_ASSERT_PTR_NULL(waiting[2].buf);
++
++	/* The second, in order. */
++	set_thread(1);
++	spdk_iobuf_put(&ch[1], held[1], LARGE_BUFSIZE);
++	spdk_delay_us(IOBUF_RETRY_PERIOD_US);
++	poll_threads();
++	CU_ASSERT_PTR_EQUAL(waiting[1].buf, held[1]);
++	CU_ASSERT_PTR_NULL(waiting[2].buf);
++	CU_ASSERT_PTR_NOT_NULL(iobuf_ch0->retry_poller);
++
++	/* A buffer returned on thread 0 still goes to its first request at once, and with nothing
++	 * left waiting the poller stops. */
++	set_thread(0);
++	spdk_iobuf_put(&ch[0], waiting[0].buf, LARGE_BUFSIZE);
++	CU_ASSERT_PTR_EQUAL(waiting[2].buf, held[0]);
++	spdk_delay_us(IOBUF_RETRY_PERIOD_US);
++	poll_threads();
++	CU_ASSERT_PTR_NULL(iobuf_ch0->retry_poller);
++
++	spdk_iobuf_put(&ch[0], waiting[1].buf, LARGE_BUFSIZE);
++	spdk_iobuf_put(&ch[0], waiting[2].buf, LARGE_BUFSIZE);
++	spdk_iobuf_channel_fini(&ch[0]);
++	set_thread(1);
++	spdk_iobuf_channel_fini(&ch[1]);
++	poll_threads();
++
++	set_thread(0);
++	spdk_iobuf_finish(ut_iobuf_finish_cb, &finish);
++	poll_threads();
++	CU_ASSERT_EQUAL(finish, 1);
++
++	free_threads();
++	free_cores();
++}
++
+ int
+ main(int argc, char **argv)
+ {
+@@ -775,6 +866,7 @@ main(int argc, char **argv)
+ 	CU_ADD_TEST(suite, iobuf_cache);
+ 	CU_ADD_TEST(suite, iobuf_priority);
+ 	CU_ADD_TEST(suite, iobuf_pool_free);
++	CU_ADD_TEST(suite, iobuf_served_across_threads);
+ 
+ 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
+ 	CU_cleanup_registry();
