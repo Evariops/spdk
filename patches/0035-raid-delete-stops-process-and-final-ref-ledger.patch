@@ -1,9 +1,9 @@
 diff --git a/module/bdev/nvme/bdev_nvme.c b/module/bdev/nvme/bdev_nvme.c
-index c79cdcc..fa7fc4f 100644
+index 84e75e2..a8be8f4 100644
 --- a/module/bdev/nvme/bdev_nvme.c
 +++ b/module/bdev/nvme/bdev_nvme.c
-@@ -914,6 +914,12 @@ nvme_ctrlr_put_ref_ext(struct nvme_ctrlr *nvme_ctrlr, enum nvme_ctrlr_ref_holder
- 		return;
+@@ -901,6 +901,12 @@ nvme_ctrlr_put_ref(struct nvme_ctrlr *nvme_ctrlr, enum nvme_ctrlr_ref_holder hol
+ 		return ref;
  	}
  
 +	/* Evariops 0035: the final release is the other exit of this ledger, and it
@@ -13,24 +13,24 @@ index c79cdcc..fa7fc4f 100644
 +			     "final ref released (by %s): destruct proceeds (Evariops 0035)\n",
 +			     g_nvme_ctrlr_ref_holder_names[holder]);
  	pthread_mutex_unlock(&nvme_ctrlr->mutex);
- 	spdk_thread_send_msg(spdk_thread_get_app_thread(), nvme_ctrlr_unregister, nvme_ctrlr);
- }
+ 
+ 	/* Flags are set after ref get and cleared before ref put, so the above check is sufficient. */
 diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
-index 56ac873..d448bbe 100644
+index dc8a208..9e05397 100644
 --- a/module/bdev/raid/bdev_raid.c
 +++ b/module/bdev/raid/bdev_raid.c
-@@ -2761,6 +2761,8 @@ raid_bdev_event_base_bdev(enum spdk_bdev_event_type type, struct spdk_bdev *bdev
+@@ -2886,6 +2886,8 @@ raid_bdev_delete_clear_sb_cb(int status, struct raid_bdev *raid_bdev, void *ctx)
   * cb_fn - callback function
   * cb_arg - argument to callback function
   */
 +static void raid_bdev_delete_stop_process(void *ctx);
 +
  void
- raid_bdev_delete(struct raid_bdev *raid_bdev, raid_bdev_destruct_cb cb_fn, void *cb_arg)
- {
-@@ -2779,6 +2781,18 @@ raid_bdev_delete(struct raid_bdev *raid_bdev, raid_bdev_destruct_cb cb_fn, void
- 
- 	raid_bdev->destroy_started = true;
+ raid_bdev_delete(struct raid_bdev *raid_bdev, bool clear_sb, raid_bdev_action_cb cb_fn,
+ 		 void *cb_arg)
+@@ -2905,6 +2907,18 @@ raid_bdev_delete(struct raid_bdev *raid_bdev, bool clear_sb, raid_bdev_action_cb
+ 	raid_bdev->destroy_cb = cb_fn;
+ 	raid_bdev->destroy_cb_ctx = cb_arg;
  
 +	/* Evariops 0035: a delete must stop an active background process itself. The
 +	 * unregister event only covers ONLINE raids, so without this edge the delete
@@ -44,10 +44,10 @@ index 56ac873..d448bbe 100644
 +				     raid_bdev_delete_stop_process, raid_bdev->process);
 +	}
 +
- 	RAID_FOR_EACH_BASE_BDEV(raid_bdev, base_info) {
- 		base_info->remove_scheduled = true;
- 
-@@ -3102,6 +3116,14 @@ raid_bdev_process_finish(struct raid_bdev_process *process, int status)
+ 	if (raid_bdev->sb != NULL && clear_sb) {
+ 		raid_bdev_clear_superblock(raid_bdev, raid_bdev_delete_clear_sb_cb, NULL);
+ 		return;
+@@ -3213,6 +3227,14 @@ raid_bdev_process_finish(struct raid_bdev_process *process, int status)
  	assert(process->state == RAID_PROCESS_STATE_RUNNING);
  	process->state = RAID_PROCESS_STATE_STOPPING;
  
@@ -62,7 +62,7 @@ index 56ac873..d448bbe 100644
  	if (process->window_range_locked) {
  		raid_bdev_process_unlock_window_range(process);
  	} else {
-@@ -3109,6 +3131,17 @@ raid_bdev_process_finish(struct raid_bdev_process *process, int status)
+@@ -3220,6 +3242,17 @@ raid_bdev_process_finish(struct raid_bdev_process *process, int status)
  	}
  }
  
@@ -80,7 +80,7 @@ index 56ac873..d448bbe 100644
  static void
  raid_bdev_process_window_range_unlocked(void *ctx, int status)
  {
-@@ -3344,9 +3377,15 @@ raid_bdev_process_lock_window_range(struct raid_bdev_process *process)
+@@ -3455,9 +3488,15 @@ raid_bdev_process_lock_window_range(struct raid_bdev_process *process)
  	if (process->qos.enable_qos) {
  		if (spdk_unlikely(process->seeded) &&
  		    raid_bdev_process_window_seeded_clean(process)) {

@@ -1,11 +1,12 @@
 diff --git a/lib/nvme/nvme_tcp.c b/lib/nvme/nvme_tcp.c
-index 7f093ec..e8eada7 100644
+index 35adfa4..5c08d09 100644
 --- a/lib/nvme/nvme_tcp.c
 +++ b/lib/nvme/nvme_tcp.c
-@@ -2165,6 +2165,15 @@ nvme_tcp_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_c
+@@ -2398,6 +2398,19 @@ nvme_tcp_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_c
+ 		rc = spdk_sock_flush(tqpair->sock);
  		if (rc < 0 && rc != -EAGAIN) {
  			NVME_TQPAIR_ERRLOG(tqpair, "spdk_sock_flush() failed, rc %d: %s\n", rc, spdk_strerror(-rc));
- 			if (nvme_qpair_get_state(qpair) == NVME_QPAIR_DISCONNECTING) {
++			if (nvme_qpair_get_state(qpair) == NVME_QPAIR_DISCONNECTING) {
 +				/* Evariops 0027: re-abort before the emptiness check. The disconnect-time
 +				 * abort skips requests that have an accel operation in flight, and once
 +				 * the socket is closed those requests can never complete on their own
@@ -13,8 +14,11 @@ index 7f093ec..e8eada7 100644
 +				 * never empties and the qpair never leaves DISCONNECTING. A failed flush
 +				 * here proves the socket is dead, so force-completing acked-or-not requests
 +				 * is safe; requests still inside accel are skipped again and drained on a
-+				 * later poll. */
++				 * later poll. The fail path's disconnect does not re-abort a DISCONNECTING
++				 * qpair: it only checks for emptiness. */
 +				nvme_tcp_qpair_abort_reqs(qpair, qpair->abort_dnr);
- 				if (TAILQ_EMPTY(&tqpair->outstanding_reqs)) {
- 					nvme_transport_ctrlr_disconnect_qpair_done(qpair);
- 				}
++			}
++
+ 			goto fail;
+ 		}
+ 

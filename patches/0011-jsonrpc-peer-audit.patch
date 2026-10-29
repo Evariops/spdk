@@ -1,5 +1,5 @@
 diff --git a/include/spdk/jsonrpc.h b/include/spdk/jsonrpc.h
-index 760039d..0be1c32 100644
+index 4e38359..a001976 100644
 --- a/include/spdk/jsonrpc.h
 +++ b/include/spdk/jsonrpc.h
 @@ -124,6 +124,33 @@ void spdk_jsonrpc_server_shutdown(struct spdk_jsonrpc_server *server);
@@ -37,10 +37,10 @@ index 760039d..0be1c32 100644
   * Add callback called when connection is closed. Pair of  \c cb and \c ctx must be unique or error is returned.
   * Registered callback is called only once and there is no need to call  \c spdk_jsonrpc_conn_del_close_cb
 diff --git a/lib/jsonrpc/jsonrpc_internal.h b/lib/jsonrpc/jsonrpc_internal.h
-index d13ec7a..d36271b 100644
+index 851724f..f6644e0 100644
 --- a/lib/jsonrpc/jsonrpc_internal.h
 +++ b/lib/jsonrpc/jsonrpc_internal.h
-@@ -49,6 +49,13 @@ struct spdk_jsonrpc_server_conn {
+@@ -90,6 +90,13 @@ struct spdk_jsonrpc_server_conn {
  	struct spdk_jsonrpc_server *server;
  	int sockfd;
  	bool closed;
@@ -55,10 +55,10 @@ index d13ec7a..d36271b 100644
  	uint8_t recv_buf[SPDK_JSONRPC_RECV_BUF_SIZE];
  	uint32_t outstanding_requests;
 diff --git a/lib/jsonrpc/jsonrpc_server.c b/lib/jsonrpc/jsonrpc_server.c
-index c122613..158ed7f 100644
+index c433a94..395b07e 100644
 --- a/lib/jsonrpc/jsonrpc_server.c
 +++ b/lib/jsonrpc/jsonrpc_server.c
-@@ -278,6 +278,45 @@ spdk_jsonrpc_get_conn(struct spdk_jsonrpc_request *request)
+@@ -604,6 +604,45 @@ spdk_jsonrpc_get_conn(struct spdk_jsonrpc_request *request)
  	return request->conn;
  }
  
@@ -105,10 +105,10 @@ index c122613..158ed7f 100644
  static struct spdk_json_write_ctx *
  begin_response(struct spdk_jsonrpc_request *request)
 diff --git a/lib/jsonrpc/jsonrpc_server_tcp.c b/lib/jsonrpc/jsonrpc_server_tcp.c
-index e30f37f..74d408d 100644
+index 8c170b8..13ea56a 100644
 --- a/lib/jsonrpc/jsonrpc_server_tcp.c
 +++ b/lib/jsonrpc/jsonrpc_server_tcp.c
-@@ -192,6 +192,23 @@ jsonrpc_server_accept(struct spdk_jsonrpc_server *server)
+@@ -195,6 +195,23 @@ jsonrpc_server_accept(struct spdk_jsonrpc_server *server)
  		conn->server = server;
  		conn->sockfd = rc;
  		conn->closed = false;
@@ -133,7 +133,7 @@ index e30f37f..74d408d 100644
  		conn->outstanding_requests = 0;
  		STAILQ_INIT(&conn->send_queue);
 diff --git a/lib/jsonrpc/spdk_jsonrpc.map b/lib/jsonrpc/spdk_jsonrpc.map
-index a62f4a4..5555990 100644
+index bf46735..f7290cc 100644
 --- a/lib/jsonrpc/spdk_jsonrpc.map
 +++ b/lib/jsonrpc/spdk_jsonrpc.map
 @@ -6,6 +6,8 @@

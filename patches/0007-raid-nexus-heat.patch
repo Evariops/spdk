@@ -1,8 +1,8 @@
 diff --git a/module/bdev/raid/Makefile b/module/bdev/raid/Makefile
-index 3dff369..cb46945 100644
+index cbf2e46..dfaa028 100644
 --- a/module/bdev/raid/Makefile
 +++ b/module/bdev/raid/Makefile
-@@ -10,7 +10,7 @@ SO_VER := 7
+@@ -10,7 +10,7 @@ SO_VER := 8
  SO_MINOR := 0
  
  CFLAGS += -I$(SPDK_ROOT_DIR)/lib/bdev/
@@ -12,10 +12,10 @@ index 3dff369..cb46945 100644
  ifeq ($(CONFIG_RAID5F),y)
  C_SRCS += raid5f.c
 diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
-index c86c748..a24f53c 100644
+index 1cee7e7..7208c2b 100644
 --- a/module/bdev/raid/bdev_raid.c
 +++ b/module/bdev/raid/bdev_raid.c
-@@ -393,6 +393,9 @@ raid_bdev_cleanup(struct raid_bdev *raid_bdev)
+@@ -392,6 +392,9 @@ raid_bdev_cleanup(struct raid_bdev *raid_bdev)
  static void
  raid_bdev_free(struct raid_bdev *raid_bdev)
  {
@@ -25,7 +25,7 @@ index c86c748..a24f53c 100644
  	raid_bdev_free_superblock(raid_bdev);
  	free(raid_bdev->base_bdev_info);
  	free(raid_bdev->bdev.name);
-@@ -968,6 +971,19 @@ static void
+@@ -967,6 +970,19 @@ static void
  raid_bdev_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
  {
  	struct raid_bdev_io *raid_io = (struct raid_bdev_io *)bdev_io->driver_ctx;
@@ -46,10 +46,10 @@ index c86c748..a24f53c 100644
  	raid_bdev_io_init(raid_io, spdk_io_channel_get_ctx(ch), bdev_io->type,
  			  bdev_io->u.bdev.offset_blocks, bdev_io->u.bdev.num_blocks,
 diff --git a/module/bdev/raid/bdev_raid.h b/module/bdev/raid/bdev_raid.h
-index d0484ca..7267e64 100644
+index 6a38d76..9106145 100644
 --- a/module/bdev/raid/bdev_raid.h
 +++ b/module/bdev/raid/bdev_raid.h
-@@ -237,6 +237,9 @@ struct raid_bdev {
+@@ -205,6 +205,9 @@ struct raid_bdev {
  	/* Private data for the raid module */
  	void				*module_private;
  
@@ -59,7 +59,7 @@ index d0484ca..7267e64 100644
  	/* Superblock */
  	bool				superblock_enabled;
  	struct raid_bdev_superblock	*sb;
-@@ -570,4 +573,10 @@ struct spdk_raid_bdev_opts {
+@@ -546,4 +549,10 @@ struct spdk_raid_bdev_opts {
  void raid_bdev_get_opts(struct spdk_raid_bdev_opts *opts);
  int raid_bdev_set_opts(const struct spdk_raid_bdev_opts *opts);
  
@@ -72,7 +72,7 @@ index d0484ca..7267e64 100644
  #endif /* SPDK_BDEV_RAID_INTERNAL_H */
 diff --git a/module/bdev/raid/bdev_raid_heat.c b/module/bdev/raid/bdev_raid_heat.c
 new file mode 100644
-index 0000000..2eda221
+index 0000000..c1d42ef
 --- /dev/null
 +++ b/module/bdev/raid/bdev_raid_heat.c
 @@ -0,0 +1,311 @@
@@ -289,7 +289,7 @@ index 0000000..2eda221
 +		spdk_jsonrpc_send_bool_response(request, true);
 +		goto cleanup;
 +	}
-+	if (raid_bdev->state == RAID_BDEV_STATE_ONLINE) {
++	if (raid_bdev->state == SPDK_BDEV_RAID_STATE_ONLINE) {
 +		struct heat_disable_ctx *ctx = calloc(1, sizeof(*ctx));
 +
 +		if (ctx == NULL) {
@@ -388,10 +388,10 @@ index 0000000..2eda221
 +}
 +SPDK_RPC_REGISTER("vbdev_nexus_get_heat", rpc_vbdev_nexus_get_heat, SPDK_RPC_RUNTIME)
 diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
-index c4b478a..ce3af2f 100644
+index effecf2..3c11457 100644
 --- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
 +++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
-@@ -200,6 +200,10 @@ DEFINE_STUB(spdk_bdev_writev_blocks_ext, int, (struct spdk_bdev_desc *desc,
+@@ -199,6 +199,10 @@ DEFINE_STUB(spdk_bdev_writev_blocks_ext, int, (struct spdk_bdev_desc *desc,
  		struct spdk_io_channel *ch, struct iovec *iov, int iovcnt, uint64_t offset_blocks,
  		uint64_t num_blocks, spdk_bdev_io_completion_cb cb, void *cb_arg,
  		struct spdk_bdev_ext_io_opts *opts), 0);

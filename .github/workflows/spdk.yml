@@ -283,7 +283,7 @@ jobs:
             "${IMAGE}:${TAG}-amd64" \
             "${IMAGE}:${TAG}-arm64"
 
-          # Floating minor tag (e.g. v26.01 from v26.01.0)
+          # Floating minor tag (e.g. v26.09 from v26.09.0)
           if [[ -n "${MINOR_TAG}" ]]; then
             docker buildx imagetools create \
               -t "${IMAGE}:${MINOR_TAG}" \

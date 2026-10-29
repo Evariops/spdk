@@ -1,8 +1,8 @@
 diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
-index 228233a..56ac873 100644
+index ddc2c30..dc8a208 100644
 --- a/module/bdev/raid/bdev_raid.c
 +++ b/module/bdev/raid/bdev_raid.c
-@@ -1219,12 +1219,19 @@ raid_bdev_write_info_json(struct raid_bdev *raid_bdev, struct spdk_json_write_ct
+@@ -1218,12 +1218,19 @@ raid_bdev_write_info_json(struct raid_bdev *raid_bdev, struct spdk_json_write_ct
  
  	spdk_json_write_named_uuid(w, "uuid", &raid_bdev->bdev.uuid);
  	spdk_json_write_named_uint32(w, "strip_size_kb", raid_bdev->strip_size_kb);
@@ -25,10 +25,10 @@ index 228233a..56ac873 100644
  	spdk_json_write_named_bool(w, "superblock", raid_bdev->superblock_enabled);
  	spdk_json_write_named_uint32(w, "num_base_bdevs", raid_bdev->num_base_bdevs);
 diff --git a/module/bdev/raid/bdev_raid.h b/module/bdev/raid/bdev_raid.h
-index 44066af..280d61c 100644
+index 371ab5d..bfbc0be 100644
 --- a/module/bdev/raid/bdev_raid.h
 +++ b/module/bdev/raid/bdev_raid.h
-@@ -228,6 +228,11 @@ typedef void (*raid_bdev_configure_cb)(void *cb_ctx, int rc);
+@@ -195,6 +195,11 @@ struct raid_bdev_process_request {
   * and the information related to any raid bdev either configured or
   * in configuring list. io device is created on this.
   */
@@ -40,7 +40,7 @@ index 44066af..280d61c 100644
  struct raid_bdev {
  	/* raid bdev device, this will get registered in bdev layer */
  	struct spdk_bdev		bdev;
-@@ -302,17 +307,25 @@ struct raid_bdev {
+@@ -271,17 +276,25 @@ struct raid_bdev {
  	/* Raid bdev background process, e.g. rebuild */
  	struct raid_bdev_process	*process;
  
@@ -72,10 +72,10 @@ index 44066af..280d61c 100644
 +	int64_t				verify_since;		/* unix seconds, 0 = none */
 +
  	/* Callback and context for raid_bdev configuration */
- 	raid_bdev_configure_cb		configure_cb;
+ 	raid_bdev_action_cb		configure_cb;
  	void				*configure_cb_ctx;
 diff --git a/module/bdev/raid/bdev_raid_verify_ranges.c b/module/bdev/raid/bdev_raid_verify_ranges.c
-index bb8fb73..048fc31 100644
+index 92b09b5..88eb9a0 100644
 --- a/module/bdev/raid/bdev_raid_verify_ranges.c
 +++ b/module/bdev/raid/bdev_raid_verify_ranges.c
 @@ -74,7 +74,12 @@ struct raid_verify_ctx {

@@ -1,8 +1,8 @@
 diff --git a/include/spdk/bdev_module.h b/include/spdk/bdev_module.h
-index fce200b..e4a45e7 100644
+index 819ac2f..b56380c 100644
 --- a/include/spdk/bdev_module.h
 +++ b/include/spdk/bdev_module.h
-@@ -1954,6 +1954,21 @@ int spdk_bdev_unquiesce_range(struct spdk_bdev *bdev, struct spdk_bdev_module *m
+@@ -1968,6 +1968,21 @@ int spdk_bdev_unquiesce_range(struct spdk_bdev *bdev, struct spdk_bdev_module *m
  			      uint64_t offset, uint64_t length,
  			      spdk_bdev_quiesce_cb cb_fn, void *cb_arg);
  
@@ -25,10 +25,10 @@ index fce200b..e4a45e7 100644
   *  Macro used to register module for later initialization.
   */
 diff --git a/lib/bdev/bdev.c b/lib/bdev/bdev.c
-index 98e01ca..a7ccfe6 100644
+index f3adc26..7fcbd7f 100644
 --- a/lib/bdev/bdev.c
 +++ b/lib/bdev/bdev.c
-@@ -11189,6 +11189,30 @@ spdk_bdev_unquiesce_range(struct spdk_bdev *bdev, struct spdk_bdev_module *modul
+@@ -11275,6 +11275,30 @@ spdk_bdev_unquiesce_range(struct spdk_bdev *bdev, struct spdk_bdev_module *modul
  	return _spdk_bdev_quiesce(bdev, module, offset, length, cb_fn, cb_arg, true);
  }
  
@@ -60,10 +60,10 @@ index 98e01ca..a7ccfe6 100644
  spdk_bdev_get_memory_domains(struct spdk_bdev *bdev, struct spdk_memory_domain **domains,
  			     int array_size)
 diff --git a/lib/bdev/spdk_bdev.map b/lib/bdev/spdk_bdev.map
-index 57c7889..889d36c 100644
+index 649ea44..eafa550 100644
 --- a/lib/bdev/spdk_bdev.map
 +++ b/lib/bdev/spdk_bdev.map
-@@ -201,6 +201,8 @@
+@@ -203,6 +203,8 @@
  	spdk_bdev_quiesce;
  	spdk_bdev_unquiesce;
  	spdk_bdev_quiesce_range;
@@ -71,12 +71,12 @@ index 57c7889..889d36c 100644
 +	spdk_bdev_unlock_lba_range;
  	spdk_bdev_unquiesce_range;
  	spdk_bdev_io_hide_metadata;
- 
+ 	spdk_bdev_desc_hide_metadata;
 diff --git a/module/bdev/raid/Makefile b/module/bdev/raid/Makefile
-index cb46945..e118002 100644
+index dfaa028..bc7cbc6 100644
 --- a/module/bdev/raid/Makefile
 +++ b/module/bdev/raid/Makefile
-@@ -10,7 +10,7 @@ SO_VER := 7
+@@ -10,7 +10,7 @@ SO_VER := 8
  SO_MINOR := 0
  
  CFLAGS += -I$(SPDK_ROOT_DIR)/lib/bdev/
@@ -86,10 +86,10 @@ index cb46945..e118002 100644
  ifeq ($(CONFIG_RAID5F),y)
  C_SRCS += raid5f.c
 diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
-index a24f53c..594e47a 100644
+index 7208c2b..8dc30e3 100644
 --- a/module/bdev/raid/bdev_raid.c
 +++ b/module/bdev/raid/bdev_raid.c
-@@ -1121,6 +1121,17 @@ raid_bdev_write_info_json(struct raid_bdev *raid_bdev, struct spdk_json_write_ct
+@@ -1120,6 +1120,17 @@ raid_bdev_write_info_json(struct raid_bdev *raid_bdev, struct spdk_json_write_ct
  	spdk_json_write_named_uint32(w, "num_base_bdevs_discovered", raid_bdev->num_base_bdevs_discovered);
  	spdk_json_write_named_uint32(w, "num_base_bdevs_operational",
  				     raid_bdev->num_base_bdevs_operational);

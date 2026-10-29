@@ -1,5 +1,5 @@
 diff --git a/module/bdev/lvol/vbdev_lvol.c b/module/bdev/lvol/vbdev_lvol.c
-index 7b40b09..3673b97 100644
+index 298e9c3..9546aa2 100644
 --- a/module/bdev/lvol/vbdev_lvol.c
 +++ b/module/bdev/lvol/vbdev_lvol.c
 @@ -586,8 +586,14 @@ _vbdev_lvol_unregister_unload_lvs(void *cb_arg, int lvserrno)
@@ -18,7 +18,7 @@ index 7b40b09..3673b97 100644
  	}
  
  	TAILQ_REMOVE(&g_spdk_lvol_pairs, lvs_bdev, lvol_stores);
-@@ -1504,8 +1510,12 @@ vbdev_lvs_fini_start_unload_cb(void *cb_arg, int lvserrno)
+@@ -1528,8 +1534,12 @@ vbdev_lvs_fini_start_unload_cb(void *cb_arg, int lvserrno)
  	struct lvol_store_bdev *lvs_bdev = cb_arg;
  	struct lvol_store_bdev *next_lvs_bdev = vbdev_lvol_store_next(lvs_bdev);
  
@@ -32,7 +32,7 @@ index 7b40b09..3673b97 100644
  	}
  
  	TAILQ_REMOVE(&g_spdk_lvol_pairs, lvs_bdev, lvol_stores);
-@@ -1526,6 +1536,11 @@ vbdev_lvs_fini_start_iter(struct lvol_store_bdev *lvs_bdev)
+@@ -1550,6 +1560,11 @@ vbdev_lvs_fini_start_iter(struct lvol_store_bdev *lvs_bdev)
  			spdk_lvs_unload(lvs, vbdev_lvs_fini_start_unload_cb, lvs_bdev);
  			return;
  		}

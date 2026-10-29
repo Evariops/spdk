@@ -1,8 +1,8 @@
 diff --git a/module/bdev/raid/Makefile b/module/bdev/raid/Makefile
-index 120700c..c90b4a2 100644
+index 6a3e804..4c8f52a 100644
 --- a/module/bdev/raid/Makefile
 +++ b/module/bdev/raid/Makefile
-@@ -10,7 +10,7 @@ SO_VER := 7
+@@ -10,7 +10,7 @@ SO_VER := 8
  SO_MINOR := 0
  
  CFLAGS += -I$(SPDK_ROOT_DIR)/lib/bdev/
@@ -12,7 +12,7 @@ index 120700c..c90b4a2 100644
  ifeq ($(CONFIG_RAID5F),y)
  C_SRCS += raid5f.c
 diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
-index 0a1cdee..40d393d 100644
+index 4e5bd0e..cef716a 100644
 --- a/module/bdev/raid/bdev_raid.c
 +++ b/module/bdev/raid/bdev_raid.c
 @@ -5,14 +5,14 @@
@@ -37,7 +37,7 @@ index 0a1cdee..40d393d 100644
  #include "spdk/env.h"
  #include "spdk/thread.h"
  #include "spdk/log.h"
-@@ -3952,13 +3952,23 @@ raid_bdev_process_alloc(struct raid_bdev *raid_bdev, enum raid_process_type type
+@@ -4063,13 +4063,23 @@ raid_bdev_process_alloc(struct raid_bdev *raid_bdev, enum raid_process_type type
  	TAILQ_INIT(&process->requests);
  	TAILQ_INIT(&process->finish_actions);
  
@@ -68,7 +68,7 @@ index 0a1cdee..40d393d 100644
  	}
  
  	for (i = 0; i < RAID_BDEV_PROCESS_MAX_QD; i++) {
-@@ -3982,6 +3992,15 @@ raid_bdev_start_rebuild(struct raid_base_bdev_info *target)
+@@ -4093,6 +4103,15 @@ raid_bdev_start_rebuild(struct raid_base_bdev_info *target)
  
  	assert(spdk_get_thread() == spdk_thread_get_app_thread());
  
@@ -84,7 +84,7 @@ index 0a1cdee..40d393d 100644
  	process = raid_bdev_process_alloc(target->raid_bdev, RAID_PROCESS_REBUILD, target);
  	if (process == NULL) {
  		return -ENOMEM;
-@@ -4020,6 +4039,13 @@ raid_bdev_start_seeded_rebuild(struct raid_base_bdev_info *target,
+@@ -4131,6 +4150,13 @@ raid_bdev_start_seeded_rebuild(struct raid_base_bdev_info *target,
  		return -EINVAL;
  	}
  
@@ -235,7 +235,7 @@ index 0000000..eb551a5
 +
 +#endif /* SPDK_BDEV_RAID_ENVELOPES_H */
 diff --git a/module/bdev/raid/bdev_raid_rpc.c b/module/bdev/raid/bdev_raid_rpc.c
-index 31896d5..5d9917f 100644
+index a0839bc..da46656 100644
 --- a/module/bdev/raid/bdev_raid_rpc.c
 +++ b/module/bdev/raid/bdev_raid_rpc.c
 @@ -6,7 +6,8 @@
@@ -248,7 +248,7 @@ index 31896d5..5d9917f 100644
  #include "spdk/util.h"
  #include "spdk/string.h"
  #include "spdk/log.h"
-@@ -906,6 +907,127 @@ err:
+@@ -607,6 +608,127 @@ err:
  }
  SPDK_RPC_REGISTER("bdev_raid_remove_base_bdev", rpc_bdev_raid_remove_base_bdev, SPDK_RPC_RUNTIME)
  
@@ -377,10 +377,10 @@ index 31896d5..5d9917f 100644
   * outcome registry. Entries outlive the raid bdev they describe and are matched
   * by token, so an attempt can still be resolved after its raid is gone. See
 diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
-index 43d6c52..55bdca4 100644
+index 4bb1925..93ce034 100644
 --- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
 +++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
-@@ -243,6 +243,12 @@ DEFINE_STUB_V(raid_rebuild_outcome_set_verifying, (struct raid_rebuild_outcome *
+@@ -240,6 +240,12 @@ DEFINE_STUB_V(raid_rebuild_outcome_set_verifying, (struct raid_rebuild_outcome *
   * has CBT here (-ENODEV), which the raid passes over. */
  DEFINE_STUB(vbdev_cbt_auto_epoch_open, int, (const char *bdev_name, const char *stale_backend_id),
  	    -ENODEV);

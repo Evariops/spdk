@@ -1,8 +1,8 @@
 diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
-index da919f1..22ea08b 100644
+index 5a793d8..2dc782c 100644
 --- a/module/bdev/raid/bdev_raid.c
 +++ b/module/bdev/raid/bdev_raid.c
-@@ -516,6 +516,7 @@ raid_bdev_free_base_bdev_resource(struct raid_base_bdev_info *base_info)
+@@ -515,6 +515,7 @@ raid_bdev_free_base_bdev_resource(struct raid_base_bdev_info *base_info)
  	/* Evariops 0033: reset remove_error with is_failed, so a reused slot never
  	 * inherits the previous incarnation's removal failure. */
  	base_info->remove_error = 0;
@@ -10,7 +10,7 @@ index da919f1..22ea08b 100644
  	raid_bdev_base_bdev_state_touch(base_info);
  
  	/* clear `data_offset` to allow it to be recalculated during configuration */
-@@ -2271,12 +2272,69 @@ raid_bdev_remove_base_bdev_write_sb_cb(int status, struct raid_bdev *raid_bdev,
+@@ -2354,12 +2355,69 @@ raid_bdev_remove_base_bdev_write_sb_cb(int status, struct raid_bdev *raid_bdev,
  	raid_bdev_remove_base_bdev_cont(base_info);
  }
  
@@ -57,7 +57,7 @@ index da919f1..22ea08b 100644
 +	char member_id[SPDK_UUID_STRING_LEN];
 +	int rc;
 +
-+	if (raid_bdev->level != RAID1 || spdk_uuid_is_null(&base_info->uuid) ||
++	if (raid_bdev->level != SPDK_BDEV_RAID_LEVEL_RAID1 || spdk_uuid_is_null(&base_info->uuid) ||
 +	    !raid_bdev_base_bdev_left_current(base_info)) {
 +		return;
 +	}
@@ -81,7 +81,7 @@ index da919f1..22ea08b 100644
  
  	if (status != 0) {
  		SPDK_ERRLOG("Failed to quiesce raid bdev %s: %s\n",
-@@ -2285,28 +2343,7 @@ raid_bdev_remove_base_bdev_on_quiesced(void *ctx, int status)
+@@ -2368,28 +2426,7 @@ raid_bdev_remove_base_bdev_on_quiesced(void *ctx, int status)
  		return;
  	}
  
@@ -111,7 +111,7 @@ index da919f1..22ea08b 100644
  
  	if (raid_bdev->sb) {
  		struct raid_bdev_superblock *sb = raid_bdev->sb;
-@@ -2599,6 +2636,9 @@ raid_bdev_fail_base_remove_cb(void *ctx, int status)
+@@ -2682,6 +2719,9 @@ raid_bdev_fail_base_remove_cb(void *ctx, int status)
  	 * local reflex. Service I/O is unaffected either way: raid1 routes on the
  	 * slot's channel, never on is_failed. */
  	base_info->remove_error = status;
@@ -122,10 +122,10 @@ index da919f1..22ea08b 100644
  
  	SPDK_NOTICELOG("Failed to remove failed base bdev '%s' from raid bdev '%s' slot %d: %s (%d) — the member "
 diff --git a/module/bdev/raid/bdev_raid.h b/module/bdev/raid/bdev_raid.h
-index 947359c..8f5d692 100644
+index 24ccf44..bf7933e 100644
 --- a/module/bdev/raid/bdev_raid.h
 +++ b/module/bdev/raid/bdev_raid.h
-@@ -116,6 +116,11 @@ struct raid_base_bdev_info {
+@@ -85,6 +85,11 @@ struct raid_base_bdev_info {
  	 * the only thing that re-arms the local fail path. */
  	int			remove_error;
  
@@ -135,13 +135,13 @@ index 947359c..8f5d692 100644
 +	bool			removal_failed;
 +
  	/* callback for base bdev configuration */
- 	raid_base_bdev_cb	configure_cb;
+ 	raid_bdev_action_cb	configure_cb;
  
 diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
-index a488d6d..c359160 100644
+index d6412f0..dcdab81 100644
 --- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
 +++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
-@@ -242,10 +242,22 @@ DEFINE_STUB(vbdev_cbt_query_latest_epoch, int, (const char *bdev_name,
+@@ -239,10 +239,22 @@ DEFINE_STUB(vbdev_cbt_query_latest_epoch, int, (const char *bdev_name,
  		struct vbdev_cbt_epoch_facts *out), -ENODEV);
  /* Evariops 0018: a rebuild's outcome turns to verifying before its verify pass. */
  DEFINE_STUB_V(raid_rebuild_outcome_set_verifying, (struct raid_rebuild_outcome *outcome));
@@ -168,7 +168,7 @@ index a488d6d..c359160 100644
  
  /* Evariops 0046: a seeded rebuild reads its ranges from a CBT epoch. The CBT
   * module is not part of this suite: the epoch's delta is this fake's. */
-@@ -679,12 +691,15 @@ spdk_bdev_get_by_name(const char *bdev_name)
+@@ -682,12 +694,15 @@ spdk_bdev_get_by_name(const char *bdev_name)
  	return NULL;
  }
  
@@ -185,7 +185,7 @@ index a488d6d..c359160 100644
  	}
  
  	return 0;
-@@ -2156,6 +2171,162 @@ test_raid_io_split(void)
+@@ -2153,6 +2168,162 @@ test_raid_io_split(void)
  	reset_globals();
  }
  
@@ -209,8 +209,8 @@ index a488d6d..c359160 100644
 +		    void (*setup)(struct raid_bdev *raid_bdev, struct raid_bdev_superblock *sb),
 +		    char *member, size_t member_len)
 +{
-+	struct rpc_bdev_raid_create req;
-+	struct rpc_bdev_raid_delete destroy_req;
++	struct rpc_bdev_raid_create_ctx req;
++	struct rpc_bdev_raid_delete_ctx destroy_req;
 +	struct raid_bdev_superblock *sb;
 +	struct raid_base_bdev_info *base_info;
 +	struct raid_bdev *pbdev;
@@ -225,7 +225,7 @@ index a488d6d..c359160 100644
 +
 +	pbdev = raid_bdev_find_by_name("raid1");
 +	SPDK_CU_ASSERT_FATAL(pbdev != NULL);
-+	pbdev->level = RAID1;
++	pbdev->level = SPDK_BDEV_RAID_LEVEL_RAID1;
 +	pbdev->min_base_bdevs_operational = 1;
 +	sb = calloc(1, sizeof(*sb) + pbdev->num_base_bdevs * sizeof(sb->base_bdevs[0]));
 +	SPDK_CU_ASSERT_FATAL(sb != NULL);
@@ -348,7 +348,7 @@ index a488d6d..c359160 100644
  static int
  test_new_thread_fn(struct spdk_thread *thread)
  {
-@@ -2207,6 +2378,8 @@ main(int argc, char **argv)
+@@ -2204,6 +2375,8 @@ main(int argc, char **argv)
  	CU_ADD_TEST(suite, test_raid_seeded_rebuild_from_epoch_refuses_a_delta_it_cannot_take_whole);
  	CU_ADD_TEST(suite, test_raid_process_request_max_part);
  	CU_ADD_TEST(suite, test_raid_process_with_qos);

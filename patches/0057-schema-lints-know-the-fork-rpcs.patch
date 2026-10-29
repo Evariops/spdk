@@ -1,0 +1,139 @@
+diff --git a/doc/jsonrpc.md.jinja2 b/doc/jsonrpc.md.jinja2
+index 4bd6d0e..66cf6ac 100644
+--- a/doc/jsonrpc.md.jinja2
++++ b/doc/jsonrpc.md.jinja2
+@@ -8364,7 +8364,7 @@ Example response:
+ 
+ Example request:
+ 
+-{{ example_request("bdev_raid_create", "-n", "Raid0", "-z", "4", "-r", "0", "-b", "Malloc0 Malloc1 Malloc2 Malloc3") }}
++{{ example_request("bdev_raid_create", "-n", "Raid0", "-z", "4", "-r", "0", "-b", "Malloc0 Malloc1 Malloc2 Malloc3", "--incarnation", "ctl-1") }}
+ 
+ Example response:
+ 
+diff --git a/python/spdk/cli/bdev.py b/python/spdk/cli/bdev.py
+index fca9725..8dea84f 100644
+--- a/python/spdk/cli/bdev.py
++++ b/python/spdk/cli/bdev.py
+@@ -791,7 +791,13 @@ def add_parser(subparsers):
+                                   raid_level=args.raid_level,
+                                   base_bdevs=args.base_bdevs,
+                                   uuid=args.uuid,
+-                                  superblock=args.superblock)
++                                  superblock=args.superblock,
++                                  incarnation=args.incarnation,
++                                  lineage=args.lineage,
++                                  view_epoch=args.view_epoch,
++                                  force_restamp=args.force_restamp,
++                                  expected_view_epoch=args.expected_view_epoch,
++                                  declared_slots=args.declared_slots)
+     p = subparsers.add_parser('bdev_raid_create', help='Create new raid bdev')
+     p.add_argument('-n', '--name', help='raid bdev name', required=True)
+     p.add_argument('-z', '--strip-size-kb', help='strip size in KB', type=int)
+@@ -800,30 +806,48 @@ def add_parser(subparsers):
+     p.add_argument('--uuid', help='UUID for this raid bdev')
+     p.add_argument('-s', '--superblock', help='information about raid bdev will be stored in superblock on each base bdev, '
+                                               'disabled by default due to backward compatibility', action='store_true')
++    p.add_argument('--incarnation', help='identity of the creating control-plane incarnation (Evariops)', required=True)
++    p.add_argument('--lineage', help='UUID of the volume the raid serves (Evariops)')
++    p.add_argument('--view-epoch', help='view the raid is created in (Evariops)', type=int)
++    p.add_argument('--force-restamp', help="overwrite another owner's stamps of --expected-view-epoch (Evariops)",
++                   action='store_true')
++    p.add_argument('--expected-view-epoch', help='epoch --force-restamp overwrites (Evariops)', type=int)
++    p.add_argument('--declared-slots', help='raid width when wider than its listed base bdevs (Evariops)', type=int)
+     p.set_defaults(func=bdev_raid_create)
+ 
+     def bdev_raid_delete(args):
+         args.client.bdev_raid_delete(
+                                   name=args.name,
+-                                  clear_sb=args.clear_sb)
++                                  clear_sb=args.clear_sb,
++                                  expected_incarnation=args.expected_incarnation)
+     p = subparsers.add_parser('bdev_raid_delete', help='Delete existing raid bdev')
+     p.add_argument('name', help='raid bdev name')
+     p.add_argument('-c', '--clear-sb', help='If set, clear the superblock from all base bdevs', action='store_true')
++    p.add_argument('--expected-incarnation', help="refuse with -ESTALE when the raid's incarnation differs (Evariops)")
+     p.set_defaults(func=bdev_raid_delete)
+ 
+     def bdev_raid_add_base_bdev(args):
+         args.client.bdev_raid_add_base_bdev(
+                                          raid_bdev=args.raid_bdev,
+-                                         base_bdev=args.base_bdev)
++                                         base_bdev=args.base_bdev,
++                                         skip_rebuild=args.skip_rebuild,
++                                         write_only=args.write_only,
++                                         expected_incarnation=args.expected_incarnation)
+     p = subparsers.add_parser('bdev_raid_add_base_bdev', help='Add base bdev to existing raid bdev')
+     p.add_argument('raid_bdev', help='raid bdev name')
+     p.add_argument('base_bdev', help='base bdev name')
++    p.add_argument('--skip-rebuild', help='promote the base bdev without a rebuild, copied externally (Evariops)',
++                   action='store_true')
++    p.add_argument('--write-only', help='attach the base bdev write-only, for a seeded rebuild (Evariops)',
++                   action='store_true')
++    p.add_argument('--expected-incarnation', help="refuse with -ESTALE when the raid's incarnation differs (Evariops)")
+     p.set_defaults(func=bdev_raid_add_base_bdev)
+ 
+     def bdev_raid_remove_base_bdev(args):
+-        args.client.bdev_raid_remove_base_bdev(name=args.name)
++        args.client.bdev_raid_remove_base_bdev(name=args.name, expected_incarnation=args.expected_incarnation)
+     p = subparsers.add_parser('bdev_raid_remove_base_bdev', help='Remove base bdev from existing raid bdev')
+     p.add_argument('name', help='base bdev name')
++    p.add_argument('--expected-incarnation', help="refuse with -ESTALE when the raid's incarnation differs (Evariops)")
+     p.set_defaults(func=bdev_raid_remove_base_bdev)
+ 
+     # split
+diff --git a/scripts/genrpc.py b/scripts/genrpc.py
+index 276d504..6255b39 100755
+--- a/scripts/genrpc.py
++++ b/scripts/genrpc.py
+@@ -105,17 +105,41 @@ def lint_c_code(schema: Dict[str, Any]) -> None:
+         "nvmf_set_config",
+     }
+     manual_decoder_names = {f"rpc_{name}_decoders_manual" for name in manual_decoders}
++    # Evariops: the fork's own RPCs stay outside the schema, with their hand-written
++    # decoders — whole files of them, and those registered in upstream files. An RPC
++    # the fork adds to an upstream file is named here, or this lint refuses it.
++    fork_rpc_files = {
++        "lib/nvmf/nvmf_pause_rpc.c",
++        "module/bdev/cbt/vbdev_cbt_rpc.c",
++        "module/bdev/lvol/vbdev_lvol_ranges_rpc.c",
++        "module/bdev/lvol/vbdev_lvol_tier_rpc.c",
++        "module/bdev/tier/vbdev_tier_rpc.c",
++    }
++    fork_rpcs = {
++        "bdev_raid_claim",
++        "bdev_raid_clear_superblock",
++        "bdev_raid_get_envelopes",
++        "bdev_raid_get_rebuild_outcomes",
++        "bdev_raid_journal_view_epoch",
++        "bdev_raid_restamp_copied_member",
++        "bdev_raid_set_envelopes",
++        "bdev_raid_start_seeded_rebuild",
++        "bdev_raid_start_seeded_rebuild_from_epoch",
++    }
++    fork_decoder_names = {f"rpc_{name}_decoders" for name in fork_rpcs}
+     c_code_methods = dict()
+     c_code_aliases = dict()
+     c_code_free = set()
+     for folder in ("module", "lib"):
+         for path in (base_dir / folder).rglob("*rpc.c"):
++            if str(path.relative_to(base_dir)) in fork_rpc_files:
++                continue
+             data = path.read_text()
+             methods = re.findall(r'SPDK_RPC_REGISTER\("([A-Za-z0-9_]+)"\s*,\s*([A-Za-z0-9_]+)\s*,', data, re.MULTILINE)
+             for name, func in methods:
+                 if func != f"rpc_{name}":
+                     raise ValueError(f"In file {path}: RPC name '{name}' does not match function name '{func}'")
+-                if name not in schema_methods:
++                if name not in schema_methods and name not in fork_rpcs:
+                     raise ValueError(f"In file {path}: RPC name '{name}' does not appear in schema. Update schema or exception list")
+             aliases = re.findall(r'SPDK_RPC_REGISTER_ALIAS_DEPRECATED\(\s*([A-Za-z0-9_]+)\s*,\s*([A-Za-z0-9_]+)\s*\)', data)
+             c_code_aliases.update(aliases)
+@@ -123,6 +147,7 @@ def lint_c_code(schema: Dict[str, Any]) -> None:
+             c_code_free.update(free_functions)
+             decoders = re.findall(r"static\s+const\s+struct\s+spdk_json_object_decoder\s+(.+?)\[\]\s+=\s+{(.+?)};",
+                                   data, re.MULTILINE | re.DOTALL)
++            decoders = [(name, fields) for name, fields in decoders if name not in fork_decoder_names]
+             decoder_names = {name for name, _ in decoders}
+             invalid = decoder_names - manual_decoder_names
+             if invalid:

@@ -1,9 +1,9 @@
 diff --git a/module/bdev/lvol/Makefile b/module/bdev/lvol/Makefile
-index aba6620..a8ed387 100644
+index ee57a5d..3ac9d52 100644
 --- a/module/bdev/lvol/Makefile
 +++ b/module/bdev/lvol/Makefile
 @@ -9,7 +9,8 @@ include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
- SO_VER := 7
+ SO_VER := 8
  SO_MINOR := 0
  
 -C_SRCS = vbdev_lvol.c vbdev_lvol_rpc.c vbdev_lvol_ranges_rpc.c

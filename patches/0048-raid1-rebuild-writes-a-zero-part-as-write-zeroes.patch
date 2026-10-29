@@ -1,8 +1,8 @@
 diff --git a/module/bdev/raid/bdev_raid.h b/module/bdev/raid/bdev_raid.h
-index f584d19..947359c 100644
+index a425960..24ccf44 100644
 --- a/module/bdev/raid/bdev_raid.h
 +++ b/module/bdev/raid/bdev_raid.h
-@@ -560,6 +560,18 @@ raid_bdev_unmap_blocks(struct raid_base_bdev_info *base_info, struct spdk_io_cha
+@@ -533,6 +533,18 @@ raid_bdev_unmap_blocks(struct raid_base_bdev_info *base_info, struct spdk_io_cha
  				      num_blocks, cb, cb_arg);
  }
  
@@ -22,7 +22,7 @@ index f584d19..947359c 100644
   * Raid bdev I/O read/write wrapper for spdk_bdev_flush_blocks function.
   */
 diff --git a/module/bdev/raid/raid1.c b/module/bdev/raid/raid1.c
-index 51efb51..388b9a9 100644
+index e037b52..fda3647 100644
 --- a/module/bdev/raid/raid1.c
 +++ b/module/bdev/raid/raid1.c
 @@ -7,6 +7,7 @@
@@ -82,7 +82,7 @@ index 51efb51..388b9a9 100644
  		if (ret == -ENOMEM) {
  			raid_bdev_queue_io_wait(raid_io, spdk_bdev_desc_get_bdev(process_req->target->desc),
 diff --git a/test/unit/lib/bdev/raid/raid1.c/raid1_ut.c b/test/unit/lib/bdev/raid/raid1.c/raid1_ut.c
-index 88f4295..cad171b 100644
+index f8f3379..c5f2bca 100644
 --- a/test/unit/lib/bdev/raid/raid1.c/raid1_ut.c
 +++ b/test/unit/lib/bdev/raid/raid1.c/raid1_ut.c
 @@ -37,6 +37,7 @@ DEFINE_STUB(spdk_bdev_unmap_blocks, int, (struct spdk_bdev_desc *desc, struct sp

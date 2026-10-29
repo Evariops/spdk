@@ -1,8 +1,8 @@
 diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
-index c18bde7..0bd65e1 100644
+index b5ace82..1741cf8 100644
 --- a/module/bdev/raid/bdev_raid.c
 +++ b/module/bdev/raid/bdev_raid.c
-@@ -5147,6 +5147,77 @@ raid_bdev_lay_out_view(struct raid_bdev *raid_bdev, const struct raid_bdev_view
+@@ -5330,6 +5330,77 @@ raid_bdev_lay_out_view(struct raid_bdev *raid_bdev, const struct raid_bdev_view
  	return 0;
  }
  
@@ -23,7 +23,7 @@ index c18bde7..0bd65e1 100644
 +
 +	assert(spdk_get_thread() == spdk_thread_get_app_thread());
 +
-+	if (raid_bdev->state != RAID_BDEV_STATE_ONLINE || sb == NULL ||
++	if (raid_bdev->state != SPDK_BDEV_RAID_STATE_ONLINE || sb == NULL ||
 +	    raid_bdev->incarnation == NULL || epoch == 0) {
 +		return -EINVAL;
 +	}
@@ -78,13 +78,13 @@ index c18bde7..0bd65e1 100644
 +}
 +
  static void raid_bdev_examine_sb(const struct raid_bdev_superblock *sb, struct spdk_bdev *bdev,
- 				 raid_base_bdev_cb cb_fn, void *cb_ctx);
+ 				 raid_bdev_action_cb cb_fn, void *cb_ctx);
  
 diff --git a/module/bdev/raid/bdev_raid.h b/module/bdev/raid/bdev_raid.h
-index 2594564..5c30917 100644
+index 417a25d..a77984b 100644
 --- a/module/bdev/raid/bdev_raid.h
 +++ b/module/bdev/raid/bdev_raid.h
-@@ -793,6 +793,14 @@ void raid_bdev_write_superblock(struct raid_bdev *raid_bdev, raid_bdev_write_sb_
+@@ -773,6 +773,14 @@ void raid_bdev_clear_superblock(struct raid_bdev *raid_bdev, raid_bdev_write_sb_
  int raid_bdev_load_base_bdev_superblock(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
  					raid_bdev_load_sb_cb cb, void *cb_ctx);
  
@@ -100,10 +100,10 @@ index 2594564..5c30917 100644
  	/* Size of the background process window in KiB */
  	uint32_t process_window_size_kb;
 diff --git a/module/bdev/raid/bdev_raid_rpc.c b/module/bdev/raid/bdev_raid_rpc.c
-index 9119230..aada046 100644
+index 96aa344..a8b074f 100644
 --- a/module/bdev/raid/bdev_raid_rpc.c
 +++ b/module/bdev/raid/bdev_raid_rpc.c
-@@ -597,6 +597,83 @@ rpc_bdev_raid_claim(struct spdk_jsonrpc_request *request, const struct spdk_json
+@@ -451,6 +451,83 @@ rpc_bdev_raid_claim(struct spdk_jsonrpc_request *request, const struct spdk_json
  }
  SPDK_RPC_REGISTER("bdev_raid_claim", rpc_bdev_raid_claim, SPDK_RPC_RUNTIME)
  
@@ -185,13 +185,13 @@ index 9119230..aada046 100644
 +SPDK_RPC_REGISTER("bdev_raid_journal_view_epoch", rpc_bdev_raid_journal_view_epoch, SPDK_RPC_RUNTIME)
 +
  /*
-  * Input structure for RPC deleting a raid bdev
-  */
+  * brief:
+  * params:
 diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
-index 0f21d2c..beaec9b 100644
+index e17703d..970a988 100644
 --- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
 +++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
-@@ -355,7 +355,7 @@ spdk_bdev_get_data_block_size(const struct spdk_bdev *bdev)
+@@ -352,7 +352,7 @@ spdk_bdev_get_data_block_size(const struct spdk_bdev *bdev)
   * its later superblock when it has one: a leg that changed between a create's
   * survey and its claim. */
  #define UT_LEGS_MAX 4
@@ -200,7 +200,7 @@ index 0f21d2c..beaec9b 100644
  
  struct ut_leg {
  	const char			*name;
-@@ -413,6 +413,23 @@ ut_legs_reset(void)
+@@ -410,6 +410,23 @@ ut_legs_reset(void)
  	}
  }
  
@@ -224,7 +224,7 @@ index 0f21d2c..beaec9b 100644
  int
  raid_bdev_load_base_bdev_superblock(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
  				    raid_bdev_load_sb_cb cb, void *cb_ctx)
-@@ -450,10 +467,33 @@ raid_bdev_load_base_bdev_superblock(struct spdk_bdev_desc *desc, struct spdk_io_
+@@ -447,10 +464,33 @@ raid_bdev_load_base_bdev_superblock(struct spdk_bdev_desc *desc, struct spdk_io_
  	return 0;
  }
  
@@ -258,8 +258,8 @@ index 0f21d2c..beaec9b 100644
 +	cb(g_ut_sb_write_status, raid_bdev, cb_ctx);
  }
  
- const struct spdk_uuid *
-@@ -2498,6 +2538,8 @@ ut_view_teardown(void)
+ /* Evariops 0053: the superblock clears the raids ask for. */
+@@ -2500,6 +2540,8 @@ ut_view_teardown(void)
  	reset_globals();
  	ut_legs_reset();
  	g_ut_alloc_superblock = false;
@@ -268,7 +268,7 @@ index 0f21d2c..beaec9b 100644
  	g_max_base_drives = g_ut_saved_max_base_drives;
  }
  
-@@ -2519,15 +2561,7 @@ ut_view_create_req(struct rpc_bdev_raid_create *r, uint64_t epoch)
+@@ -2521,15 +2563,7 @@ ut_view_create_req(struct rpc_bdev_raid_create_ctx *r, uint64_t epoch)
  static struct raid_bdev_superblock *
  ut_sb(const struct spdk_uuid *lineage, const char *owner, uint64_t epoch)
  {
@@ -285,7 +285,7 @@ index 0f21d2c..beaec9b 100644
  
  	memcpy(sb->signature, RAID_BDEV_SB_SIG, sizeof(sb->signature));
  	sb->version.major = RAID_BDEV_SB_VERSION_MAJOR;
-@@ -3181,6 +3215,296 @@ test_raid_reassembled_from_a_stamped_superblock_keeps_its_view(void)
+@@ -3208,6 +3242,296 @@ test_raid_reassembled_from_a_stamped_superblock_keeps_its_view(void)
  	ut_view_teardown();
  }
  
@@ -352,7 +352,7 @@ index 0f21d2c..beaec9b 100644
 +static struct raid_bdev *
 +ut_view_raid_after_an_ejection(uint16_t minor)
 +{
-+	struct rpc_bdev_raid_create req;
++	struct rpc_bdev_raid_create_ctx req;
 +	struct raid_bdev *raid_bdev;
 +
 +	g_ut_alloc_superblock = true;
@@ -452,13 +452,13 @@ index 0f21d2c..beaec9b 100644
 +static void
 +test_raid_journal_joins_a_raid_created_outside_the_view(void)
 +{
-+	struct rpc_bdev_raid_create req;
++	struct rpc_bdev_raid_create_ctx req;
 +	struct raid_bdev *raid_bdev;
 +
 +	ut_view_setup();
 +	g_ut_alloc_superblock = true;
 +	create_raid_bdev_create_req(&req, "raid1", 0, true, 0, true);
-+	req.level = RAID1;
++	req.raid_level = RPC_BDEV_RAID_LEVEL_RAID1;
 +	req.strip_size_kb = 0;
 +	rpc_bdev_raid_create(NULL, NULL);
 +	poll_app_thread();
@@ -517,8 +517,8 @@ index 0f21d2c..beaec9b 100644
 +test_raid_journaled_epoch_refuses_a_create_from_an_older_view(void)
 +{
 +	const uint64_t refused_epochs[] = { 5, 6 };
-+	struct rpc_bdev_raid_create req;
-+	struct rpc_bdev_raid_delete delete_req;
++	struct rpc_bdev_raid_create_ctx req;
++	struct rpc_bdev_raid_delete_ctx delete_req;
 +	struct raid_bdev *raid_bdev;
 +	size_t i;
 +
@@ -545,7 +545,7 @@ index 0f21d2c..beaec9b 100644
 +		g_json_decode_obj_create = 1;
 +		g_json_decode_obj_err = 0;
 +		g_test_multi_raids = 0;
-+		req.level = RAID1;
++		req.raid_level = RPC_BDEV_RAID_LEVEL_RAID1;
 +		req.strip_size_kb = 0;
 +		spdk_uuid_copy(&req.lineage, &g_ut_lineage);
 +		req.view_epoch = refused_epochs[i];
@@ -563,7 +563,7 @@ index 0f21d2c..beaec9b 100644
 +	g_json_decode_obj_create = 1;
 +	g_json_decode_obj_err = 0;
 +	g_test_multi_raids = 0;
-+	req.level = RAID1;
++	req.raid_level = RPC_BDEV_RAID_LEVEL_RAID1;
 +	req.strip_size_kb = 0;
 +	spdk_uuid_copy(&req.lineage, &g_ut_lineage);
 +	req.view_epoch = 7;
@@ -582,7 +582,7 @@ index 0f21d2c..beaec9b 100644
  static int
  test_new_thread_fn(struct spdk_thread *thread)
  {
-@@ -3248,6 +3572,11 @@ main(int argc, char **argv)
+@@ -3276,6 +3600,11 @@ main(int argc, char **argv)
  	CU_ADD_TEST(suite, test_raid_create_with_declared_slots_leaves_the_slots_past_its_legs_empty);
  	CU_ADD_TEST(suite, test_raid_add_into_a_raid_of_a_lineage_checks_the_stamp);
  	CU_ADD_TEST(suite, test_raid_reassembled_from_a_stamped_superblock_keeps_its_view);

@@ -1,8 +1,8 @@
 diff --git a/lib/blob/blobstore.c b/lib/blob/blobstore.c
-index 4d656c9..b3105f4 100644
+index 92150a7..3dd1734 100644
 --- a/lib/blob/blobstore.c
 +++ b/lib/blob/blobstore.c
-@@ -3255,6 +3255,14 @@ blob_request_submit_op_single(struct spdk_io_channel *_ch, struct spdk_blob *blo
+@@ -3302,6 +3302,14 @@ blob_request_submit_op_single(struct spdk_io_channel *_ch, struct spdk_blob *blo
  			}
  
  			bs_batch_close(batch);
@@ -18,10 +18,10 @@ index 4d656c9..b3105f4 100644
  			/* Queue this operation and allocate the cluster */
  			spdk_bs_user_op_t *op;
 diff --git a/test/unit/lib/blob/blob.c/blob_ut.c b/test/unit/lib/blob/blob.c/blob_ut.c
-index 3bb3f5c..cdf55b1 100644
+index dfee372..f86c880 100644
 --- a/test/unit/lib/blob/blob.c/blob_ut.c
 +++ b/test/unit/lib/blob/blob.c/blob_ut.c
-@@ -4944,6 +4944,106 @@ blob_thin_prov_full_cluster_write_is_not_cleared_first(void)
+@@ -4968,6 +4968,106 @@ blob_thin_prov_full_cluster_write_is_not_cleared_first(void)
  	g_blobid = 0;
  }
  
@@ -128,7 +128,7 @@ index 3bb3f5c..cdf55b1 100644
  static void
  blob_thin_prov_unmap_cluster(void)
  {
-@@ -10501,6 +10601,7 @@ main(int argc, char **argv)
+@@ -10755,6 +10855,7 @@ main(int argc, char **argv)
  		CU_ADD_TEST(suite, blob_thin_prov_write_count_io);
  		CU_ADD_TEST(suite_bs, blob_thin_prov_new_cluster_reads_zeroes);
  		CU_ADD_TEST(suite_bs, blob_thin_prov_full_cluster_write_is_not_cleared_first);

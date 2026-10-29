@@ -1,8 +1,8 @@
 diff --git a/module/bdev/raid/Makefile b/module/bdev/raid/Makefile
-index e118002..120700c 100644
+index bc7cbc6..6a3e804 100644
 --- a/module/bdev/raid/Makefile
 +++ b/module/bdev/raid/Makefile
-@@ -10,7 +10,7 @@ SO_VER := 7
+@@ -10,7 +10,7 @@ SO_VER := 8
  SO_MINOR := 0
  
  CFLAGS += -I$(SPDK_ROOT_DIR)/lib/bdev/
@@ -12,7 +12,7 @@ index e118002..120700c 100644
  ifeq ($(CONFIG_RAID5F),y)
  C_SRCS += raid5f.c
 diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
-index ed1a1ad..a8e6165 100644
+index 3b33841..5c78dfc 100644
 --- a/module/bdev/raid/bdev_raid.c
 +++ b/module/bdev/raid/bdev_raid.c
 @@ -5,6 +5,7 @@
@@ -34,7 +34,7 @@ index ed1a1ad..a8e6165 100644
  };
  
  struct raid_process_finish_action {
-@@ -2725,6 +2730,27 @@ raid_bdev_process_finish_done(void *ctx)
+@@ -2836,6 +2841,27 @@ raid_bdev_process_finish_done(void *ctx)
  
  	process->state = RAID_PROCESS_STATE_STOPPED;
  
@@ -62,7 +62,7 @@ index ed1a1ad..a8e6165 100644
  	if (process->status == 0) {
  		SPDK_NOTICELOG("Finished %s on raid bdev %s\n",
  			       raid_bdev_process_to_str(process->type),
-@@ -2915,6 +2941,12 @@ raid_bdev_process_request_complete(struct raid_bdev_process_request *process_req
+@@ -3026,6 +3052,12 @@ raid_bdev_process_request_complete(struct raid_bdev_process_request *process_req
  
  	if (status != 0) {
  		process->window_status = status;
@@ -75,7 +75,7 @@ index ed1a1ad..a8e6165 100644
  	}
  
  	process->window_remaining -= process_req->num_blocks;
-@@ -3306,6 +3338,13 @@ raid_bdev_process_free(struct raid_bdev_process *process)
+@@ -3417,6 +3449,13 @@ raid_bdev_process_free(struct raid_bdev_process *process)
  	/* SPEC-74 M6: the seeded process owns its ranges — every teardown path
  	 * (finish or aborted start) goes through here. */
  	free(process->seed_ranges);
@@ -89,7 +89,7 @@ index ed1a1ad..a8e6165 100644
  	free(process);
  }
  
-@@ -3357,6 +3396,7 @@ static int
+@@ -3468,6 +3507,7 @@ static int
  raid_bdev_start_rebuild(struct raid_base_bdev_info *target)
  {
  	struct raid_bdev_process *process;
@@ -97,7 +97,7 @@ index ed1a1ad..a8e6165 100644
  
  	assert(spdk_get_thread() == spdk_thread_get_app_thread());
  
-@@ -3365,6 +3405,15 @@ raid_bdev_start_rebuild(struct raid_base_bdev_info *target)
+@@ -3476,6 +3516,15 @@ raid_bdev_start_rebuild(struct raid_base_bdev_info *target)
  		return -ENOMEM;
  	}
  
@@ -113,7 +113,7 @@ index ed1a1ad..a8e6165 100644
  	raid_bdev_process_start(process);
  
  	return 0;
-@@ -3377,9 +3426,11 @@ raid_bdev_start_rebuild(struct raid_base_bdev_info *target)
+@@ -3488,9 +3537,11 @@ raid_bdev_start_rebuild(struct raid_base_bdev_info *target)
   * mid-backfill. Takes ownership of \c ranges on success. */
  int
  raid_bdev_start_seeded_rebuild(struct raid_base_bdev_info *target,
@@ -126,7 +126,7 @@ index ed1a1ad..a8e6165 100644
  
  	assert(spdk_get_thread() == spdk_thread_get_app_thread());
  
-@@ -3396,6 +3447,18 @@ raid_bdev_start_seeded_rebuild(struct raid_base_bdev_info *target,
+@@ -3507,6 +3558,18 @@ raid_bdev_start_seeded_rebuild(struct raid_base_bdev_info *target,
  	process->seed_ranges = ranges;
  	process->num_seed_ranges = num_ranges;
  
@@ -146,10 +146,10 @@ index ed1a1ad..a8e6165 100644
  
  	return 0;
 diff --git a/module/bdev/raid/bdev_raid.h b/module/bdev/raid/bdev_raid.h
-index a66ad3d..681aeec 100644
+index c430bdf..35c7c87 100644
 --- a/module/bdev/raid/bdev_raid.h
 +++ b/module/bdev/raid/bdev_raid.h
-@@ -324,7 +324,8 @@ struct raid_bdev_seed_range {
+@@ -298,7 +298,8 @@ struct raid_bdev_seed_range {
  };
  
  int raid_bdev_start_seeded_rebuild(struct raid_base_bdev_info *target,
@@ -157,8 +157,8 @@ index a66ad3d..681aeec 100644
 +				   struct raid_bdev_seed_range *ranges, uint32_t num_ranges,
 +				   const char *rebuild_token);
  struct raid_bdev *raid_bdev_find_by_name(const char *name);
- enum raid_level raid_bdev_str_to_level(const char *str);
- const char *raid_bdev_level_to_str(enum raid_level level);
+ enum spdk_bdev_raid_level raid_bdev_str_to_level(const char *str);
+ const char *raid_bdev_level_to_str(enum spdk_bdev_raid_level level);
 diff --git a/module/bdev/raid/bdev_raid_outcomes.c b/module/bdev/raid/bdev_raid_outcomes.c
 new file mode 100644
 index 0000000..c16138c
@@ -468,7 +468,7 @@ index 0000000..ef563c4
 +
 +#endif /* SPDK_BDEV_RAID_OUTCOMES_H */
 diff --git a/module/bdev/raid/bdev_raid_rpc.c b/module/bdev/raid/bdev_raid_rpc.c
-index 3de537f..31896d5 100644
+index 7e7d61b..a0839bc 100644
 --- a/module/bdev/raid/bdev_raid_rpc.c
 +++ b/module/bdev/raid/bdev_raid_rpc.c
 @@ -6,6 +6,7 @@
@@ -479,7 +479,7 @@ index 3de537f..31896d5 100644
  #include "spdk/util.h"
  #include "spdk/string.h"
  #include "spdk/log.h"
-@@ -618,11 +619,16 @@ struct rpc_bdev_raid_start_seeded_rebuild {
+@@ -337,11 +338,16 @@ struct rpc_bdev_raid_start_seeded_rebuild {
  	/* Number of seed ranges */
  	size_t				num_ranges;
  
@@ -497,7 +497,7 @@ index 3de537f..31896d5 100644
  };
  
  static void
-@@ -632,6 +638,7 @@ free_rpc_bdev_raid_start_seeded_rebuild(struct rpc_bdev_raid_start_seeded_rebuil
+@@ -351,6 +357,7 @@ free_rpc_bdev_raid_start_seeded_rebuild(struct rpc_bdev_raid_start_seeded_rebuil
  	free(req->base_bdev);
  	free(req->ranges);
  	free(req->expected_incarnation);
@@ -505,7 +505,7 @@ index 3de537f..31896d5 100644
  }
  
  static int
-@@ -668,6 +675,7 @@ static const struct spdk_json_object_decoder rpc_bdev_raid_start_seeded_rebuild_
+@@ -387,6 +394,7 @@ static const struct spdk_json_object_decoder rpc_bdev_raid_start_seeded_rebuild_
  	{"base_bdev", offsetof(struct rpc_bdev_raid_start_seeded_rebuild, base_bdev), spdk_json_decode_string},
  	{"ranges", offsetof(struct rpc_bdev_raid_start_seeded_rebuild, ranges), decode_seed_ranges},
  	{"expected_incarnation", offsetof(struct rpc_bdev_raid_start_seeded_rebuild, expected_incarnation), spdk_json_decode_string, true},
@@ -513,7 +513,7 @@ index 3de537f..31896d5 100644
  };
  
  static int
-@@ -773,6 +781,14 @@ rpc_bdev_raid_start_seeded_rebuild(struct spdk_jsonrpc_request *request,
+@@ -492,6 +500,14 @@ rpc_bdev_raid_start_seeded_rebuild(struct spdk_jsonrpc_request *request,
  		}
  	}
  
@@ -528,7 +528,7 @@ index 3de537f..31896d5 100644
  	/* Evariops 0011: audit every RPC that writes to the array — this one arms
  	 * a background writer. */
  	snprintf(detail, sizeof(detail), "raid=%s base=%s ranges=%zu",
-@@ -789,7 +805,8 @@ rpc_bdev_raid_start_seeded_rebuild(struct spdk_jsonrpc_request *request,
+@@ -508,7 +524,8 @@ rpc_bdev_raid_start_seeded_rebuild(struct spdk_jsonrpc_request *request,
  	}
  	req.ranges = NULL;
  
@@ -538,7 +538,7 @@ index 3de537f..31896d5 100644
  	if (rc != 0) {
  		free(ranges);
  		spdk_jsonrpc_send_error_response_fmt(request, rc,
-@@ -889,6 +906,45 @@ err:
+@@ -590,6 +607,45 @@ err:
  }
  SPDK_RPC_REGISTER("bdev_raid_remove_base_bdev", rpc_bdev_raid_remove_base_bdev, SPDK_RPC_RUNTIME)
  
@@ -581,14 +581,14 @@ index 3de537f..31896d5 100644
 +SPDK_RPC_REGISTER("bdev_raid_get_rebuild_outcomes", rpc_bdev_raid_get_rebuild_outcomes,
 +		  SPDK_RPC_RUNTIME)
 +
- static const struct spdk_json_object_decoder rpc_bdev_raid_set_options_decoders[] = {
- 	{"process_window_size_kb", offsetof(struct spdk_raid_bdev_opts, process_window_size_kb), spdk_json_decode_uint32, true},
- 	{"process_max_bandwidth_mb_sec", offsetof(struct spdk_raid_bdev_opts, process_max_bandwidth_mb_sec), spdk_json_decode_uint32, true},
+ static void
+ rpc_bdev_raid_set_options(struct spdk_jsonrpc_request *request, const struct spdk_json_val *params)
+ {
 diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
-index c262806..c538a3c 100644
+index 72e54d0..c5b2c85 100644
 --- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
 +++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
-@@ -220,6 +220,16 @@ DEFINE_STUB_V(spdk_bdev_io_complete_nvme_status, (struct spdk_bdev_io *bdev_io,
+@@ -217,6 +217,16 @@ DEFINE_STUB_V(spdk_bdev_io_complete_nvme_status, (struct spdk_bdev_io *bdev_io,
   * audit is stubbed rather than linked. */
  DEFINE_STUB_V(spdk_jsonrpc_request_audit, (struct spdk_jsonrpc_request *request,
  	      const char *method, const char *detail));

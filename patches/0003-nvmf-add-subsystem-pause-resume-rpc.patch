@@ -1,5 +1,5 @@
 diff --git a/lib/nvmf/Makefile b/lib/nvmf/Makefile
-index 3136f7a..0af5836 100644
+index fcdd776..e0a0e0e 100644
 --- a/lib/nvmf/Makefile
 +++ b/lib/nvmf/Makefile
 @@ -11,7 +11,7 @@ SO_MINOR := 0

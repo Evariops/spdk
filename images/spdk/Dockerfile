@@ -37,11 +37,11 @@ FROM docker.io/library/fedora:43@sha256:762d73ba1c455232b0272c5d445a34f36c4b9f42
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-ARG SPDK_VERSION=v26.01
+ARG SPDK_VERSION=v26.09
 # Supply chain: a git TAG is mutable — pin the exact upstream commit and
 # verify it after clone, so a moved/replaced tag fails the build instead of
-# silently shipping different sources. Must match vendor/spdk (v26.01).
-ARG SPDK_COMMIT_SHA=2ef883e
+# silently shipping different sources. Must match vendor/spdk (v26.09).
+ARG SPDK_COMMIT_SHA=0bbb7fe
 ARG TARGETARCH
 ARG BUILD_TYPE=release
 
@@ -68,15 +68,19 @@ WORKDIR /build/spdk
 
 # Fedora's CMake rejects cmake_minimum_required(<3.5) in SPDK subprojects (ISA-L, etc.)
 ENV CMAKE_POLICY_VERSION_MINIMUM=3.5
-# PyPI drift-pin (2026-08-03): pip 26.2 (pulled by `venv --upgrade-deps`) added
-# a required kwarg to make_requirement_preparer that NO pip-tools release passes
-# yet — pkgdep's pip-compile dies on a pip-internal TypeError ('allow_editables').
-# Constrain the whole 2026-07-16 green triple (pip 26.1.2 / pip-tools 7.5.3 /
-# setuptools 83.0.0); PIP_CONSTRAINT is honored by every pip invocation in
-# pkgdep.sh, venv --upgrade-deps included. Bump deliberately.
-RUN printf 'pip==26.1.2\npip-tools==7.5.3\nsetuptools==83.0.0\n' > /tmp/pip-constraints.txt
+# PyPI drift-pin: pip 26.2 added a required kwarg to make_requirement_preparer
+# that no pip-tools release passes yet — pkgdep's pip-compile dies on a
+# pip-internal TypeError ('allow_editables'). Since v26.09, pkgdep itself
+# installs "pip<26", so a pip 26.x pin no longer resolves: constrain the last
+# pip below 26 with pip-tools 7.5.3 / setuptools 83.0.0. PIP_CONSTRAINT is
+# honored by every pip invocation in pkgdep.sh. Bump deliberately.
+RUN printf 'pip==25.3\npip-tools==7.5.3\nsetuptools==83.0.0\n' > /tmp/pip-constraints.txt
 ENV PIP_CONSTRAINT=/tmp/pip-constraints.txt
 RUN ./scripts/pkgdep.sh -d
+# pkgdep installs the Python dependencies into this venv. The build needs them
+# since v26.09: make generates the RPC decoders from schema/schema.yaml with
+# scripts/genrpc.py (pyyaml, jinja2).
+ENV PATH="/var/spdk/dependencies/pip/bin:${PATH}"
 
 # Ensure io_uring and AIO dependencies are present (pkgdep.sh may not install them)
 RUN dnf install -y --setopt=install_weak_deps=False --nodocs liburing-devel libaio-devel && \

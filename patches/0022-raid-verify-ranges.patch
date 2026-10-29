@@ -1,8 +1,8 @@
 diff --git a/module/bdev/raid/Makefile b/module/bdev/raid/Makefile
-index c90b4a2..d381b3b 100644
+index 4c8f52a..931fd4a 100644
 --- a/module/bdev/raid/Makefile
 +++ b/module/bdev/raid/Makefile
-@@ -10,7 +10,7 @@ SO_VER := 7
+@@ -10,7 +10,7 @@ SO_VER := 8
  SO_MINOR := 0
  
  CFLAGS += -I$(SPDK_ROOT_DIR)/lib/bdev/
@@ -13,7 +13,7 @@ index c90b4a2..d381b3b 100644
  C_SRCS += raid5f.c
 diff --git a/module/bdev/raid/bdev_raid_verify_ranges.c b/module/bdev/raid/bdev_raid_verify_ranges.c
 new file mode 100644
-index 0000000..bb8fb73
+index 0000000..92b09b5
 --- /dev/null
 +++ b/module/bdev/raid/bdev_raid_verify_ranges.c
 @@ -0,0 +1,830 @@
@@ -671,13 +671,13 @@ index 0000000..bb8fb73
 +		goto cleanup;
 +	}
 +
-+	if ((raid_bdev->level != RAID1 && raid_bdev->level != RAID5F) ||
-+	    raid_bdev->state != RAID_BDEV_STATE_ONLINE) {
++	if ((raid_bdev->level != SPDK_BDEV_RAID_LEVEL_RAID1 && raid_bdev->level != SPDK_BDEV_RAID_LEVEL_RAID5F) ||
++	    raid_bdev->state != SPDK_BDEV_RAID_STATE_ONLINE) {
 +		spdk_jsonrpc_send_error_response(request, -EINVAL,
 +						 "verify_ranges requires an ONLINE raid1 or raid5f bdev");
 +		goto cleanup;
 +	}
-+	syndrome = raid_bdev->level == RAID5F;
++	syndrome = raid_bdev->level == SPDK_BDEV_RAID_LEVEL_RAID5F;
 +	if (syndrome &&
 +	    (raid_bdev->bdev.md_len != 0 || raid_bdev->bdev.blocklen % sizeof(uint64_t) != 0)) {
 +		/* Interleaved metadata would need md-aware parity accounting:

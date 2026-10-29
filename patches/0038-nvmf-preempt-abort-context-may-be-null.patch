@@ -1,8 +1,8 @@
 diff --git a/lib/nvmf/subsystem.c b/lib/nvmf/subsystem.c
-index 2fca2cc..356361f 100644
+index 36a6e62..0f84cef 100644
 --- a/lib/nvmf/subsystem.c
 +++ b/lib/nvmf/subsystem.c
-@@ -1819,8 +1819,12 @@ poll_group_reservation_preempt_abort_process(struct spdk_nvmf_poll_group *group,
+@@ -2132,8 +2132,12 @@ poll_group_reservation_preempt_abort_process(struct spdk_nvmf_poll_group *group,
  		return;
  	}
  	req = STAILQ_FIRST(&ns->reservations);
@@ -17,7 +17,7 @@ index 2fca2cc..356361f 100644
  		return;
  	}
  
-@@ -4045,7 +4049,11 @@ _nvmf_ns_reservation_update_done(struct spdk_nvmf_subsystem *subsystem,
+@@ -4352,7 +4356,11 @@ _nvmf_ns_reservation_update_done(struct spdk_nvmf_subsystem *subsystem,
  	assert(req->reservation_queued == true);
  	assert(req == STAILQ_FIRST(&ns->reservations));
  
