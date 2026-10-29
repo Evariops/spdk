@@ -8,7 +8,7 @@ Terms. A **tier** is a composite bdev built from **bands**, fixed-geometry exten
 
 ## Global assumptions
 
-- **Several reactors.** The concurrency pass is done, and `evariops_get_capabilities` reports `single_reactor_assumed: false`.
+- **Several reactors.** The concurrency pass is done: `evariops_get_capabilities` reports `single_reactor_assumed: false`, and the image `reactors-multi` (`spdk-features`).
   - The standing-pause registry (patch 0003) and `g_relocate_inflight` (patch 0005) belong to the app thread whatever the CPU mask, and assert it (0078). The RPC handlers run there, a pause's or a resume's completion runs on its subsystem's thread (the RPC's), and a relocation completes on the thread that started it.
   - A tier band's state is read with an acquire load. A failed metadata write degrades a leg by compare-and-swap from any reactor, and only the winner logs and persists.
   - The superblock persist state is the composite's thread's.

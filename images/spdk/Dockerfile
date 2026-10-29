@@ -171,6 +171,7 @@ RUN { echo spdk; \
       test -x /build/spdk-takeover-proof && echo takeover-proof; \
       test -n "$(find /build/patches -name '0073-*.patch')" && echo nvme-async-aen; \
       test -n "$(find /build/patches -name '0076-*.patch')" && echo nvmf-local; \
+      test -n "$(find /build/patches -name '0078-*.patch')" && echo reactors-multi; \
       true; } > /build/features.txt && \
     { printf '#include <stdio.h>\nstatic const char features[] =\n'; \
       sed 's/.*/"&\\n"/' /build/features.txt; \
