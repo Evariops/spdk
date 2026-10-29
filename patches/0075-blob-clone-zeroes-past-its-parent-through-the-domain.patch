@@ -1,0 +1,244 @@
+diff --git a/lib/blob/blob_bs_dev.c b/lib/blob/blob_bs_dev.c
+index 3bb0b25..4c62a5d 100644
+--- a/lib/blob/blob_bs_dev.c
++++ b/lib/blob/blob_bs_dev.c
+@@ -8,6 +8,7 @@
+ #include "spdk/blob.h"
+ #include "spdk/log.h"
+ #include "spdk/likely.h"
++#include "spdk/dma.h"
+ #include "blobstore.h"
+ 
+ static void
+@@ -135,6 +136,96 @@ blob_bs_dev_readv(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
+ 			   blob_bs_dev_read_cpl, cb_args);
+ }
+ 
++/*
++ * Evariops 0075: a read past the end of a clone's parent (a clone grown larger than its snapshot)
++ * zeroes the part the parent does not hold. zero_trailing_bytes writes those zeroes with memset,
++ * which is right for buffers the process can reach. A request whose buffers live in a memory
++ * domain (ublk's zero copy, fork 0067) carries iovecs that are no memory of this process: memset
++ * into them killed it (SIGSEGV), at the kernel's first read past the parent, its partition scan
++ * of the device's end. Such a request has its domain zero that part
++ * (spdk_memory_domain_memzero), as the zeroes device does for an unallocated cluster, then reads
++ * the part the parent holds.
++ */
++struct blob_bs_dev_domain_read {
++	struct spdk_blob_bs_dev		*b;
++	struct spdk_io_channel		*channel;
++	struct iovec			*iov;
++	int				iovcnt;
++	uint64_t			lba;
++	uint32_t			lba_count;
++	struct spdk_bs_dev_cb_args	*cb_args;
++	struct spdk_blob_ext_io_opts	*ext_opts;
++	struct iovec			trailing[];
++};
++
++static void
++blob_bs_dev_domain_zeroed(void *ctx, int rc)
++{
++	struct blob_bs_dev_domain_read *r = ctx;
++	struct spdk_bs_dev_cb_args *cb_args = r->cb_args;
++
++	if (rc != 0 || r->lba_count == 0) {
++		free(r);
++		cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, rc);
++		return;
++	}
++
++	spdk_blob_io_readv_ext(r->b->blob, r->channel, r->iov, r->iovcnt, r->lba, r->lba_count,
++			       blob_bs_dev_read_cpl, cb_args, r->ext_opts);
++	free(r);
++}
++
++static void
++blob_bs_dev_readv_domain(struct spdk_blob_bs_dev *b, struct spdk_io_channel *channel,
++			 struct iovec *iov, int iovcnt, uint64_t lba, uint32_t lba_count,
++			 struct spdk_bs_dev_cb_args *cb_args, struct spdk_blob_ext_io_opts *ext_opts)
++{
++	struct blob_bs_dev_domain_read *r;
++	uint32_t zero_lba_count;
++	uint64_t valid_bytes, zero_bytes;
++	int i, n = 0, rc;
++
++	zero_lba_count = spdk_min(lba_count, lba + lba_count - b->bs_dev.blockcnt);
++	zero_bytes = zero_lba_count * (uint64_t)b->bs_dev.blocklen;
++	valid_bytes = (lba_count - zero_lba_count) * (uint64_t)b->bs_dev.blocklen;
++
++	r = calloc(1, sizeof(*r) + iovcnt * sizeof(struct iovec));
++	if (r == NULL) {
++		cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, -ENOMEM);
++		return;
++	}
++
++	/* The trailing part, as iovecs of the domain: the same bases, offset past the valid bytes. */
++	for (i = 0; i < iovcnt && zero_bytes > 0; i++) {
++		if (iov[i].iov_len <= valid_bytes) {
++			valid_bytes -= iov[i].iov_len;
++			continue;
++		}
++
++		r->trailing[n].iov_base = (uint8_t *)iov[i].iov_base + valid_bytes;
++		r->trailing[n].iov_len = spdk_min(iov[i].iov_len - valid_bytes, zero_bytes);
++		zero_bytes -= r->trailing[n].iov_len;
++		valid_bytes = 0;
++		n++;
++	}
++
++	r->b = b;
++	r->channel = channel;
++	r->iov = iov;
++	r->iovcnt = iovcnt;
++	r->lba = lba;
++	r->lba_count = lba_count - zero_lba_count;
++	r->cb_args = cb_args;
++	r->ext_opts = ext_opts;
++
++	rc = spdk_memory_domain_memzero(ext_opts->memory_domain, ext_opts->memory_domain_ctx,
++					r->trailing, n, blob_bs_dev_domain_zeroed, r);
++	if (rc != 0) {
++		free(r);
++		cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, rc);
++	}
++}
++
+ static inline void
+ blob_bs_dev_readv_ext(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
+ 		      struct iovec *iov, int iovcnt,
+@@ -143,6 +234,12 @@ blob_bs_dev_readv_ext(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
+ {
+ 	struct spdk_blob_bs_dev *b = (struct spdk_blob_bs_dev *)dev;
+ 
++	if (ext_opts != NULL && ext_opts->memory_domain != NULL &&
++	    spdk_unlikely(lba + lba_count > b->bs_dev.blockcnt)) {
++		blob_bs_dev_readv_domain(b, channel, iov, iovcnt, lba, lba_count, cb_args, ext_opts);
++		return;
++	}
++
+ 	/* The backing blob may be smaller than this blob, so zero any trailing bytes. */
+ 	zero_trailing_bytes(b, iov, iovcnt, lba, &lba_count);
+ 
+diff --git a/test/unit/lib/blob/blob.c/blob_ut.c b/test/unit/lib/blob/blob.c/blob_ut.c
+index 2afc597..c63a673 100644
+--- a/test/unit/lib/blob/blob.c/blob_ut.c
++++ b/test/unit/lib/blob/blob.c/blob_ut.c
+@@ -62,9 +62,23 @@ static void ut_blob_close_and_delete(struct spdk_blob_store *bs, struct spdk_blo
+ static void suite_blob_setup(void);
+ static void suite_blob_cleanup(void);
+ 
+-DEFINE_STUB(spdk_memory_domain_memzero, int, (struct spdk_memory_domain *src_domain,
+-		void *src_domain_ctx, struct iovec *iov, uint32_t iovcnt, void (*cpl_cb)(void *, int),
+-		void *cpl_cb_arg), 0);
++/* Evariops 0075: a domain's memzero, on buffers a test can reach, completed at once; counted. */
++static uint32_t g_memory_domain_memzero_calls;
++
++int
++spdk_memory_domain_memzero(struct spdk_memory_domain *src_domain, void *src_domain_ctx,
++			   struct iovec *iov, uint32_t iovcnt, void (*cpl_cb)(void *, int), void *cpl_cb_arg)
++{
++	uint32_t i;
++
++	g_memory_domain_memzero_calls++;
++	for (i = 0; i < iovcnt; i++) {
++		memset(iov[i].iov_base, 0, iov[i].iov_len);
++	}
++
++	cpl_cb(cpl_cb_arg, 0);
++	return 0;
++}
+ 
+ static bool
+ is_esnap_clone(struct spdk_blob *_blob, const void *id, size_t id_len)
+@@ -2726,6 +2740,82 @@ bs_load_custom_cluster_size(void)
+ 	g_bs = NULL;
+ }
+ 
++/*
++ * Evariops 0075: a clone grown larger than its snapshot reads zeroes past the snapshot. A read
++ * whose buffers live in a memory domain has the domain write those zeroes, never memset: its
++ * iovecs need not be memory of the process (ublk's zero copy).
++ */
++static void
++blob_clone_grown_reads_past_its_parent_through_the_domain(void)
++{
++	struct spdk_blob_store *bs = g_bs;
++	struct spdk_blob_opts opts;
++	struct spdk_blob *blob, *clone;
++	struct spdk_io_channel *channel;
++	spdk_blob_id snapshotid;
++	uint64_t units = spdk_bs_get_cluster_size(bs) / spdk_bs_get_io_unit_size(bs);
++	uint64_t len = 3 * spdk_bs_get_cluster_size(bs);
++	uint8_t *payload, *expected;
++	struct iovec iov;
++	struct spdk_blob_ext_io_opts ext_opts = {
++		.memory_domain = (struct spdk_memory_domain *)0xfeedbeef,
++		.memory_domain_ctx = (void *)0xf00df00d,
++		.size = sizeof(struct spdk_blob_ext_io_opts),
++	};
++
++	channel = spdk_bs_alloc_io_channel(bs);
++	SPDK_CU_ASSERT_FATAL(channel != NULL);
++	payload = malloc(len);
++	expected = calloc(1, len);
++	SPDK_CU_ASSERT_FATAL(payload != NULL && expected != NULL);
++
++	ut_spdk_blob_opts_init(&opts);
++	opts.num_clusters = 1;
++	blob = ut_blob_create_and_open(bs, &opts);
++	memset(expected, 0xa5, spdk_bs_get_cluster_size(bs));
++	spdk_blob_io_write(blob, channel, expected, 0, units, blob_op_complete, NULL);
++	poll_threads();
++	CU_ASSERT(g_bserrno == 0);
++
++	/* A snapshot of one cluster, a clone of it grown to three. */
++	spdk_bs_create_snapshot(bs, spdk_blob_get_id(blob), NULL, blob_op_with_id_complete, NULL);
++	poll_threads();
++	CU_ASSERT(g_bserrno == 0);
++	snapshotid = g_blobid;
++	spdk_bs_create_clone(bs, snapshotid, NULL, blob_op_with_id_complete, NULL);
++	poll_threads();
++	CU_ASSERT(g_bserrno == 0);
++	spdk_bs_open_blob(bs, g_blobid, blob_op_with_handle_complete, NULL);
++	poll_threads();
++	CU_ASSERT(g_bserrno == 0);
++	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
++	clone = g_blob;
++	spdk_blob_resize(clone, 3, blob_op_complete, NULL);
++	poll_threads();
++	CU_ASSERT(g_bserrno == 0);
++
++	/* The snapshot's cluster, then zeroes, written by the domain. */
++	memset(payload, 0xff, len);
++	iov.iov_base = payload;
++	iov.iov_len = len;
++	g_memory_domain_memzero_calls = 0;
++	spdk_blob_io_readv_ext(clone, channel, &iov, 1, 0, 3 * units, blob_op_complete, NULL, &ext_opts);
++	poll_threads();
++	CU_ASSERT(g_bserrno == 0);
++	CU_ASSERT(memcmp(payload, expected, len) == 0);
++	CU_ASSERT(g_memory_domain_memzero_calls > 0);
++
++	ut_blob_close_and_delete(bs, clone);
++	ut_blob_close_and_delete(bs, blob);
++	spdk_bs_delete_blob(bs, snapshotid, blob_op_complete, NULL);
++	poll_threads();
++	CU_ASSERT(g_bserrno == 0);
++	spdk_bs_free_io_channel(channel);
++	poll_threads();
++	free(payload);
++	free(expected);
++}
++
+ /* Evariops 0071: the reads of a load, and the largest. */
+ static uint64_t g_ut_md_window_reads;
+ static uint64_t g_ut_md_window_largest_read;
+@@ -10963,6 +11053,7 @@ main(int argc, char **argv)
+ 		CU_ADD_TEST(suite, bs_load);
+ 		CU_ADD_TEST(suite_bs, bs_load_pending_removal);
+ 		CU_ADD_TEST(suite_bs, bs_dirty_load_reads_md_by_windows);
++		CU_ADD_TEST(suite_bs, blob_clone_grown_reads_past_its_parent_through_the_domain);
+ 		CU_ADD_TEST(suite, bs_load_custom_cluster_size);
+ 		CU_ADD_TEST(suite, bs_load_after_failed_grow);
+ 		CU_ADD_TEST(suite, bs_load_error);
