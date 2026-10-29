@@ -1,0 +1,2874 @@
+diff --git a/include/spdk_internal/nvme_local.h b/include/spdk_internal/nvme_local.h
+new file mode 100644
+index 0000000..0c65266
+--- /dev/null
++++ b/include/spdk_internal/nvme_local.h
+@@ -0,0 +1,173 @@
++/*   SPDX-License-Identifier: BSD-3-Clause
++ *   Copyright (c) 2026 Evariops.
++ */
++
++/** \file
++ * The LOCAL transport pair (Evariops 0076).
++ *
++ * An NVMe initiator qpair (lib/nvme/nvme_local.c) and an NVMe-oF target qpair (lib/nvmf/local.c)
++ * of the same process share a connection. A command is a slot handed over a ring; its data stay in
++ * the initiator's buffers; the target hands the slot back on a second ring with its completion.
++ * The target side is an ordinary NVMe-oF controller: the subsystem's hosts, its reservations, its
++ * pause and its list of controllers apply to it as to a controller reached over a network.
++ *
++ * Ownership. A slot belongs to the side that last took it. The initiator writes the command and
++ * the description of the data, then hands the slot over; from then on only the target touches
++ * the slot and the data, until it hands the slot back. Every slot handed over comes back once:
++ * completed, or aborted when the target frees its request without completing it. The exception
++ * is a target that closes: once it has set target_closed it touches no slot again, and the
++ * initiator takes back every slot still out (those the target never took).
++ *
++ * The connection has two references, one per side; the side that drops the last frees it.
++ */
++
++#ifndef SPDK_INTERNAL_NVME_LOCAL_H
++#define SPDK_INTERNAL_NVME_LOCAL_H
++
++#include "spdk/stdinc.h"
++#include "spdk/nvme.h"
++#include "spdk/util.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define NVME_LOCAL_TRSTRING	"LOCAL"
++
++/* Fewer than the iovecs of an spdk_nvmf_request (NVMF_REQ_MAX_BUFFERS). */
++#define NVME_LOCAL_MAX_SGES	32
++
++/*
++ * A single-producer single-consumer ring of pointers, in ordinary memory: no DPDK memzone per
++ * connection. The counters run free; the producer owns tail, the consumer owns head. A side may
++ * change thread between calls only under a lock (the admin queue's), which orders the accesses.
++ */
++struct nvme_local_ring {
++	void		**entries;
++	uint32_t	mask;
++	uint32_t	tail;
++	uint8_t		pad[SPDK_CACHE_LINE_SIZE - sizeof(uint32_t)];
++	uint32_t	head;
++};
++
++static inline int
++nvme_local_ring_init(struct nvme_local_ring *ring, uint32_t count)
++{
++	uint32_t size = spdk_align32pow2(spdk_max(count, 1u));
++
++	ring->entries = calloc(size, sizeof(*ring->entries));
++	if (ring->entries == NULL) {
++		return -ENOMEM;
++	}
++
++	ring->mask = size - 1;
++	ring->tail = 0;
++	ring->head = 0;
++	return 0;
++}
++
++static inline void
++nvme_local_ring_fini(struct nvme_local_ring *ring)
++{
++	free(ring->entries);
++	ring->entries = NULL;
++}
++
++static inline bool
++nvme_local_ring_put(struct nvme_local_ring *ring, void *obj)
++{
++	uint32_t tail = __atomic_load_n(&ring->tail, __ATOMIC_RELAXED);
++	uint32_t head = __atomic_load_n(&ring->head, __ATOMIC_ACQUIRE);
++
++	if (spdk_unlikely(tail - head > ring->mask)) {
++		return false;
++	}
++
++	ring->entries[tail & ring->mask] = obj;
++	/* Publishes the entry and everything written to the object before it. */
++	__atomic_store_n(&ring->tail, tail + 1, __ATOMIC_RELEASE);
++	return true;
++}
++
++static inline uint32_t
++nvme_local_ring_take(struct nvme_local_ring *ring, void **objs, uint32_t max)
++{
++	uint32_t head = __atomic_load_n(&ring->head, __ATOMIC_RELAXED);
++	uint32_t tail = __atomic_load_n(&ring->tail, __ATOMIC_ACQUIRE);
++	uint32_t i, n = spdk_min(tail - head, max);
++
++	for (i = 0; i < n; i++) {
++		objs[i] = ring->entries[(head + i) & ring->mask];
++	}
++
++	/* Gives the entries back to the producer. */
++	__atomic_store_n(&ring->head, head + n, __ATOMIC_RELEASE);
++	return n;
++}
++
++struct nvme_local_slot {
++	/* Written by the initiator before the handover. */
++	struct spdk_nvme_cmd		cmd;
++	/* Written by the target before the handback. */
++	struct spdk_nvme_cpl		cpl;
++	uint16_t			index;
++	uint16_t			iovcnt;
++	uint32_t			length;
++	struct spdk_memory_domain	*memory_domain;
++	void				*memory_domain_ctx;
++	/*
++	 * Admin queue only: the data go through this buffer, which the connection owns. An
++	 * initiator that leaves while the target still holds the slot (a controller destroyed with
++	 * an admin command in flight) never leaves the target writing into memory it freed.
++	 */
++	void				*bounce;
++	struct iovec			iov[NVME_LOCAL_MAX_SGES];
++};
++
++struct nvme_local_conn {
++	/* Slots the initiator hands over; the target takes them. */
++	struct nvme_local_ring		sq;
++	/* Slots the target hands back; the initiator takes them. */
++	struct nvme_local_ring		cq;
++	struct nvme_local_slot		*slots;
++	uint16_t			num_slots;
++	uint16_t			qid;
++	/* The listener's own transport ID: the address the target's qpair reports. */
++	struct spdk_nvme_transport_id	trid;
++	/* The initiator asks the target to disconnect its qpair (set once, release). */
++	bool				initiator_leaving;
++	/* The target touches no slot again (set once, release). */
++	bool				target_closed;
++	uint32_t			refs;
++};
++
++static inline void
++nvme_local_conn_get(struct nvme_local_conn *conn)
++{
++	__atomic_add_fetch(&conn->refs, 1, __ATOMIC_RELAXED);
++}
++
++/* Drops one reference; the last frees the connection, its rings, its slots and their buffers. */
++void spdk_nvme_local_conn_put(struct nvme_local_conn *conn);
++
++/*
++ * Called with the registry's lock held, on the connecting initiator's thread: takes its own
++ * reference on success, must not block, and must not call into the registry.
++ */
++typedef int (*spdk_nvme_local_accept_cb)(void *ctx, struct nvme_local_conn *conn);
++
++/*
++ * Listens on trid (its traddr and trsvcid): an initiator whose controller names that address
++ * connects through accept. -EADDRINUSE if the address is already listened on.
++ */
++int spdk_nvme_local_listen(const struct spdk_nvme_transport_id *trid,
++			   spdk_nvme_local_accept_cb accept, void *ctx);
++
++/* Once it returns, accept is not running and is not called again for trid. */
++void spdk_nvme_local_stop_listen(const struct spdk_nvme_transport_id *trid);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* SPDK_INTERNAL_NVME_LOCAL_H */
+diff --git a/lib/nvme/Makefile b/lib/nvme/Makefile
+index 5070bd6..0c88aa4 100644
+--- a/lib/nvme/Makefile
++++ b/lib/nvme/Makefile
+@@ -14,7 +14,7 @@ C_SRCS = nvme_ctrlr_cmd.c nvme_ctrlr.c nvme_fabric.c nvme_ns_cmd.c \
+ 	nvme_quirks.c nvme_transport.c nvme_discovery.c \
+ 	nvme_ctrlr_ocssd_cmd.c nvme_ns_ocssd_cmd.c nvme_tcp.c \
+ 	nvme_opal.c nvme_io_msg.c nvme_poll_group.c nvme_zns.c nvme_kv.c \
+-	nvme_stubs.c nvme_auth.c nvme_util.c
++	nvme_stubs.c nvme_auth.c nvme_util.c nvme_local.c
+ C_SRCS-$(CONFIG_NVME_CUSE) += nvme_cuse.c
+ C_SRCS-$(CONFIG_VFIO_USER) += nvme_vfio_user.c
+ C_SRCS-$(CONFIG_RDMA) += nvme_rdma.c
+diff --git a/lib/nvme/nvme.c b/lib/nvme/nvme.c
+index 5643426..76fab86 100644
+--- a/lib/nvme/nvme.c
++++ b/lib/nvme/nvme.c
+@@ -1139,6 +1139,8 @@ spdk_nvme_transport_id_trtype_str(enum spdk_nvme_transport_type trtype)
+ 		return "VFIOUSER";
+ 	case SPDK_NVME_TRANSPORT_CUSTOM:
+ 		return "CUSTOM";
++	case SPDK_NVME_TRANSPORT_CUSTOM_FABRICS:
++		return "CUSTOM_FABRICS";
+ 	default:
+ 		return NULL;
+ 	}
+diff --git a/lib/nvme/nvme_local.c b/lib/nvme/nvme_local.c
+new file mode 100644
+index 0000000..0c259c1
+--- /dev/null
++++ b/lib/nvme/nvme_local.c
+@@ -0,0 +1,1076 @@
++/*   SPDX-License-Identifier: BSD-3-Clause
++ *   Copyright (c) 2026 Evariops.
++ */
++
++/*
++ * The LOCAL NVMe transport (Evariops 0076): an initiator whose controller is an NVMe-oF controller
++ * of the same process (lib/nvmf/local.c). spdk_internal/nvme_local.h describes the connection; the
++ * registry where the target's listeners are found lives here, in the library both sides link.
++ *
++ * The data are not copied: the target's bdevs read and write the initiator's buffers. A slot that
++ * carries data is therefore never completed to its user while the target holds it, and a
++ * disconnect waits, through process_completions and the poll group, until nothing is in flight.
++ * Qpairs are asynchronous only: a synchronous wait would spin a reactor the target may need.
++ */
++
++#include "nvme_internal.h"
++
++#include "spdk/dma.h"
++#include "spdk/env.h"
++#include "spdk/nvmf_spec.h"
++#include "spdk/string.h"
++#include "spdk_internal/nvme_local.h"
++
++#define NVME_LOCAL_REAP_BATCH	32
++
++struct nvme_local_listener {
++	struct spdk_nvme_transport_id		trid;
++	spdk_nvme_local_accept_cb		accept;
++	void					*ctx;
++	TAILQ_ENTRY(nvme_local_listener)	link;
++};
++
++static pthread_mutex_t g_nvme_local_lock = PTHREAD_MUTEX_INITIALIZER;
++static TAILQ_HEAD(, nvme_local_listener) g_nvme_local_listeners =
++	TAILQ_HEAD_INITIALIZER(g_nvme_local_listeners);
++
++enum nvme_local_qpair_state {
++	NVME_LOCAL_QPAIR_IDLE = 0,
++	NVME_LOCAL_QPAIR_CONNECT_SEND,
++	NVME_LOCAL_QPAIR_CONNECT_POLL,
++	NVME_LOCAL_QPAIR_RUNNING,
++	/* Disconnecting: waits for the slots the target holds. */
++	NVME_LOCAL_QPAIR_QUIESCING,
++};
++
++struct nvme_local_req {
++	struct nvme_request		*req;
++	uint16_t			index;
++	/* Handed over and not handed back: the slot, and its data, are the target's. */
++	bool				in_flight;
++	/*
++	 * Completed to its user while the target still holds the slot (an AER that a reset or a
++	 * destruction aborts, an admin command of a qpair deleted): the slot comes back to nobody.
++	 */
++	bool				user_done;
++	TAILQ_ENTRY(nvme_local_req)	link;
++};
++
++struct nvme_local_qpair {
++	struct spdk_nvme_qpair		qpair;
++	uint16_t			num_entries;
++	uint16_t			in_flight;
++	uint8_t				state;
++	struct nvme_local_conn		*conn;
++	struct nvme_local_req		*reqs;
++	TAILQ_HEAD(, nvme_local_req)	free_reqs;
++};
++
++struct nvme_local_ctrlr {
++	struct spdk_nvme_ctrlr		ctrlr;
++};
++
++struct nvme_local_poll_group {
++	struct spdk_nvme_transport_poll_group	group;
++};
++
++static int nvme_local_ctrlr_delete_io_qpair(struct spdk_nvme_ctrlr *ctrlr,
++		struct spdk_nvme_qpair *qpair);
++
++static inline struct nvme_local_qpair *
++nvme_local_qpair(struct spdk_nvme_qpair *qpair)
++{
++	return SPDK_CONTAINEROF(qpair, struct nvme_local_qpair, qpair);
++}
++
++static inline struct nvme_local_ctrlr *
++nvme_local_ctrlr(struct spdk_nvme_ctrlr *ctrlr)
++{
++	return SPDK_CONTAINEROF(ctrlr, struct nvme_local_ctrlr, ctrlr);
++}
++
++/* ── The registry ── */
++
++static struct nvme_local_listener *
++nvme_local_find_listener(const struct spdk_nvme_transport_id *trid)
++{
++	struct nvme_local_listener *listener;
++
++	TAILQ_FOREACH(listener, &g_nvme_local_listeners, link) {
++		if (strcasecmp(listener->trid.traddr, trid->traddr) == 0 &&
++		    strcasecmp(listener->trid.trsvcid, trid->trsvcid) == 0) {
++			return listener;
++		}
++	}
++
++	return NULL;
++}
++
++int
++spdk_nvme_local_listen(const struct spdk_nvme_transport_id *trid,
++		       spdk_nvme_local_accept_cb accept, void *ctx)
++{
++	struct nvme_local_listener *listener;
++	int rc = 0;
++
++	pthread_mutex_lock(&g_nvme_local_lock);
++	if (nvme_local_find_listener(trid) != NULL) {
++		rc = -EADDRINUSE;
++		goto out;
++	}
++
++	listener = calloc(1, sizeof(*listener));
++	if (listener == NULL) {
++		rc = -ENOMEM;
++		goto out;
++	}
++
++	listener->trid = *trid;
++	listener->accept = accept;
++	listener->ctx = ctx;
++	TAILQ_INSERT_TAIL(&g_nvme_local_listeners, listener, link);
++out:
++	pthread_mutex_unlock(&g_nvme_local_lock);
++	return rc;
++}
++
++void
++spdk_nvme_local_stop_listen(const struct spdk_nvme_transport_id *trid)
++{
++	struct nvme_local_listener *listener;
++
++	pthread_mutex_lock(&g_nvme_local_lock);
++	listener = nvme_local_find_listener(trid);
++	if (listener != NULL) {
++		TAILQ_REMOVE(&g_nvme_local_listeners, listener, link);
++		free(listener);
++	}
++	pthread_mutex_unlock(&g_nvme_local_lock);
++}
++
++/* ── The connection ── */
++
++static struct nvme_local_conn *
++nvme_local_conn_create(uint16_t qid, uint16_t num_slots)
++{
++	struct nvme_local_conn *conn;
++	uint16_t i;
++
++	conn = calloc(1, sizeof(*conn));
++	if (conn == NULL) {
++		return NULL;
++	}
++
++	conn->slots = calloc(num_slots, sizeof(*conn->slots));
++	if (conn->slots == NULL ||
++	    nvme_local_ring_init(&conn->sq, num_slots) != 0 ||
++	    nvme_local_ring_init(&conn->cq, num_slots) != 0) {
++		nvme_local_ring_fini(&conn->sq);
++		nvme_local_ring_fini(&conn->cq);
++		free(conn->slots);
++		free(conn);
++		return NULL;
++	}
++
++	for (i = 0; i < num_slots; i++) {
++		conn->slots[i].index = i;
++	}
++
++	conn->num_slots = num_slots;
++	conn->qid = qid;
++	conn->refs = 1;
++	return conn;
++}
++
++void
++spdk_nvme_local_conn_put(struct nvme_local_conn *conn)
++{
++	uint16_t i;
++
++	if (__atomic_sub_fetch(&conn->refs, 1, __ATOMIC_ACQ_REL) != 0) {
++		return;
++	}
++
++	for (i = 0; i < conn->num_slots; i++) {
++		spdk_free(conn->slots[i].bounce);
++	}
++
++	nvme_local_ring_fini(&conn->sq);
++	nvme_local_ring_fini(&conn->cq);
++	free(conn->slots);
++	free(conn);
++}
++
++static inline bool
++nvme_local_target_closed(struct nvme_local_conn *conn)
++{
++	return __atomic_load_n(&conn->target_closed, __ATOMIC_ACQUIRE);
++}
++
++/* ── Requests and slots ── */
++
++static enum spdk_nvme_data_transfer
++nvme_local_xfer(const struct nvme_request *req)
++{
++	if (req->cmd.opc == SPDK_NVME_OPC_FABRIC) {
++		const struct spdk_nvmf_capsule_cmd *nvmf_cmd = (const void *)&req->cmd;
++
++		return spdk_nvme_opc_get_data_transfer(nvmf_cmd->fctype);
++	}
++
++	return spdk_nvme_opc_get_data_transfer(req->cmd.opc);
++}
++
++/*
++ * The user's buffers of req, as iovecs: what the target reads and writes on an I/O queue, or what
++ * the admin queue's bounce buffer is filled from and copied back to.
++ */
++static int
++nvme_local_payload_iovs(struct nvme_request *req, struct iovec *iov, uint32_t max,
++			uint32_t *iovcnt)
++{
++	uint32_t remaining = req->payload.size, cnt = 0, len, skip, i;
++	void *addr;
++
++	switch (nvme_req_payload_type(req)) {
++	case NVME_PAYLOAD_TYPE_CONTIG:
++		iov[0].iov_base = (void *)((uintptr_t)req->payload.contig_or_cb_arg + req->payload.offset);
++		iov[0].iov_len = remaining;
++		cnt = 1;
++		break;
++	case NVME_PAYLOAD_TYPE_SGL:
++		req->payload.reset_sgl_fn(req->payload.contig_or_cb_arg, req->payload.offset);
++		while (remaining > 0) {
++			if (cnt == max) {
++				return -E2BIG;
++			}
++			if (req->payload.next_sge_fn(req->payload.contig_or_cb_arg, &addr, &len) != 0 ||
++			    len == 0) {
++				return -EINVAL;
++			}
++			len = spdk_min(len, remaining);
++			iov[cnt].iov_base = addr;
++			iov[cnt].iov_len = len;
++			cnt++;
++			remaining -= len;
++		}
++		break;
++	case NVME_PAYLOAD_TYPE_IOV:
++		skip = req->payload.offset;
++		for (i = 0; i < req->payload.iov_count && remaining > 0; i++) {
++			const struct iovec *src = &req->payload.iov[i];
++
++			if (skip >= src->iov_len) {
++				skip -= src->iov_len;
++				continue;
++			}
++			if (cnt == max) {
++				return -E2BIG;
++			}
++			len = spdk_min(src->iov_len - skip, remaining);
++			iov[cnt].iov_base = (uint8_t *)src->iov_base + skip;
++			iov[cnt].iov_len = len;
++			cnt++;
++			remaining -= len;
++			skip = 0;
++		}
++		if (remaining > 0) {
++			return -EINVAL;
++		}
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	*iovcnt = cnt;
++	return 0;
++}
++
++static int
++nvme_local_slot_fill(struct nvme_local_qpair *lqpair, struct nvme_local_slot *slot,
++		     struct nvme_request *req)
++{
++	struct iovec iov[NVME_LOCAL_MAX_SGES];
++	enum spdk_nvme_data_transfer xfer;
++	uint32_t iovcnt;
++	int rc;
++
++	slot->cmd = req->cmd;
++	slot->cmd.psdt = SPDK_NVME_PSDT_SGL_MPTR_CONTIG;
++	slot->cmd.dptr.sgl1.address = 0;
++	slot->cmd.dptr.sgl1.unkeyed.type = SPDK_NVME_SGL_TYPE_TRANSPORT_DATA_BLOCK;
++	slot->cmd.dptr.sgl1.unkeyed.subtype = SPDK_NVME_SGL_SUBTYPE_TRANSPORT;
++	slot->cmd.dptr.sgl1.unkeyed.length = req->payload.size;
++	slot->length = req->payload.size;
++	slot->iovcnt = 0;
++	slot->memory_domain = NULL;
++	slot->memory_domain_ctx = NULL;
++	assert(slot->bounce == NULL);
++
++	if (req->payload.size == 0) {
++		return 0;
++	}
++
++	if (spdk_likely(!nvme_qpair_is_admin_queue(&lqpair->qpair))) {
++		rc = nvme_local_payload_iovs(req, slot->iov, NVME_LOCAL_MAX_SGES, &iovcnt);
++		if (spdk_unlikely(rc != 0)) {
++			return rc;
++		}
++
++		slot->iovcnt = iovcnt;
++		/* The target's bdevs pull and push through the domain where they cannot use it. */
++		if (req->payload.opts != NULL && req->payload.opts->memory_domain != NULL) {
++			slot->memory_domain = req->payload.opts->memory_domain;
++			slot->memory_domain_ctx = req->payload.opts->memory_domain_ctx;
++		}
++		return 0;
++	}
++
++	slot->bounce = spdk_zmalloc(req->payload.size, 0x1000, NULL, SPDK_ENV_NUMA_ID_ANY,
++				    SPDK_MALLOC_DMA);
++	if (slot->bounce == NULL) {
++		return -ENOMEM;
++	}
++
++	xfer = nvme_local_xfer(req);
++	if (xfer == SPDK_NVME_DATA_HOST_TO_CONTROLLER || xfer == SPDK_NVME_DATA_BIDIRECTIONAL) {
++		rc = nvme_local_payload_iovs(req, iov, NVME_LOCAL_MAX_SGES, &iovcnt);
++		if (rc != 0) {
++			spdk_free(slot->bounce);
++			slot->bounce = NULL;
++			return rc;
++		}
++		spdk_copy_iovs_to_buf(slot->bounce, req->payload.size, iov, iovcnt);
++	}
++
++	slot->iov[0].iov_base = slot->bounce;
++	slot->iov[0].iov_len = req->payload.size;
++	slot->iovcnt = 1;
++	return 0;
++}
++
++/* An admin slot is back: its data go to the user's buffers, and its bounce buffer away. */
++static void
++nvme_local_bounce_back(struct nvme_request *req, struct nvme_local_slot *slot, bool copy)
++{
++	enum spdk_nvme_data_transfer xfer;
++	struct iovec iov[NVME_LOCAL_MAX_SGES];
++	uint32_t iovcnt;
++
++	if (copy) {
++		xfer = nvme_local_xfer(req);
++		if ((xfer == SPDK_NVME_DATA_CONTROLLER_TO_HOST || xfer == SPDK_NVME_DATA_BIDIRECTIONAL) &&
++		    nvme_local_payload_iovs(req, iov, NVME_LOCAL_MAX_SGES, &iovcnt) == 0) {
++			spdk_copy_buf_to_iovs(iov, iovcnt, slot->bounce, req->payload.size);
++		}
++	}
++
++	spdk_free(slot->bounce);
++	slot->bounce = NULL;
++}
++
++static void
++nvme_local_req_put(struct nvme_local_qpair *lqpair, struct nvme_local_req *lreq)
++{
++	assert(lreq->in_flight);
++	lqpair->in_flight--;
++	lreq->req = NULL;
++	lreq->in_flight = false;
++	lreq->user_done = false;
++	TAILQ_INSERT_HEAD(&lqpair->free_reqs, lreq, link);
++}
++
++static void
++nvme_local_req_complete(struct nvme_local_qpair *lqpair, struct nvme_request *req,
++			struct spdk_nvme_cpl *cpl)
++{
++	struct spdk_nvme_qpair *qpair = &lqpair->qpair;
++
++	qpair->queue_depth--;
++	if (spdk_unlikely(spdk_nvme_cpl_is_error(cpl)) && !qpair->ctrlr->opts.disable_error_logging &&
++	    !spdk_nvme_cpl_is_aborted_sq_deletion(cpl)) {
++		spdk_nvme_qpair_print_command(qpair, &req->cmd);
++		spdk_nvme_qpair_print_completion_ext(qpair, cpl, req->cmd.opc);
++	}
++
++	nvme_complete_request(req->cb_fn, req->cb_arg, qpair, req, cpl);
++}
++
++/* The target handed the slot back; slot->cpl holds its completion. */
++static void
++nvme_local_slot_back(struct nvme_local_qpair *lqpair, struct nvme_local_slot *slot)
++{
++	struct nvme_local_req *lreq = &lqpair->reqs[slot->index];
++	struct nvme_request *req = lreq->req;
++	struct spdk_nvme_cpl cpl = slot->cpl;
++	bool user_done = lreq->user_done;
++
++	assert(lreq->in_flight);
++	if (slot->bounce != NULL) {
++		nvme_local_bounce_back(req, slot, !user_done && !spdk_nvme_cpl_is_error(&cpl));
++	}
++
++	/* Free before the user's callback, which may submit into this very slot. */
++	nvme_local_req_put(lqpair, lreq);
++	if (user_done) {
++		return;
++	}
++
++	cpl.cid = req->cmd.cid;
++	nvme_local_req_complete(lqpair, req, &cpl);
++}
++
++/*
++ * Completes, as aborted, the requests of the slots chosen by pick while the target still holds
++ * them. Two passes: a callback may submit, and must not see its new request picked.
++ */
++static void
++nvme_local_user_abort(struct nvme_local_qpair *lqpair, uint32_t dnr,
++		      bool (*pick)(struct nvme_local_qpair *lqpair, struct nvme_local_req *lreq))
++{
++	STAILQ_HEAD(, nvme_request) aborted = STAILQ_HEAD_INITIALIZER(aborted);
++	struct spdk_nvme_cpl cpl = {};
++	struct nvme_local_req *lreq;
++	struct nvme_request *req;
++	uint16_t i;
++
++	for (i = 0; i < lqpair->num_entries; i++) {
++		lreq = &lqpair->reqs[i];
++		if (lreq->in_flight && !lreq->user_done && pick(lqpair, lreq)) {
++			lreq->user_done = true;
++			STAILQ_INSERT_TAIL(&aborted, lreq->req, stailq);
++			lreq->req = NULL;
++		}
++	}
++
++	cpl.sqid = lqpair->qpair.id;
++	cpl.status.sct = SPDK_NVME_SCT_GENERIC;
++	cpl.status.sc = SPDK_NVME_SC_ABORTED_SQ_DELETION;
++	cpl.status.dnr = dnr;
++	while ((req = STAILQ_FIRST(&aborted)) != NULL) {
++		STAILQ_REMOVE_HEAD(&aborted, stailq);
++		cpl.cid = req->cmd.cid;
++		nvme_local_req_complete(lqpair, req, &cpl);
++	}
++}
++
++static bool
++nvme_local_pick_aer(struct nvme_local_qpair *lqpair, struct nvme_local_req *lreq)
++{
++	return lreq->req->cmd.opc == SPDK_NVME_OPC_ASYNC_EVENT_REQUEST;
++}
++
++/* What holds none of the user's memory: an admin command (its data are the slot's) or one
++ * without data. */
++static bool
++nvme_local_pick_memoryless(struct nvme_local_qpair *lqpair, struct nvme_local_req *lreq)
++{
++	return nvme_qpair_is_admin_queue(&lqpair->qpair) || lreq->req->payload.size == 0;
++}
++
++static bool
++nvme_local_pick_all(struct nvme_local_qpair *lqpair, struct nvme_local_req *lreq)
++{
++	return true;
++}
++
++static uint32_t
++nvme_local_reap(struct nvme_local_qpair *lqpair, uint32_t max)
++{
++	void *batch[NVME_LOCAL_REAP_BATCH];
++	uint32_t i, n, total = 0;
++
++	/* A callback may disconnect the qpair: once nothing is in flight, it lets go of conn. */
++	while (total < max && lqpair->conn != NULL && lqpair->in_flight > 0) {
++		n = nvme_local_ring_take(&lqpair->conn->cq, batch,
++					 spdk_min(max - total, NVME_LOCAL_REAP_BATCH));
++		for (i = 0; i < n; i++) {
++			nvme_local_slot_back(lqpair, batch[i]);
++		}
++		total += n;
++		if (n < NVME_LOCAL_REAP_BATCH) {
++			break;
++		}
++	}
++
++	return total;
++}
++
++/*
++ * The target closed: it touches no slot again, and what it handed back was taken first. A slot
++ * still in flight was never taken (or freed by a target that closed before it could hand it
++ * back): the slot is ours again and its request is aborted.
++ */
++static void
++nvme_local_take_back(struct nvme_local_qpair *lqpair)
++{
++	struct nvme_local_req *lreq;
++	uint16_t i;
++
++	/* The aborted requests' callbacks may submit: not to a target that closed. */
++	lqpair->state = NVME_LOCAL_QPAIR_QUIESCING;
++	nvme_local_user_abort(lqpair, 0, nvme_local_pick_all);
++	for (i = 0; i < lqpair->num_entries; i++) {
++		lreq = &lqpair->reqs[i];
++		if (lreq->in_flight) {
++			spdk_free(lqpair->conn->slots[i].bounce);
++			lqpair->conn->slots[i].bounce = NULL;
++			nvme_local_req_put(lqpair, lreq);
++		}
++	}
++}
++
++/* The initiator lets go of the connection; the target frees it if it already did. */
++static void
++nvme_local_qpair_leave(struct nvme_local_qpair *lqpair)
++{
++	struct nvme_local_conn *conn = lqpair->conn;
++
++	lqpair->conn = NULL;
++	lqpair->state = NVME_LOCAL_QPAIR_IDLE;
++	__atomic_store_n(&conn->initiator_leaving, true, __ATOMIC_RELEASE);
++	spdk_nvme_local_conn_put(conn);
++}
++
++static void
++nvme_local_qpair_try_finish_disconnect(struct nvme_local_qpair *lqpair)
++{
++	assert(nvme_qpair_get_state(&lqpair->qpair) == NVME_QPAIR_DISCONNECTING);
++	if (lqpair->in_flight > 0) {
++		return;
++	}
++
++	if (lqpair->conn != NULL) {
++		nvme_local_qpair_leave(lqpair);
++	}
++
++	nvme_transport_ctrlr_disconnect_qpair_done(&lqpair->qpair);
++}
++
++/* ── The qpair ── */
++
++static struct spdk_nvme_qpair *
++nvme_local_ctrlr_create_qpair(struct spdk_nvme_ctrlr *ctrlr, uint16_t qid, uint32_t qsize,
++			      enum spdk_nvme_qprio qprio, uint32_t num_requests, bool async)
++{
++	struct nvme_local_qpair *lqpair;
++	uint16_t i;
++	int rc;
++
++	if (qsize < SPDK_NVME_QUEUE_MIN_ENTRIES || qsize > UINT16_MAX) {
++		NVME_CTRLR_ERRLOG(ctrlr, "Failed to create qpair with size %u.\n", qsize);
++		return NULL;
++	}
++
++	if (!async) {
++		NVME_CTRLR_ERRLOG(ctrlr, "LOCAL qpairs connect asynchronously only (async_mode)\n");
++		return NULL;
++	}
++
++	lqpair = calloc(1, sizeof(*lqpair));
++	if (lqpair == NULL) {
++		return NULL;
++	}
++
++	/* One entry of a queue stays empty (NVMe and NVMe-oF). */
++	lqpair->num_entries = qsize - 1;
++	rc = nvme_qpair_init(&lqpair->qpair, qid, ctrlr, qprio, num_requests, async);
++	if (rc != 0) {
++		free(lqpair);
++		return NULL;
++	}
++
++	lqpair->reqs = calloc(lqpair->num_entries, sizeof(*lqpair->reqs));
++	if (lqpair->reqs == NULL) {
++		nvme_qpair_deinit(&lqpair->qpair);
++		free(lqpair);
++		return NULL;
++	}
++
++	TAILQ_INIT(&lqpair->free_reqs);
++	for (i = 0; i < lqpair->num_entries; i++) {
++		lqpair->reqs[i].index = i;
++		TAILQ_INSERT_TAIL(&lqpair->free_reqs, &lqpair->reqs[i], link);
++	}
++
++	return &lqpair->qpair;
++}
++
++static struct spdk_nvme_qpair *
++nvme_local_ctrlr_create_io_qpair(struct spdk_nvme_ctrlr *ctrlr, uint16_t qid,
++				 const struct spdk_nvme_io_qpair_opts *opts)
++{
++	return nvme_local_ctrlr_create_qpair(ctrlr, qid, opts->io_queue_size, opts->qprio,
++					     opts->io_queue_requests, opts->async_mode);
++}
++
++/*
++ * A qpair deleted with slots the target still holds. An admin slot holds the connection's memory
++ * only, so its request is completed here. An I/O slot holds the user's buffers, which only the
++ * target's completion may give back: bdev_nvme deletes a qpair once disconnected, when none is in
++ * flight.
++ */
++static void
++nvme_local_qpair_abandon(struct nvme_local_qpair *lqpair)
++{
++	nvme_local_user_abort(lqpair, 1, nvme_local_pick_memoryless);
++	if (lqpair->in_flight > 0 && !nvme_qpair_is_admin_queue(&lqpair->qpair)) {
++		NVME_QPAIR_ERRLOG(&lqpair->qpair, "deleted with %u commands the LOCAL target still holds\n",
++				  lqpair->in_flight);
++	}
++
++	nvme_local_qpair_leave(lqpair);
++}
++
++static int
++nvme_local_ctrlr_delete_io_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair)
++{
++	struct nvme_local_qpair *lqpair = nvme_local_qpair(qpair);
++
++	if (lqpair->conn != NULL) {
++		nvme_local_qpair_abandon(lqpair);
++	}
++
++	nvme_qpair_deinit(qpair);
++	free(lqpair->reqs);
++	free(lqpair);
++	return 0;
++}
++
++static int
++nvme_local_ctrlr_connect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair)
++{
++	struct nvme_local_qpair *lqpair = nvme_local_qpair(qpair);
++	struct nvme_local_listener *listener;
++	struct nvme_local_conn *conn;
++	int rc;
++
++	assert(lqpair->conn == NULL);
++	assert(lqpair->in_flight == 0);
++
++	conn = nvme_local_conn_create(qpair->id, lqpair->num_entries);
++	if (conn == NULL) {
++		return -ENOMEM;
++	}
++
++	pthread_mutex_lock(&g_nvme_local_lock);
++	listener = nvme_local_find_listener(&ctrlr->trid);
++	if (listener == NULL) {
++		rc = -ECONNREFUSED;
++	} else {
++		conn->trid = listener->trid;
++		rc = listener->accept(listener->ctx, conn);
++	}
++	pthread_mutex_unlock(&g_nvme_local_lock);
++
++	if (rc != 0) {
++		NVME_CTRLR_ERRLOG(ctrlr, "LOCAL connect to %s:%s refused: %s\n", ctrlr->trid.traddr,
++				  ctrlr->trid.trsvcid, spdk_strerror(-rc));
++		spdk_nvme_local_conn_put(conn);
++		return rc;
++	}
++
++	lqpair->conn = conn;
++	lqpair->state = NVME_LOCAL_QPAIR_CONNECT_SEND;
++	return 0;
++}
++
++static void
++nvme_local_ctrlr_disconnect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair)
++{
++	struct nvme_local_qpair *lqpair = nvme_local_qpair(qpair);
++
++	if (lqpair->conn != NULL) {
++		/* The target disconnects its qpair: it completes what it holds, and hands back as
++		 * aborted what it frees instead (its AERs). */
++		__atomic_store_n(&lqpair->conn->initiator_leaving, true, __ATOMIC_RELEASE);
++		lqpair->state = NVME_LOCAL_QPAIR_QUIESCING;
++	}
++
++	nvme_local_qpair_try_finish_disconnect(lqpair);
++}
++
++static int
++nvme_local_connect_poll(struct nvme_local_qpair *lqpair)
++{
++	struct spdk_nvme_qpair *qpair = &lqpair->qpair;
++	int rc;
++
++	/* nvme_fabric_qpair_connect_poll() polls the qpair, so this runs within itself. */
++	if (qpair->in_connect_poll) {
++		return -EAGAIN;
++	}
++
++	qpair->in_connect_poll = true;
++	switch (lqpair->state) {
++	case NVME_LOCAL_QPAIR_CONNECT_SEND:
++		rc = nvme_fabric_qpair_connect_async(qpair, lqpair->num_entries + 1);
++		if (rc == 0) {
++			lqpair->state = NVME_LOCAL_QPAIR_CONNECT_POLL;
++			rc = -EAGAIN;
++		}
++		break;
++	case NVME_LOCAL_QPAIR_CONNECT_POLL:
++		rc = nvme_fabric_qpair_connect_poll(qpair);
++		if (rc == 0) {
++			if (nvme_fabric_qpair_auth_required(qpair)) {
++				/* Same process: nothing to authenticate, and nothing to do it with. */
++				NVME_QPAIR_ERRLOG(qpair, "the subsystem asks for authentication, which LOCAL does not do\n");
++				rc = -ENOTSUP;
++			} else {
++				lqpair->state = NVME_LOCAL_QPAIR_RUNNING;
++				nvme_qpair_set_state(qpair, NVME_QPAIR_CONNECTED);
++			}
++		}
++		break;
++	default:
++		rc = 0;
++		break;
++	}
++	qpair->in_connect_poll = false;
++
++	return rc;
++}
++
++static int32_t
++nvme_local_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_completions)
++{
++	struct nvme_local_qpair *lqpair = nvme_local_qpair(qpair);
++	uint32_t max, reaped;
++	int rc;
++
++	if (spdk_unlikely(lqpair->conn == NULL)) {
++		return nvme_qpair_get_state(qpair) == NVME_QPAIR_DISCONNECTED ? -ENXIO : 0;
++	}
++
++	max = max_completions == 0 ? lqpair->num_entries : spdk_min(max_completions, lqpair->num_entries);
++	reaped = nvme_local_reap(lqpair, max);
++
++	if (spdk_unlikely(lqpair->conn != NULL && nvme_local_target_closed(lqpair->conn))) {
++		/* What it handed back before closing comes first. */
++		reaped += nvme_local_reap(lqpair, UINT32_MAX);
++		if (lqpair->conn != NULL) {
++			nvme_local_take_back(lqpair);
++		}
++		if (nvme_qpair_get_state(qpair) != NVME_QPAIR_DISCONNECTING &&
++		    nvme_qpair_get_state(qpair) != NVME_QPAIR_DISCONNECTED) {
++			goto fail;
++		}
++	}
++
++	if (spdk_unlikely(nvme_qpair_get_state(qpair) == NVME_QPAIR_DISCONNECTING)) {
++		nvme_local_qpair_try_finish_disconnect(lqpair);
++		return reaped;
++	}
++
++	if (spdk_unlikely(lqpair->state == NVME_LOCAL_QPAIR_CONNECT_SEND ||
++			  lqpair->state == NVME_LOCAL_QPAIR_CONNECT_POLL)) {
++		rc = nvme_local_connect_poll(lqpair);
++		if (rc == 0) {
++			/* What was queued while connecting goes now. */
++			nvme_qpair_resubmit_requests(qpair, lqpair->num_entries);
++		} else if (rc != -EAGAIN) {
++			goto fail;
++		}
++	}
++
++	return reaped;
++fail:
++	if (!qpair->transport_failure_reason) {
++		qpair->transport_failure_reason = SPDK_NVME_QPAIR_FAILURE_REMOTE;
++	}
++
++	nvme_ctrlr_disconnect_qpair(qpair);
++	/* No error until the qpair is disconnected. */
++	return nvme_qpair_get_state(qpair) == NVME_QPAIR_DISCONNECTED ? -ENXIO : 0;
++}
++
++static int
++nvme_local_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request *req)
++{
++	struct nvme_local_qpair *lqpair = nvme_local_qpair(qpair);
++	struct nvme_local_conn *conn = lqpair->conn;
++	struct nvme_local_slot *slot;
++	struct nvme_local_req *lreq;
++	int rc;
++
++	if (spdk_unlikely(conn == NULL || lqpair->state == NVME_LOCAL_QPAIR_QUIESCING)) {
++		return -ENXIO;
++	}
++
++	/* NVMe-oF carries no separate metadata buffer. */
++	if (spdk_unlikely(req->payload.md != NULL)) {
++		return -ENOTSUP;
++	}
++
++	lreq = TAILQ_FIRST(&lqpair->free_reqs);
++	if (spdk_unlikely(lreq == NULL)) {
++		return -EAGAIN;
++	}
++
++	slot = &conn->slots[lreq->index];
++	req->cmd.cid = lreq->index;
++	rc = nvme_local_slot_fill(lqpair, slot, req);
++	if (spdk_unlikely(rc != 0)) {
++		NVME_QPAIR_ERRLOG(qpair, "LOCAL command 0x%x not built: %s\n", req->cmd.opc,
++				  spdk_strerror(-rc));
++		return rc;
++	}
++
++	TAILQ_REMOVE(&lqpair->free_reqs, lreq, link);
++	lreq->req = req;
++	lreq->in_flight = true;
++	lqpair->in_flight++;
++	qpair->queue_depth++;
++
++	/* A slot is in one ring at a time and the rings have a place per slot: never full. */
++	if (spdk_unlikely(!nvme_local_ring_put(&conn->sq, slot))) {
++		assert(false);
++		spdk_free(slot->bounce);
++		slot->bounce = NULL;
++		nvme_local_req_put(lqpair, lreq);
++		qpair->queue_depth--;
++		return -EAGAIN;
++	}
++
++	return 0;
++}
++
++static void
++nvme_local_qpair_abort_reqs(struct spdk_nvme_qpair *qpair, uint32_t dnr)
++{
++	/* The target completes the others: their data are the user's. */
++	nvme_local_user_abort(nvme_local_qpair(qpair), dnr, nvme_local_pick_memoryless);
++}
++
++static void
++nvme_local_admin_qpair_abort_aers(struct spdk_nvme_qpair *qpair)
++{
++	nvme_local_user_abort(nvme_local_qpair(qpair), 0, nvme_local_pick_aer);
++}
++
++static int
++nvme_local_qpair_reset(struct spdk_nvme_qpair *qpair)
++{
++	return 0;
++}
++
++static int
++nvme_local_qpair_iterate_requests(struct spdk_nvme_qpair *qpair,
++				  int (*iter_fn)(struct nvme_request *req, void *arg), void *arg)
++{
++	struct nvme_local_qpair *lqpair = nvme_local_qpair(qpair);
++	struct nvme_local_req *lreq;
++	uint16_t i;
++	int rc;
++
++	for (i = 0; i < lqpair->num_entries; i++) {
++		lreq = &lqpair->reqs[i];
++		if (lreq->in_flight && !lreq->user_done) {
++			rc = iter_fn(lreq->req, arg);
++			if (rc != 0) {
++				return rc;
++			}
++		}
++	}
++
++	return 0;
++}
++
++/* ── The controller ── */
++
++static struct spdk_nvme_ctrlr *
++nvme_local_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
++			   const struct spdk_nvme_ctrlr_opts *opts, void *devhandle)
++{
++	struct nvme_local_ctrlr *lctrlr;
++	int rc;
++
++	lctrlr = calloc(1, sizeof(*lctrlr));
++	if (lctrlr == NULL) {
++		return NULL;
++	}
++
++	lctrlr->ctrlr.opts = *opts;
++	lctrlr->ctrlr.trid = *trid;
++	/* A fabrics controller: bdev_nvme resets it by disconnecting it. */
++	lctrlr->ctrlr.trid.trtype = SPDK_NVME_TRANSPORT_CUSTOM_FABRICS;
++
++	rc = nvme_ctrlr_construct(&lctrlr->ctrlr);
++	if (rc != 0) {
++		free(lctrlr);
++		return NULL;
++	}
++
++	lctrlr->ctrlr.adminq = nvme_local_ctrlr_create_qpair(&lctrlr->ctrlr, 0,
++			       lctrlr->ctrlr.opts.admin_queue_size, 0,
++			       lctrlr->ctrlr.opts.admin_queue_size, true);
++	if (lctrlr->ctrlr.adminq == NULL) {
++		NVME_CTRLR_ERRLOG(&lctrlr->ctrlr, "failed to create admin qpair\n");
++		nvme_ctrlr_destruct(&lctrlr->ctrlr);
++		return NULL;
++	}
++
++	if (nvme_ctrlr_add_process(&lctrlr->ctrlr, 0) != 0) {
++		NVME_CTRLR_ERRLOG(&lctrlr->ctrlr, "nvme_ctrlr_add_process() failed\n");
++		nvme_ctrlr_destruct(&lctrlr->ctrlr);
++		return NULL;
++	}
++
++	return &lctrlr->ctrlr;
++}
++
++static int
++nvme_local_ctrlr_destruct(struct spdk_nvme_ctrlr *ctrlr)
++{
++	struct nvme_local_ctrlr *lctrlr = nvme_local_ctrlr(ctrlr);
++
++	if (ctrlr->adminq != NULL) {
++		nvme_local_ctrlr_delete_io_qpair(ctrlr, ctrlr->adminq);
++	}
++
++	nvme_ctrlr_destruct_finish(ctrlr);
++	free(lctrlr);
++	return 0;
++}
++
++static int
++nvme_local_ctrlr_enable(struct spdk_nvme_ctrlr *ctrlr)
++{
++	return 0;
++}
++
++static uint32_t
++nvme_local_ctrlr_get_max_xfer_size(struct spdk_nvme_ctrlr *ctrlr)
++{
++	/* The target's MDTS is the limit. */
++	return UINT32_MAX;
++}
++
++static uint16_t
++nvme_local_ctrlr_get_max_sges(struct spdk_nvme_ctrlr *ctrlr)
++{
++	return NVME_LOCAL_MAX_SGES;
++}
++
++static int
++nvme_local_ctrlr_get_memory_domains(const struct spdk_nvme_ctrlr *ctrlr,
++				    struct spdk_memory_domain **domains, int array_size)
++{
++	/* Says the transport takes I/O described by a memory domain: it hands the domain over. */
++	if (domains != NULL && array_size > 0) {
++		domains[0] = spdk_memory_domain_get_system_domain();
++	}
++
++	return 1;
++}
++
++/* ── The poll group ── */
++
++static struct spdk_nvme_transport_poll_group *
++nvme_local_poll_group_create(void)
++{
++	struct nvme_local_poll_group *group;
++
++	group = calloc(1, sizeof(*group));
++	return group != NULL ? &group->group : NULL;
++}
++
++/* A qpair in the group's disconnected list waits there for the target's slots. */
++static bool
++nvme_local_qpair_check_disconnected(struct spdk_nvme_qpair *qpair)
++{
++	if (nvme_qpair_get_state(qpair) == NVME_QPAIR_DISCONNECTING) {
++		spdk_nvme_qpair_process_completions(qpair, 0);
++	}
++
++	return nvme_qpair_get_state(qpair) == NVME_QPAIR_DISCONNECTED;
++}
++
++static void
++nvme_local_poll_group_check_disconnected_qpairs(struct spdk_nvme_transport_poll_group *tgroup,
++		spdk_nvme_disconnected_qpair_cb disconnected_qpair_cb)
++{
++	struct spdk_nvme_qpair *qpair, *tmp;
++
++	STAILQ_FOREACH_SAFE(qpair, &tgroup->disconnected_qpairs, poll_group_stailq, tmp) {
++		if (nvme_local_qpair_check_disconnected(qpair)) {
++			disconnected_qpair_cb(qpair, tgroup->group->ctx);
++		}
++	}
++}
++
++static int64_t
++nvme_local_poll_group_process_completions(struct spdk_nvme_transport_poll_group *tgroup,
++		uint32_t completions_per_qpair, spdk_nvme_disconnected_qpair_cb disconnected_qpair_cb)
++{
++	struct spdk_nvme_qpair *qpair, *tmp;
++	int64_t num_completions = 0;
++	int32_t rc;
++
++	nvme_local_poll_group_check_disconnected_qpairs(tgroup, disconnected_qpair_cb);
++
++	STAILQ_FOREACH_SAFE(qpair, &tgroup->connected_qpairs, poll_group_stailq, tmp) {
++		rc = spdk_nvme_qpair_process_completions(qpair, completions_per_qpair);
++		if (spdk_unlikely(rc < 0)) {
++			num_completions = -ENXIO;
++		} else if (num_completions >= 0) {
++			num_completions += rc;
++		}
++	}
++
++	return num_completions;
++}
++
++static int
++nvme_local_poll_group_destroy(struct spdk_nvme_transport_poll_group *tgroup)
++{
++	if (!STAILQ_EMPTY(&tgroup->connected_qpairs) || !STAILQ_EMPTY(&tgroup->disconnected_qpairs)) {
++		return -EBUSY;
++	}
++
++	free(SPDK_CONTAINEROF(tgroup, struct nvme_local_poll_group, group));
++	return 0;
++}
++
++const struct spdk_nvme_transport_ops local_ops = {
++	.name = NVME_LOCAL_TRSTRING,
++	.type = SPDK_NVME_TRANSPORT_CUSTOM_FABRICS,
++	.ctrlr_construct = nvme_local_ctrlr_construct,
++	.ctrlr_scan = nvme_fabric_ctrlr_scan,
++	.ctrlr_destruct = nvme_local_ctrlr_destruct,
++	.ctrlr_enable = nvme_local_ctrlr_enable,
++
++	.ctrlr_set_reg_4 = nvme_fabric_ctrlr_set_reg_4,
++	.ctrlr_set_reg_8 = nvme_fabric_ctrlr_set_reg_8,
++	.ctrlr_get_reg_4 = nvme_fabric_ctrlr_get_reg_4,
++	.ctrlr_get_reg_8 = nvme_fabric_ctrlr_get_reg_8,
++	.ctrlr_set_reg_4_async = nvme_fabric_ctrlr_set_reg_4_async,
++	.ctrlr_set_reg_8_async = nvme_fabric_ctrlr_set_reg_8_async,
++	.ctrlr_get_reg_4_async = nvme_fabric_ctrlr_get_reg_4_async,
++	.ctrlr_get_reg_8_async = nvme_fabric_ctrlr_get_reg_8_async,
++
++	.ctrlr_get_max_xfer_size = nvme_local_ctrlr_get_max_xfer_size,
++	.ctrlr_get_max_sges = nvme_local_ctrlr_get_max_sges,
++
++	.ctrlr_create_io_qpair = nvme_local_ctrlr_create_io_qpair,
++	.ctrlr_delete_io_qpair = nvme_local_ctrlr_delete_io_qpair,
++	.ctrlr_connect_qpair = nvme_local_ctrlr_connect_qpair,
++	.ctrlr_disconnect_qpair = nvme_local_ctrlr_disconnect_qpair,
++
++	.ctrlr_get_memory_domains = nvme_local_ctrlr_get_memory_domains,
++
++	.qpair_abort_reqs = nvme_local_qpair_abort_reqs,
++	.qpair_reset = nvme_local_qpair_reset,
++	.qpair_submit_request = nvme_local_qpair_submit_request,
++	.qpair_process_completions = nvme_local_qpair_process_completions,
++	.qpair_iterate_requests = nvme_local_qpair_iterate_requests,
++	.admin_qpair_abort_aers = nvme_local_admin_qpair_abort_aers,
++
++	.poll_group_create = nvme_local_poll_group_create,
++	.poll_group_process_completions = nvme_local_poll_group_process_completions,
++	.poll_group_check_disconnected_qpairs = nvme_local_poll_group_check_disconnected_qpairs,
++	.poll_group_destroy = nvme_local_poll_group_destroy,
++};
++
++SPDK_NVME_TRANSPORT_REGISTER(local, &local_ops);
+diff --git a/lib/nvme/spdk_nvme.map b/lib/nvme/spdk_nvme.map
+index fa08a79..6ee3948 100644
+--- a/lib/nvme/spdk_nvme.map
++++ b/lib/nvme/spdk_nvme.map
+@@ -314,5 +314,10 @@
+ 	spdk_nvme_trid_entry_parse;
+ 	spdk_nvme_build_name;
+ 
++	# internal functions in spdk_internal/nvme_local.h (Evariops 0076)
++	spdk_nvme_local_listen;
++	spdk_nvme_local_stop_listen;
++	spdk_nvme_local_conn_put;
++
+ 	local: *;
+ };
+diff --git a/lib/nvmf/Makefile b/lib/nvmf/Makefile
+index e0a0e0e..a51e804 100644
+--- a/lib/nvmf/Makefile
++++ b/lib/nvmf/Makefile
+@@ -11,7 +11,7 @@ SO_MINOR := 0
+ 
+ C_SRCS = ctrlr.c ctrlr_discovery.c ctrlr_bdev.c \
+ 	 subsystem.c nvmf.c nvmf_rpc.c transport.c tcp.c \
+-	 stubs.c mdns_server.c nvmf_pause_rpc.c
++	 stubs.c mdns_server.c nvmf_pause_rpc.c local.c
+ 
+ C_SRCS-$(CONFIG_RDMA) += rdma.c
+ C_SRCS-$(CONFIG_HAVE_EVP_MAC) += auth.c
+diff --git a/lib/nvmf/local.c b/lib/nvmf/local.c
+new file mode 100644
+index 0000000..69847ca
+--- /dev/null
++++ b/lib/nvmf/local.c
+@@ -0,0 +1,498 @@
++/*   SPDX-License-Identifier: BSD-3-Clause
++ *   Copyright (c) 2026 Evariops.
++ */
++
++/*
++ * The LOCAL NVMe-oF transport (Evariops 0076): the target side of the in-memory pair. An initiator
++ * of the same process (lib/nvme/nvme_local.c) connects to a listener of this transport; each
++ * connection becomes an ordinary qpair of an nvmf poll group, and each of its commands an ordinary
++ * nvmf request whose data are the initiator's buffers. spdk_internal/nvme_local.h describes the
++ * connection.
++ */
++
++#include "spdk/stdinc.h"
++
++#include "spdk/log.h"
++#include "spdk/nvmf_transport.h"
++#include "spdk/string.h"
++#include "spdk/thread.h"
++#include "spdk/util.h"
++#include "spdk_internal/nvme_local.h"
++
++#define NVMF_LOCAL_DEFAULT_MAX_QUEUE_DEPTH		128
++#define NVMF_LOCAL_DEFAULT_MAX_QPAIRS_PER_CTRLR		128
++#define NVMF_LOCAL_DEFAULT_MAX_IO_SIZE			131072
++#define NVMF_LOCAL_DEFAULT_MAX_ADMIN_QUEUE_DEPTH	128
++#define NVMF_LOCAL_DEFAULT_ABORT_TIMEOUT_SEC		1
++#define NVMF_LOCAL_POLL_BATCH				32
++
++SPDK_STATIC_ASSERT(NVME_LOCAL_MAX_SGES <= NVMF_REQ_MAX_BUFFERS, "a slot's iovecs fit a request's");
++SPDK_STATIC_ASSERT(sizeof(union nvmf_h2c_msg) == sizeof(struct spdk_nvme_cmd), "a slot's command");
++SPDK_STATIC_ASSERT(sizeof(union nvmf_c2h_msg) == sizeof(struct spdk_nvme_cpl), "a slot's completion");
++
++struct nvmf_local_req {
++	struct spdk_nvmf_request	req;
++	struct nvme_local_slot		*slot;
++};
++
++struct nvmf_local_qpair {
++	struct spdk_nvmf_qpair		qpair;
++	struct nvme_local_conn		*conn;
++	/* One request per slot of conn, by slot index. */
++	struct nvmf_local_req		*reqs;
++	/* The listener's address, kept past the connection for the qpair's last reports. */
++	struct spdk_nvme_transport_id	trid;
++	/* The qpair asked nvmf to disconnect it: its initiator leaves. */
++	bool				disconnecting;
++	/* qpair_fini ran: the qpair touches no slot again, and a message frees it. */
++	bool				closed;
++	TAILQ_ENTRY(nvmf_local_qpair)	link;
++};
++
++struct nvmf_local_poll_group {
++	struct spdk_nvmf_transport_poll_group	group;
++	TAILQ_HEAD(, nvmf_local_qpair)		qpairs;
++};
++
++struct nvmf_local_transport {
++	struct spdk_nvmf_transport	transport;
++	struct spdk_poller		*accept_poller;
++	/* Connections accepted on an initiator's thread, given to the target by the poller. */
++	pthread_mutex_t			lock;
++	TAILQ_HEAD(, nvmf_local_qpair)	pending;
++};
++
++static void nvmf_local_hand_back(struct spdk_nvmf_request *req);
++
++static inline struct nvmf_local_transport *
++nvmf_local_transport(struct spdk_nvmf_transport *transport)
++{
++	return SPDK_CONTAINEROF(transport, struct nvmf_local_transport, transport);
++}
++
++static inline struct nvmf_local_qpair *
++nvmf_local_qpair(struct spdk_nvmf_qpair *qpair)
++{
++	return SPDK_CONTAINEROF(qpair, struct nvmf_local_qpair, qpair);
++}
++
++static inline struct nvmf_local_poll_group *
++nvmf_local_poll_group(struct spdk_nvmf_transport_poll_group *group)
++{
++	return SPDK_CONTAINEROF(group, struct nvmf_local_poll_group, group);
++}
++
++/* The target lets go of the connection: no slot of it is touched again. */
++static void
++nvmf_local_conn_close(struct nvmf_local_qpair *lqpair)
++{
++	struct nvme_local_conn *conn = lqpair->conn;
++
++	lqpair->closed = true;
++	lqpair->conn = NULL;
++	__atomic_store_n(&conn->target_closed, true, __ATOMIC_RELEASE);
++	spdk_nvme_local_conn_put(conn);
++}
++
++static void
++nvmf_local_qpair_free(void *ctx)
++{
++	struct nvmf_local_qpair *lqpair = ctx;
++
++	free(lqpair->reqs);
++	free(lqpair);
++}
++
++/* ── Accepting ── */
++
++/* On the connecting initiator's thread, with the registry's lock held. */
++static int
++nvmf_local_accept_conn(void *ctx, struct nvme_local_conn *conn)
++{
++	struct nvmf_local_transport *ltransport = ctx;
++	struct nvmf_local_qpair *lqpair;
++	struct nvmf_local_req *lreq;
++	uint16_t i;
++
++	lqpair = calloc(1, sizeof(*lqpair));
++	if (lqpair == NULL) {
++		return -ENOMEM;
++	}
++
++	lqpair->reqs = calloc(conn->num_slots, sizeof(*lqpair->reqs));
++	if (lqpair->reqs == NULL) {
++		free(lqpair);
++		return -ENOMEM;
++	}
++
++	for (i = 0; i < conn->num_slots; i++) {
++		lreq = &lqpair->reqs[i];
++		lreq->slot = &conn->slots[i];
++		lreq->req.qpair = &lqpair->qpair;
++		lreq->req.cmd = (union nvmf_h2c_msg *)&conn->slots[i].cmd;
++		lreq->req.rsp = (union nvmf_c2h_msg *)&conn->slots[i].cpl;
++	}
++
++	lqpair->qpair.transport = &ltransport->transport;
++	lqpair->trid = conn->trid;
++	nvme_local_conn_get(conn);
++	lqpair->conn = conn;
++
++	pthread_mutex_lock(&ltransport->lock);
++	TAILQ_INSERT_TAIL(&ltransport->pending, lqpair, link);
++	pthread_mutex_unlock(&ltransport->lock);
++	return 0;
++}
++
++/* spdk_nvmf_tgt_new_qpair() wants the transport's thread. */
++static int
++nvmf_local_accept(void *ctx)
++{
++	struct nvmf_local_transport *ltransport = ctx;
++	TAILQ_HEAD(, nvmf_local_qpair) accepted = TAILQ_HEAD_INITIALIZER(accepted);
++	struct nvmf_local_qpair *lqpair;
++
++	pthread_mutex_lock(&ltransport->lock);
++	TAILQ_CONCAT(&accepted, &ltransport->pending, link);
++	pthread_mutex_unlock(&ltransport->lock);
++
++	if (TAILQ_EMPTY(&accepted)) {
++		return SPDK_POLLER_IDLE;
++	}
++
++	while ((lqpair = TAILQ_FIRST(&accepted)) != NULL) {
++		TAILQ_REMOVE(&accepted, lqpair, link);
++		spdk_nvmf_tgt_new_qpair(ltransport->transport.tgt, &lqpair->qpair);
++	}
++
++	return SPDK_POLLER_BUSY;
++}
++
++/* ── The transport ── */
++
++static void
++nvmf_local_opts_init(struct spdk_nvmf_transport_opts *opts)
++{
++	opts->max_queue_depth = NVMF_LOCAL_DEFAULT_MAX_QUEUE_DEPTH;
++	opts->max_qpairs_per_ctrlr = NVMF_LOCAL_DEFAULT_MAX_QPAIRS_PER_CTRLR;
++	/* No capsule carries data: they stay in the initiator's buffers. */
++	opts->in_capsule_data_size = 0;
++	opts->max_io_size = NVMF_LOCAL_DEFAULT_MAX_IO_SIZE;
++	opts->max_aq_depth = NVMF_LOCAL_DEFAULT_MAX_ADMIN_QUEUE_DEPTH;
++	/* No buffer of its own: no iobuf cache per poll group. */
++	opts->iobuf_small_cache_size = 0;
++	opts->iobuf_large_cache_size = 0;
++	opts->dif_insert_or_strip = false;
++	opts->abort_timeout_sec = NVMF_LOCAL_DEFAULT_ABORT_TIMEOUT_SEC;
++	opts->transport_specific = NULL;
++}
++
++static struct spdk_nvmf_transport *
++nvmf_local_create(struct spdk_nvmf_transport_opts *opts)
++{
++	struct nvmf_local_transport *ltransport;
++
++	ltransport = calloc(1, sizeof(*ltransport));
++	if (ltransport == NULL) {
++		return NULL;
++	}
++
++	pthread_mutex_init(&ltransport->lock, NULL);
++	TAILQ_INIT(&ltransport->pending);
++	ltransport->accept_poller = SPDK_POLLER_REGISTER(nvmf_local_accept, ltransport,
++				    opts->acceptor_poll_rate);
++	if (ltransport->accept_poller == NULL) {
++		pthread_mutex_destroy(&ltransport->lock);
++		free(ltransport);
++		return NULL;
++	}
++
++	SPDK_NOTICELOG("*** LOCAL Transport Init ***\n");
++	return &ltransport->transport;
++}
++
++static void
++nvmf_local_destroy(struct spdk_nvmf_transport *transport,
++		   spdk_nvmf_transport_destroy_done_cb cb_fn, void *cb_arg)
++{
++	struct nvmf_local_transport *ltransport = nvmf_local_transport(transport);
++	struct nvmf_local_qpair *lqpair;
++
++	/* The listeners are stopped already (spdk_nvmf_transport_destroy): nothing is accepted
++	 * anymore, and what was never given to the target is closed here. */
++	spdk_poller_unregister(&ltransport->accept_poller);
++	while ((lqpair = TAILQ_FIRST(&ltransport->pending)) != NULL) {
++		TAILQ_REMOVE(&ltransport->pending, lqpair, link);
++		nvmf_local_conn_close(lqpair);
++		nvmf_local_qpair_free(lqpair);
++	}
++
++	pthread_mutex_destroy(&ltransport->lock);
++	free(ltransport);
++	if (cb_fn != NULL) {
++		cb_fn(cb_arg);
++	}
++}
++
++static int
++nvmf_local_listen(struct spdk_nvmf_transport *transport, const struct spdk_nvme_transport_id *trid,
++		  struct spdk_nvmf_listen_opts *listen_opts)
++{
++	int rc;
++
++	rc = spdk_nvme_local_listen(trid, nvmf_local_accept_conn, nvmf_local_transport(transport));
++	if (rc != 0) {
++		SPDK_ERRLOG("LOCAL listen on %s:%s failed: %s\n", trid->traddr, trid->trsvcid,
++			    spdk_strerror(-rc));
++		return rc;
++	}
++
++	SPDK_NOTICELOG("*** NVMe/LOCAL Target Listening on %s port %s ***\n", trid->traddr,
++		       trid->trsvcid);
++	return 0;
++}
++
++static void
++nvmf_local_stop_listen(struct spdk_nvmf_transport *transport,
++		       const struct spdk_nvme_transport_id *trid)
++{
++	spdk_nvme_local_stop_listen(trid);
++}
++
++static void
++nvmf_local_listener_discover(struct spdk_nvmf_transport *transport,
++			     struct spdk_nvme_transport_id *trid,
++			     struct spdk_nvmf_discovery_log_page_entry *entry)
++{
++	/* The specification's loopback transport: only a host of the same process reaches it. */
++	entry->trtype = SPDK_NVMF_TRTYPE_INTRA_HOST;
++	entry->adrfam = SPDK_NVMF_ADRFAM_INTRA_HOST;
++	entry->treq.secure_channel = SPDK_NVMF_TREQ_SECURE_CHANNEL_NOT_SPECIFIED;
++	spdk_strcpy_pad(entry->trsvcid, trid->trsvcid, sizeof(entry->trsvcid), ' ');
++	spdk_strcpy_pad(entry->traddr, trid->traddr, sizeof(entry->traddr), ' ');
++}
++
++/* ── The poll group ── */
++
++static struct spdk_nvmf_transport_poll_group *
++nvmf_local_poll_group_create(struct spdk_nvmf_transport *transport,
++			     struct spdk_nvmf_poll_group *group)
++{
++	struct nvmf_local_poll_group *lgroup;
++
++	lgroup = calloc(1, sizeof(*lgroup));
++	if (lgroup == NULL) {
++		return NULL;
++	}
++
++	TAILQ_INIT(&lgroup->qpairs);
++	return &lgroup->group;
++}
++
++static void
++nvmf_local_poll_group_destroy(struct spdk_nvmf_transport_poll_group *group)
++{
++	struct nvmf_local_poll_group *lgroup = nvmf_local_poll_group(group);
++
++	assert(TAILQ_EMPTY(&lgroup->qpairs));
++	free(lgroup);
++}
++
++static int
++nvmf_local_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
++			  struct spdk_nvmf_qpair *qpair)
++{
++	TAILQ_INSERT_TAIL(&nvmf_local_poll_group(group)->qpairs, nvmf_local_qpair(qpair), link);
++	return 0;
++}
++
++static int
++nvmf_local_poll_group_remove(struct spdk_nvmf_transport_poll_group *group,
++			     struct spdk_nvmf_qpair *qpair)
++{
++	TAILQ_REMOVE(&nvmf_local_poll_group(group)->qpairs, nvmf_local_qpair(qpair), link);
++	return 0;
++}
++
++static void
++nvmf_local_req_exec(struct nvmf_local_qpair *lqpair, struct nvme_local_slot *slot)
++{
++	struct spdk_nvmf_request *req = &lqpair->reqs[slot->index].req;
++
++	memset(&slot->cpl, 0, sizeof(slot->cpl));
++	lqpair->qpair.queue_depth++;
++
++	/* As TCP refuses an SGL longer than the MDTS it announced. */
++	if (spdk_unlikely(slot->length > lqpair->qpair.transport->opts.max_io_size)) {
++		slot->cpl.cid = slot->cmd.cid;
++		slot->cpl.status.sct = SPDK_NVME_SCT_GENERIC;
++		slot->cpl.status.sc = SPDK_NVME_SC_DATA_SGL_LENGTH_INVALID;
++		slot->cpl.status.dnr = 1;
++		nvmf_local_hand_back(req);
++		return;
++	}
++
++	req->raw = 0;
++	req->zcopy_phase = NVMF_ZCOPY_PHASE_NONE;
++	req->cmd_cb_fn = NULL;
++	req->accel_sequence = NULL;
++	req->length = slot->length;
++	req->iovcnt = slot->iovcnt;
++	memcpy(req->iov, slot->iov, slot->iovcnt * sizeof(*slot->iov));
++	req->memory_domain = slot->memory_domain;
++	req->memory_domain_ctx = slot->memory_domain_ctx;
++	req->xfer = spdk_nvmf_req_get_xfer(req);
++
++	spdk_nvmf_request_exec(req);
++}
++
++static int
++nvmf_local_qpair_poll(struct nvmf_local_qpair *lqpair)
++{
++	struct nvme_local_conn *conn = lqpair->conn;
++	void *batch[NVMF_LOCAL_POLL_BATCH];
++	uint32_t i, n;
++
++	/* Finished while the group's poll held it as the next one. */
++	if (spdk_unlikely(lqpair->closed)) {
++		return 0;
++	}
++
++	if (spdk_unlikely(__atomic_load_n(&conn->initiator_leaving, __ATOMIC_ACQUIRE))) {
++		/* nvmf completes what it holds, frees its AERs (handed back as aborted), then
++		 * finishes the qpair. What the initiator handed over since stays in the ring: the
++		 * initiator takes it back once the qpair is closed. */
++		if (!lqpair->disconnecting) {
++			lqpair->disconnecting = true;
++			spdk_nvmf_qpair_disconnect(&lqpair->qpair);
++		}
++		return 0;
++	}
++
++	if (spdk_unlikely(!spdk_nvmf_qpair_is_active(&lqpair->qpair))) {
++		return 0;
++	}
++
++	n = nvme_local_ring_take(&conn->sq, batch, NVMF_LOCAL_POLL_BATCH);
++	for (i = 0; i < n; i++) {
++		/* A request completed in place may finish the qpair: the rest of the batch is the
++		 * initiator's again. */
++		if (spdk_unlikely(lqpair->closed)) {
++			break;
++		}
++		nvmf_local_req_exec(lqpair, batch[i]);
++	}
++
++	return n;
++}
++
++static int
++nvmf_local_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
++{
++	struct nvmf_local_poll_group *lgroup = nvmf_local_poll_group(group);
++	struct nvmf_local_qpair *lqpair, *tmp;
++	int count = 0;
++
++	TAILQ_FOREACH_SAFE(lqpair, &lgroup->qpairs, link, tmp) {
++		count += nvmf_local_qpair_poll(lqpair);
++	}
++
++	return count;
++}
++
++/* ── Requests ── */
++
++static void
++nvmf_local_hand_back(struct spdk_nvmf_request *req)
++{
++	struct nvmf_local_req *lreq = SPDK_CONTAINEROF(req, struct nvmf_local_req, req);
++	struct nvmf_local_qpair *lqpair = nvmf_local_qpair(req->qpair);
++
++	assert(lqpair->conn != NULL);
++	lqpair->qpair.queue_depth--;
++	if (spdk_unlikely(!nvme_local_ring_put(&lqpair->conn->cq, lreq->slot))) {
++		/* A place per slot: never full. */
++		assert(false);
++	}
++}
++
++static void
++nvmf_local_req_complete(struct spdk_nvmf_request *req)
++{
++	nvmf_local_hand_back(req);
++}
++
++/* nvmf frees a request without completing it on a qpair it takes down (its AERs, the requests a
++ * paused subsystem queued): the slot goes back as aborted, so that every slot comes back. */
++static void
++nvmf_local_req_free(struct spdk_nvmf_request *req)
++{
++	struct spdk_nvme_cpl *cpl = &req->rsp->nvme_cpl;
++
++	memset(cpl, 0, sizeof(*cpl));
++	cpl->cid = req->cmd->nvme_cmd.cid;
++	cpl->sqid = req->qpair->qid;
++	cpl->status.sct = SPDK_NVME_SCT_GENERIC;
++	cpl->status.sc = SPDK_NVME_SC_ABORTED_SQ_DELETION;
++	nvmf_local_hand_back(req);
++}
++
++static void
++nvmf_local_qpair_fini(struct spdk_nvmf_qpair *qpair, spdk_nvmf_transport_qpair_fini_cb cb_fn,
++		      void *cb_arg)
++{
++	struct nvmf_local_qpair *lqpair = nvmf_local_qpair(qpair);
++
++	if (lqpair->conn != NULL) {
++		nvmf_local_conn_close(lqpair);
++	}
++
++	/* Freed once the poll that may hold it in its batch has returned. */
++	spdk_thread_send_msg(spdk_get_thread(), nvmf_local_qpair_free, lqpair);
++	if (cb_fn != NULL) {
++		cb_fn(cb_arg);
++	}
++}
++
++static int
++nvmf_local_qpair_get_trid(struct spdk_nvmf_qpair *qpair, struct spdk_nvme_transport_id *trid)
++{
++	*trid = nvmf_local_qpair(qpair)->trid;
++	return 0;
++}
++
++/* The transport holds no request of its own: each runs as it arrives. */
++static void
++nvmf_local_qpair_abort_request(struct spdk_nvmf_qpair *qpair, struct spdk_nvmf_request *req)
++{
++	spdk_nvmf_request_complete(req);
++}
++
++const struct spdk_nvmf_transport_ops spdk_nvmf_transport_local = {
++	.name = NVME_LOCAL_TRSTRING,
++	.type = SPDK_NVME_TRANSPORT_CUSTOM_FABRICS,
++	.opts_init = nvmf_local_opts_init,
++	.create = nvmf_local_create,
++	.destroy = nvmf_local_destroy,
++
++	.listen = nvmf_local_listen,
++	.stop_listen = nvmf_local_stop_listen,
++	.listener_discover = nvmf_local_listener_discover,
++
++	.poll_group_create = nvmf_local_poll_group_create,
++	.poll_group_destroy = nvmf_local_poll_group_destroy,
++	.poll_group_add = nvmf_local_poll_group_add,
++	.poll_group_remove = nvmf_local_poll_group_remove,
++	.poll_group_poll = nvmf_local_poll_group_poll,
++
++	.req_free = nvmf_local_req_free,
++	.req_complete = nvmf_local_req_complete,
++
++	.qpair_fini = nvmf_local_qpair_fini,
++	.qpair_get_peer_trid = nvmf_local_qpair_get_trid,
++	.qpair_get_local_trid = nvmf_local_qpair_get_trid,
++	.qpair_get_listen_trid = nvmf_local_qpair_get_trid,
++	.qpair_abort_request = nvmf_local_qpair_abort_request,
++};
++
++SPDK_NVMF_TRANSPORT_REGISTER(local, &spdk_nvmf_transport_local);
+diff --git a/module/bdev/nvme/bdev_nvme.c b/module/bdev/nvme/bdev_nvme.c
+index dae987a..d71427c 100644
+--- a/module/bdev/nvme/bdev_nvme.c
++++ b/module/bdev/nvme/bdev_nvme.c
+@@ -674,7 +674,14 @@ nvme_bdev_dump_trid_json(const struct spdk_nvme_transport_id *trid, struct spdk_
+ 	const char *trtype_str;
+ 	const char *adrfam_str;
+ 
+-	trtype_str = spdk_nvme_transport_id_trtype_str(trid->trtype);
++	/* Evariops 0076: a custom transport is named as the attach takes it (LOCAL), so that the
++	 * saved configuration attaches it again. */
++	if (trid->trtype == SPDK_NVME_TRANSPORT_CUSTOM ||
++	    trid->trtype == SPDK_NVME_TRANSPORT_CUSTOM_FABRICS) {
++		trtype_str = trid->trstring;
++	} else {
++		trtype_str = spdk_nvme_transport_id_trtype_str(trid->trtype);
++	}
+ 	if (trtype_str) {
+ 		spdk_json_write_named_string(w, "trtype", trtype_str);
+ 	}
+diff --git a/test/unit/lib/nvme/nvme.c/nvme_ut.c b/test/unit/lib/nvme/nvme.c/nvme_ut.c
+index 056e101..6485c9d 100644
+--- a/test/unit/lib/nvme/nvme.c/nvme_ut.c
++++ b/test/unit/lib/nvme/nvme.c/nvme_ut.c
+@@ -1289,6 +1289,10 @@ test_trid_trtype_str(void)
+ 	s = spdk_nvme_transport_id_trtype_str(SPDK_NVME_TRANSPORT_TCP);
+ 	SPDK_CU_ASSERT_FATAL(s != NULL);
+ 	CU_ASSERT(strcmp(s, "TCP") == 0);
++
++	s = spdk_nvme_transport_id_trtype_str(SPDK_NVME_TRANSPORT_CUSTOM_FABRICS);
++	SPDK_CU_ASSERT_FATAL(s != NULL);
++	CU_ASSERT(strcmp(s, "CUSTOM_FABRICS") == 0);
+ }
+ 
+ static void
+diff --git a/test/unit/lib/nvme/nvme_local.c/Makefile b/test/unit/lib/nvme/nvme_local.c/Makefile
+new file mode 100644
+index 0000000..3786bba
+--- /dev/null
++++ b/test/unit/lib/nvme/nvme_local.c/Makefile
+@@ -0,0 +1,9 @@
++#  SPDX-License-Identifier: BSD-3-Clause
++#  Copyright (c) 2026 Evariops.
++#
++
++SPDK_ROOT_DIR := $(abspath $(CURDIR)/../../../../..)
++
++TEST_FILE = nvme_local_ut.c
++
++include $(SPDK_ROOT_DIR)/mk/spdk.unittest.mk
+diff --git a/test/unit/lib/nvme/nvme_local.c/nvme_local_ut.c b/test/unit/lib/nvme/nvme_local.c/nvme_local_ut.c
+new file mode 100644
+index 0000000..81027b7
+--- /dev/null
++++ b/test/unit/lib/nvme/nvme_local.c/nvme_local_ut.c
+@@ -0,0 +1,500 @@
++/*   SPDX-License-Identifier: BSD-3-Clause
++ *   Copyright (c) 2026 Evariops.
++ */
++
++/*
++ * The LOCAL initiator (Evariops 0076) against a target the test plays itself: it takes the slots
++ * the initiator hands over, completes them, frees them or closes, through the shared connection.
++ */
++
++#include "spdk/stdinc.h"
++#include "spdk/nvme.h"
++
++#include "spdk_internal/cunit.h"
++
++#include "nvme/nvme_internal.h"
++#include "common/lib/nvme/common_stubs.h"
++
++/* The generic layer's state changes, which the stubs above do not make. */
++static void ut_disconnect_qpair_done(struct spdk_nvme_qpair *qpair);
++#define nvme_transport_ctrlr_disconnect_qpair_done ut_disconnect_qpair_done
++static void ut_ctrlr_disconnect_qpair(struct spdk_nvme_qpair *qpair);
++#define nvme_ctrlr_disconnect_qpair ut_ctrlr_disconnect_qpair
++
++#include "nvme/nvme_local.c"
++
++SPDK_LOG_REGISTER_COMPONENT(nvme)
++
++DEFINE_STUB_V(nvme_qpair_resubmit_requests, (struct spdk_nvme_qpair *qpair,
++		uint32_t num_requests));
++DEFINE_STUB_V(spdk_nvme_qpair_print_command, (struct spdk_nvme_qpair *qpair,
++		struct spdk_nvme_cmd *cmd));
++DEFINE_STUB_V(spdk_nvme_qpair_print_completion_ext, (const struct spdk_nvme_qpair *qpair,
++		const struct spdk_nvme_cpl *cpl, uint8_t opc));
++DEFINE_STUB(spdk_memory_domain_get_system_domain, struct spdk_memory_domain *, (void), NULL);
++
++static void
++ut_disconnect_qpair_done(struct spdk_nvme_qpair *qpair)
++{
++	nvme_qpair_set_state(qpair, NVME_QPAIR_DISCONNECTED);
++}
++
++static void
++ut_ctrlr_disconnect_qpair(struct spdk_nvme_qpair *qpair)
++{
++	if (nvme_qpair_get_state(qpair) == NVME_QPAIR_DISCONNECTING ||
++	    nvme_qpair_get_state(qpair) == NVME_QPAIR_DISCONNECTED) {
++		return;
++	}
++
++	nvme_qpair_set_state(qpair, NVME_QPAIR_DISCONNECTING);
++	nvme_local_ctrlr_disconnect_qpair(qpair->ctrlr, qpair);
++}
++
++/* ── The target the test plays ── */
++
++static struct nvme_local_conn *g_accepted;
++static int g_accept_rc;
++
++static int
++ut_accept(void *ctx, struct nvme_local_conn *conn)
++{
++	if (g_accept_rc != 0) {
++		return g_accept_rc;
++	}
++
++	nvme_local_conn_get(conn);
++	g_accepted = conn;
++	return 0;
++}
++
++static struct nvme_local_slot *
++ut_take(struct nvme_local_conn *conn)
++{
++	void *slot = NULL;
++
++	return nvme_local_ring_take(&conn->sq, &slot, 1) == 1 ? slot : NULL;
++}
++
++static void
++ut_hand_back(struct nvme_local_conn *conn, struct nvme_local_slot *slot, uint8_t sct, uint8_t sc)
++{
++	memset(&slot->cpl, 0, sizeof(slot->cpl));
++	slot->cpl.cid = slot->cmd.cid;
++	slot->cpl.status.sct = sct;
++	slot->cpl.status.sc = sc;
++	CU_ASSERT(nvme_local_ring_put(&conn->cq, slot));
++}
++
++static void
++ut_target_close(struct nvme_local_conn *conn)
++{
++	__atomic_store_n(&conn->target_closed, true, __ATOMIC_RELEASE);
++	spdk_nvme_local_conn_put(conn);
++}
++
++/* ── The initiator side ── */
++
++struct ut_done {
++	int			called;
++	struct spdk_nvme_cpl	cpl;
++};
++
++static void
++ut_cb(void *arg, const struct spdk_nvme_cpl *cpl)
++{
++	struct ut_done *done = arg;
++
++	done->called++;
++	done->cpl = *cpl;
++}
++
++static struct spdk_nvme_transport_id g_trid = { .trtype = SPDK_NVME_TRANSPORT_CUSTOM };
++static struct spdk_nvme_ctrlr g_ctrlr;
++
++static void
++ut_setup(void)
++{
++	memset(&g_ctrlr, 0, sizeof(g_ctrlr));
++	snprintf(g_trid.trstring, sizeof(g_trid.trstring), "%s", NVME_LOCAL_TRSTRING);
++	snprintf(g_trid.traddr, sizeof(g_trid.traddr), "node0");
++	snprintf(g_trid.trsvcid, sizeof(g_trid.trsvcid), "1");
++	g_ctrlr.trid = g_trid;
++	g_accepted = NULL;
++	g_accept_rc = 0;
++	CU_ASSERT(spdk_nvme_local_listen(&g_trid, ut_accept, NULL) == 0);
++}
++
++static void
++ut_teardown(void)
++{
++	spdk_nvme_local_stop_listen(&g_trid);
++}
++
++/* A qpair connected the way the generic layer drives it: connect, then polls until CONNECTED. */
++static struct spdk_nvme_qpair *
++ut_qpair_connected(uint16_t qid, uint32_t qsize)
++{
++	struct spdk_nvme_qpair *qpair;
++
++	qpair = nvme_local_ctrlr_create_qpair(&g_ctrlr, qid, qsize, 0, qsize, true);
++	SPDK_CU_ASSERT_FATAL(qpair != NULL);
++	nvme_qpair_set_state(qpair, NVME_QPAIR_CONNECTING);
++	CU_ASSERT(nvme_local_ctrlr_connect_qpair(&g_ctrlr, qpair) == 0);
++	SPDK_CU_ASSERT_FATAL(g_accepted != NULL);
++	CU_ASSERT(g_accepted->num_slots == qsize - 1);
++	CU_ASSERT(g_accepted->qid == qid);
++	/* Sends the Fabrics CONNECT (stubbed), then polls it (stubbed: done). */
++	CU_ASSERT(nvme_local_qpair_process_completions(qpair, 0) == 0);
++	CU_ASSERT(nvme_local_qpair_process_completions(qpair, 0) == 0);
++	CU_ASSERT(nvme_qpair_get_state(qpair) == NVME_QPAIR_CONNECTED);
++	nvme_qpair_set_state(qpair, NVME_QPAIR_ENABLED);
++	return qpair;
++}
++
++static void
++ut_req(struct nvme_request *req, struct spdk_nvme_qpair *qpair, uint8_t opc, struct ut_done *done)
++{
++	req->cmd.opc = opc;
++	req->cmd.nsid = 1;
++	req->qpair = qpair;
++	qpair->num_outstanding_reqs++;
++	memset(done, 0, sizeof(*done));
++}
++
++static void
++ut_qpair_delete(struct spdk_nvme_qpair *qpair)
++{
++	CU_ASSERT(nvme_local_ctrlr_delete_io_qpair(&g_ctrlr, qpair) == 0);
++}
++
++/* ── Tests ── */
++
++static void
++test_listen_and_refuse(void)
++{
++	struct spdk_nvme_transport_id other = g_trid;
++	struct spdk_nvme_qpair *qpair;
++
++	ut_setup();
++
++	/* One listener per address. */
++	CU_ASSERT(spdk_nvme_local_listen(&g_trid, ut_accept, NULL) == -EADDRINUSE);
++
++	/* No listener there: refused, and nothing accepted. */
++	qpair = nvme_local_ctrlr_create_qpair(&g_ctrlr, 1, 4, 0, 4, true);
++	SPDK_CU_ASSERT_FATAL(qpair != NULL);
++	snprintf(other.trsvcid, sizeof(other.trsvcid), "2");
++	g_ctrlr.trid = other;
++	CU_ASSERT(nvme_local_ctrlr_connect_qpair(&g_ctrlr, qpair) == -ECONNREFUSED);
++	CU_ASSERT(g_accepted == NULL);
++
++	/* The target refuses: its error, and nothing accepted. */
++	g_ctrlr.trid = g_trid;
++	g_accept_rc = -ENOMEM;
++	CU_ASSERT(nvme_local_ctrlr_connect_qpair(&g_ctrlr, qpair) == -ENOMEM);
++	CU_ASSERT(g_accepted == NULL);
++
++	/* Stopped: refused. */
++	g_accept_rc = 0;
++	spdk_nvme_local_stop_listen(&g_trid);
++	CU_ASSERT(nvme_local_ctrlr_connect_qpair(&g_ctrlr, qpair) == -ECONNREFUSED);
++	ut_qpair_delete(qpair);
++}
++
++static void
++test_qpairs_are_async_only(void)
++{
++	ut_setup();
++	/* A synchronous wait spins a reactor the target may share. */
++	CU_ASSERT(nvme_local_ctrlr_create_qpair(&g_ctrlr, 1, 4, 0, 4, false) == NULL);
++	ut_teardown();
++}
++
++static void
++test_io_data_stay_in_the_users_buffers(void)
++{
++	struct spdk_nvme_ns_cmd_ext_io_opts opts = { .size = sizeof(opts) };
++	struct spdk_memory_domain *domain = (struct spdk_memory_domain *)0xD0;
++	char buf0[512], buf1[1024];
++	struct iovec iov[2] = { { buf0, sizeof(buf0) }, { buf1, sizeof(buf1) } };
++	struct spdk_nvme_qpair *qpair;
++	struct nvme_local_conn *conn;
++	struct nvme_local_slot *slot;
++	struct nvme_request req = {};
++	struct ut_done done;
++
++	ut_setup();
++	qpair = ut_qpair_connected(1, 4);
++	conn = g_accepted;
++
++	/* An I/O of two iovecs, from the second byte of the first, with a memory domain. */
++	NVME_INIT_REQUEST_IOV((&req), ut_cb, &done, iov, 2, NULL, sizeof(buf0) + sizeof(buf1) - 1, 0,
++			      1, 0);
++	ut_req(&req, qpair, SPDK_NVME_OPC_WRITE, &done);
++	opts.memory_domain = domain;
++	opts.memory_domain_ctx = (void *)0xC7;
++	req.payload.opts = &opts;
++	CU_ASSERT(nvme_local_qpair_submit_request(qpair, &req) == 0);
++
++	slot = ut_take(conn);
++	SPDK_CU_ASSERT_FATAL(slot != NULL);
++	CU_ASSERT(slot->cmd.opc == SPDK_NVME_OPC_WRITE);
++	CU_ASSERT(slot->cmd.cid == slot->index);
++	CU_ASSERT(req.cmd.cid == slot->index);
++	CU_ASSERT(slot->cmd.psdt == SPDK_NVME_PSDT_SGL_MPTR_CONTIG);
++	CU_ASSERT(slot->cmd.dptr.sgl1.unkeyed.type == SPDK_NVME_SGL_TYPE_TRANSPORT_DATA_BLOCK);
++	CU_ASSERT(slot->cmd.dptr.sgl1.unkeyed.length == sizeof(buf0) + sizeof(buf1) - 1);
++	/* Zero copy: the target is given the user's own buffers. */
++	CU_ASSERT(slot->bounce == NULL);
++	CU_ASSERT(slot->iovcnt == 2);
++	CU_ASSERT(slot->iov[0].iov_base == buf0 + 1);
++	CU_ASSERT(slot->iov[0].iov_len == sizeof(buf0) - 1);
++	CU_ASSERT(slot->iov[1].iov_base == buf1);
++	CU_ASSERT(slot->iov[1].iov_len == sizeof(buf1));
++	CU_ASSERT(slot->memory_domain == domain);
++	CU_ASSERT(slot->memory_domain_ctx == (void *)0xC7);
++
++	/* Nothing completes before the target hands the slot back. */
++	CU_ASSERT(nvme_local_qpair_process_completions(qpair, 0) == 0);
++	CU_ASSERT(done.called == 0);
++	ut_hand_back(conn, slot, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS);
++	CU_ASSERT(nvme_local_qpair_process_completions(qpair, 0) == 1);
++	CU_ASSERT(done.called == 1);
++	CU_ASSERT(spdk_nvme_cpl_is_success(&done.cpl));
++	CU_ASSERT(done.cpl.cid == req.cmd.cid);
++	CU_ASSERT(nvme_local_qpair(qpair)->in_flight == 0);
++
++	/* The target's reference, then the initiator's. */
++	ut_target_close(conn);
++	ut_qpair_delete(qpair);
++	ut_teardown();
++}
++
++static void
++test_slots_run_out(void)
++{
++	struct nvme_request req[4] = {};
++	struct ut_done done[4];
++	struct spdk_nvme_qpair *qpair;
++	struct nvme_local_slot *slot;
++	int i;
++
++	ut_setup();
++	/* A queue of 4 entries carries 3 commands. */
++	qpair = ut_qpair_connected(1, 4);
++	for (i = 0; i < 4; i++) {
++		NVME_INIT_REQUEST_CONTIG((&req[i]), ut_cb, &done[i], NULL, NULL, 0, 0, 0, 0);
++		ut_req(&req[i], qpair, SPDK_NVME_OPC_FLUSH, &done[i]);
++	}
++	for (i = 0; i < 3; i++) {
++		CU_ASSERT(nvme_local_qpair_submit_request(qpair, &req[i]) == 0);
++	}
++	CU_ASSERT(nvme_local_qpair_submit_request(qpair, &req[3]) == -EAGAIN);
++
++	/* One back: room for one. */
++	slot = ut_take(g_accepted);
++	SPDK_CU_ASSERT_FATAL(slot != NULL);
++	ut_hand_back(g_accepted, slot, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS);
++	CU_ASSERT(nvme_local_qpair_process_completions(qpair, 0) == 1);
++	CU_ASSERT(nvme_local_qpair_submit_request(qpair, &req[3]) == 0);
++
++	/* The target closes: what it holds and what it never took come back aborted. */
++	ut_target_close(g_accepted);
++	CU_ASSERT(nvme_local_qpair_process_completions(qpair, 0) == -ENXIO);
++	for (i = 1; i < 4; i++) {
++		CU_ASSERT(done[i].called == 1);
++		CU_ASSERT(spdk_nvme_cpl_is_aborted_sq_deletion(&done[i].cpl));
++	}
++	CU_ASSERT(nvme_qpair_get_state(qpair) == NVME_QPAIR_DISCONNECTED);
++	ut_qpair_delete(qpair);
++	ut_teardown();
++}
++
++static void
++test_admin_data_go_through_the_slot(void)
++{
++	uint8_t out[4096], in[64];
++	struct nvme_request get = {}, set = {};
++	struct ut_done get_done, set_done;
++	struct spdk_nvme_qpair *adminq;
++	struct nvme_local_slot *slot;
++
++	ut_setup();
++	adminq = ut_qpair_connected(0, 4);
++
++	/* Controller to host: the target writes into the slot's buffer, copied back. */
++	memset(out, 0, sizeof(out));
++	NVME_INIT_REQUEST_CONTIG((&get), ut_cb, &get_done, out, NULL, sizeof(out), 0, 0, 0);
++	ut_req(&get, adminq, SPDK_NVME_OPC_IDENTIFY, &get_done);
++	CU_ASSERT(nvme_local_qpair_submit_request(adminq, &get) == 0);
++	slot = ut_take(g_accepted);
++	SPDK_CU_ASSERT_FATAL(slot != NULL);
++	SPDK_CU_ASSERT_FATAL(slot->bounce != NULL);
++	CU_ASSERT(slot->iovcnt == 1 && slot->iov[0].iov_base == slot->bounce);
++	CU_ASSERT(slot->iov[0].iov_len == sizeof(out));
++	memset(slot->bounce, 0xA5, sizeof(out));
++	ut_hand_back(g_accepted, slot, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS);
++	CU_ASSERT(nvme_local_qpair_process_completions(adminq, 0) == 1);
++	CU_ASSERT(get_done.called == 1);
++	CU_ASSERT(out[0] == 0xA5 && out[sizeof(out) - 1] == 0xA5);
++	CU_ASSERT(slot->bounce == NULL);
++
++	/* Host to controller: the slot's buffer holds the user's data when handed over. */
++	memset(in, 0x3C, sizeof(in));
++	NVME_INIT_REQUEST_CONTIG((&set), ut_cb, &set_done, in, NULL, sizeof(in), 0, 0, 0);
++	ut_req(&set, adminq, SPDK_NVME_OPC_SET_FEATURES, &set_done);
++	CU_ASSERT(nvme_local_qpair_submit_request(adminq, &set) == 0);
++	slot = ut_take(g_accepted);
++	SPDK_CU_ASSERT_FATAL(slot != NULL && slot->bounce != NULL);
++	CU_ASSERT(((uint8_t *)slot->bounce)[0] == 0x3C && ((uint8_t *)slot->bounce)[63] == 0x3C);
++	ut_hand_back(g_accepted, slot, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS);
++	CU_ASSERT(nvme_local_qpair_process_completions(adminq, 0) == 1);
++	CU_ASSERT(set_done.called == 1);
++
++	ut_target_close(g_accepted);
++	ut_qpair_delete(adminq);
++	ut_teardown();
++}
++
++static void
++test_aer_aborted_early_comes_back_to_nobody(void)
++{
++	struct nvme_request aer = {};
++	struct ut_done done;
++	struct spdk_nvme_qpair *adminq;
++	struct nvme_local_slot *slot;
++
++	ut_setup();
++	adminq = ut_qpair_connected(0, 4);
++	NVME_INIT_REQUEST_CONTIG((&aer), ut_cb, &done, NULL, NULL, 0, 0, 0, 0);
++	ut_req(&aer, adminq, SPDK_NVME_OPC_ASYNC_EVENT_REQUEST, &done);
++	CU_ASSERT(nvme_local_qpair_submit_request(adminq, &aer) == 0);
++	slot = ut_take(g_accepted);
++	SPDK_CU_ASSERT_FATAL(slot != NULL);
++
++	/* A reset aborts the AERs: completed at once, while the target still holds the slot. */
++	nvme_local_admin_qpair_abort_aers(adminq);
++	CU_ASSERT(done.called == 1);
++	CU_ASSERT(spdk_nvme_cpl_is_aborted_sq_deletion(&done.cpl));
++	CU_ASSERT(nvme_local_qpair(adminq)->in_flight == 1);
++
++	/* The slot comes back (the target freed the AER): no second completion. */
++	ut_hand_back(g_accepted, slot, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_ABORTED_SQ_DELETION);
++	CU_ASSERT(nvme_local_qpair_process_completions(adminq, 0) == 1);
++	CU_ASSERT(done.called == 1);
++	CU_ASSERT(nvme_local_qpair(adminq)->in_flight == 0);
++
++	ut_target_close(g_accepted);
++	ut_qpair_delete(adminq);
++	ut_teardown();
++}
++
++static void
++test_disconnect_waits_for_the_targets_slots(void)
++{
++	char buf[512];
++	struct nvme_request write = {}, flush = {};
++	struct ut_done write_done, flush_done;
++	struct spdk_nvme_qpair *qpair;
++	struct nvme_local_conn *conn;
++	struct nvme_local_slot *wslot, *fslot;
++
++	ut_setup();
++	qpair = ut_qpair_connected(1, 4);
++	conn = g_accepted;
++	NVME_INIT_REQUEST_CONTIG((&write), ut_cb, &write_done, buf, NULL, sizeof(buf), 0, 0, 0);
++	ut_req(&write, qpair, SPDK_NVME_OPC_WRITE, &write_done);
++	NVME_INIT_REQUEST_CONTIG((&flush), ut_cb, &flush_done, NULL, NULL, 0, 0, 0, 0);
++	ut_req(&flush, qpair, SPDK_NVME_OPC_FLUSH, &flush_done);
++	CU_ASSERT(nvme_local_qpair_submit_request(qpair, &write) == 0);
++	CU_ASSERT(nvme_local_qpair_submit_request(qpair, &flush) == 0);
++	wslot = ut_take(conn);
++	fslot = ut_take(conn);
++	SPDK_CU_ASSERT_FATAL(wslot != NULL && fslot != NULL);
++
++	/* An abort completes only what holds none of the user's memory: the flush. */
++	nvme_local_qpair_abort_reqs(qpair, 0);
++	CU_ASSERT(flush_done.called == 1);
++	CU_ASSERT(write_done.called == 0);
++
++	/* Disconnecting: the target is told, and the qpair waits for the write it holds. */
++	ut_ctrlr_disconnect_qpair(qpair);
++	CU_ASSERT(__atomic_load_n(&conn->initiator_leaving, __ATOMIC_ACQUIRE));
++	CU_ASSERT(nvme_qpair_get_state(qpair) == NVME_QPAIR_DISCONNECTING);
++	CU_ASSERT(nvme_local_qpair_submit_request(qpair, &write) == -ENXIO);
++	CU_ASSERT(nvme_local_qpair_process_completions(qpair, 0) == 0);
++	CU_ASSERT(nvme_qpair_get_state(qpair) == NVME_QPAIR_DISCONNECTING);
++
++	/* The write comes back with its own outcome; the flush, to nobody; then the qpair is out. */
++	ut_hand_back(conn, wslot, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS);
++	ut_hand_back(conn, fslot, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS);
++	CU_ASSERT(nvme_local_qpair_process_completions(qpair, 0) == 2);
++	CU_ASSERT(write_done.called == 1 && spdk_nvme_cpl_is_success(&write_done.cpl));
++	CU_ASSERT(flush_done.called == 1);
++	CU_ASSERT(nvme_qpair_get_state(qpair) == NVME_QPAIR_DISCONNECTED);
++	CU_ASSERT(nvme_local_qpair(qpair)->conn == NULL);
++	/* Only the target's reference is left. */
++	CU_ASSERT(conn->refs == 1);
++
++	ut_target_close(conn);
++	ut_qpair_delete(qpair);
++	ut_teardown();
++}
++
++static void
++test_admin_qpair_deleted_with_a_command_in_flight(void)
++{
++	uint8_t out[4096];
++	struct nvme_request get = {};
++	struct ut_done done;
++	struct spdk_nvme_qpair *adminq;
++	struct nvme_local_conn *conn;
++	struct nvme_local_slot *slot;
++
++	ut_setup();
++	adminq = ut_qpair_connected(0, 4);
++	conn = g_accepted;
++	NVME_INIT_REQUEST_CONTIG((&get), ut_cb, &done, out, NULL, sizeof(out), 0, 0, 0);
++	ut_req(&get, adminq, SPDK_NVME_OPC_GET_LOG_PAGE, &done);
++	CU_ASSERT(nvme_local_qpair_submit_request(adminq, &get) == 0);
++	slot = ut_take(conn);
++	SPDK_CU_ASSERT_FATAL(slot != NULL);
++
++	/* A controller destroyed with an admin command in flight (its destruction does not wait):
++	 * the command is aborted at once, as the target writes into the slot's buffer only. */
++	ut_qpair_delete(adminq);
++	CU_ASSERT(done.called == 1);
++	CU_ASSERT(spdk_nvme_cpl_is_aborted_sq_deletion(&done.cpl));
++	CU_ASSERT(conn->initiator_leaving);
++	CU_ASSERT(conn->refs == 1);
++
++	/* The target finishes later, into the connection's memory, and lets go: freed. */
++	memset(slot->bounce, 0xEE, sizeof(out));
++	ut_hand_back(conn, slot, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS);
++	ut_target_close(conn);
++	ut_teardown();
++}
++
++int
++main(int argc, char **argv)
++{
++	CU_pSuite suite = NULL;
++	unsigned int num_failures;
++
++	CU_initialize_registry();
++
++	suite = CU_add_suite("nvme_local", NULL, NULL);
++	CU_ADD_TEST(suite, test_listen_and_refuse);
++	CU_ADD_TEST(suite, test_qpairs_are_async_only);
++	CU_ADD_TEST(suite, test_io_data_stay_in_the_users_buffers);
++	CU_ADD_TEST(suite, test_slots_run_out);
++	CU_ADD_TEST(suite, test_admin_data_go_through_the_slot);
++	CU_ADD_TEST(suite, test_aer_aborted_early_comes_back_to_nobody);
++	CU_ADD_TEST(suite, test_disconnect_waits_for_the_targets_slots);
++	CU_ADD_TEST(suite, test_admin_qpair_deleted_with_a_command_in_flight);
++
++	num_failures = spdk_ut_run_tests(argc, argv, NULL);
++	CU_cleanup_registry();
++	return num_failures;
++}
+diff --git a/test/unit/lib/nvmf/local.c/Makefile b/test/unit/lib/nvmf/local.c/Makefile
+new file mode 100644
+index 0000000..89f9c17
+--- /dev/null
++++ b/test/unit/lib/nvmf/local.c/Makefile
+@@ -0,0 +1,9 @@
++#  SPDX-License-Identifier: BSD-3-Clause
++#  Copyright (c) 2026 Evariops.
++#
++
++SPDK_ROOT_DIR := $(abspath $(CURDIR)/../../../../..)
++
++TEST_FILE = local_ut.c
++
++include $(SPDK_ROOT_DIR)/mk/spdk.unittest.mk
+diff --git a/test/unit/lib/nvmf/local.c/local_ut.c b/test/unit/lib/nvmf/local.c/local_ut.c
+new file mode 100644
+index 0000000..816c237
+--- /dev/null
++++ b/test/unit/lib/nvmf/local.c/local_ut.c
+@@ -0,0 +1,478 @@
++/*   SPDX-License-Identifier: BSD-3-Clause
++ *   Copyright (c) 2026 Evariops.
++ */
++
++/*
++ * The LOCAL target (Evariops 0076) against an initiator the test plays itself: it fills slots,
++ * hands them over, and reads what comes back, through the shared connection. nvmf's own request
++ * handling is stubbed: what is checked is what the transport gives nvmf and gives back.
++ */
++
++#include "spdk/stdinc.h"
++#include "spdk_internal/cunit.h"
++
++#include "common/lib/test_env.c"
++
++#include "nvmf/local.c"
++
++SPDK_LOG_REGISTER_COMPONENT(nvmf)
++
++DEFINE_STUB_V(spdk_nvmf_transport_register, (const struct spdk_nvmf_transport_ops *ops));
++
++/* ── The registry and the connection, which lib/nvme holds ── */
++
++static struct spdk_nvme_transport_id g_listened;
++static spdk_nvme_local_accept_cb g_accept;
++static void *g_accept_ctx;
++
++int
++spdk_nvme_local_listen(const struct spdk_nvme_transport_id *trid,
++		       spdk_nvme_local_accept_cb accept, void *ctx)
++{
++	g_listened = *trid;
++	g_accept = accept;
++	g_accept_ctx = ctx;
++	return 0;
++}
++
++void
++spdk_nvme_local_stop_listen(const struct spdk_nvme_transport_id *trid)
++{
++	g_accept = NULL;
++}
++
++static int g_conns;
++
++void
++spdk_nvme_local_conn_put(struct nvme_local_conn *conn)
++{
++	if (__atomic_sub_fetch(&conn->refs, 1, __ATOMIC_ACQ_REL) != 0) {
++		return;
++	}
++
++	nvme_local_ring_fini(&conn->sq);
++	nvme_local_ring_fini(&conn->cq);
++	free(conn->slots);
++	free(conn);
++	g_conns--;
++}
++
++/* As the initiator creates one: its reference, the slots, the two rings. */
++static struct nvme_local_conn *
++ut_conn(uint16_t num_slots)
++{
++	struct nvme_local_conn *conn = calloc(1, sizeof(*conn));
++	uint16_t i;
++
++	SPDK_CU_ASSERT_FATAL(conn != NULL);
++	conn->slots = calloc(num_slots, sizeof(*conn->slots));
++	SPDK_CU_ASSERT_FATAL(conn->slots != NULL);
++	CU_ASSERT(nvme_local_ring_init(&conn->sq, num_slots) == 0);
++	CU_ASSERT(nvme_local_ring_init(&conn->cq, num_slots) == 0);
++	for (i = 0; i < num_slots; i++) {
++		conn->slots[i].index = i;
++	}
++	conn->num_slots = num_slots;
++	conn->qid = 1;
++	conn->refs = 1;
++	snprintf(conn->trid.traddr, sizeof(conn->trid.traddr), "node0");
++	g_conns++;
++	return conn;
++}
++
++/* ── nvmf, stubbed ── */
++
++static struct spdk_nvmf_qpair *g_new_qpair;
++static int g_disconnects;
++static struct spdk_nvmf_request *g_exec[8];
++static int g_execs;
++static bool g_fini_on_exec;
++static struct nvmf_local_poll_group *g_lgroup;
++
++void
++spdk_nvmf_tgt_new_qpair(struct spdk_nvmf_tgt *tgt, struct spdk_nvmf_qpair *qpair)
++{
++	g_new_qpair = qpair;
++}
++
++int
++spdk_nvmf_qpair_disconnect(struct spdk_nvmf_qpair *qpair)
++{
++	g_disconnects++;
++	return 0;
++}
++
++static void
++ut_fini_done(void *arg)
++{
++	(*(int *)arg)++;
++}
++
++static int g_fini_done;
++
++void
++spdk_nvmf_request_exec(struct spdk_nvmf_request *req)
++{
++	SPDK_CU_ASSERT_FATAL(g_execs < (int)SPDK_COUNTOF(g_exec));
++	g_exec[g_execs++] = req;
++	if (g_fini_on_exec) {
++		/* nvmf finishing the qpair from within a request, as a completion in place may. */
++		nvmf_local_poll_group_remove(&g_lgroup->group, req->qpair);
++		nvmf_local_qpair_fini(req->qpair, ut_fini_done, &g_fini_done);
++	}
++}
++
++int
++spdk_nvmf_request_complete(struct spdk_nvmf_request *req)
++{
++	nvmf_local_req_complete(req);
++	return 0;
++}
++
++/* ── Helpers ── */
++
++static struct spdk_thread *g_thread;
++static struct nvmf_local_transport *g_ltransport;
++
++static void
++ut_setup(void)
++{
++	struct spdk_nvmf_transport_opts opts = {};
++	struct spdk_nvmf_transport *transport;
++
++	g_thread = spdk_thread_create(NULL, NULL);
++	SPDK_CU_ASSERT_FATAL(g_thread != NULL);
++	spdk_set_thread(g_thread);
++
++	nvmf_local_opts_init(&opts);
++	opts.acceptor_poll_rate = 0;
++	transport = nvmf_local_create(&opts);
++	SPDK_CU_ASSERT_FATAL(transport != NULL);
++	transport->opts = opts;
++	g_ltransport = nvmf_local_transport(transport);
++	g_lgroup = nvmf_local_poll_group(nvmf_local_poll_group_create(transport, NULL));
++	SPDK_CU_ASSERT_FATAL(g_lgroup != NULL);
++	g_lgroup->group.transport = transport;
++
++	g_new_qpair = NULL;
++	g_disconnects = 0;
++	g_execs = 0;
++	g_fini_on_exec = false;
++	g_fini_done = 0;
++}
++
++static void
++ut_teardown(void)
++{
++	nvmf_local_poll_group_destroy(&g_lgroup->group);
++	nvmf_local_destroy(&g_ltransport->transport, NULL, NULL);
++	while (spdk_thread_poll(g_thread, 0, 0) > 0) {}
++	spdk_thread_exit(g_thread);
++	while (!spdk_thread_is_exited(g_thread)) {
++		spdk_thread_poll(g_thread, 0, 0);
++	}
++	spdk_thread_destroy(g_thread);
++	spdk_set_thread(NULL);
++	CU_ASSERT(g_conns == 0);
++}
++
++/* Accepted, given to the target and in its poll group, enabled. */
++static struct nvmf_local_qpair *
++ut_qpair(struct nvme_local_conn *conn)
++{
++	struct nvmf_local_qpair *lqpair;
++
++	CU_ASSERT(nvmf_local_accept_conn(g_ltransport, conn) == 0);
++	CU_ASSERT(nvmf_local_accept(g_ltransport) == SPDK_POLLER_BUSY);
++	SPDK_CU_ASSERT_FATAL(g_new_qpair != NULL);
++	lqpair = nvmf_local_qpair(g_new_qpair);
++	g_new_qpair = NULL;
++	CU_ASSERT(nvmf_local_poll_group_add(&g_lgroup->group, &lqpair->qpair) == 0);
++	lqpair->qpair.state = SPDK_NVMF_QPAIR_ENABLED;
++	return lqpair;
++}
++
++static void
++ut_hand_over(struct nvme_local_conn *conn, struct nvme_local_slot *slot)
++{
++	CU_ASSERT(nvme_local_ring_put(&conn->sq, slot));
++}
++
++static struct nvme_local_slot *
++ut_back(struct nvme_local_conn *conn)
++{
++	void *slot = NULL;
++
++	return nvme_local_ring_take(&conn->cq, &slot, 1) == 1 ? slot : NULL;
++}
++
++/* What the initiator does at the end: lets go. */
++static void
++ut_initiator_leaves(struct nvme_local_conn *conn)
++{
++	__atomic_store_n(&conn->initiator_leaving, true, __ATOMIC_RELEASE);
++	spdk_nvme_local_conn_put(conn);
++}
++
++static void
++ut_finish(struct nvmf_local_qpair *lqpair)
++{
++	nvmf_local_poll_group_remove(&g_lgroup->group, &lqpair->qpair);
++	nvmf_local_qpair_fini(&lqpair->qpair, NULL, NULL);
++}
++
++/* ── Tests ── */
++
++static void
++test_listen_and_accept(void)
++{
++	struct spdk_nvme_transport_id trid = {};
++	struct nvme_local_conn *conn;
++	struct nvmf_local_qpair *lqpair;
++
++	ut_setup();
++	snprintf(trid.traddr, sizeof(trid.traddr), "node0");
++	CU_ASSERT(nvmf_local_listen(&g_ltransport->transport, &trid, NULL) == 0);
++	CU_ASSERT(g_accept == nvmf_local_accept_conn);
++	CU_ASSERT(g_accept_ctx == g_ltransport);
++
++	/* Accepted on the initiator's thread: a reference, and pending until the poller. */
++	conn = ut_conn(4);
++	CU_ASSERT(g_accept(g_accept_ctx, conn) == 0);
++	CU_ASSERT(conn->refs == 2);
++	CU_ASSERT(g_new_qpair == NULL);
++	CU_ASSERT(!TAILQ_EMPTY(&g_ltransport->pending));
++
++	/* On the transport's thread: given to the target. */
++	CU_ASSERT(nvmf_local_accept(g_ltransport) == SPDK_POLLER_BUSY);
++	SPDK_CU_ASSERT_FATAL(g_new_qpair != NULL);
++	CU_ASSERT(TAILQ_EMPTY(&g_ltransport->pending));
++	CU_ASSERT(nvmf_local_accept(g_ltransport) == SPDK_POLLER_IDLE);
++	lqpair = nvmf_local_qpair(g_new_qpair);
++	CU_ASSERT(lqpair->conn == conn);
++	CU_ASSERT(lqpair->qpair.transport == &g_ltransport->transport);
++	CU_ASSERT(strcmp(lqpair->trid.traddr, "node0") == 0);
++
++	nvmf_local_stop_listen(&g_ltransport->transport, &trid);
++	CU_ASSERT(g_accept == NULL);
++	nvmf_local_qpair_fini(&lqpair->qpair, NULL, NULL);
++	ut_initiator_leaves(conn);
++	ut_teardown();
++}
++
++static void
++test_requests_are_the_initiators_slots(void)
++{
++	char buf0[512], buf1[512];
++	struct spdk_memory_domain *domain = (struct spdk_memory_domain *)0xD0;
++	struct nvme_local_conn *conn;
++	struct nvmf_local_qpair *lqpair;
++	struct nvme_local_slot *slot;
++	struct spdk_nvmf_request *req;
++
++	ut_setup();
++	conn = ut_conn(4);
++	lqpair = ut_qpair(conn);
++
++	slot = &conn->slots[2];
++	slot->cmd.opc = SPDK_NVME_OPC_WRITE;
++	slot->cmd.cid = 2;
++	slot->cmd.dptr.sgl1.unkeyed.type = SPDK_NVME_SGL_TYPE_TRANSPORT_DATA_BLOCK;
++	slot->cmd.dptr.sgl1.unkeyed.length = sizeof(buf0) + sizeof(buf1);
++	slot->length = sizeof(buf0) + sizeof(buf1);
++	slot->iovcnt = 2;
++	slot->iov[0].iov_base = buf0;
++	slot->iov[0].iov_len = sizeof(buf0);
++	slot->iov[1].iov_base = buf1;
++	slot->iov[1].iov_len = sizeof(buf1);
++	slot->memory_domain = domain;
++	slot->memory_domain_ctx = (void *)0xC7;
++	ut_hand_over(conn, slot);
++
++	CU_ASSERT(nvmf_local_poll_group_poll(&g_lgroup->group) == 1);
++	SPDK_CU_ASSERT_FATAL(g_execs == 1);
++	req = g_exec[0];
++	/* The command and its completion are the slot's own; the data, the initiator's buffers. */
++	CU_ASSERT((void *)req->cmd == (void *)&slot->cmd);
++	CU_ASSERT((void *)req->rsp == (void *)&slot->cpl);
++	CU_ASSERT(req->length == sizeof(buf0) + sizeof(buf1));
++	CU_ASSERT(req->iovcnt == 2);
++	CU_ASSERT(req->iov[0].iov_base == buf0 && req->iov[1].iov_base == buf1);
++	CU_ASSERT(req->memory_domain == domain && req->memory_domain_ctx == (void *)0xC7);
++	CU_ASSERT(req->xfer == SPDK_NVME_DATA_HOST_TO_CONTROLLER);
++	CU_ASSERT(!req->data_from_pool);
++	CU_ASSERT(lqpair->qpair.queue_depth == 1);
++
++	/* nvmf completes it: the slot goes back, with what nvmf wrote in its completion. */
++	CU_ASSERT(ut_back(conn) == NULL);
++	req->rsp->nvme_cpl.cid = 2;
++	req->rsp->nvme_cpl.cdw0 = 0x5A;
++	nvmf_local_req_complete(req);
++	CU_ASSERT(ut_back(conn) == slot);
++	CU_ASSERT(slot->cpl.cid == 2 && slot->cpl.cdw0 == 0x5A);
++	CU_ASSERT(lqpair->qpair.queue_depth == 0);
++
++	ut_finish(lqpair);
++	ut_initiator_leaves(conn);
++	ut_teardown();
++}
++
++static void
++test_a_command_above_the_mdts_comes_back_refused(void)
++{
++	struct nvme_local_conn *conn;
++	struct nvmf_local_qpair *lqpair;
++	struct nvme_local_slot *slot;
++
++	ut_setup();
++	conn = ut_conn(4);
++	lqpair = ut_qpair(conn);
++	slot = &conn->slots[0];
++	slot->cmd.opc = SPDK_NVME_OPC_READ;
++	slot->cmd.cid = 0;
++	slot->length = g_ltransport->transport.opts.max_io_size + 4096;
++	ut_hand_over(conn, slot);
++
++	CU_ASSERT(nvmf_local_poll_group_poll(&g_lgroup->group) == 1);
++	CU_ASSERT(g_execs == 0);
++	CU_ASSERT(ut_back(conn) == slot);
++	CU_ASSERT(slot->cpl.status.sct == SPDK_NVME_SCT_GENERIC);
++	CU_ASSERT(slot->cpl.status.sc == SPDK_NVME_SC_DATA_SGL_LENGTH_INVALID);
++	CU_ASSERT(slot->cpl.status.dnr == 1);
++	CU_ASSERT(lqpair->qpair.queue_depth == 0);
++
++	ut_finish(lqpair);
++	ut_initiator_leaves(conn);
++	ut_teardown();
++}
++
++static void
++test_a_request_freed_comes_back_aborted(void)
++{
++	struct nvme_local_conn *conn;
++	struct nvmf_local_qpair *lqpair;
++	struct nvme_local_slot *slot;
++
++	ut_setup();
++	conn = ut_conn(4);
++	lqpair = ut_qpair(conn);
++	lqpair->qpair.qid = 0;
++	slot = &conn->slots[1];
++	slot->cmd.opc = SPDK_NVME_OPC_ASYNC_EVENT_REQUEST;
++	slot->cmd.cid = 1;
++	ut_hand_over(conn, slot);
++	CU_ASSERT(nvmf_local_poll_group_poll(&g_lgroup->group) == 1);
++	SPDK_CU_ASSERT_FATAL(g_execs == 1);
++
++	/* nvmf frees an AER it will never complete (its qpair goes down): the slot still comes back. */
++	nvmf_local_req_free(g_exec[0]);
++	CU_ASSERT(ut_back(conn) == slot);
++	CU_ASSERT(slot->cpl.cid == 1);
++	CU_ASSERT(spdk_nvme_cpl_is_aborted_sq_deletion(&slot->cpl));
++
++	ut_finish(lqpair);
++	ut_initiator_leaves(conn);
++	ut_teardown();
++}
++
++static void
++test_an_initiator_that_leaves_disconnects_the_qpair(void)
++{
++	struct nvme_local_conn *conn;
++	struct nvmf_local_qpair *lqpair;
++
++	ut_setup();
++	conn = ut_conn(4);
++	lqpair = ut_qpair(conn);
++	ut_hand_over(conn, &conn->slots[0]);
++	__atomic_store_n(&conn->initiator_leaving, true, __ATOMIC_RELEASE);
++
++	/* Disconnected once; what was handed over since is not taken: the initiator takes it back. */
++	CU_ASSERT(nvmf_local_poll_group_poll(&g_lgroup->group) == 0);
++	CU_ASSERT(nvmf_local_poll_group_poll(&g_lgroup->group) == 0);
++	CU_ASSERT(g_disconnects == 1);
++	CU_ASSERT(g_execs == 0);
++
++	/* nvmf finishes the qpair: closed, the target's reference dropped, freed later. */
++	nvmf_local_poll_group_remove(&g_lgroup->group, &lqpair->qpair);
++	nvmf_local_qpair_fini(&lqpair->qpair, ut_fini_done, &g_fini_done);
++	CU_ASSERT(g_fini_done == 1);
++	CU_ASSERT(__atomic_load_n(&conn->target_closed, __ATOMIC_ACQUIRE));
++	CU_ASSERT(conn->refs == 1);
++	spdk_nvme_local_conn_put(conn);
++	ut_teardown();
++}
++
++static void
++test_a_qpair_finished_in_a_batch_takes_no_more(void)
++{
++	struct nvme_local_conn *conn;
++
++	ut_setup();
++	conn = ut_conn(4);
++	ut_qpair(conn);
++	ut_hand_over(conn, &conn->slots[0]);
++	ut_hand_over(conn, &conn->slots[1]);
++	ut_hand_over(conn, &conn->slots[2]);
++
++	/* The first request finishes the qpair: the two others stay the initiator's. */
++	g_fini_on_exec = true;
++	CU_ASSERT(nvmf_local_poll_group_poll(&g_lgroup->group) == 3);
++	CU_ASSERT(g_execs == 1);
++	CU_ASSERT(g_fini_done == 1);
++	CU_ASSERT(__atomic_load_n(&conn->target_closed, __ATOMIC_ACQUIRE));
++	CU_ASSERT(TAILQ_EMPTY(&g_lgroup->qpairs));
++	ut_initiator_leaves(conn);
++	ut_teardown();
++}
++
++static void
++test_destroy_closes_what_was_never_given(void)
++{
++	struct nvme_local_conn *conn;
++
++	ut_setup();
++	conn = ut_conn(4);
++	CU_ASSERT(nvmf_local_accept_conn(g_ltransport, conn) == 0);
++	CU_ASSERT(conn->refs == 2);
++
++	/* The transport goes before its poller ran: the connection is closed, not leaked. */
++	nvmf_local_poll_group_destroy(&g_lgroup->group);
++	nvmf_local_destroy(&g_ltransport->transport, NULL, NULL);
++	CU_ASSERT(__atomic_load_n(&conn->target_closed, __ATOMIC_ACQUIRE));
++	CU_ASSERT(conn->refs == 1);
++	ut_initiator_leaves(conn);
++
++	while (spdk_thread_poll(g_thread, 0, 0) > 0) {}
++	spdk_thread_exit(g_thread);
++	while (!spdk_thread_is_exited(g_thread)) {
++		spdk_thread_poll(g_thread, 0, 0);
++	}
++	spdk_thread_destroy(g_thread);
++	spdk_set_thread(NULL);
++	CU_ASSERT(g_conns == 0);
++}
++
++int
++main(int argc, char **argv)
++{
++	CU_pSuite suite = NULL;
++	unsigned int num_failures;
++
++	CU_initialize_registry();
++	spdk_thread_lib_init(NULL, 0);
++
++	suite = CU_add_suite("nvmf_local", NULL, NULL);
++	CU_ADD_TEST(suite, test_listen_and_accept);
++	CU_ADD_TEST(suite, test_requests_are_the_initiators_slots);
++	CU_ADD_TEST(suite, test_a_command_above_the_mdts_comes_back_refused);
++	CU_ADD_TEST(suite, test_a_request_freed_comes_back_aborted);
++	CU_ADD_TEST(suite, test_an_initiator_that_leaves_disconnects_the_qpair);
++	CU_ADD_TEST(suite, test_a_qpair_finished_in_a_batch_takes_no_more);
++	CU_ADD_TEST(suite, test_destroy_closes_what_was_never_given);
++
++	num_failures = spdk_ut_run_tests(argc, argv, NULL);
++	spdk_thread_lib_fini();
++	CU_cleanup_registry();
++	return num_failures;
++}
