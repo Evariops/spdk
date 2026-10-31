@@ -1,0 +1,114 @@
+diff --git a/lib/bdev/bdev.c b/lib/bdev/bdev.c
+index 7fcbd7f00..07200a439 100644
+--- a/lib/bdev/bdev.c
++++ b/lib/bdev/bdev.c
+@@ -5479,6 +5479,31 @@ bdev_get_max_write(const struct spdk_bdev *bdev, uint64_t num_bytes)
+ 	return max_write_blocks;
+ }
+ 
++/*
++ * Evariops 0080: the largest read or write handed whole to a bdev that wants aligned buffers,
++ * from the size of an iobuf buffer, in whole 4 KiB when its blocks divide a page. The bare
++ * computation, (132 KiB - (alignment - 1)) / block size, gives 263 blocks of 512 B: a 1 MiB I/O
++ * split in pieces of 131.5 KiB reaches a disk whose largest transfer is 128 KiB as 128 KiB plus
++ * 3.5 KiB, and every piece after the first starts inside a page.
++ */
++static uint64_t
++bdev_get_max_buffered_rw(const struct spdk_bdev *bdev, uint64_t num_bytes)
++{
++	uint64_t max_blocks = bdev_get_max_write(bdev, num_bytes);
++	uint32_t block_size = spdk_bdev_get_data_block_size(bdev);
++	uint64_t page_blocks;
++
++	if (spdk_bdev_is_md_interleaved(bdev) || block_size >= 4096 || 4096 % block_size != 0) {
++		return max_blocks;
++	}
++	page_blocks = 4096 / block_size;
++	if (page_blocks % bdev->write_unit_size != 0 || max_blocks < page_blocks) {
++		return max_blocks;
++	}
++
++	return max_blocks - max_blocks % page_blocks;
++}
++
+ uint32_t
+ spdk_bdev_get_max_copy(const struct spdk_bdev *bdev)
+ {
+@@ -8563,7 +8588,7 @@ bdev_register(struct spdk_bdev *bdev)
+ 	spdk_iobuf_get_opts(&iobuf_opts, sizeof(iobuf_opts));
+ 	if (spdk_bdev_get_buf_align(bdev) > 1) {
+ 		bdev->max_rw_size = spdk_min(bdev->max_rw_size ? bdev->max_rw_size : UINT32_MAX,
+-					     bdev_get_max_write(bdev, iobuf_opts.large_bufsize));
++					     bdev_get_max_buffered_rw(bdev, iobuf_opts.large_bufsize));
+ 	}
+ 
+ 	/* Set ACWU value to the write unit size if bdev module did not set it (does not support it natively) */
+diff --git a/test/unit/lib/bdev/bdev.c/bdev_ut.c b/test/unit/lib/bdev/bdev.c/bdev_ut.c
+index 098ca533e..b2b6c69b5 100644
+--- a/test/unit/lib/bdev/bdev.c/bdev_ut.c
++++ b/test/unit/lib/bdev/bdev.c/bdev_ut.c
+@@ -3508,6 +3508,56 @@ bdev_io_write_unit_split_test(void)
+ 	ut_fini_bdev();
+ }
+ 
++/*
++ * Evariops 0080: a bdev that wants aligned buffers is handed reads and writes an iobuf buffer
++ * long at most, in whole 4 KiB when its blocks divide a page. With 132 KiB buffers, 512 B blocks
++ * aligned on 512 B were handed 263 blocks (131.5 KiB): a 128 KiB disk transfer plus 3.5 KiB.
++ */
++static void
++bdev_max_rw_size_whole_pages(void)
++{
++	struct spdk_iobuf_opts iobuf_opts = {};
++	struct {
++		uint32_t blocklen;
++		uint32_t alignment;
++		uint32_t write_unit_size;
++		uint32_t max_rw_size;
++	} cases[] = {
++		{ 512, 512, 1, 256 },
++		{ 512, 4096, 1, 256 },
++		{ 2048, 2048, 1, 64 },
++		{ 4096, 4096, 1, 32 },
++		/* A write unit that does not divide a page keeps the bare computation. */
++		{ 512, 512, 3, 261 },
++	};
++	struct spdk_bdev *bdev;
++	size_t i;
++	int rc;
++
++	ut_init_bdev(NULL);
++	spdk_iobuf_get_opts(&iobuf_opts, sizeof(iobuf_opts));
++	SPDK_CU_ASSERT_FATAL(iobuf_opts.large_bufsize == 132 * 1024);
++
++	for (i = 0; i < SPDK_COUNTOF(cases); i++) {
++		bdev = calloc(1, sizeof(*bdev));
++		SPDK_CU_ASSERT_FATAL(bdev != NULL);
++		bdev->name = "bdev0";
++		bdev->fn_table = &fn_table;
++		bdev->module = &bdev_ut_if;
++		bdev->blockcnt = 1024;
++		bdev->blocklen = cases[i].blocklen;
++		bdev->required_alignment = spdk_u32log2(cases[i].alignment);
++		bdev->write_unit_size = cases[i].write_unit_size;
++		rc = spdk_bdev_register(bdev);
++		poll_threads();
++		CU_ASSERT(rc == 0);
++		CU_ASSERT_EQUAL(bdev->max_rw_size, cases[i].max_rw_size);
++		free_bdev(bdev);
++	}
++
++	ut_fini_bdev();
++}
++
+ static void
+ bdev_io_alignment(void)
+ {
+@@ -8922,6 +8972,7 @@ main(int argc, char **argv)
+ 	CU_ADD_TEST(suite, bdev_io_write_unit_split_test);
+ 	CU_ADD_TEST(suite, bdev_io_alignment_with_boundary);
+ 	CU_ADD_TEST(suite, bdev_io_alignment);
++	CU_ADD_TEST(suite, bdev_max_rw_size_whole_pages);
+ 	CU_ADD_TEST(suite, bdev_histograms);
+ 	CU_ADD_TEST(suite, bdev_write_zeroes);
+ 	CU_ADD_TEST(suite, bdev_write_uncorrectable);
