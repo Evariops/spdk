@@ -97,7 +97,7 @@ vbdev_tier_band_of_lba(struct vbdev_tier *t, uint64_t lba, uint64_t *band_offset
 	struct tier_band *b;
 
 	TAILQ_FOREACH(b, &t->bands, link) {
-		if (b->state == TIER_BAND_RETIRED) {
+		if (tier_band_state(b) == TIER_BAND_RETIRED) {
 			continue;
 		}
 		if (lba >= b->lba_start && lba < b->lba_start + b->num_blocks) {
@@ -231,16 +231,17 @@ tier_degrade_persist_msg(void *arg)
  * the sibling leg DID leaves the two metadata copies divergent and both ACTIVE:
  * resync_md only targets DEGRADED legs, so it would never repair them, and a
  * reboot could prefer the stale copy. Degrade the failing leg and persist.
- * Idempotent. May run on any reactor; the persist is funneled to t->thread. */
+ * Idempotent. May run on any reactor: of two reactors whose writes fail together, the one
+ * whose compare-and-swap degrades the leg logs and persists, once. The persist is funneled
+ * to t->thread. */
 static void
 tier_degrade_md_leg(struct vbdev_tier *t, struct tier_band *leg)
 {
-	if (leg == NULL || leg->state != TIER_BAND_ACTIVE) {
+	if (leg == NULL || !tier_band_degrade(leg)) {
 		return;
 	}
 	SPDK_ERRLOG("tier '%s': md write failed on band %u — degrading leg\n",
 		    t->bdev.name, leg->band_id);
-	leg->state = TIER_BAND_DEGRADED;
 	if (!t->registered) {
 		return;
 	}
@@ -297,7 +298,7 @@ _tier_leg_complete(struct spdk_bdev_io *leg_io, bool success, void *cb_arg)
 			 * copy; fail over instead of failing the read. */
 			struct tier_band *alt = tier_md_other_leg(t, fb);
 
-			if (alt != NULL && alt != fb && alt->state == TIER_BAND_ACTIVE &&
+			if (alt != NULL && alt != fb && tier_band_state(alt) == TIER_BAND_ACTIVE &&
 			    alt->desc != NULL) {
 				struct tier_io_channel *tch = spdk_io_channel_get_ctx(io_ctx->ch);
 
@@ -365,7 +366,7 @@ tier_submit_leg(struct vbdev_tier *t, struct tier_io_channel *tch, struct spdk_b
 	struct spdk_bdev_ext_io_opts io_opts;
 	int rc;
 
-	if (spdk_unlikely(band->state != TIER_BAND_ACTIVE || band->desc == NULL ||
+	if (spdk_unlikely(tier_band_state(band) != TIER_BAND_ACTIVE || band->desc == NULL ||
 			  base_ch == NULL)) {
 		return -EIO;	/* per-band isolation: caller fails THIS io, not the chunk */
 	}
@@ -425,10 +426,10 @@ tier_route_md_fanout(struct vbdev_tier *t, struct tier_io_channel *tch,
 	struct tier_band *b = vbdev_tier_band_by_id(t, t->md_mirror_b);
 	int nlegs = 0, submitted = 0, nfailed = 0, i, rc = -EIO;
 
-	if (a != NULL && a->state == TIER_BAND_ACTIVE) {
+	if (a != NULL && tier_band_state(a) == TIER_BAND_ACTIVE) {
 		legs[nlegs++] = a;
 	}
-	if (b != NULL && b->state == TIER_BAND_ACTIVE) {
+	if (b != NULL && tier_band_state(b) == TIER_BAND_ACTIVE) {
 		legs[nlegs++] = b;
 	}
 	if (nlegs == 0) {
@@ -490,12 +491,14 @@ tier_route_rw(struct vbdev_tier *t, struct tier_io_channel *tch, struct spdk_bde
 			 * (An ASYNC media error on the chosen leg is retried on the mirror
 			 * by _tier_leg_complete.) */
 			struct tier_band *src = band;
-			if (band->state != TIER_BAND_ACTIVE && band_b != NULL && band_b->state == TIER_BAND_ACTIVE) {
+			if (tier_band_state(band) != TIER_BAND_ACTIVE && band_b != NULL &&
+			    tier_band_state(band_b) == TIER_BAND_ACTIVE) {
 				src = band_b;
 			}
 			io_ctx->remaining = 1;
 			rc = tier_submit_leg(t, tch, bdev_io, src, t->sb_blocks + offset);
-			if (rc != 0 && src == band && band_b != NULL && band_b->state == TIER_BAND_ACTIVE) {
+			if (rc != 0 && src == band && band_b != NULL &&
+			    tier_band_state(band_b) == TIER_BAND_ACTIVE) {
 				rc = tier_submit_leg(t, tch, bdev_io, band_b, t->sb_blocks + offset);
 			}
 			return rc;
@@ -548,7 +551,7 @@ tier_retired_hole_end(struct vbdev_tier *t, uint64_t lba)
 	struct tier_band *b;
 
 	TAILQ_FOREACH(b, &t->bands, link) {
-		if (b->state == TIER_BAND_RETIRED &&
+		if (tier_band_state(b) == TIER_BAND_RETIRED &&
 		    lba >= b->lba_start && lba < b->lba_start + b->num_blocks) {
 			return b->lba_start + b->num_blocks;
 		}
@@ -587,7 +590,7 @@ tier_route_mgmt(struct vbdev_tier *t, struct tier_io_channel *tch, struct spdk_b
 		legs[0] = vbdev_tier_band_by_id(t, t->md_mirror_a);
 		legs[1] = vbdev_tier_band_by_id(t, t->md_mirror_b);
 		for (k = 0; k < 2; k++) {
-			if (legs[k] != NULL && legs[k]->state == TIER_BAND_ACTIVE) {
+			if (legs[k] != NULL && tier_band_state(legs[k]) == TIER_BAND_ACTIVE) {
 				segs[nseg].band = legs[k];
 				segs[nseg].base_phys = t->sb_blocks + offset;
 				segs[nseg].num = md_num;
@@ -645,7 +648,7 @@ tier_route_mgmt(struct vbdev_tier *t, struct tier_io_channel *tch, struct spdk_b
 		struct spdk_io_channel *base_ch = band->band_id < TIER_MAX_BANDS ?
 						  tch->base_ch[band->band_id] : NULL;
 
-		if (band->state != TIER_BAND_ACTIVE || band->desc == NULL || base_ch == NULL) {
+		if (tier_band_state(band) != TIER_BAND_ACTIVE || band->desc == NULL || base_ch == NULL) {
 			/* A FLUSH over a DEGRADED *data* band is a no-op, not a failure:
 			 * the range is already unreachable (reads and writes return -EIO)
 			 * and no flush can make an unreachable range durable. Failing the
@@ -731,7 +734,7 @@ tier_route_reset(struct vbdev_tier *t, struct tier_io_channel *tch, struct spdk_
 	int nlegs = 0, submitted = 0, rc = -EIO;
 
 	TAILQ_FOREACH(b, &t->bands, link) {
-		if (b->state == TIER_BAND_ACTIVE && b->desc != NULL &&
+		if (tier_band_state(b) == TIER_BAND_ACTIVE && b->desc != NULL &&
 		    b->band_id < TIER_MAX_BANDS && tch->base_ch[b->band_id] != NULL) {
 			nlegs++;
 		}
@@ -743,7 +746,7 @@ tier_route_reset(struct vbdev_tier *t, struct tier_io_channel *tch, struct spdk_
 	TAILQ_FOREACH(b, &t->bands, link) {
 		struct spdk_io_channel *base_ch;
 
-		if (b->state != TIER_BAND_ACTIVE || b->desc == NULL ||
+		if (tier_band_state(b) != TIER_BAND_ACTIVE || b->desc == NULL ||
 		    b->band_id >= TIER_MAX_BANDS || tch->base_ch[b->band_id] == NULL) {
 			continue;
 		}
@@ -851,7 +854,7 @@ vbdev_tier_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
 		 * type a band cannot execute makes the leg complete FAILED (a base
 		 * lacking UNMAP would fail every discard the consumer was told worked). */
 		TAILQ_FOREACH(b, &t->bands, link) {
-			if (b->state == TIER_BAND_RETIRED || b->desc == NULL) {
+			if (tier_band_state(b) == TIER_BAND_RETIRED || b->desc == NULL) {
 				continue;
 			}
 			if (!spdk_bdev_io_type_supported(spdk_bdev_desc_get_bdev(b->desc),
@@ -878,7 +881,7 @@ tier_ch_create_cb(void *io_device, void *ctx_buf)
 
 	memset(tch, 0, sizeof(*tch));
 	TAILQ_FOREACH(b, &t->bands, link) {
-		if (b->state != TIER_BAND_RETIRED && b->desc != NULL &&
+		if (tier_band_state(b) != TIER_BAND_RETIRED && b->desc != NULL &&
 		    b->band_id < TIER_MAX_BANDS) {
 			tch->base_ch[b->band_id] = spdk_bdev_get_io_channel(b->desc);
 			if (tch->base_ch[b->band_id] == NULL) {
@@ -952,7 +955,7 @@ vbdev_tier_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 		spdk_json_write_named_uint32(w, "band_id", b->band_id);
 		spdk_json_write_named_string(w, "base_bdev_name", b->base_bdev_name);
 		spdk_json_write_named_uint32(w, "tier", b->tier);
-		spdk_json_write_named_uint32(w, "state", b->state);
+		spdk_json_write_named_uint32(w, "state", tier_band_state(b));
 		spdk_json_write_named_uint64(w, "lba_start", b->lba_start);
 		spdk_json_write_named_uint64(w, "num_blocks", b->num_blocks);
 		spdk_json_write_named_uint64(w, "capacity_blocks", b->num_blocks);
@@ -993,7 +996,7 @@ tier_common_memory_domains(struct vbdev_tier *t, struct spdk_memory_domain **out
 	int ncommon = -1, nown, i;
 
 	TAILQ_FOREACH(b, &t->bands, link) {
-		if (b->state == TIER_BAND_RETIRED || b->desc == NULL) {
+		if (tier_band_state(b) == TIER_BAND_RETIRED || b->desc == NULL) {
 			continue;	/* a hole, or a disk gone: no request reaches it */
 		}
 		nown = spdk_bdev_get_memory_domains(spdk_bdev_desc_get_bdev(b->desc), own,
@@ -1243,7 +1246,7 @@ tier_base_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev, void 
 	}
 	SPDK_WARNLOG("tier: base bdev '%s' removed, degrading band %u\n",
 		     bdev->name, band->band_id);
-	band->state = TIER_BAND_DEGRADED;
+	tier_band_set_state(band, TIER_BAND_DEGRADED);
 	/* Persist DEGRADED to the surviving bands (the fan-out excludes this one) —
 	 * otherwise a reboot reassembles the band ACTIVE and md reads can prefer its
 	 * STALE metadata copy, which is silent corruption. */
@@ -1443,7 +1446,7 @@ vbdev_tier_add_band(struct vbdev_tier *t, const char *base_bdev_name, enum tier_
 
 	band->band_id = t->next_band_id;	/* consumed (incremented) only at commit */
 	band->tier = tier;
-	band->state = TIER_BAND_ACTIVE;
+	tier_band_set_state(band, TIER_BAND_ACTIVE);
 	snprintf(band->base_bdev_name, sizeof(band->base_bdev_name), "%s", base_bdev_name);
 	if (wwn) {
 		snprintf(band->wwn, sizeof(band->wwn), "%s", wwn);
@@ -1721,7 +1724,7 @@ vbdev_tier_assemble_band(struct vbdev_tier *t, const char *base_bdev_name, uint3
 	t->sb_blocks = sb_blocks;
 	band->band_id = band_id;
 	band->tier = tier;
-	band->state = state;
+	tier_band_set_state(band, state);
 	snprintf(band->base_bdev_name, sizeof(band->base_bdev_name), "%s", base_bdev_name);
 	if (wwn) {
 		snprintf(band->wwn, sizeof(band->wwn), "%s", wwn);
@@ -1828,7 +1831,7 @@ vbdev_tier_retire_band(struct vbdev_tier *t, uint32_t band_id,
 	 * retiring. The slot and its LBA range stay as an unreclaimable hole. Re-running
 	 * the flow on an already-RETIRED band is the idempotent retry path: it
 	 * re-persists (in case the first persist failed) and re-closes. */
-	band->state = TIER_BAND_RETIRED;
+	tier_band_set_state(band, TIER_BAND_RETIRED);
 	/* Persist to the SURVIVING bands BEFORE closing the retired one's desc, so the
 	 * seq bump durably records the retirement, then drain+close, then complete: the
 	 * caller acks only a durable retirement. */
@@ -2048,7 +2051,7 @@ vbdev_tier_register(struct vbdev_tier *t)
 			return -EINVAL;
 		}
 		TAILQ_FOREACH(vb, &t->bands, link) {
-			if (vb->state == TIER_BAND_RETIRED) {
+			if (tier_band_state(vb) == TIER_BAND_RETIRED) {
 				continue;
 			}
 			if (vb->lba_start % t->cluster_blocks != 0 || vb->num_blocks % t->cluster_blocks != 0) {
@@ -2070,7 +2073,7 @@ vbdev_tier_register(struct vbdev_tier *t)
 		struct tier_band *ab;
 
 		TAILQ_FOREACH(ab, &t->bands, link) {
-			if (ab->state != TIER_BAND_RETIRED && ab->desc != NULL) {
+			if (tier_band_state(ab) != TIER_BAND_RETIRED && ab->desc != NULL) {
 				t->bdev.required_alignment = spdk_max(t->bdev.required_alignment,
 								      spdk_bdev_desc_get_bdev(ab->desc)->required_alignment);
 			}
@@ -2155,7 +2158,7 @@ tier_copy_finish(struct tier_copy_ctx *c, int rc)
 static inline bool
 tier_copy_dst_alive(const struct tier_copy_ctx *c)
 {
-	return c->dst_band->desc != NULL && c->dst_band->state == TIER_BAND_ACTIVE;
+	return c->dst_band->desc != NULL && tier_band_state(c->dst_band) == TIER_BAND_ACTIVE;
 }
 
 /* Write-then-flush durability step. A base WITHOUT FLUSH support has no volatile
@@ -2311,8 +2314,8 @@ vbdev_tier_relocate_copy(struct vbdev_tier *t, uint64_t src_lba, uint64_t dst_lb
 
 	sb = vbdev_tier_band_of_lba(t, src_lba, &src_off);
 	db = vbdev_tier_band_of_lba(t, dst_lba, &dst_off);
-	if (sb == NULL || db == NULL || sb->state != TIER_BAND_ACTIVE ||
-	    db->state != TIER_BAND_ACTIVE || sb->desc == NULL || db->desc == NULL) {
+	if (sb == NULL || db == NULL || tier_band_state(sb) != TIER_BAND_ACTIVE ||
+	    tier_band_state(db) != TIER_BAND_ACTIVE || sb->desc == NULL || db->desc == NULL) {
 		return -EIO;
 	}
 	/* The copy must stay inside both bands: a straddling range would read or write a
@@ -2391,8 +2394,8 @@ static void tier_md_resync_next(struct tier_md_resync_ctx *c);
 static inline bool
 tier_md_resync_legs_alive(const struct tier_md_resync_ctx *c)
 {
-	return c->src->desc != NULL && c->src->state == TIER_BAND_ACTIVE &&
-	       c->dst->desc != NULL && c->dst->state != TIER_BAND_RETIRED;
+	return c->src->desc != NULL && tier_band_state(c->src) == TIER_BAND_ACTIVE &&
+	       c->dst->desc != NULL && tier_band_state(c->dst) != TIER_BAND_RETIRED;
 }
 
 static void
@@ -2442,7 +2445,7 @@ tier_md_resync_persisted(void *cb_arg, int rc)
 
 	if (rc != 0) {
 		/* Not durable: revert so the CSI retries (the copy itself is redoable). */
-		c->dst->state = TIER_BAND_DEGRADED;
+		tier_band_set_state(c->dst, TIER_BAND_DEGRADED);
 	}
 	tier_md_resync_finish(c, rc);
 }
@@ -2479,9 +2482,9 @@ tier_md_resync_ch_open_done(struct spdk_io_channel_iter *i, int status)
 		return;
 	}
 	/* Copy durable + channels reachable: activate the leg, persist, unquiesce. */
-	c->dst->state = TIER_BAND_ACTIVE;
+	tier_band_set_state(c->dst, TIER_BAND_ACTIVE);
 	if (tier_sb_write_all(c->t, tier_md_resync_persisted, c) != 0) {
-		c->dst->state = TIER_BAND_DEGRADED;
+		tier_band_set_state(c->dst, TIER_BAND_DEGRADED);
 		tier_md_resync_finish(c, -ENOMEM);
 	}
 }
@@ -2595,11 +2598,11 @@ vbdev_tier_resync_md(struct vbdev_tier *t, uint32_t target_band_id,
 	if (target_band_id != t->md_mirror_a && target_band_id != t->md_mirror_b) {
 		return -EINVAL;	/* only md legs carry the mirrored region */
 	}
-	if (dst->state != TIER_BAND_DEGRADED) {
+	if (tier_band_state(dst) != TIER_BAND_DEGRADED) {
 		return -EINVAL;	/* resync only rebuilds a degraded/replacement leg */
 	}
 	src = tier_md_other_leg(t, dst);
-	if (src == NULL || src->state != TIER_BAND_ACTIVE || src->desc == NULL) {
+	if (src == NULL || tier_band_state(src) != TIER_BAND_ACTIVE || src->desc == NULL) {
 		return -EIO;	/* no healthy leg to copy from */
 	}
 

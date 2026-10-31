@@ -1,0 +1,389 @@
+diff --git a/lib/nvme/nvme_ctrlr.c b/lib/nvme/nvme_ctrlr.c
+index a08e607..d4b9902 100644
+--- a/lib/nvme/nvme_ctrlr.c
++++ b/lib/nvme/nvme_ctrlr.c
+@@ -806,10 +806,46 @@ nvme_ctrlr_alloc_ana_log_page(struct spdk_nvme_ctrlr *ctrlr)
+ 	return 0;
+ }
+ 
++/*
++ * Evariops 0073: the ANA log page is read with no wait. Both readers, the ANA change event and the
++ * controller's init state machine (run again at every reconnect), waited on the admin queue after
++ * the command, polling that queue alone: a process that is also an NVMe-oF target answered nobody
++ * meanwhile. cb_fn is invoked once, at the command's completion, when 0 is returned; a failure to
++ * submit is returned, and cb_fn is not invoked.
++ */
++typedef void (*nvme_ctrlr_ana_log_page_cb)(struct spdk_nvme_ctrlr *ctrlr, void *cb_arg, int rc,
++		const struct spdk_nvme_cpl *cpl);
++
++struct nvme_ctrlr_ana_log_page_ctx {
++	struct spdk_nvme_ctrlr *ctrlr;
++	nvme_ctrlr_ana_log_page_cb cb_fn;
++	void *cb_arg;
++};
++
++static void
++nvme_ctrlr_update_ana_log_page_done(void *arg, const struct spdk_nvme_cpl *cpl)
++{
++	struct nvme_ctrlr_ana_log_page_ctx *ctx = arg;
++	struct spdk_nvme_ctrlr *ctrlr = ctx->ctrlr;
++	nvme_ctrlr_ana_log_page_cb cb_fn = ctx->cb_fn;
++	void *cb_arg = ctx->cb_arg;
++	int rc = 0;
++
++	free(ctx);
++	if (spdk_nvme_cpl_is_error(cpl)) {
++		NVME_CTRLR_ERRLOG(ctrlr, "Failed to read the ANA log page: sct %u, sc %u\n",
++				  cpl->status.sct, cpl->status.sc);
++		rc = -EIO;
++	}
++
++	cb_fn(ctrlr, cb_arg, rc, cpl);
++}
++
+ static int
+-nvme_ctrlr_update_ana_log_page(struct spdk_nvme_ctrlr *ctrlr)
++nvme_ctrlr_update_ana_log_page_async(struct spdk_nvme_ctrlr *ctrlr,
++				     nvme_ctrlr_ana_log_page_cb cb_fn, void *cb_arg)
+ {
+-	struct nvme_completion_poll_status *status;
++	struct nvme_ctrlr_ana_log_page_ctx *ctx;
+ 	int rc;
+ 
+ 	rc = nvme_ctrlr_alloc_ana_log_page(ctrlr);
+@@ -817,25 +853,22 @@ nvme_ctrlr_update_ana_log_page(struct spdk_nvme_ctrlr *ctrlr)
+ 		return rc;
+ 	}
+ 
+-	status = calloc(1, sizeof(*status));
+-	if (status == NULL) {
+-		NVME_CTRLR_ERRLOG(ctrlr, "Failed to allocate status tracker\n");
++	ctx = calloc(1, sizeof(*ctx));
++	if (ctx == NULL) {
++		NVME_CTRLR_ERRLOG(ctrlr, "Failed to allocate the ANA log page ctx\n");
+ 		return -ENOMEM;
+ 	}
+ 
++	ctx->ctrlr = ctrlr;
++	ctx->cb_fn = cb_fn;
++	ctx->cb_arg = cb_arg;
++
+ 	rc = spdk_nvme_ctrlr_cmd_get_log_page(ctrlr, SPDK_NVME_LOG_ASYMMETRIC_NAMESPACE_ACCESS,
+ 					      SPDK_NVME_GLOBAL_NS_TAG, ctrlr->ana_log_page,
+ 					      ctrlr->ana_log_page_size, 0,
+-					      nvme_completion_poll_cb, status);
++					      nvme_ctrlr_update_ana_log_page_done, ctx);
+ 	if (rc != 0) {
+-		free(status);
+-		return rc;
+-	}
+-
+-	rc = nvme_wait_for_adminq_completion(ctrlr, status, true);
+-	if (rc) {
+-		NVME_CTRLR_ERRLOG(ctrlr, "wait for spdk_nvme_ctrlr_cmd_get_log_page failed: rc=%s\n",
+-				  spdk_strerror(abs(rc)));
++		free(ctx);
+ 	}
+ 
+ 	return rc;
+@@ -903,6 +936,22 @@ nvme_ctrlr_parse_ana_log_page(struct spdk_nvme_ctrlr *ctrlr,
+ 	return rc;
+ }
+ 
++static void nvme_ctrlr_set_supported_log_pages_done(struct spdk_nvme_ctrlr *ctrlr);
++
++static void
++nvme_ctrlr_init_ana_log_page_done(struct spdk_nvme_ctrlr *ctrlr, void *cb_arg, int rc,
++				  const struct spdk_nvme_cpl *cpl)
++{
++	/* As when the read was waited for: a failed read fails the controller's init. */
++	if (rc != 0) {
++		nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_ERROR, NVME_TIMEOUT_INFINITE);
++		return;
++	}
++
++	nvme_ctrlr_parse_ana_log_page(ctrlr, nvme_ctrlr_update_ns_ana_states, ctrlr);
++	nvme_ctrlr_set_supported_log_pages_done(ctrlr);
++}
++
+ static int
+ nvme_ctrlr_set_supported_log_pages(struct spdk_nvme_ctrlr *ctrlr)
+ {
+@@ -917,24 +966,38 @@ nvme_ctrlr_set_supported_log_pages(struct spdk_nvme_ctrlr *ctrlr)
+ 		ctrlr->log_page_supported[SPDK_NVME_LOG_COMMAND_EFFECTS_LOG] = true;
+ 	}
+ 
++	if (ctrlr->cdata.ctratt.fdps) {
++		ctrlr->log_page_supported[SPDK_NVME_LOG_FDP_CONFIGURATIONS] = true;
++		ctrlr->log_page_supported[SPDK_NVME_LOG_RECLAIM_UNIT_HANDLE_USAGE] = true;
++		ctrlr->log_page_supported[SPDK_NVME_LOG_FDP_STATISTICS] = true;
++		ctrlr->log_page_supported[SPDK_NVME_LOG_FDP_EVENTS] = true;
++	}
++
+ 	if (ctrlr->cdata.cmic.anars) {
+ 		ctrlr->log_page_supported[SPDK_NVME_LOG_ASYMMETRIC_NAMESPACE_ACCESS] = true;
+ 		if (!ctrlr->opts.disable_read_ana_log_page) {
+-			rc = nvme_ctrlr_update_ana_log_page(ctrlr);
+-			if (rc == 0) {
+-				nvme_ctrlr_parse_ana_log_page(ctrlr, nvme_ctrlr_update_ns_ana_states,
+-							      ctrlr);
++			/* Evariops 0073: the state waits for the page, the completion moves on.
++			 * Set before the command, which a completion may follow at once. */
++			nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_WAIT_FOR_SUPPORTED_LOG_PAGES,
++					     ctrlr->opts.admin_timeout_ms);
++			rc = nvme_ctrlr_update_ana_log_page_async(ctrlr,
++					nvme_ctrlr_init_ana_log_page_done, NULL);
++			if (rc != 0) {
++				NVME_CTRLR_ERRLOG(ctrlr, "Failed to read the ANA log page: %s\n",
++						  spdk_strerror(-rc));
+ 			}
++
++			return rc;
+ 		}
+ 	}
+ 
+-	if (ctrlr->cdata.ctratt.fdps) {
+-		ctrlr->log_page_supported[SPDK_NVME_LOG_FDP_CONFIGURATIONS] = true;
+-		ctrlr->log_page_supported[SPDK_NVME_LOG_RECLAIM_UNIT_HANDLE_USAGE] = true;
+-		ctrlr->log_page_supported[SPDK_NVME_LOG_FDP_STATISTICS] = true;
+-		ctrlr->log_page_supported[SPDK_NVME_LOG_FDP_EVENTS] = true;
+-	}
++	nvme_ctrlr_set_supported_log_pages_done(ctrlr);
++	return rc;
++}
+ 
++static void
++nvme_ctrlr_set_supported_log_pages_done(struct spdk_nvme_ctrlr *ctrlr)
++{
+ 	if (ctrlr->cdata.vid == SPDK_PCI_VID_INTEL &&
+ 	    ctrlr->trid.trtype == SPDK_NVME_TRANSPORT_PCIE &&
+ 	    !(ctrlr->quirks & NVME_INTEL_QUIRK_NO_LOG_PAGES)) {
+@@ -946,8 +1009,6 @@ nvme_ctrlr_set_supported_log_pages(struct spdk_nvme_ctrlr *ctrlr)
+ 				     ctrlr->opts.admin_timeout_ms);
+ 
+ 	}
+-
+-	return rc;
+ }
+ 
+ static void
+@@ -1529,6 +1590,8 @@ nvme_ctrlr_state_string(enum nvme_ctrlr_state state)
+ 		return "wait for identify ns iocs specific";
+ 	case NVME_CTRLR_STATE_SET_SUPPORTED_LOG_PAGES:
+ 		return "set supported log pages";
++	case NVME_CTRLR_STATE_WAIT_FOR_SUPPORTED_LOG_PAGES:
++		return "wait for supported log pages";
+ 	case NVME_CTRLR_STATE_SET_SUPPORTED_INTEL_LOG_PAGES:
+ 		return "set supported INTEL log pages";
+ 	case NVME_CTRLR_STATE_WAIT_FOR_SUPPORTED_INTEL_LOG_PAGES:
+@@ -3853,6 +3916,25 @@ nvme_ctrlr_publish_async_event(struct spdk_nvme_ctrlr_aer_completion *src)
+ 	}
+ }
+ 
++/* Evariops 0073: an ANA change event ends at its log page's completion. */
++static void
++nvme_ctrlr_aer_ana_log_page_done(struct spdk_nvme_ctrlr *ctrlr, void *cb_arg, int rc,
++				 const struct spdk_nvme_cpl *cpl)
++{
++	struct spdk_nvme_ctrlr_aer_completion *async_event = cb_arg;
++
++	if (nvme_ctrlr_aer_lost(ctrlr, cpl)) {
++		nvme_ctrlr_free_async_event(async_event);
++		return;
++	}
++
++	if (rc == 0) {
++		nvme_ctrlr_parse_ana_log_page(ctrlr, nvme_ctrlr_update_ns_ana_states, ctrlr);
++	}
++
++	nvme_ctrlr_process_async_event_finish(async_event, false);
++}
++
+ static void
+ nvme_ctrlr_process_async_event(struct spdk_nvme_ctrlr_aer_completion *async_event)
+ {
+@@ -3886,12 +3968,12 @@ nvme_ctrlr_process_async_event(struct spdk_nvme_ctrlr_aer_completion *async_even
+ 			break;
+ 		}
+ 
+-		rc = nvme_ctrlr_update_ana_log_page(ctrlr);
+-		if (rc) {
+-			break;
++		/* Evariops 0073: the completion ends the event. Not submitted, it ends here. */
++		rc = nvme_ctrlr_update_ana_log_page_async(ctrlr, nvme_ctrlr_aer_ana_log_page_done,
++				async_event);
++		if (rc == 0) {
++			return;
+ 		}
+-
+-		nvme_ctrlr_parse_ana_log_page(ctrlr, nvme_ctrlr_update_ns_ana_states, ctrlr);
+ 		break;
+ 	default:
+ 		break;
+@@ -4845,6 +4927,7 @@ nvme_ctrlr_process_init(struct spdk_nvme_ctrlr *ctrlr)
+ 	case NVME_CTRLR_STATE_WAIT_FOR_IDENTIFY_NS:
+ 	case NVME_CTRLR_STATE_WAIT_FOR_IDENTIFY_ID_DESCS:
+ 	case NVME_CTRLR_STATE_WAIT_FOR_IDENTIFY_NS_IOCS_SPECIFIC:
++	case NVME_CTRLR_STATE_WAIT_FOR_SUPPORTED_LOG_PAGES:
+ 	case NVME_CTRLR_STATE_WAIT_FOR_SUPPORTED_INTEL_LOG_PAGES:
+ 	case NVME_CTRLR_STATE_WAIT_FOR_SET_HOST_FEATURE:
+ 	case NVME_CTRLR_STATE_WAIT_FOR_DB_BUF_CFG:
+diff --git a/lib/nvme/nvme_internal.h b/lib/nvme/nvme_internal.h
+index 2319fc7..85a3e7b 100644
+--- a/lib/nvme/nvme_internal.h
++++ b/lib/nvme/nvme_internal.h
+@@ -963,6 +963,11 @@ enum nvme_ctrlr_state {
+ 	 */
+ 	NVME_CTRLR_STATE_SET_SUPPORTED_LOG_PAGES,
+ 
++	/**
++	 * Waiting for the ANA log page (Evariops 0073: read with no wait).
++	 */
++	NVME_CTRLR_STATE_WAIT_FOR_SUPPORTED_LOG_PAGES,
++
+ 	/**
+ 	 * Set supported log pages of INTEL controller.
+ 	 */
+diff --git a/test/unit/lib/nvme/nvme_ctrlr.c/nvme_ctrlr_ut.c b/test/unit/lib/nvme/nvme_ctrlr.c/nvme_ctrlr_ut.c
+index 9c6ac78..10471e9 100644
+--- a/test/unit/lib/nvme/nvme_ctrlr.c/nvme_ctrlr_ut.c
++++ b/test/unit/lib/nvme/nvme_ctrlr.c/nvme_ctrlr_ut.c
+@@ -536,8 +536,10 @@ struct spdk_nvme_ana_page *g_ana_hdr;
+ struct spdk_nvme_ana_group_descriptor **g_ana_descs;
+ 
+ static uint32_t g_get_log_page_sent_counter = 0;
+-/* Evariops 0072: the changed-namespace log is held, its completion delivered by the test. */
++/* Evariops 0072: the changed-namespace log is held, its completion delivered by the test;
++ * 0073: the ANA log page as well. */
+ static bool g_defer_changed_ns_log;
++static bool g_defer_ana_log;
+ static spdk_nvme_cmd_cb g_deferred_log_cb;
+ static void *g_deferred_log_arg;
+ 
+@@ -547,6 +549,12 @@ spdk_nvme_ctrlr_cmd_get_log_page(struct spdk_nvme_ctrlr *ctrlr, uint8_t log_page
+ 				 uint64_t offset, spdk_nvme_cmd_cb cb_fn, void *cb_arg)
+ {
+ 	g_get_log_page_sent_counter++;
++	if (log_page == SPDK_NVME_LOG_ASYMMETRIC_NAMESPACE_ACCESS && g_defer_ana_log) {
++		g_deferred_log_cb = cb_fn;
++		g_deferred_log_arg = cb_arg;
++		return 0;
++	}
++
+ 	if ((log_page == SPDK_NVME_LOG_ASYMMETRIC_NAMESPACE_ACCESS) && g_ana_hdr) {
+ 		uint32_t i;
+ 		uint8_t *ptr = payload;
+@@ -3581,6 +3589,93 @@ test_nvme_ctrlr_set_intel_supported_log_pages(void)
+ 	nvme_ctrlr_destruct(&ctrlr);
+ }
+ 
++/* Evariops 0073: the ANA log page is read with no wait; its completion is recorded here. */
++static int g_ut_ana_log_page_rc;
++
++static void
++ut_ana_log_page_done(struct spdk_nvme_ctrlr *ctrlr, void *cb_arg, int rc,
++		     const struct spdk_nvme_cpl *cpl)
++{
++	g_ut_ana_log_page_rc = rc;
++}
++
++/*
++ * Evariops 0073: the ANA log page is read with no wait, by the controller's init state machine
++ * and by the ANA change event. Held by the test, the init's read leaves the state waiting for it,
++ * and its completion moves the state on; the event stays in progress until its read completes,
++ * then ends and calls back. No wait on the admin queue at any point.
++ */
++static void
++test_nvme_ctrlr_ana_log_page_waits_for_nothing(void)
++{
++	DECLARE_AND_CONSTRUCT_CTRLR();
++	union spdk_nvme_async_event_completion	aer_event = {
++		.bits.async_event_type = SPDK_NVME_ASYNC_EVENT_TYPE_NOTICE,
++		.bits.async_event_info = SPDK_NVME_ASYNC_EVENT_ANA_CHANGE
++	};
++	struct spdk_nvme_cpl aer_cpl = {
++		.status.sct = SPDK_NVME_SCT_GENERIC,
++		.status.sc = SPDK_NVME_SC_SUCCESS,
++		.cdw0 = aer_event.raw
++	};
++	struct spdk_nvme_cpl done = {
++		.status.sct = SPDK_NVME_SCT_GENERIC,
++		.status.sc = SPDK_NVME_SC_SUCCESS,
++	};
++	spdk_nvme_cmd_cb cb;
++
++	SPDK_CU_ASSERT_FATAL(nvme_ctrlr_construct(&ctrlr) == 0);
++	ctrlr.vs.bits.mjr = 1;
++	ctrlr.vs.bits.mnr = 2;
++	ctrlr.cdata.nn = 4096;
++	ctrlr.cdata.cmic.anars = true;
++	ctrlr.cdata.nanagrpid = 1;
++
++	ctrlr.state = NVME_CTRLR_STATE_CONFIGURE_AER;
++	while (ctrlr.state != NVME_CTRLR_STATE_READY) {
++		SPDK_CU_ASSERT_FATAL(nvme_ctrlr_process_init(&ctrlr) == 0);
++	}
++
++	CU_ASSERT(nvme_ctrlr_add_process(&ctrlr, NULL) == 0);
++	spdk_nvme_ctrlr_register_aer_callback(&ctrlr, aer_cb, NULL);
++
++	g_defer_ana_log = true;
++	g_deferred_log_cb = NULL;
++	g_wait_for_adminq_calls = 0;
++	g_aer_cb_counter = 0;
++
++	/* The event: in progress until its read completes, then it ends and calls back. */
++	nvme_ctrlr_async_event_cb(&ctrlr.aer[0], &aer_cpl);
++	nvme_ctrlr_complete_queued_async_events(&ctrlr);
++	SPDK_CU_ASSERT_FATAL(g_deferred_log_cb != NULL);
++	CU_ASSERT(ctrlr.async_event_in_progress != NULL);
++	CU_ASSERT(g_aer_cb_counter == 0);
++
++	cb = g_deferred_log_cb;
++	g_deferred_log_cb = NULL;
++	cb(g_deferred_log_arg, &done);
++	CU_ASSERT(ctrlr.async_event_in_progress == NULL);
++	CU_ASSERT(g_aer_cb_counter == 1);
++
++	/* The init (again at a reconnect): the state waits for the page, and moves on at its
++	 * completion. */
++	ctrlr.opts.admin_timeout_ms = NVME_TIMEOUT_INFINITE;
++	ctrlr.state = NVME_CTRLR_STATE_SET_SUPPORTED_LOG_PAGES;
++	CU_ASSERT(nvme_ctrlr_process_init(&ctrlr) == 0);
++	CU_ASSERT(ctrlr.state == NVME_CTRLR_STATE_WAIT_FOR_SUPPORTED_LOG_PAGES);
++	SPDK_CU_ASSERT_FATAL(g_deferred_log_cb != NULL);
++
++	cb = g_deferred_log_cb;
++	g_deferred_log_cb = NULL;
++	cb(g_deferred_log_arg, &done);
++	CU_ASSERT(ctrlr.state == NVME_CTRLR_STATE_SET_SUPPORTED_FEATURES);
++	CU_ASSERT(g_wait_for_adminq_calls == 0);
++
++	g_defer_ana_log = false;
++	nvme_ctrlr_free_processes(&ctrlr);
++	nvme_ctrlr_destruct(&ctrlr);
++}
++
+ #define UT_ANA_DESC_SIZE	(sizeof(struct spdk_nvme_ana_group_descriptor) +	\
+ 				 sizeof(uint32_t))
+ static void
+@@ -3606,8 +3701,10 @@ test_nvme_ctrlr_parse_ana_log_page(void)
+ 	ctrlr.cdata.nn = 3;
+ 	ctrlr.cdata.nanagrpid = 3;
+ 
+-	rc = nvme_ctrlr_update_ana_log_page(&ctrlr);
++	g_ut_ana_log_page_rc = -1;
++	rc = nvme_ctrlr_update_ana_log_page_async(&ctrlr, ut_ana_log_page_done, NULL);
+ 	CU_ASSERT(rc == 0);
++	CU_ASSERT(g_ut_ana_log_page_rc == 0);
+ 	CU_ASSERT(ctrlr.ana_log_page != NULL);
+ 	CU_ASSERT(ctrlr.copied_ana_desc != NULL);
+ 
+@@ -3928,6 +4025,7 @@ main(int argc, char **argv)
+ 	CU_ADD_TEST(suite, test_nvme_ctrlr_set_supported_log_pages);
+ 	CU_ADD_TEST(suite, test_nvme_ctrlr_set_intel_supported_log_pages);
+ 	CU_ADD_TEST(suite, test_nvme_ctrlr_parse_ana_log_page);
++	CU_ADD_TEST(suite, test_nvme_ctrlr_ana_log_page_waits_for_nothing);
+ 	CU_ADD_TEST(suite, test_nvme_ctrlr_ana_resize);
+ 	CU_ADD_TEST(suite, test_nvme_ctrlr_get_memory_domains);
+ 	CU_ADD_TEST(suite, test_nvme_transport_ctrlr_ready);

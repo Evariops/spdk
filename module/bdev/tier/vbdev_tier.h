@@ -269,6 +269,9 @@ tier_unit_identity_validate(const uint8_t *part_uuid, uint64_t part_start_lba,
 struct tier_band {
 	uint32_t		band_id;
 	enum tier_class		tier;
+	/* Read by the I/O path of every reactor, and degraded from any reactor by a failed
+	 * metadata write: go through tier_band_state(), tier_band_set_state() and
+	 * tier_band_degrade(). */
 	enum tier_band_state	state;
 
 	char			base_bdev_name[TIER_BDEV_NAME_LEN];
@@ -314,6 +317,29 @@ struct tier_band {
 
 	TAILQ_ENTRY(tier_band)	link;
 };
+
+static inline enum tier_band_state
+tier_band_state(const struct tier_band *band)
+{
+	return __atomic_load_n(&band->state, __ATOMIC_ACQUIRE);
+}
+
+/* The management paths, on the composite's thread. */
+static inline void
+tier_band_set_state(struct tier_band *band, enum tier_band_state state)
+{
+	__atomic_store_n(&band->state, state, __ATOMIC_RELEASE);
+}
+
+/* ACTIVE to DEGRADED from any reactor; true for the one call that made the change. */
+static inline bool
+tier_band_degrade(struct tier_band *band)
+{
+	enum tier_band_state active = TIER_BAND_ACTIVE;
+
+	return __atomic_compare_exchange_n(&band->state, &active, TIER_BAND_DEGRADED, false,
+					   __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
 
 /* Per-band fill accounting provider. The composite only knows geometry; which
  * blocks are LIVE is logical state owned by the blobstore sitting on top. The

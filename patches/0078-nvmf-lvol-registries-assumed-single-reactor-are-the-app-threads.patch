@@ -1,0 +1,104 @@
+diff --git a/lib/nvmf/nvmf_pause_rpc.c b/lib/nvmf/nvmf_pause_rpc.c
+index 0bef5a4..6952941 100644
+--- a/lib/nvmf/nvmf_pause_rpc.c
++++ b/lib/nvmf/nvmf_pause_rpc.c
+@@ -11,14 +11,15 @@
+ #include "spdk/util.h"
+ #include "spdk/log.h"
+ #include "spdk/queue.h"
+-#include "spdk/env.h"           /* spdk_env_get_core_count */
+ #include "spdk/uuid.h"          /* random per-process nonce */
+ 
+ #define PAUSE_TTL_DEFAULT_MS  30000u
+ #define PAUSE_TTL_MAX_MS      60000u    /* 60 s ceiling; keep below the host io_timeout */
+ 
+-/* Standing-pause registry. SPDK control runs on a single reactor (-m 0x1):
+- * every access below is on the app thread. Add a lock if the CPU mask widens. */
++/* Standing-pause registry. Evariops 0078: it is the app thread's whatever the CPU
++ * mask, with no lock: the RPC handlers run there, the TTL poller is registered
++ * there, and nvmf calls a pause's or a resume's completion on the subsystem's
++ * thread, the one that created it, the RPC's. Each access asserts it. */
+ enum paused_state {
+ 	PSTATE_PAUSED,      /* standing-paused, TTL armed */
+ 	PSTATE_RESUMING,    /* resume dispatched; freed (ok) or reverted (fail) in the completion cb */
+@@ -48,10 +49,16 @@ static TAILQ_HEAD(, paused_subsystem) g_paused = TAILQ_HEAD_INITIALIZER(g_paused
+ static uint64_t g_instance;
+ static uint64_t g_epoch;
+ 
++static inline void
++paused_on_app_thread(void)
++{
++	assert(spdk_get_thread() == spdk_thread_get_app_thread());
++}
++
+ static void
+ paused_first_use(void)
+ {
+-	static bool warned;
++	paused_on_app_thread();
+ 	if (g_instance == 0) {
+ 		/* The nonce must not collide across quick restarts, so derive it from
+ 		 * random bits rather than the clock; |1 keeps it provably nonzero. */
+@@ -62,19 +69,14 @@ paused_first_use(void)
+ 		memcpy(&hi, &u, sizeof(hi));
+ 		g_instance = hi | 1;
+ 	}
+-	/* The lock-free registry assumes a single reactor (-m 0x1). */
+-	if (!warned && spdk_env_get_core_count() > 1) {
+-		warned = true;
+-		SPDK_ERRLOG("nvmf pause: %u reactors active; the standing-pause registry is "
+-			    "lock-free and assumes -m 0x1 — guard g_paused before widening the mask\n",
+-			    spdk_env_get_core_count());
+-	}
+ }
+ 
+ static struct paused_subsystem *
+ paused_find(struct spdk_nvmf_subsystem *ss)
+ {
+ 	struct paused_subsystem *p;
++
++	paused_on_app_thread();
+ 	TAILQ_FOREACH(p, &g_paused, link) {
+ 		if (p->subsystem == ss) { return p; }
+ 	}
+@@ -84,6 +86,7 @@ paused_find(struct spdk_nvmf_subsystem *ss)
+ static void
+ paused_entry_free(struct paused_subsystem *p)
+ {
++	paused_on_app_thread();
+ 	spdk_poller_unregister(&p->ttl_poller);   /* safe if already NULL */
+ 	TAILQ_REMOVE(&g_paused, p, link);
+ 	free(p);
+diff --git a/module/bdev/lvol/vbdev_lvol_tier_rpc.c b/module/bdev/lvol/vbdev_lvol_tier_rpc.c
+index 7b326a4..3804548 100644
+--- a/module/bdev/lvol/vbdev_lvol_tier_rpc.c
++++ b/module/bdev/lvol/vbdev_lvol_tier_rpc.c
+@@ -35,8 +35,10 @@
+ /* ===================== per-blob relocate serialization ===================== */
+ /* Two relocate/remap ops in flight on the SAME blob can issue concurrent writes to
+  * the same extent page (the commit re-points one); a reordered completion loses an
+- * update and orphans a cluster. Allow at most one per blob. The JSON-RPC handlers
+- * all run on a single reactor thread, so no lock is needed. */
++ * update and orphans a cluster. Allow at most one per blob. Evariops 0078: no lock,
++ * whatever the CPU mask: the JSON-RPC handlers run on the app thread, and a
++ * relocation's copy (channels taken on the calling thread) and its commit complete on
++ * the thread that started them. Each access asserts it. */
+ struct relocate_inflight {
+ 	struct spdk_blob		*blob;
+ 	TAILQ_ENTRY(relocate_inflight)	link;
+@@ -48,6 +50,7 @@ relocate_blob_acquire(struct spdk_blob *blob)
+ {
+ 	struct relocate_inflight *e;
+ 
++	assert(spdk_get_thread() == spdk_thread_get_app_thread());
+ 	TAILQ_FOREACH(e, &g_relocate_inflight, link) {
+ 		if (e->blob == blob) {
+ 			return false;
+@@ -67,6 +70,7 @@ relocate_blob_release(struct spdk_blob *blob)
+ {
+ 	struct relocate_inflight *e;
+ 
++	assert(spdk_get_thread() == spdk_thread_get_app_thread());
+ 	TAILQ_FOREACH(e, &g_relocate_inflight, link) {
+ 		if (e->blob == blob) {
+ 			TAILQ_REMOVE(&g_relocate_inflight, e, link);

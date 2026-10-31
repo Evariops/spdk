@@ -1,0 +1,741 @@
+diff --git a/lib/nvme/nvme_ctrlr.c b/lib/nvme/nvme_ctrlr.c
+index d410f29..a08e607 100644
+--- a/lib/nvme/nvme_ctrlr.c
++++ b/lib/nvme/nvme_ctrlr.c
+@@ -3524,33 +3524,35 @@ nvme_ctrlr_process_async_event_finish(struct spdk_nvme_ctrlr_aer_completion *asy
+ 	nvme_ctrlr_free_async_event(async_event);
+ }
+ 
+-static int
+-nvme_ctrlr_prepare_async_event(struct spdk_nvme_ctrlr *ctrlr,
+-			       struct spdk_nvme_ctrlr_aer_completion *async_event)
+-{
+-	if (async_event->poll_status) {
+-		goto out;
+-	}
++static void nvme_ctrlr_aer_handle_changed_ns_log(struct spdk_nvme_ctrlr *ctrlr,
++		struct spdk_nvme_ctrlr_aer_completion *async_event);
+ 
+-	/* Must be shared memory so other processes can access */
+-	async_event->poll_status = spdk_zmalloc(sizeof(*async_event->poll_status), 0, NULL,
+-						SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_SHARE);
+-	if (!async_event->poll_status) {
+-		NVME_CTRLR_ERRLOG(ctrlr, "Failed to allocate completion status tracker\n");
+-		return -ENOMEM;
++/*
++ * Evariops 0072: a namespace-change event is handled with no wait. Each admin command it needs
++ * (the changed-namespace log, the active list, each namespace's identify) is submitted, and its
++ * completion goes on with the event; the event ends at the last one. upstream waited on the admin
++ * queue after each, polling only that queue: a process that also serves as an NVMe-oF target
++ * then answered nobody, and two such processes that wait on each other froze until the admin
++ * timeout. The event keeps the controller's one event in progress until it ends, as before
++ * (ctrlr->async_event_in_progress).
++ *
++ * A command aborted with its queue, or a controller resetting, failed or destroyed, ends the
++ * event with no callback: the reset identifies every namespace again.
++ */
++static bool
++nvme_ctrlr_aer_lost(struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_cpl *cpl)
++{
++	if (cpl != NULL && cpl->status.sct == SPDK_NVME_SCT_GENERIC &&
++	    cpl->status.sc == SPDK_NVME_SC_ABORTED_SQ_DELETION) {
++		return true;
+ 	}
+ 
+-out:
+-	memset(async_event->poll_status, 0, sizeof(*async_event->poll_status));
+-	return 0;
++	return ctrlr->is_resetting || ctrlr->is_failed || ctrlr->is_destructed;
+ }
+ 
+-static void nvme_ctrlr_aer_handle_changed_ns_log(struct spdk_nvme_ctrlr *ctrlr,
+-		struct spdk_nvme_ctrlr_aer_completion *async_event);
+-
+ struct nvme_ctrlr_aer_get_changed_ns_log_ctx {
+-	struct nvme_completion_poll_status *status;
+ 	struct spdk_nvme_ctrlr *ctrlr;
++	struct spdk_nvme_ctrlr_aer_completion *async_event;
+ 	uint32_t *changed_ns_list;
+ };
+ 
+@@ -3559,39 +3561,43 @@ nvme_ctrlr_aer_get_changed_ns_log_cb(void *arg, const struct spdk_nvme_cpl *cpl)
+ {
+ 	struct nvme_ctrlr_aer_get_changed_ns_log_ctx *ctx = arg;
+ 	struct spdk_nvme_ctrlr *ctrlr = ctx->ctrlr;
++	struct spdk_nvme_ctrlr_aer_completion *async_event = ctx->async_event;
++	uint32_t *changed_ns_list = ctx->changed_ns_list;
+ 
+-	if (ctx->status->timed_out) {
+-		spdk_free(ctx->status);
+-		spdk_free(ctx->changed_ns_list);
+-		free(ctx);
+-		return;
+-	}
+-
+-	ctx->status->done = true;
++	free(ctx);
+ 
+ 	if (spdk_nvme_cpl_is_error(cpl)) {
+ 		NVME_CTRLR_ERRLOG(ctrlr, "Failed to retrieve changed ns log data\n");
+-		ctx->status->cpl = *cpl;
+-		ctx->changed_ns_list = NULL;
++		spdk_free(changed_ns_list);
++		changed_ns_list = NULL;
+ 	} else {
+-		if (ctx->changed_ns_list[0] == 0) {
++		if (changed_ns_list[0] == 0) {
+ 			NVME_CTRLR_WARNLOG(ctrlr, "changed ns log is empty despite NS_ATTR_CHANGED AER.\n");
+ 		}
+ 
+-		if (ctx->changed_ns_list[0] == UINT32_MAX) {
++		if (changed_ns_list[0] == UINT32_MAX) {
+ 			NVME_CTRLR_WARNLOG(ctrlr, "changed ns log overflowed.\n");
+-			spdk_free(ctx->changed_ns_list);
+-			ctx->changed_ns_list = NULL;
++			spdk_free(changed_ns_list);
++			changed_ns_list = NULL;
+ 		}
+ 	}
++
++	if (nvme_ctrlr_aer_lost(ctrlr, cpl)) {
++		spdk_free(changed_ns_list);
++		nvme_ctrlr_free_async_event(async_event);
++		return;
++	}
++
++	async_event->log_page.changed_ns_list = changed_ns_list;
++	nvme_ctrlr_aer_handle_changed_ns_log(ctrlr, async_event);
+ }
+ 
+ static void
+ nvme_ctrlr_aer_get_changed_ns_log(struct spdk_nvme_ctrlr *ctrlr,
+ 				  struct spdk_nvme_ctrlr_aer_completion *async_event)
+ {
+-	struct nvme_ctrlr_aer_get_changed_ns_log_ctx	*ctx = NULL;
+-	int		rc = -ENOMEM;
++	struct nvme_ctrlr_aer_get_changed_ns_log_ctx	*ctx;
++	int		rc;
+ 	uint32_t	*changed_ns_list;
+ 	size_t		changed_ns_list_length = SPDK_NVME_MAX_CHANGED_NAMESPACES * sizeof(uint32_t);
+ 
+@@ -3599,23 +3605,21 @@ nvme_ctrlr_aer_get_changed_ns_log(struct spdk_nvme_ctrlr *ctrlr,
+ 				       SPDK_MALLOC_SHARE);
+ 	if (!changed_ns_list) {
+ 		NVME_CTRLR_ERRLOG(ctrlr, "Failed to allocate buffer for getting changed ns log.\n");
+-		goto out;
+-	}
+-
+-	rc = nvme_ctrlr_prepare_async_event(ctrlr, async_event);
+-	if (rc) {
+-		goto out;
++		nvme_ctrlr_aer_handle_changed_ns_log(ctrlr, async_event);
++		return;
+ 	}
+ 
+ 	ctx = calloc(1, sizeof(*ctx));
+ 	if (!ctx) {
+ 		NVME_CTRLR_ERRLOG(ctrlr, "Failed to allocate get log ctx\n");
+-		goto out;
++		spdk_free(changed_ns_list);
++		nvme_ctrlr_aer_handle_changed_ns_log(ctrlr, async_event);
++		return;
+ 	}
+ 
+ 	ctx->ctrlr = ctrlr;
++	ctx->async_event = async_event;
+ 	ctx->changed_ns_list = changed_ns_list;
+-	ctx->status = async_event->poll_status;
+ 
+ 	rc = spdk_nvme_ctrlr_cmd_get_log_page(ctrlr,
+ 					      SPDK_NVME_LOG_CHANGED_NS_LIST,
+@@ -3632,76 +3636,160 @@ nvme_ctrlr_aer_get_changed_ns_log(struct spdk_nvme_ctrlr *ctrlr,
+ 		}
+ 
+ 		nvme_ctrlr_aer_handle_changed_ns_log(ctrlr, async_event);
+-		return;
+ 	}
+ 
+-	rc = nvme_wait_for_adminq_completion(ctrlr, ctx->status, false);
+-	if (ctx->status->timed_out) {
+-		nvme_ctrlr_free_async_event(async_event);
+-		return;
++	/* Submitted: the completion goes on with the event (0072). */
++}
++
++struct nvme_ctrlr_aer_identify_ctx {
++	struct spdk_nvme_ctrlr *ctrlr;
++	struct spdk_nvme_ctrlr_aer_completion *async_event;
++	/* With the changed-namespace log: the index of its next entry, then their count. Without
++	 * it: the last namespace id taken, the next one pending identify being above it. */
++	uint32_t next;
++	bool from_log;
++};
++
++static struct spdk_nvme_ns *
++nvme_ctrlr_aer_identify_next_ns(struct nvme_ctrlr_aer_identify_ctx *ctx)
++{
++	struct spdk_nvme_ctrlr *ctrlr = ctx->ctrlr;
++	struct spdk_nvme_ns tmp = {.id = 0};
++	struct spdk_nvme_ns *ns;
++	uint32_t nsid;
++
++	if (ctx->from_log) {
++		while (ctx->next < SPDK_NVME_MAX_CHANGED_NAMESPACES) {
++			nsid = ctx->async_event->log_page.changed_ns_list[ctx->next];
++			if (nsid == 0) {
++				return NULL;
++			}
++
++			ctx->next++;
++			ns = spdk_nvme_ctrlr_get_ns(ctrlr, nsid);
++			if (!ns) {
++				assert(false);
++				NVME_CTRLR_ERRLOG(ctrlr, "Failed to get namespace %u from changed NS list "
++						  "(NSID out of range or OOM)\n", nsid);
++				continue;
++			}
++
++			return ns;
++		}
++
++		return NULL;
+ 	}
+ 
+-out:
+-	if (rc) {
+-		spdk_free(changed_ns_list);
++	/* Found again by id at each step: a namespace object may go between two completions. */
++	if (ctx->next == UINT32_MAX) {
++		return NULL;
+ 	}
+ 
+-	async_event->log_page.changed_ns_list = ctx ? ctx->changed_ns_list : NULL;
+-	nvme_ctrlr_aer_handle_changed_ns_log(ctrlr, async_event);
+-	free(ctx);
++	tmp.id = ctx->next + 1;
++	ns = RB_NFIND(nvme_ns_tree, &ctrlr->ns, &tmp);
++	while (ns != NULL && !ns->identify_pending) {
++		ns = RB_NEXT(nvme_ns_tree, &ctrlr->ns, ns);
++	}
++
++	if (ns != NULL) {
++		ctx->next = ns->id;
++	}
++
++	return ns;
+ }
+ 
++static void nvme_ctrlr_aer_identify_next(struct nvme_ctrlr_aer_identify_ctx *ctx);
++
+ static void
+-nvme_ctrlr_aer_identify_changed_ns(struct spdk_nvme_ctrlr *ctrlr,
+-				   struct spdk_nvme_ctrlr_aer_completion *async_event)
++nvme_ctrlr_aer_identify_ns_done(uint32_t nsid, void *arg, int rc)
+ {
++	/* upstream went on past a namespace whose identify failed: so does this. */
++	nvme_ctrlr_aer_identify_next(arg);
++}
++
++static void
++nvme_ctrlr_aer_identify_next(struct nvme_ctrlr_aer_identify_ctx *ctx)
++{
++	struct spdk_nvme_ctrlr *ctrlr = ctx->ctrlr;
++	struct spdk_nvme_ctrlr_aer_completion *async_event = ctx->async_event;
+ 	struct spdk_nvme_ns *ns;
+-	uint32_t ns_count;
+-	uint32_t nsid;
+ 
+-	for (ns_count = 0; ns_count < SPDK_NVME_MAX_CHANGED_NAMESPACES; ns_count++) {
+-		nsid = async_event->log_page.changed_ns_list[ns_count];
+-		if (nsid == 0) {
+-			break;
+-		}
++	if (nvme_ctrlr_aer_lost(ctrlr, NULL)) {
++		free(ctx);
++		nvme_ctrlr_free_async_event(async_event);
++		return;
++	}
+ 
+-		ns = spdk_nvme_ctrlr_get_ns(ctrlr, nsid);
+-		if (!ns) {
+-			assert(false);
+-			NVME_CTRLR_ERRLOG(ctrlr, "Failed to get namespace %u from changed NS list "
+-					  "(NSID out of range or OOM)\n", nsid);
+-			continue;
++	while ((ns = nvme_ctrlr_aer_identify_next_ns(ctx)) != NULL) {
++		if (nvme_ns_identify_async(ns, nvme_ctrlr_aer_identify_ns_done, ctx) == 0) {
++			return;
+ 		}
++		/* Not submitted: on to the next, as upstream went on past a failed identify. */
++	}
+ 
+-		nvme_ns_identify(ns);
++	if (ctx->from_log) {
++		async_event->changed_ns_count = ctx->next;
+ 	}
+ 
++	free(ctx);
+ 	nvme_io_msg_ctrlr_update(ctrlr);
+-	async_event->changed_ns_count = ns_count;
+ 	nvme_ctrlr_process_async_event_finish(async_event, true);
+ }
+ 
+ static void
+-nvme_ctrlr_aer_identify_active_ns(struct spdk_nvme_ctrlr *ctrlr,
+-				  struct spdk_nvme_ctrlr_aer_completion *async_event)
++nvme_ctrlr_aer_identify_start(struct spdk_nvme_ctrlr *ctrlr,
++			      struct spdk_nvme_ctrlr_aer_completion *async_event, bool from_log)
+ {
+-	struct spdk_nvme_ns *ns;
+-	int rc;
++	struct nvme_ctrlr_aer_identify_ctx *ctx;
+ 
+-	rc = nvme_ctrlr_identify_active_ns(ctrlr);
+-	if (rc) {
++	ctx = calloc(1, sizeof(*ctx));
++	if (!ctx) {
++		NVME_CTRLR_ERRLOG(ctrlr, "Failed to allocate the namespace change's identify ctx\n");
+ 		nvme_ctrlr_free_async_event(async_event);
+ 		return;
+ 	}
+ 
+-	RB_FOREACH(ns, nvme_ns_tree, &ctrlr->ns) {
+-		if (ns->identify_pending) {
+-			nvme_ns_identify(ns);
+-		}
++	ctx->ctrlr = ctrlr;
++	ctx->async_event = async_event;
++	ctx->from_log = from_log;
++	nvme_ctrlr_aer_identify_next(ctx);
++}
++
++static void
++nvme_ctrlr_aer_identify_changed_ns(struct spdk_nvme_ctrlr *ctrlr,
++				   struct spdk_nvme_ctrlr_aer_completion *async_event)
++{
++	nvme_ctrlr_aer_identify_start(ctrlr, async_event, true);
++}
++
++static void
++nvme_ctrlr_aer_identify_active_ns_done(struct spdk_nvme_ctrlr *ctrlr, void *cb_arg, int status)
++{
++	struct spdk_nvme_ctrlr_aer_completion *async_event = cb_arg;
++
++	if (status != 0 || nvme_ctrlr_aer_lost(ctrlr, NULL)) {
++		nvme_ctrlr_free_async_event(async_event);
++		return;
+ 	}
+ 
+-	nvme_io_msg_ctrlr_update(ctrlr);
+-	nvme_ctrlr_process_async_event_finish(async_event, true);
++	nvme_ctrlr_aer_identify_start(ctrlr, async_event, false);
++}
++
++static void
++nvme_ctrlr_aer_identify_active_ns(struct spdk_nvme_ctrlr *ctrlr,
++				  struct spdk_nvme_ctrlr_aer_completion *async_event)
++{
++	struct nvme_active_ns_ctx *ctx;
++
++	ctx = nvme_active_ns_ctx_create(ctrlr, NULL, nvme_ctrlr_aer_identify_active_ns_done,
++					async_event);
++	if (!ctx) {
++		nvme_ctrlr_free_async_event(async_event);
++		return;
++	}
++
++	/* Invokes its callback exactly once, and takes the ctx. */
++	nvme_ctrlr_identify_active_ns_async(ctx);
+ }
+ 
+ static void
+diff --git a/lib/nvme/nvme_internal.h b/lib/nvme/nvme_internal.h
+index c07d387..2319fc7 100644
+--- a/lib/nvme/nvme_internal.h
++++ b/lib/nvme/nvme_internal.h
+@@ -1532,6 +1532,8 @@ void	nvme_ns_set_id_desc_list_data(struct spdk_nvme_ns *ns, const uint8_t *buf,
+ void	nvme_ns_free_iocs_specific_data(struct spdk_nvme_ns *ns);
+ bool	nvme_ns_has_supported_iocs_specific_data(struct spdk_nvme_ns *ns);
+ int	nvme_ns_identify(struct spdk_nvme_ns *ns);
++/* Evariops 0072: nvme_ns_identify with no wait; cb_fn is invoked once, when 0 is returned. */
++int	nvme_ns_identify_async(struct spdk_nvme_ns *ns, nvme_ns_async_cb_fn cb_fn, void *cb_arg);
+ void	nvme_ns_mark_inactive(struct spdk_nvme_ns *ns);
+ int	nvme_ns_cmd_zone_append_with_md(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
+ 					void *buffer, void *metadata, uint64_t zslba,
+diff --git a/lib/nvme/nvme_ns.c b/lib/nvme/nvme_ns.c
+index bf7143c..1704da5 100644
+--- a/lib/nvme/nvme_ns.c
++++ b/lib/nvme/nvme_ns.c
+@@ -835,3 +835,115 @@ nvme_ns_identify(struct spdk_nvme_ns *ns)
+ 
+ 	return 0;
+ }
++
++/*
++ * Evariops 0072: nvme_ns_identify with no wait, for the namespace-change event. The same steps,
++ * each started by the previous one's completion: the namespace's data, then, when it is active,
++ * its descriptors, then its command-set data. The namespace is found again by id at each step.
++ * cb_fn is invoked exactly once, with what nvme_ns_identify would return, when 0 is returned; a
++ * failure to submit the first command is returned, and cb_fn is not invoked.
++ */
++struct nvme_ns_identify_async_ctx {
++	struct spdk_nvme_ctrlr *ctrlr;
++	nvme_ns_async_cb_fn cb_fn;
++	void *cb_arg;
++};
++
++static void
++nvme_ns_identify_async_done(struct nvme_ns_identify_async_ctx *ctx, uint32_t nsid, int rc)
++{
++	nvme_ns_async_cb_fn cb_fn = ctx->cb_fn;
++	void *cb_arg = ctx->cb_arg;
++
++	free(ctx);
++	cb_fn(nsid, cb_arg, rc);
++}
++
++static void
++nvme_ns_identify_async_iocs_cb(uint32_t nsid, void *arg, int rc)
++{
++	nvme_ns_identify_async_done(arg, nsid, rc);
++}
++
++static void
++nvme_ns_identify_async_id_desc_cb(uint32_t nsid, void *arg, int rc)
++{
++	struct nvme_ns_identify_async_ctx *ctx = arg;
++	struct spdk_nvme_ns *ns;
++
++	if (rc != 0) {
++		nvme_ns_identify_async_done(ctx, nsid, rc);
++		return;
++	}
++
++	ns = nvme_ctrlr_find_ns(ctx->ctrlr, nsid);
++	if (ns == NULL) {
++		nvme_ns_identify_async_done(ctx, nsid, -ENODEV);
++		return;
++	}
++
++	if (!nvme_ctrlr_multi_iocs_enabled(ctx->ctrlr) ||
++	    !nvme_ns_has_supported_iocs_specific_data(ns)) {
++		nvme_ns_identify_async_done(ctx, nsid, 0);
++		return;
++	}
++
++	rc = nvme_ns_identify_iocs_specific_async(ns, NULL, nvme_ns_identify_async_iocs_cb, ctx);
++	if (rc != 0) {
++		nvme_ns_identify_async_done(ctx, nsid, rc);
++	}
++}
++
++static void
++nvme_ns_identify_async_data_cb(uint32_t nsid, void *arg, int rc)
++{
++	struct nvme_ns_identify_async_ctx *ctx = arg;
++	struct spdk_nvme_ns *ns;
++
++	if (rc != 0) {
++		nvme_ns_identify_async_done(ctx, nsid, rc);
++		return;
++	}
++
++	ns = nvme_ctrlr_find_ns(ctx->ctrlr, nsid);
++	if (ns == NULL) {
++		nvme_ns_identify_async_done(ctx, nsid, -ENODEV);
++		return;
++	}
++
++	if (!spdk_nvme_ns_is_active(ns)) {
++		nvme_ns_identify_async_done(ctx, nsid, 0);
++		return;
++	}
++
++	rc = nvme_ns_identify_id_desc_async(ns, NULL, nvme_ns_identify_async_id_desc_cb, ctx);
++	if (rc != 0) {
++		nvme_ns_identify_async_done(ctx, nsid, rc);
++	}
++}
++
++int
++nvme_ns_identify_async(struct spdk_nvme_ns *ns, nvme_ns_async_cb_fn cb_fn, void *cb_arg)
++{
++	struct nvme_ns_identify_async_ctx *ctx;
++	int rc;
++
++	assert(ns->id > 0);
++	assert(cb_fn != NULL);
++
++	ctx = calloc(1, sizeof(*ctx));
++	if (!ctx) {
++		return -ENOMEM;
++	}
++
++	ctx->ctrlr = ns->ctrlr;
++	ctx->cb_fn = cb_fn;
++	ctx->cb_arg = cb_arg;
++
++	rc = nvme_ns_identify_data_async(ns, NULL, nvme_ns_identify_async_data_cb, ctx);
++	if (rc != 0) {
++		free(ctx);
++	}
++
++	return rc;
++}
+diff --git a/test/unit/lib/nvme/nvme_ctrlr.c/nvme_ctrlr_ut.c b/test/unit/lib/nvme/nvme_ctrlr.c/nvme_ctrlr_ut.c
+index d78d739..9c6ac78 100644
+--- a/test/unit/lib/nvme/nvme_ctrlr.c/nvme_ctrlr_ut.c
++++ b/test/unit/lib/nvme/nvme_ctrlr.c/nvme_ctrlr_ut.c
+@@ -393,6 +393,8 @@ nvme_completion_poll_cb(void *arg, const struct spdk_nvme_cpl *cpl)
+ }
+ 
+ static struct nvme_completion_poll_status *g_failed_status;
++/* Evariops 0072: the waits on the admin queue, which a namespace-change event makes none of. */
++static uint32_t g_wait_for_adminq_calls;
+ 
+ int
+ nvme_wait_for_adminq_completion(struct spdk_nvme_ctrlr *ctrlr,
+@@ -400,6 +402,7 @@ nvme_wait_for_adminq_completion(struct spdk_nvme_ctrlr *ctrlr,
+ {
+ 	int rc;
+ 
++	g_wait_for_adminq_calls++;
+ 	if (spdk_nvme_qpair_process_completions(ctrlr->adminq, 0) < 0) {
+ 		g_failed_status = status;
+ 		status->timed_out = true;
+@@ -533,6 +536,10 @@ struct spdk_nvme_ana_page *g_ana_hdr;
+ struct spdk_nvme_ana_group_descriptor **g_ana_descs;
+ 
+ static uint32_t g_get_log_page_sent_counter = 0;
++/* Evariops 0072: the changed-namespace log is held, its completion delivered by the test. */
++static bool g_defer_changed_ns_log;
++static spdk_nvme_cmd_cb g_deferred_log_cb;
++static void *g_deferred_log_arg;
+ 
+ int
+ spdk_nvme_ctrlr_cmd_get_log_page(struct spdk_nvme_ctrlr *ctrlr, uint8_t log_page,
+@@ -576,6 +583,12 @@ spdk_nvme_ctrlr_cmd_get_log_page(struct spdk_nvme_ctrlr *ctrlr, uint8_t log_page
+ 						g_aer_ns_change.changed_ns_list, g_aer_ns_change.changed_ns_list_length);
+ 			g_needs_setup_aer_for_ns_change = false;
+ 		}
++
++		if (g_defer_changed_ns_log) {
++			g_deferred_log_cb = cb_fn;
++			g_deferred_log_arg = cb_arg;
++			return 0;
++		}
+ 	}
+ 
+ 	fake_cpl_sc(cb_fn, cb_arg);
+@@ -755,6 +768,16 @@ nvme_ns_identify(struct spdk_nvme_ns *ns)
+ 	return 0;
+ }
+ 
++/* Evariops 0072: the namespace-change event identifies with no wait; completed at once here. */
++int
++nvme_ns_identify_async(struct spdk_nvme_ns *ns, nvme_ns_async_cb_fn cb_fn, void *cb_arg)
++{
++	int rc = nvme_ns_identify(ns);
++
++	cb_fn(ns->id, cb_arg, rc);
++	return 0;
++}
++
+ void
+ nvme_ns_set_identify_data(struct spdk_nvme_ns *ns, const struct spdk_nvme_ns_data *nsdata)
+ {
+@@ -3077,6 +3100,96 @@ test_nvme_ctrlr_aer_callback(void)
+ 	nvme_ctrlr_destruct(&ctrlr);
+ }
+ 
++/*
++ * Evariops 0072: a namespace-change event waits on nothing. Its changed-namespace log is
++ * submitted and the event stays in progress; the log's completion goes on with the event, which
++ * ends with the namespaces identified and the callback invoked, with no wait on the admin queue
++ * at any point. A log aborted with its queue ends the event, with no callback.
++ */
++static void
++test_nvme_ctrlr_ns_attr_changed_waits_for_nothing(void)
++{
++	DECLARE_AND_CONSTRUCT_CTRLR();
++	uint32_t active_ns_list[] = { 1, 2, 100 };
++	uint32_t changed_ns_list[] = { 100 };
++	union spdk_nvme_async_event_completion	aer_event = {
++		.bits.async_event_type = SPDK_NVME_ASYNC_EVENT_TYPE_NOTICE,
++		.bits.async_event_info = SPDK_NVME_ASYNC_EVENT_NS_ATTR_CHANGED
++	};
++	struct spdk_nvme_cpl aer_cpl = {
++		.status.sct = SPDK_NVME_SCT_GENERIC,
++		.status.sc = SPDK_NVME_SC_SUCCESS,
++		.cdw0 = aer_event.raw
++	};
++	struct spdk_nvme_cpl done = {
++		.status.sct = SPDK_NVME_SCT_GENERIC,
++		.status.sc = SPDK_NVME_SC_SUCCESS,
++	};
++	struct spdk_nvme_cpl aborted = {
++		.status.sct = SPDK_NVME_SCT_GENERIC,
++		.status.sc = SPDK_NVME_SC_ABORTED_SQ_DELETION,
++	};
++	spdk_nvme_cmd_cb cb;
++
++	SPDK_CU_ASSERT_FATAL(nvme_ctrlr_construct(&ctrlr) == 0);
++
++	ctrlr.vs.bits.mjr = 1;
++	ctrlr.vs.bits.mnr = 2;
++	ctrlr.vs.bits.ter = 0;
++	ctrlr.cdata.nn = 4096;
++
++	ctrlr.state = NVME_CTRLR_STATE_CONFIGURE_AER;
++	g_active_ns_list = active_ns_list;
++	g_active_ns_list_length = SPDK_COUNTOF(active_ns_list);
++	while (ctrlr.state != NVME_CTRLR_STATE_READY) {
++		SPDK_CU_ASSERT_FATAL(nvme_ctrlr_process_init(&ctrlr) == 0);
++	}
++
++	CU_ASSERT(nvme_ctrlr_add_process(&ctrlr, NULL) == 0);
++	spdk_nvme_ctrlr_register_aer_callback(&ctrlr, aer_cb, NULL);
++
++	g_defer_changed_ns_log = true;
++	g_wait_for_adminq_calls = 0;
++	g_aer_cb_counter = 0;
++	g_changed_ns_list = changed_ns_list;
++	g_changed_ns_list_length = SPDK_COUNTOF(changed_ns_list);
++
++	nvme_ctrlr_async_event_cb(&ctrlr.aer[0], &aer_cpl);
++	nvme_ctrlr_complete_queued_async_events(&ctrlr);
++
++	/* Submitted, not completed: the event is in progress, and nothing waited for it. */
++	SPDK_CU_ASSERT_FATAL(g_deferred_log_cb != NULL);
++	CU_ASSERT(ctrlr.async_event_in_progress != NULL);
++	CU_ASSERT(g_aer_cb_counter == 0);
++	CU_ASSERT(g_wait_for_adminq_calls == 0);
++
++	cb = g_deferred_log_cb;
++	g_deferred_log_cb = NULL;
++	cb(g_deferred_log_arg, &done);
++
++	CU_ASSERT(ctrlr.async_event_in_progress == NULL);
++	CU_ASSERT(g_aer_cb_counter == 1);
++	CU_ASSERT(g_wait_for_adminq_calls == 0);
++
++	/* The next event's log is aborted with its queue: the event ends, with no callback. */
++	nvme_ctrlr_async_event_cb(&ctrlr.aer[0], &aer_cpl);
++	nvme_ctrlr_complete_queued_async_events(&ctrlr);
++	SPDK_CU_ASSERT_FATAL(g_deferred_log_cb != NULL);
++	CU_ASSERT(ctrlr.async_event_in_progress != NULL);
++
++	cb = g_deferred_log_cb;
++	g_deferred_log_cb = NULL;
++	cb(g_deferred_log_arg, &aborted);
++
++	CU_ASSERT(ctrlr.async_event_in_progress == NULL);
++	CU_ASSERT(g_aer_cb_counter == 1);
++	CU_ASSERT(g_wait_for_adminq_calls == 0);
++
++	g_defer_changed_ns_log = false;
++	nvme_ctrlr_free_processes(&ctrlr);
++	nvme_ctrlr_destruct(&ctrlr);
++}
++
+ static void
+ check_active_ns(struct spdk_nvme_ctrlr *ctrlr, uint32_t *active_ns_list, uint32_t max_count)
+ {
+@@ -3810,6 +3923,7 @@ main(int argc, char **argv)
+ 	CU_ADD_TEST(suite, test_nvme_ctrlr_reset);
+ 	CU_ADD_TEST(suite, test_nvme_ctrlr_aer_callback);
+ 	CU_ADD_TEST(suite, test_nvme_ctrlr_ns_attr_changed);
++	CU_ADD_TEST(suite, test_nvme_ctrlr_ns_attr_changed_waits_for_nothing);
+ 	CU_ADD_TEST(suite, test_nvme_ctrlr_identify_namespaces_iocs_specific_next);
+ 	CU_ADD_TEST(suite, test_nvme_ctrlr_set_supported_log_pages);
+ 	CU_ADD_TEST(suite, test_nvme_ctrlr_set_intel_supported_log_pages);
+diff --git a/test/unit/lib/nvme/nvme_ns.c/nvme_ns_ut.c b/test/unit/lib/nvme/nvme_ns.c/nvme_ns_ut.c
+index 9196bc6..907b8ff 100644
+--- a/test/unit/lib/nvme/nvme_ns.c/nvme_ns_ut.c
++++ b/test/unit/lib/nvme/nvme_ns.c/nvme_ns_ut.c
+@@ -63,6 +63,8 @@ static struct spdk_nvme_nvm_ns_data nsdata_nvm = {
+ };
+ 
+ struct spdk_nvme_cmd g_ut_cmd = {};
++static spdk_nvme_cmd_cb g_ut_id_desc_cb;
++static void *g_ut_id_desc_arg;
+ 
+ int
+ nvme_ctrlr_cmd_identify(struct spdk_nvme_ctrlr *ctrlr, uint8_t cns, uint16_t cntid, uint32_t nsid,
+@@ -97,6 +99,9 @@ nvme_ctrlr_cmd_identify(struct spdk_nvme_ctrlr *ctrlr, uint8_t cns, uint16_t cnt
+ 		g_ut_cmd.cdw10_bits.identify.cntid = cntid;
+ 		g_ut_cmd.cdw11_bits.identify.csi = csi;
+ 		g_ut_cmd.nsid = nsid;
++		/* Evariops 0072: held, for a test to complete. */
++		g_ut_id_desc_cb = cb_fn;
++		g_ut_id_desc_arg = cb_arg;
+ 		return 0;
+ 	}
+ 	return -1;
+@@ -138,6 +143,58 @@ test_nvme_ns_identify(void)
+ 	g_ut_ns = NULL;
+ }
+ 
++static uint32_t g_ut_identify_async_calls;
++static int g_ut_identify_async_rc;
++
++static void
++ut_identify_async_cb(uint32_t nsid, void *cb_arg, int rc)
++{
++	g_ut_identify_async_calls++;
++	g_ut_identify_async_rc = rc;
++}
++
++/*
++ * Evariops 0072: nvme_ns_identify_async takes nvme_ns_identify's steps, each at the previous
++ * one's completion, and calls back once at the end. A step whose completion has not come leaves
++ * the callback pending, and nothing waits for it.
++ */
++static void
++test_nvme_ns_identify_async(void)
++{
++	struct spdk_nvme_ctrlr ctrlr = {};
++	struct spdk_nvme_ns *ns = ut_ns_alloc(1, &ctrlr);
++	struct spdk_nvme_ns_data nsdata = { .ncap = 1 };
++	struct spdk_nvme_cpl cpl = {};
++
++	g_ut_ns = ns;
++	ns->csi = SPDK_NVME_CSI_NVM;
++	fake_nsdata = &nsdata;
++
++	/* Before 1.3 a controller has no descriptor list: the data, then the callback. */
++	ctrlr.vs.raw = SPDK_NVME_VERSION(1, 2, 0);
++	g_ut_identify_async_calls = 0;
++	CU_ASSERT(nvme_ns_identify_async(ns, ut_identify_async_cb, NULL) == 0);
++	CU_ASSERT(g_ut_identify_async_calls == 1);
++	CU_ASSERT(g_ut_identify_async_rc == 0);
++
++	/* From 1.3 the descriptor list is asked, and the stub holds its completion. */
++	ctrlr.vs.raw = SPDK_NVME_VERSION(1, 3, 0);
++	g_ut_identify_async_calls = 0;
++	g_ut_id_desc_cb = NULL;
++	CU_ASSERT(nvme_ns_identify_async(ns, ut_identify_async_cb, NULL) == 0);
++	CU_ASSERT(g_ut_identify_async_calls == 0);
++	SPDK_CU_ASSERT_FATAL(g_ut_id_desc_cb != NULL);
++
++	g_ut_id_desc_cb(g_ut_id_desc_arg, &cpl);
++	CU_ASSERT(g_ut_identify_async_calls == 1);
++	CU_ASSERT(g_ut_identify_async_rc == 0);
++
++	g_ut_id_desc_cb = NULL;
++	fake_nsdata = NULL;
++	ut_ns_free(ns);
++	g_ut_ns = NULL;
++}
++
+ static void
+ test_nvme_ns_uuid(void)
+ {
+@@ -677,6 +734,7 @@ main(int argc, char **argv)
+ 	suite = CU_add_suite("nvme", NULL, NULL);
+ 
+ 	CU_ADD_TEST(suite, test_nvme_ns_identify);
++	CU_ADD_TEST(suite, test_nvme_ns_identify_async);
+ 	CU_ADD_TEST(suite, test_nvme_ns_uuid);
+ 	CU_ADD_TEST(suite, test_nvme_ns_csi);
+ 	CU_ADD_TEST(suite, test_nvme_ns_data);

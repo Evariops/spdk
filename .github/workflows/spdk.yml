@@ -255,7 +255,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          sparse-checkout: images/spdk/ublk-functional.sh
+          sparse-checkout: |
+            images/spdk/ublk-functional.sh
+            images/spdk/multireactor-functional.sh
 
       - name: Load ublk_drv
         run: |
@@ -283,6 +285,53 @@ jobs:
           docker run --rm --privileged --user 0:0 -v /dev:/dev \
             -v "$PWD/images/spdk/ublk-functional.sh:/ublk-functional.sh:ro" \
             --entrypoint bash "$IMAGE" /ublk-functional.sh
+
+      # Two reactors under load: a two-queue ublk disk over a raid1 whose members
+      # are reached through LOCAL, while a member's target goes away and comes back.
+      - name: Two reactors under load
+        env:
+          IMAGE: ghcr.io/evariops/spdk-debug:${{ needs.compute-tag.outputs.tag }}-amd64
+        run: |
+          docker run --rm --privileged --user 0:0 -v /dev:/dev \
+            -v "$PWD/images/spdk/multireactor-functional.sh:/multireactor-functional.sh:ro" \
+            --entrypoint bash "$IMAGE" /multireactor-functional.sh
+
+  # ────────────────────────────────────────────────────────────────
+  # 3c. LOCAL functional — the in-memory transport pair (0076)
+  # ────────────────────────────────────────────────────────────────
+  # Initiators and an NVMe-oF target of one spdk_tgt, joined in memory:
+  # data, hosts, reservations against a host of a second process, pause,
+  # namespace and ANA events, teardown. No device, no privilege.
+  local-functional:
+    needs: [compute-tag, build]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: images/spdk/local-functional.sh
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Connect, reserve, pause and tear down LOCAL controllers
+        env:
+          IMAGE: ghcr.io/evariops/spdk-debug:${{ needs.compute-tag.outputs.tag }}-amd64
+        run: |
+          # Root in the container, not privileged: uid 1000 cannot write DPDK's
+          # runtime directory nor the core's lock where spdk_tgt puts them.
+          docker run --rm --user 0:0 \
+            -v "$PWD/images/spdk/local-functional.sh:/local-functional.sh:ro" \
+            --entrypoint bash "$IMAGE" /local-functional.sh
 
   # ────────────────────────────────────────────────────────────────
   # 4b. Release publish — multi-arch manifest + Sign + SBOM + Attest
@@ -433,7 +482,7 @@ jobs:
   # Une PR non autorisée saute build, et seul lint reste déterminant.
   ci-gate:
     name: ci-gate
-    needs: [lint, build, ublk-functional]
+    needs: [lint, build, ublk-functional, local-functional]
     if: always()
     runs-on: ubuntu-24.04
     steps:
