@@ -49,7 +49,7 @@ jobs:
   # ────────────────────────────────────────────────────────────────
   authorize:
     name: Authorize
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     if: >-
       github.event_name != 'pull_request'
       || (
@@ -246,7 +246,7 @@ jobs:
   ublk-functional:
     needs: [compute-tag, build]
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       packages: read
@@ -305,7 +305,7 @@ jobs:
   local-functional:
     needs: [compute-tag, build]
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       packages: read
@@ -484,7 +484,7 @@ jobs:
     name: ci-gate
     needs: [lint, build, ublk-functional, local-functional]
     if: always()
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - name: Check upstream jobs
         env:
