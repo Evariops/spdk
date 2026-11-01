@@ -1,0 +1,130 @@
+diff --git a/module/bdev/uring/bdev_uring.c b/module/bdev/uring/bdev_uring.c
+index c77e99bad..c4159018f 100644
+--- a/module/bdev/uring/bdev_uring.c
++++ b/module/bdev/uring/bdev_uring.c
+@@ -25,6 +25,7 @@
+ 
+ #ifdef SPDK_CONFIG_URING_ZNS
+ #include <linux/blkzoned.h>
++#include <sys/sysmacros.h>
+ #define SECTOR_SHIFT 9
+ #endif
+ 
+@@ -91,6 +92,8 @@ struct bdev_uring {
+ 	TAILQ_ENTRY(bdev_uring)  link;
+ 
+ 	bool			hot_remove_in_progress;
++	/* Evariops 0084: flushes submitted, for bdev_get_bdevs. */
++	uint64_t		flushes;
+ };
+ 
+ static int bdev_uring_init(void);
+@@ -295,6 +298,66 @@ bdev_uring_writev(struct bdev_uring *uring, struct spdk_io_channel *ch,
+ 	return nbytes;
+ }
+ 
++/* Evariops 0084: a flush makes durable what the device acknowledged: fdatasync on the file
++ * or the block device, which the kernel turns into a cache flush when the device has a
++ * volatile write cache. Without it, writes acknowledged by the disk's cache, fsync'ed by
++ * the filesystem above, could be lost with the power. */
++static int64_t
++bdev_uring_flush(struct bdev_uring *uring, struct spdk_io_channel *ch,
++		 struct bdev_uring_task *uring_task)
++{
++	struct bdev_uring_io_channel *uring_ch = spdk_io_channel_get_ctx(ch);
++	struct bdev_uring_group_channel *group_ch = uring_ch->group_ch;
++	struct io_uring_sqe *sqe;
++
++	sqe = io_uring_get_sqe(&group_ch->uring);
++	if (!sqe) {
++		URING_DEBUGLOG(uring, "get sqe failed as out of resource\n");
++		return -ENOMEM;
++	}
++
++	io_uring_prep_fsync(sqe, uring->fd, IORING_FSYNC_DATASYNC);
++	io_uring_sqe_set_data(sqe, uring_task);
++	uring_task->len = 0;
++	uring_task->ch = uring_ch;
++	__atomic_fetch_add(&uring->flushes, 1, __ATOMIC_RELAXED);
++
++	group_ch->io_pending++;
++	return 0;
++}
++
++/* Evariops 0084: a device with a volatile write cache says "write back" in sysfs. A file, or a
++ * device whose cache cannot be read, counts as having one: a flush then costs a syscall, and
++ * an acknowledged write is never left in a cache nobody flushes. */
++static bool
++bdev_uring_has_volatile_cache(int fd)
++{
++	struct stat st;
++	char path[96], state[32] = "";
++	FILE *f;
++
++	if (fstat(fd, &st) != 0 || !S_ISBLK(st.st_mode)) {
++		return true;
++	}
++	snprintf(path, sizeof(path), "/sys/dev/block/%u:%u/queue/write_cache",
++		 major(st.st_rdev), minor(st.st_rdev));
++	f = fopen(path, "r");
++	if (f == NULL) {
++		/* A partition has no queue of its own: its disk's. */
++		snprintf(path, sizeof(path), "/sys/dev/block/%u:%u/../queue/write_cache",
++			 major(st.st_rdev), minor(st.st_rdev));
++		f = fopen(path, "r");
++	}
++	if (f == NULL) {
++		return true;
++	}
++	if (fgets(state, sizeof(state), f) == NULL) {
++		state[0] = '\0';
++	}
++	fclose(f);
++	return strncmp(state, "write through", strlen("write through")) != 0;
++}
++
+ static int
+ bdev_uring_destruct(void *ctx)
+ {
+@@ -818,6 +881,13 @@ _bdev_uring_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev
+ 		spdk_bdev_io_get_buf(bdev_io, bdev_uring_get_buf_cb,
+ 				     bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen);
+ 		return 0;
++	case SPDK_BDEV_IO_TYPE_FLUSH:
++		/* Evariops 0084 */
++		if (bdev_uring_flush(uring_from_bdev(bdev_io->bdev), ch,
++				     (struct bdev_uring_task *)bdev_io->driver_ctx) == -ENOMEM) {
++			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_NOMEM);
++		}
++		return 0;
+ 	default:
+ 		return -1;
+ 	}
+@@ -841,6 +911,7 @@ bdev_uring_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
+ #endif
+ 	case SPDK_BDEV_IO_TYPE_READ:
+ 	case SPDK_BDEV_IO_TYPE_WRITE:
++	case SPDK_BDEV_IO_TYPE_FLUSH:	/* Evariops 0084 */
+ 		return true;
+ 	default:
+ 		return false;
+@@ -881,6 +952,9 @@ bdev_uring_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
+ 	spdk_json_write_named_object_begin(w, "uring");
+ 
+ 	spdk_json_write_named_string(w, "filename", uring->filename);
++	/* Evariops 0084 */
++	spdk_json_write_named_bool(w, "volatile_write_cache", uring->bdev.write_cache != 0);
++	spdk_json_write_named_uint64(w, "flushes", __atomic_load_n(&uring->flushes, __ATOMIC_RELAXED));
+ 
+ 	spdk_json_write_object_end(w);
+ 
+@@ -1028,7 +1102,8 @@ create_uring_bdev(const struct bdev_uring_opts *opts)
+ 	uring->bdev.product_name = "URING bdev";
+ 	uring->bdev.module = &uring_if;
+ 
+-	uring->bdev.write_cache = 0;
++	/* Evariops 0084: announced to the bdevs above (an lvol, an NVMe-oF namespace's VWC). */
++	uring->bdev.write_cache = bdev_uring_has_volatile_cache(uring->fd) ? 1 : 0;
+ 
+ 	detected_block_size = spdk_fd_get_blocklen(uring->fd);
+ 	if (block_size == 0) {
