@@ -1,0 +1,48 @@
+diff --git a/lib/ublk/ublk.c b/lib/ublk/ublk.c
+index 25d0640e7..f2c9aa300 100644
+--- a/lib/ublk/ublk.c
++++ b/lib/ublk/ublk.c
+@@ -262,6 +262,10 @@ struct ublk_poll_group {
+ 	/* Evariops 0066: starts and recoveries refused because a queue could not get a
+ 	 * channel on its bdev on this thread. */
+ 	uint64_t			channel_failures;
++	/* Evariops 0083: submissions went to the kernel since the core was last yielded. */
++	bool				kernel_work_pending;
++	/* The yields that followed a submission (ublk_get_target). */
++	uint64_t			yields;
+ };
+ 
+ #define UBLK_POLL_GROUP_PENDING	0
+@@ -1432,6 +1436,8 @@ ublk_dump_target_json(struct spdk_json_write_ctx *w)
+ 		spdk_json_write_named_bool(w, "reserve_lent", poll_group->reserve_lent);
+ 		/* Evariops 0066 */
+ 		spdk_json_write_named_uint64(w, "channel_failures", poll_group->channel_failures);
++		/* Evariops 0083: read from another thread, a count to watch, not a fence. */
++		spdk_json_write_named_uint64(w, "yields", poll_group->yields);
+ 		spdk_json_write_object_end(w);
+ 	}
+ 	spdk_json_write_array_end(w);
+@@ -2698,10 +2704,21 @@ ublk_poll(void *arg)
+ 		ublk_buffers_watch(poll_group);
+ 	}
+ 	if (count > 0) {
++		poll_group->kernel_work_pending = true;
+ 		return SPDK_POLLER_BUSY;
+-	} else {
+-		return SPDK_POLLER_IDLE;
+ 	}
++	/* Evariops 0083: a commit ends its request in this thread, on this core: the kernel
++	 * runs what follows there, and a filesystem defers the end of a direct write to a
++	 * kworker of this core (xfs, through iomap). A polling reactor keeps that kworker
++	 * waiting for the scheduler to preempt it: 5 us on average, up to a tick (4 ms), for
++	 * every write. Once its submissions are in, the first poll with nothing to do hands
++	 * the core over; with nothing else runnable, sched_yield returns at once. */
++	if (poll_group->kernel_work_pending) {
++		poll_group->kernel_work_pending = false;
++		poll_group->yields++;
++		sched_yield();
++	}
++	return SPDK_POLLER_IDLE;
+ }
+ 
+ static void
