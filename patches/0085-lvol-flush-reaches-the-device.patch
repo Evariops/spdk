@@ -1,0 +1,375 @@
+diff --git a/include/spdk/blob.h b/include/spdk/blob.h
+index ea69301d7..cf52ad4f8 100644
+--- a/include/spdk/blob.h
++++ b/include/spdk/blob.h
+@@ -1213,6 +1213,20 @@ void spdk_blob_io_readv_ext(struct spdk_blob *blob, struct spdk_io_channel *chan
+ void spdk_blob_io_unmap(struct spdk_blob *blob, struct spdk_io_channel *channel,
+ 			uint64_t offset, uint64_t length, spdk_blob_op_complete cb_fn, void *cb_arg);
+ 
++/**
++ * Make durable the writes the blobstore's device holds in a volatile cache (Evariops 0085).
++ *
++ * The cache belongs to the device: the flush covers every blob of the store. Completes at
++ * once with no error when the device has no flush.
++ *
++ * \param blob Blob whose writes are to be made durable.
++ * \param channel I/O channel used to submit requests.
++ * \param cb_fn Called when the operation is complete.
++ * \param cb_arg Argument passed to function cb_fn.
++ */
++void spdk_blob_io_flush(struct spdk_blob *blob, struct spdk_io_channel *channel,
++			spdk_blob_op_complete cb_fn, void *cb_arg);
++
+ /**
+  * Write zeros into area of a blob.
+  *
+diff --git a/lib/blob/blobstore.c b/lib/blob/blobstore.c
+index 626e6bee9..a76578095 100644
+--- a/lib/blob/blobstore.c
++++ b/lib/blob/blobstore.c
+@@ -9830,6 +9830,35 @@ spdk_blob_io_unmap(struct spdk_blob *blob, struct spdk_io_channel *channel,
+ 			       SPDK_BLOB_UNMAP);
+ }
+ 
++/* Evariops 0085: what the blob's writes left in the device's volatile cache is made durable.
++ * The cache is the device's, shared by every blob of the store: flushing it for one blob
++ * flushes it for all, and a device without flush has nothing to flush. */
++void
++spdk_blob_io_flush(struct spdk_blob *blob, struct spdk_io_channel *channel,
++		   spdk_blob_op_complete cb_fn, void *cb_arg)
++{
++	struct spdk_bs_cpl cpl;
++	spdk_bs_batch_t *batch;
++
++	if (blob->bs->dev->flush == NULL) {
++		cb_fn(cb_arg, 0);
++		return;
++	}
++
++	cpl.type = SPDK_BS_CPL_TYPE_BLOB_BASIC;
++	cpl.u.blob_basic.cb_fn = cb_fn;
++	cpl.u.blob_basic.cb_arg = cb_arg;
++
++	batch = bs_batch_open(channel, &cpl, blob);
++	if (!batch) {
++		cb_fn(cb_arg, -ENOMEM);
++		return;
++	}
++
++	bs_batch_flush_dev(batch);
++	bs_batch_close(batch);
++}
++
+ void
+ spdk_blob_io_write_zeroes(struct spdk_blob *blob, struct spdk_io_channel *channel,
+ 			  uint64_t offset, uint64_t length, spdk_blob_op_complete cb_fn, void *cb_arg)
+diff --git a/lib/blob/request.c b/lib/blob/request.c
+index 07774c475..24acc8ca8 100644
+--- a/lib/blob/request.c
++++ b/lib/blob/request.c
+@@ -431,6 +431,19 @@ bs_batch_unmap_dev(spdk_bs_batch_t *batch,
+ 			    &set->cb_args);
+ }
+ 
++/* Evariops 0085 */
++void
++bs_batch_flush_dev(spdk_bs_batch_t *batch)
++{
++	struct spdk_bs_request_set	*set = (struct spdk_bs_request_set *)batch;
++	struct spdk_bs_channel		*channel = set->channel;
++
++	SPDK_DEBUGLOG(blob_rw, "Flushing the device\n");
++
++	set->u.batch.outstanding_ops++;
++	channel->dev->flush(channel->dev, channel->dev_channel, &set->cb_args);
++}
++
+ void
+ bs_batch_write_zeroes_dev(spdk_bs_batch_t *batch,
+ 			  uint64_t lba, uint64_t lba_count)
+diff --git a/lib/blob/request.h b/lib/blob/request.h
+index c1204fd88..8ad3997c4 100644
+--- a/lib/blob/request.h
++++ b/lib/blob/request.h
+@@ -192,6 +192,9 @@ void bs_batch_unmap_dev(spdk_bs_batch_t *batch,
+ void bs_batch_write_zeroes_dev(spdk_bs_batch_t *batch,
+ 			       uint64_t lba, uint64_t lba_count);
+ 
++/* Evariops 0085: the device's flush, which the batch's device must have. */
++void bs_batch_flush_dev(spdk_bs_batch_t *batch);
++
+ void bs_batch_close(spdk_bs_batch_t *batch);
+ 
+ spdk_bs_batch_t *bs_sequence_to_batch(spdk_bs_sequence_t *seq,
+diff --git a/lib/blob/spdk_blob.map b/lib/blob/spdk_blob.map
+index 79487e57f..31dd33505 100644
+--- a/lib/blob/spdk_blob.map
++++ b/lib/blob/spdk_blob.map
+@@ -67,6 +67,7 @@
+ 	spdk_blob_io_readv_ext;
+ 	spdk_blob_io_writev_ext;
+ 	spdk_blob_io_unmap;
++	spdk_blob_io_flush;
+ 	spdk_blob_io_write_zeroes;
+ 	spdk_bs_iter_first;
+ 	spdk_bs_iter_next;
+diff --git a/module/bdev/lvol/vbdev_lvol.c b/module/bdev/lvol/vbdev_lvol.c
+index bc1d246a2..1b3ae57d1 100644
+--- a/module/bdev/lvol/vbdev_lvol.c
++++ b/module/bdev/lvol/vbdev_lvol.c
+@@ -962,6 +962,9 @@ vbdev_lvol_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
+ 	case SPDK_BDEV_IO_TYPE_SEEK_DATA:
+ 	case SPDK_BDEV_IO_TYPE_SEEK_HOLE:
+ 		return true;
++	case SPDK_BDEV_IO_TYPE_FLUSH:
++		/* Evariops 0085: the store's device flushes, so does the lvol. */
++		return lvol->lvol_store->bs_dev->flush != NULL;
+ 	default:
+ 		return false;
+ 	}
+@@ -1118,6 +1121,9 @@ vbdev_lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_
+ 	case SPDK_BDEV_IO_TYPE_SEEK_HOLE:
+ 		lvol_seek_hole(lvol, bdev_io);
+ 		break;
++	case SPDK_BDEV_IO_TYPE_FLUSH:	/* Evariops 0085 */
++		spdk_blob_io_flush(lvol->blob, ch, lvol_op_comp, bdev_io);
++		break;
+ 	default:
+ 		SPDK_INFOLOG(vbdev_lvol, "lvol: unsupported I/O type %d\n", bdev_io->type);
+ 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+@@ -1309,6 +1315,9 @@ _create_lvol_disk(struct spdk_lvol *lvol, bool destroy)
+ 	bdev->blockcnt = total_size / bdev->blocklen;
+ 	bdev->uuid = lvol->uuid;
+ 	bdev->required_alignment = lvs_bdev->bdev->required_alignment;
++	/* Evariops 0085: the base's volatile write cache is the lvol's: announced above (a ublk
++	 * disk, an NVMe-oF namespace's VWC), so that its flushes come down. */
++	bdev->write_cache = lvs_bdev->bdev->write_cache;
+ 	bdev->split_on_optimal_io_boundary = true;
+ 	bdev->optimal_io_boundary = spdk_bs_get_cluster_size(lvol->lvol_store->blobstore) / bdev->blocklen;
+ 
+diff --git a/module/blob/bdev/blob_bdev.c b/module/blob/bdev/blob_bdev.c
+index fc0ee96cd..9b9d41062 100644
+--- a/module/blob/bdev/blob_bdev.c
++++ b/module/blob/bdev/blob_bdev.c
+@@ -263,6 +263,23 @@ bdev_blob_unmap(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, uint64
+ 	}
+ }
+ 
++/* Evariops 0085: the base bdev's flush, over the whole device; set only when it has one. */
++static void
++bdev_blob_flush(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
++		struct spdk_bs_dev_cb_args *cb_args)
++{
++	int rc;
++
++	rc = spdk_bdev_flush_blocks(__get_desc(dev), channel, 0, dev->blockcnt,
++				    bdev_blob_io_complete, cb_args);
++	if (rc == -ENOMEM) {
++		bdev_blob_queue_io(dev, channel, NULL, 0, 0, 0,
++				   dev->blockcnt, SPDK_BDEV_IO_TYPE_FLUSH, cb_args, NULL);
++	} else if (rc != 0) {
++		cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, rc);
++	}
++}
++
+ static void
+ bdev_blob_copy(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
+ 	       uint64_t dst_lba, uint64_t src_lba, uint64_t lba_count,
+@@ -323,6 +340,9 @@ bdev_blob_resubmit(void *arg)
+ 		bdev_blob_write_zeroes(ctx->dev, ctx->channel,
+ 				       ctx->lba, ctx->lba_count, ctx->cb_args);
+ 		break;
++	case SPDK_BDEV_IO_TYPE_FLUSH:	/* Evariops 0085 */
++		bdev_blob_flush(ctx->dev, ctx->channel, ctx->cb_args);
++		break;
+ 	case SPDK_BDEV_IO_TYPE_COPY:
+ 		bdev_blob_copy(ctx->dev, ctx->channel,
+ 			       ctx->lba, ctx->src_lba, ctx->lba_count, ctx->cb_args);
+@@ -509,6 +529,9 @@ blob_bdev_init(struct blob_bdev *b, struct spdk_bdev_desc *desc)
+ 	if (spdk_bdev_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_COPY)) {
+ 		b->bs_dev.copy = bdev_blob_copy;
+ 	}
++	if (spdk_bdev_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_FLUSH)) {
++		b->bs_dev.flush = bdev_blob_flush;	/* Evariops 0085 */
++	}
+ 	b->bs_dev.get_base_bdev = bdev_blob_get_base_bdev;
+ 	b->bs_dev.is_zeroes = bdev_blob_is_zeroes;
+ 	b->bs_dev.is_range_valid = bdev_blob_is_range_valid;
+diff --git a/test/unit/lib/bdev/vbdev_lvol.c/vbdev_lvol_ut.c b/test/unit/lib/bdev/vbdev_lvol.c/vbdev_lvol_ut.c
+index f958cad68..143dee41c 100644
+--- a/test/unit/lib/bdev/vbdev_lvol.c/vbdev_lvol_ut.c
++++ b/test/unit/lib/bdev/vbdev_lvol.c/vbdev_lvol_ut.c
+@@ -734,6 +734,18 @@ spdk_blob_io_unmap(struct spdk_blob *blob, struct spdk_io_channel *channel,
+ 	cb_fn(cb_arg, 0);
+ }
+ 
++/* Evariops 0085 */
++static int g_blob_flushes;
++
++void
++spdk_blob_io_flush(struct spdk_blob *blob, struct spdk_io_channel *channel,
++		   spdk_blob_op_complete cb_fn, void *cb_arg)
++{
++	CU_ASSERT(channel == g_ch);
++	g_blob_flushes++;
++	cb_fn(cb_arg, 0);
++}
++
+ void
+ spdk_blob_io_write_zeroes(struct spdk_blob *blob, struct spdk_io_channel *channel,
+ 			  uint64_t offset, uint64_t length, spdk_blob_op_complete cb_fn, void *cb_arg)
+@@ -1681,14 +1693,24 @@ ut_vbdev_lvol_get_io_channel(void)
+ 	free(g_lvol);
+ }
+ 
++static void
++ut_dev_flush(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
++	     struct spdk_bs_dev_cb_args *cb_args)
++{
++}
++
+ static void
+ ut_vbdev_lvol_io_type_supported(void)
+ {
+ 	struct spdk_lvol *lvol;
++	struct spdk_lvol_store lvs = {};
++	struct spdk_bs_dev dev = {};
+ 	bool ret;
+ 
+ 	lvol = calloc(1, sizeof(struct spdk_lvol));
+ 	SPDK_CU_ASSERT_FATAL(lvol != NULL);
++	lvs.bs_dev = &dev;
++	lvol->lvol_store = &lvs;
+ 
+ 	g_blob_is_read_only = false;
+ 
+@@ -1716,6 +1738,12 @@ ut_vbdev_lvol_io_type_supported(void)
+ 	ret = vbdev_lvol_io_type_supported(lvol, SPDK_BDEV_IO_TYPE_NVME_IO);
+ 	CU_ASSERT(ret == false);
+ 
++	/* Evariops 0085: FLUSH, when the store's device flushes. */
++	dev.flush = ut_dev_flush;
++	ret = vbdev_lvol_io_type_supported(lvol, SPDK_BDEV_IO_TYPE_FLUSH);
++	CU_ASSERT(ret == true);
++	dev.flush = NULL;
++
+ 	g_blob_is_read_only = true;
+ 
+ 	/* Supported types */
+@@ -1745,6 +1773,28 @@ ut_vbdev_lvol_io_type_supported(void)
+ 	free(lvol);
+ }
+ 
++/* Evariops 0085: a FLUSH goes to the blobstore, which flushes its device. */
++static void
++ut_lvol_flush(void)
++{
++	g_io = calloc(1, sizeof(struct spdk_bdev_io) + vbdev_lvs_get_ctx_size());
++	SPDK_CU_ASSERT_FATAL(g_io != NULL);
++	g_lvol = calloc(1, sizeof(struct spdk_lvol));
++	SPDK_CU_ASSERT_FATAL(g_lvol != NULL);
++
++	g_io->bdev = &g_bdev;
++	g_io->bdev->ctxt = g_lvol;
++	g_io->type = SPDK_BDEV_IO_TYPE_FLUSH;
++	g_blob_flushes = 0;
++
++	vbdev_lvol_submit_request(g_ch, g_io);
++	CU_ASSERT(g_blob_flushes == 1);
++	CU_ASSERT(g_io->internal.status == SPDK_BDEV_IO_STATUS_SUCCESS);
++
++	free(g_io);
++	free(g_lvol);
++}
++
+ static void
+ ut_lvol_read_write(void)
+ {
+@@ -2112,6 +2162,7 @@ main(int argc, char **argv)
+ 	CU_ADD_TEST(suite, ut_vbdev_lvol_get_io_channel);
+ 	CU_ADD_TEST(suite, ut_vbdev_lvol_io_type_supported);
+ 	CU_ADD_TEST(suite, ut_lvol_read_write);
++	CU_ADD_TEST(suite, ut_lvol_flush);
+ 	CU_ADD_TEST(suite, ut_vbdev_lvol_submit_request);
+ 	CU_ADD_TEST(suite, ut_lvol_examine_config);
+ 	CU_ADD_TEST(suite, ut_lvol_examine_disk);
+diff --git a/test/unit/lib/blob/blob.c/blob_ut.c b/test/unit/lib/blob/blob.c/blob_ut.c
+index c63a673a7..f76fb1201 100644
+--- a/test/unit/lib/blob/blob.c/blob_ut.c
++++ b/test/unit/lib/blob/blob.c/blob_ut.c
+@@ -2119,6 +2119,52 @@ blob_operation_split_rw_iov(void)
+ 	ut_blob_close_and_delete(bs, blob);
+ }
+ 
++/* Evariops 0085: spdk_blob_io_flush reaches the store's device once, and completes at once,
++ * sending nothing, on a device without flush. */
++static void
++blob_flush(void)
++{
++	struct spdk_blob_store *bs = g_bs;
++	struct spdk_power_failure_thresholds thresholds = {};
++	struct spdk_blob *blob;
++	struct spdk_io_channel *channel;
++	struct spdk_blob_opts opts;
++	void (*flush)(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
++		      struct spdk_bs_dev_cb_args *cb_args);
++
++	channel = spdk_bs_alloc_io_channel(bs);
++	CU_ASSERT(channel != NULL);
++
++	ut_spdk_blob_opts_init(&opts);
++	opts.num_clusters = 1;
++	blob = ut_blob_create_and_open(bs, &opts);
++
++	/* A threshold far away counts the device's flushes without failing them. */
++	thresholds.flush_threshold = 1000;
++	dev_reset_power_failure_counters();
++	dev_set_power_failure_thresholds(thresholds);
++	g_bserrno = -1;
++	spdk_blob_io_flush(blob, channel, blob_op_complete, NULL);
++	poll_threads();
++	CU_ASSERT(g_bserrno == 0);
++	CU_ASSERT(g_power_failure_counters.flush_counter == 1);
++
++	flush = bs->dev->flush;
++	bs->dev->flush = NULL;
++	g_bserrno = -1;
++	spdk_blob_io_flush(blob, channel, blob_op_complete, NULL);
++	CU_ASSERT(g_bserrno == 0);
++	poll_threads();
++	CU_ASSERT(g_power_failure_counters.flush_counter == 1);
++	bs->dev->flush = flush;
++	dev_reset_power_failure_event();
++
++	spdk_bs_free_io_channel(channel);
++	poll_threads();
++
++	ut_blob_close_and_delete(bs, blob);
++}
++
+ static void
+ blob_unmap(void)
+ {
+@@ -11047,6 +11093,7 @@ main(int argc, char **argv)
+ 		CU_ADD_TEST(suite_blob, blob_rw_verify_iov_nomem);
+ 		CU_ADD_TEST(suite_blob, blob_rw_iov_read_only);
+ 		CU_ADD_TEST(suite_bs, blob_unmap);
++		CU_ADD_TEST(suite_bs, blob_flush);
+ 		CU_ADD_TEST(suite_bs, blob_iter);
+ 		CU_ADD_TEST(suite_blob, blob_xattr);
+ 		CU_ADD_TEST(suite_bs, blob_parse_md);
+diff --git a/test/unit/lib/blob/blob_bdev.c/blob_bdev_ut.c b/test/unit/lib/blob/blob_bdev.c/blob_bdev_ut.c
+index 723f09021..00764fe1d 100644
+--- a/test/unit/lib/blob/blob_bdev.c/blob_bdev_ut.c
++++ b/test/unit/lib/blob/blob_bdev.c/blob_bdev_ut.c
+@@ -48,6 +48,10 @@ DEFINE_STUB(spdk_bdev_write_zeroes_blocks, int,
+ DEFINE_STUB(spdk_bdev_unmap_blocks, int,
+ 	    (struct spdk_bdev_desc *desc, struct spdk_io_channel *ch, uint64_t offset_blocks,
+ 	     uint64_t num_blocks, spdk_bdev_io_completion_cb cb, void *cb_arg), 0);
++/* Evariops 0085 */
++DEFINE_STUB(spdk_bdev_flush_blocks, int,
++	    (struct spdk_bdev_desc *desc, struct spdk_io_channel *ch, uint64_t offset_blocks,
++	     uint64_t num_blocks, spdk_bdev_io_completion_cb cb, void *cb_arg), 0);
+ DEFINE_STUB(spdk_bdev_copy_blocks, int,
+ 	    (struct spdk_bdev_desc *desc, struct spdk_io_channel *ch, uint64_t dst_offset_blocks,
+ 	     uint64_t src_offset_blocks, uint64_t num_blocks, spdk_bdev_io_completion_cb cb,

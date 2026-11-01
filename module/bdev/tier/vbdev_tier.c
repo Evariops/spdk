@@ -2076,6 +2076,9 @@ vbdev_tier_register(struct vbdev_tier *t)
 			if (tier_band_state(ab) != TIER_BAND_RETIRED && ab->desc != NULL) {
 				t->bdev.required_alignment = spdk_max(t->bdev.required_alignment,
 								      spdk_bdev_desc_get_bdev(ab->desc)->required_alignment);
+				/* A band with a volatile write cache gives the composite one: the lvol
+				 * above announces it (fork 0085), and its flushes reach the band. */
+				t->bdev.write_cache |= spdk_bdev_desc_get_bdev(ab->desc)->write_cache;
 			}
 		}
 	}

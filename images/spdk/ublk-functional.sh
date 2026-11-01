@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The ublk patches (0058-0070, 0080-0083) on a real kernel: run inside the debug image, privileged, with the
+# The ublk patches (0058-0070, 0080-0085) on a real kernel: run inside the debug image, privileged, with the
 # host's /dev mounted and ublk_drv loaded on the host. Each case prints PASS, or SKIP when the
 # host's driver lacks the feature it needs; the script exits non-zero on the first failure.
 # Upstream has no unit suite for lib/ublk nor bdev_uring: this is where their behaviour is pinned.
@@ -353,6 +353,15 @@ if has auto_buf_reg && has support_zero_copy; then
 z = json.load(sys.stdin)[0]["zero_copy"]
 sys.exit(0 if z["zero_copy"] >= 2048 + 128 and z["fallbacks"] == 0 else 1)' &&
 		pass "0082 every request went with no copy, no fallback" || fail "0082 zero copy counters: $(R ublk_get_disks)"
+	# 0084, 0085: the disk announces the cache its lvol's device has, and an fsync reaches it.
+	[ "$(cat /sys/block/ublkb$ID/queue/write_cache)" = "write back" ] &&
+		pass "0085 the disk over an lvol over a file announces a volatile write cache" ||
+		fail "0085 write_cache: $(cat /sys/block/ublkb$ID/queue/write_cache)"
+	python3 -c 'import os,sys; fd = os.open(sys.argv[1], os.O_RDWR); os.fsync(fd); os.close(fd)' "$(dev)"
+	R bdev_get_bdevs '{"name":"ua"}' | python3 -c 'import json,sys
+sys.exit(0 if json.load(sys.stdin)[0]["driver_specific"]["uring"]["flushes"] > 0 else 1)' &&
+		pass "0084 an fsync of the disk reached bdev_uring as a flush" ||
+		fail "0084 flushes: $(R bdev_get_bdevs '{"name":"ua"}')"
 	# 0083: after handing requests back to the kernel, the poller gave the core up.
 	R ublk_get_target | python3 -c 'import json,sys
 sys.exit(0 if sum(g.get("yields", 0) for g in json.load(sys.stdin)["poll_groups"]) > 0 else 1)' &&
