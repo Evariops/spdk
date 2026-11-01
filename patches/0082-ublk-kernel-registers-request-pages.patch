@@ -1,0 +1,340 @@
+diff --git a/lib/ublk/ublk.c b/lib/ublk/ublk.c
+index c4d157077..25d0640e7 100644
+--- a/lib/ublk/ublk.c
++++ b/lib/ublk/ublk.c
+@@ -59,6 +59,8 @@ static bool g_disable_user_copy = false;
+ /* Evariops 0067: asked for by ublk_set_zero_copy, for the next target. */
+ static bool g_zero_copy_requested = false;
+ static uint32_t g_zero_copy_min_bytes = 0;
++/* Evariops 0082: asked for by ublk_set_auto_buf_reg, for the next target. */
++static bool g_auto_buf_reg_requested = false;
+ 
+ /* Evariops 0067: the smallest request served with no copy, unless the target says otherwise. A
+  * copy of a few pages costs less than the round trip that registers them. */
+@@ -137,6 +139,9 @@ struct ublk_io {
+ 	/* Evariops 0067: the request's pages are registered in the queue's ring at index tag,
+ 	 * and its bdev I/O carries them as the ublk-zc memory domain (zc_ctx), one iovec. */
+ 	bool			zc_registered;
++	/* Evariops 0082: the kernel registered them there as it handed the request over, and
++	 * removes them at its commit. */
++	bool			zc_auto;
+ 	struct spdk_ublk_zc_ctx	zc_ctx;
+ 	struct iovec		zc_iov;
+ 
+@@ -222,6 +227,9 @@ struct spdk_ublk_dev {
+ 	/* Evariops 0067: the disk serves its large requests with no copy: the device was created
+ 	 * with UBLK_F_SUPPORT_ZERO_COPY, and its bdev serves the ublk-zc memory domain. */
+ 	bool			zero_copy;
++	/* Evariops 0082: the device was created with UBLK_F_AUTO_BUF_REG: the kernel registers
++	 * the pages of each request it hands over, at the index its fetch or commit names. */
++	bool			auto_buf_reg;
+ 	/* Evariops 0069: quiesces asked of the disk as the application stops. */
+ 	uint32_t		fini_quiesces;
+ 
+@@ -288,6 +296,9 @@ struct ublk_tgt {
+ 	struct spdk_memory_domain	*zc_domain;
+ 	bool			zero_copy;
+ 	uint32_t		zc_min_bytes;
++	/* Evariops 0082: the disks this target creates with zero copy have their pages registered
++	 * by the kernel (asked for, and the driver has UBLK_F_AUTO_BUF_REG). */
++	bool			auto_buf_reg;
+ 	/* Evariops 0069: the target stops because ublk_destroy_target asked: its disks are
+ 	 * stopped, not released to the kernel. */
+ 	bool			delete_on_fini;
+@@ -335,6 +346,18 @@ ublk_queue_run_task_work(struct io_uring *r)
+ 	}
+ }
+ 
++/* Evariops 0082: struct ublk_auto_buf_reg as a fetch or a commit carries it in sqe->addr: the
++ * index in bits 0-15, the flags in bits 16-23, the rest zero. */
++static inline __u64
++ublk_auto_buf_reg_addr(uint16_t index)
++{
++#ifdef UBLK_F_AUTO_BUF_REG
++	return (__u64)index | ((__u64)UBLK_AUTO_BUF_REG_FALLBACK << 16);
++#else
++	return 0;
++#endif
++}
++
+ static inline struct io_uring_sqe *
+ ublk_uring_get_sqe(struct io_uring *r, uint32_t idx)
+ {
+@@ -990,6 +1013,12 @@ ublk_set_zero_copy(bool enable, uint32_t min_bytes)
+ 	g_zero_copy_min_bytes = min_bytes;
+ }
+ 
++void
++ublk_set_auto_buf_reg(bool enable)
++{
++	g_auto_buf_reg_requested = enable;
++}
++
+ /* Evariops 0067: the domain of requests served with no copy. A bdev declares it by type; its
+  * data, when a layer needs it in hand, moves through the char device, as with user copy. It
+  * exists before any bdev: the bdev layer reads a bdev's domains once, when the bdev registers,
+@@ -1020,6 +1049,7 @@ static void
+ ublk_zero_copy_decide(void)
+ {
+ 	g_ublk_tgt.zero_copy = false;
++	g_ublk_tgt.auto_buf_reg = false;
+ 	if (!g_zero_copy_requested) {
+ 		return;
+ 	}
+@@ -1033,6 +1063,22 @@ ublk_zero_copy_decide(void)
+ 	g_ublk_tgt.zc_min_bytes = g_zero_copy_min_bytes != 0 ? g_zero_copy_min_bytes : UBLK_ZC_DEFAULT_MIN_BYTES;
+ 	SPDK_NOTICELOG("zero copy for requests of %" PRIu32 " bytes and more (Evariops 0067)\n",
+ 		       g_ublk_tgt.zc_min_bytes);
++
++	/* Evariops 0082: the kernel registers the pages itself, which spares two commands per
++	 * request. A device created so is served only by a process that names the index at each
++	 * fetch and commit: one before this patch fails its fetches. Hence asked for only. */
++	if (!g_auto_buf_reg_requested) {
++		return;
++	}
++#ifdef UBLK_F_AUTO_BUF_REG
++	if (g_ublk_tgt.features & UBLK_F_AUTO_BUF_REG) {
++		g_ublk_tgt.auto_buf_reg = true;
++		SPDK_NOTICELOG("the kernel registers the pages of requests handed over (Evariops 0082)\n");
++		return;
++	}
++#endif
++	SPDK_WARNLOG("the kernel registering request pages asked for, and ublk_drv cannot: the server "
++		     "registers them (Evariops 0082)\n");
+ }
+ 
+ int
+@@ -1370,6 +1416,8 @@ ublk_dump_target_json(struct spdk_json_write_ctx *w)
+ 	}
+ 	spdk_json_write_array_end(w);
+ 	spdk_json_write_named_bool(w, "user_copy", g_ublk_tgt.user_copy);
++	/* Evariops 0082 */
++	spdk_json_write_named_bool(w, "auto_buf_reg", g_ublk_tgt.auto_buf_reg);
+ 
+ 	spdk_json_write_named_array_begin(w, "poll_groups");
+ 	for (i = 0; i < g_num_ublk_poll_groups; i++) {
+@@ -1425,6 +1473,7 @@ ublk_dev_get_zero_copy(struct spdk_ublk_dev *ublk, struct ublk_zero_copy_stats *
+ 
+ 	memset(stats, 0, sizeof(*stats));
+ 	stats->enabled = ublk->zero_copy;
++	stats->auto_buf_reg = ublk->auto_buf_reg;
+ 	for (i = 0; i < ublk->num_queues; i++) {
+ 		q = &ublk->queues[i];
+ 		stats->zero_copy += q->zc_ios;
+@@ -2055,7 +2104,7 @@ _ublk_submit_bdev_io(struct ublk_queue *q, struct ublk_io *io)
+ 
+ 	/* Evariops 0067: the request's registered pages, as the ublk-zc domain: the bdev reads into
+ 	 * them, or writes from them, with no copy, and the read is committed as is. */
+-	if (io->zc_registered) {
++	if (io->zc_registered || io->zc_auto) {
+ 		struct spdk_bdev_ext_io_opts opts = {
+ 			.size = sizeof(opts),
+ 			.memory_domain = g_ublk_tgt.zc_domain,
+@@ -2189,6 +2238,24 @@ ublk_zc_queue_buf_cmd(struct ublk_queue *q, struct ublk_io *io, uint32_t cmd_op)
+ 	return true;
+ }
+ 
++/* Evariops 0082: the request's pages are at index tag in the queue's ring, registered by the
++ * server (it removes them before the commit) or by the kernel (it removes them at the commit). */
++static void
++ublk_zc_pages_ready(struct ublk_queue *q, struct ublk_io *io, bool by_kernel)
++{
++	if (by_kernel) {
++		io->zc_auto = true;
++	} else {
++		io->zc_registered = true;
++	}
++	io->zc_ctx.ring = &q->ring;
++	io->zc_ctx.buf_index = io->tag;
++	io->zc_iov.iov_base = (void *)(uintptr_t)SPDK_UBLK_ZC_ADDR_BASE;
++	io->zc_iov.iov_len = io->result;
++	q->zc_ios++;
++	_ublk_submit_bdev_io(q, io);
++}
++
+ static void
+ ublk_zc_registered(struct ublk_queue *q, struct ublk_io *io, int32_t res)
+ {
+@@ -2200,13 +2267,7 @@ ublk_zc_registered(struct ublk_queue *q, struct ublk_io *io, int32_t res)
+ 		return;
+ 	}
+ 
+-	io->zc_registered = true;
+-	io->zc_ctx.ring = &q->ring;
+-	io->zc_ctx.buf_index = io->tag;
+-	io->zc_iov.iov_base = (void *)(uintptr_t)SPDK_UBLK_ZC_ADDR_BASE;
+-	io->zc_iov.iov_len = io->result;
+-	q->zc_ios++;
+-	_ublk_submit_bdev_io(q, io);
++	ublk_zc_pages_ready(q, io, false);
+ }
+ 
+ static void
+@@ -2218,6 +2279,19 @@ ublk_submit_bdev_io(struct ublk_queue *q, struct ublk_io *io)
+ 	io->result = iod->nr_sectors * (1ULL << LINUX_SECTOR_SHIFT);
+ 	if (q->dev->zero_copy && (ublk_op == UBLK_IO_OP_READ || ublk_op == UBLK_IO_OP_WRITE) &&
+ 	    (uint32_t)io->result >= g_ublk_tgt.zc_min_bytes) {
++#ifdef UBLK_F_AUTO_BUF_REG
++		/* Evariops 0082: the kernel registered the pages as it handed the request over,
++		 * unless it says it could not (UBLK_AUTO_BUF_REG_FALLBACK): then they are copied. */
++		if (q->dev->auto_buf_reg) {
++			if (spdk_likely(!(iod->op_flags & UBLK_IO_F_NEED_REG_BUF))) {
++				ublk_zc_pages_ready(q, io, true);
++				return;
++			}
++			q->zc_fallbacks++;
++			ublk_submit_bdev_io_copied(q, io);
++			return;
++		}
++#endif
+ 		if (ublk_zc_queue_buf_cmd(q, io, UBLK_IO_REGISTER_IO_BUF)) {
+ 			/* ublk_zc_registered goes on, from the registration's completion. */
+ 			return;
+@@ -2404,6 +2478,10 @@ ublksrv_queue_io_cmd(struct ublk_queue *q,
+ 	sqe->opcode	= IORING_OP_URING_CMD;
+ 	sqe->flags	= IOSQE_FIXED_FILE;
+ 	sqe->rw_flags	= 0;
++	/* Evariops 0082: where the kernel registers the pages of the request it hands over at this
++	 * tag, and that it hands it over unregistered rather than failing the fetch. The entry
++	 * may last have held a fixed operation: its address is always written. */
++	sqe->addr	= q->dev->auto_buf_reg && cmd_op != UBLK_IO_NEED_GET_DATA ? ublk_auto_buf_reg_addr(tag) : 0;
+ 	cmd->tag	= tag;
+ 	cmd->addr	= g_ublk_tgt.user_copy ? 0 : (__u64)(uintptr_t)(io->payload);
+ 	cmd->q_id	= q->q_id;
+@@ -2455,6 +2533,8 @@ ublk_io_xmit(struct ublk_queue *q)
+ 				ublk_zc_queue_buf_cmd(q, io, UBLK_IO_UNREGISTER_IO_BUF);
+ 				io->zc_registered = false;
+ 			}
++			/* Evariops 0082: the commit removes the pages the kernel registered. */
++			io->zc_auto = false;
+ 			ublksrv_queue_io_cmd(q, io, io->tag);
+ 		}
+ 	}
+@@ -2792,8 +2872,9 @@ ublk_dev_queue_init(struct ublk_queue *q)
+ 	}
+ 
+ 	rc = io_uring_register_files(&q->ring, &ublk->cdev_fd, 1);
+-	if (rc == 0 && ublk->zero_copy) {
+-		/* Evariops 0067: the request at tag t has its pages registered at index t. */
++	if (rc == 0 && (ublk->zero_copy || ublk->auto_buf_reg)) {
++		/* Evariops 0067: the request at tag t has its pages registered at index t; 0082: by
++		 * the kernel too, even for a disk whose bdev no longer serves them with no copy. */
+ 		rc = io_uring_register_buffers_sparse(&q->ring, q->q_depth);
+ 		if (rc != 0) {
+ 			io_uring_unregister_files(&q->ring);
+@@ -2925,6 +3006,13 @@ ublk_dev_info_init(struct spdk_ublk_dev *ublk)
+ 	if (ublk->zero_copy) {
+ 		uinfo.flags |= UBLK_F_SUPPORT_ZERO_COPY;
+ 	}
++#ifdef UBLK_F_AUTO_BUF_REG
++	/* Evariops 0082: unlike the above, it changes the fetches and commits (ublksrv_queue_io_cmd):
++	 * only a process with this patch serves, and recovers, the device. */
++	if (ublk->auto_buf_reg) {
++		uinfo.flags |= UBLK_F_AUTO_BUF_REG;
++	}
++#endif
+ 
+ 	ublk->dev_info = uinfo;
+ }
+@@ -3295,6 +3383,8 @@ ublk_start_disk(const char *bdev_name, uint32_t ublk_id,
+ 
+ 	/* Evariops 0067 */
+ 	ublk->zero_copy = ublk_bdev_serves_zero_copy(bdev);
++	/* Evariops 0082 */
++	ublk->auto_buf_reg = ublk->zero_copy && g_ublk_tgt.auto_buf_reg;
+ 	ublk_dev_info_init(ublk);
+ 	ublk_info_param_init(ublk);
+ 	rc = ublk_ios_init(ublk);
+@@ -3479,6 +3569,11 @@ ublk_ctrl_start_recovery(struct spdk_ublk_dev *ublk)
+ 	 * device created without it is served with copies, as by the process that created it. */
+ 	ublk->zero_copy = (ublk->dev_info.flags & UBLK_F_SUPPORT_ZERO_COPY) &&
+ 			  ublk_bdev_serves_zero_copy(ublk->bdev);
++#ifdef UBLK_F_AUTO_BUF_REG
++	/* Evariops 0082: a device created with the kernel registering its pages fails every fetch
++	 * that does not name the index: it is served so, whatever this target was asked. */
++	ublk->auto_buf_reg = (ublk->dev_info.flags & UBLK_F_AUTO_BUF_REG) != 0;
++#endif
+ 	ublk_info_param_init(ublk);
+ 	rc = ublk_ios_init(ublk);
+ 	if (rc != 0) {
+diff --git a/lib/ublk/ublk_internal.h b/lib/ublk/ublk_internal.h
+index 36f2042b2..4446cb685 100644
+--- a/lib/ublk/ublk_internal.h
++++ b/lib/ublk/ublk_internal.h
+@@ -128,10 +128,17 @@ void ublk_dump_target_json(struct spdk_json_write_ctx *w);
+  * ublk_create_target, which creates the domain. */
+ void ublk_set_zero_copy(bool enable, uint32_t min_bytes);
+ 
++/* Evariops 0082: the disks started with zero copy after this call have their request pages
++ * registered by the kernel when the driver can (UBLK_F_AUTO_BUF_REG). Such a disk is served,
++ * and recovered, only by a process with that patch. Called before ublk_create_target. */
++void ublk_set_auto_buf_reg(bool enable);
++
+ /* Evariops 0067: a disk's zero copy, summed over its queues. */
+ struct ublk_zero_copy_stats {
+ 	/* The disk was started with zero copy. */
+ 	bool enabled;
++	/* Evariops 0082: the kernel registers its request pages. */
++	bool auto_buf_reg;
+ 	/* Requests served with no copy. */
+ 	uint64_t zero_copy;
+ 	/* Reads and writes served through a copy: below the size, or fallen back. */
+diff --git a/lib/ublk/ublk_rpc.c b/lib/ublk/ublk_rpc.c
+index d3063e5ee..f038cea13 100644
+--- a/lib/ublk/ublk_rpc.c
++++ b/lib/ublk/ublk_rpc.c
+@@ -29,6 +29,8 @@ rpc_ublk_create_target(struct spdk_jsonrpc_request *request, const struct spdk_j
+ 	}
+ 	/* Evariops 0067 */
+ 	ublk_set_zero_copy(req.zero_copy, req.zero_copy_min_bytes);
++	/* Evariops 0082 */
++	ublk_set_auto_buf_reg(req.auto_buf_reg);
+ 	rc = ublk_create_target(req.cpumask, req.disable_user_copy);
+ 	if (rc != 0) {
+ 		goto invalid;
+@@ -199,6 +201,8 @@ rpc_dump_ublk_info(struct spdk_json_write_ctx *w,
+ 	ublk_dev_get_zero_copy(ublk, &zero_copy);
+ 	spdk_json_write_named_object_begin(w, "zero_copy");
+ 	spdk_json_write_named_bool(w, "enabled", zero_copy.enabled);
++	/* Evariops 0082 */
++	spdk_json_write_named_bool(w, "auto_buf_reg", zero_copy.auto_buf_reg);
+ 	spdk_json_write_named_uint64(w, "zero_copy", zero_copy.zero_copy);
+ 	spdk_json_write_named_uint64(w, "copied", zero_copy.copied);
+ 	spdk_json_write_named_uint64(w, "fallbacks", zero_copy.fallbacks);
+diff --git a/python/spdk/cli/ublk.py b/python/spdk/cli/ublk.py
+index 7e2931b92..a0d9ec6ee 100644
+--- a/python/spdk/cli/ublk.py
++++ b/python/spdk/cli/ublk.py
+@@ -15,7 +15,8 @@ def add_parser(subparsers):
+                                     cpumask=args.cpumask,
+                                     disable_user_copy=args.disable_user_copy,
+                                     zero_copy=args.zero_copy,
+-                                    zero_copy_min_bytes=args.zero_copy_min_bytes)
++                                    zero_copy_min_bytes=args.zero_copy_min_bytes,
++                                    auto_buf_reg=args.auto_buf_reg)
+     p = subparsers.add_parser('ublk_create_target',
+                               help='Create spdk ublk target for ublk dev')
+     p.add_argument('-m', '--cpumask', help="CPU mask for the ublk target's I/O threads")
+@@ -23,6 +24,8 @@ def add_parser(subparsers):
+     p.add_argument('--zero-copy', help='serve large requests with no copy when the driver and the bdev can (Evariops)',
+                    action='store_true')
+     p.add_argument('--zero-copy-min-bytes', help='smallest request served with no copy, 0 for 65536 (Evariops)', type=int)
++    p.add_argument('--auto-buf-reg', help='the kernel registers the pages of requests served with no copy; such a disk is '
++                   'served only by a process that can (Evariops)', action='store_true')
+     p.set_defaults(func=ublk_create_target)
+ 
+     def ublk_destroy_target(args):
+diff --git a/schema/schema.yaml b/schema/schema.yaml
+index 98bc4458e..080f082ff 100644
+--- a/schema/schema.yaml
++++ b/schema/schema.yaml
+@@ -5160,6 +5160,9 @@ methods:
+       - name: zero_copy_min_bytes
+         type: uint32
+         description: smallest request served with no copy, 0 for 65536 (Evariops)
++      - name: auto_buf_reg
++        type: boolean
++        description: the kernel registers the pages of requests served with no copy; such a disk is served only by a process that can (Evariops)
+   - name: ublk_destroy_target
+     description: Release all UBLK devices and destroy ublk target.
+     result:

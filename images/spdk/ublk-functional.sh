@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The ublk patches (0058-0070) on a real kernel: run inside the debug image, privileged, with the
+# The ublk patches (0058-0070, 0080-0082) on a real kernel: run inside the debug image, privileged, with the
 # host's /dev mounted and ublk_drv loaded on the host. Each case prints PASS, or SKIP when the
 # host's driver lacks the feature it needs; the script exits non-zero on the first failure.
 # Upstream has no unit suite for lib/ublk nor bdev_uring: this is where their behaviour is pinned.
@@ -312,6 +312,65 @@ R ublk_destroy_target > /dev/null
 sleep 1
 [ -e /sys/class/ublk-char/ublkc$ID ] && fail "the device outlived ublk_destroy_target" || pass "ublk_destroy_target deleted the device"
 stop_term
+
+# Every case above runs its queues on rings that leave the kernel's work to the poller (0081).
+echo "=== 0080: 512 B blocks, I/O handed whole in 4 KiB at most an iobuf buffer long"
+truncate -s 512M "$WORK/u512.img"
+start ""
+R bdev_uring_create "{\"filename\":\"$WORK/u512.img\",\"name\":\"u5\",\"block_size\":512}" > /dev/null || fail "bdev_uring_create 512 B"
+target '{"zero_copy":true,"zero_copy_min_bytes":4096}'
+R ublk_start_disk "{\"bdev_name\":\"u5\",\"ublk_id\":$ID}" > /dev/null || fail "0080 start over 512 B blocks"
+wait_dev
+ops() { R bdev_get_iostat '{"names":["u5"]}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["bdevs"][0]["num_write_ops"])'; }
+before=$(ops)
+# 263 blocks of 512 B: what the bare computation handed whole, a 128 KiB disk transfer and 3.5 KiB.
+# Read from the file: through a pipe, dd's one read takes what the pipe holds, a partial block.
+dd if="$WORK/pattern" of="$(dev)" bs=134656 count=1 oflag=direct conv=nocreat status=none
+[ $(( $(ops) - before )) = 2 ] && pass "0080 a 131.5 KiB write goes as 128 KiB and the rest" ||
+	fail "0080 a 131.5 KiB write went in $(( $(ops) - before )) operations, wants 2"
+dd if="$WORK/pattern" of="$(dev)" bs=1M oflag=direct conv=nocreat status=none
+[ "$(dd if="$(dev)" bs=1M count=8 iflag=direct status=none | digest)" = "$PATTERN" ] &&
+	pass "0080 8 MiB over 512 B blocks read back" || fail "0080 read back"
+R ublk_stop_disk "{\"ublk_id\":$ID}" > /dev/null
+stop_term
+
+echo "=== 0082: the kernel registers the pages of the requests it hands over"
+if has auto_buf_reg && has support_zero_copy; then
+	truncate -s 512M "$WORK/auto.img"
+	start ""
+	R bdev_uring_create "{\"filename\":\"$WORK/auto.img\",\"name\":\"ua\",\"block_size\":4096}" > /dev/null || fail "bdev_uring_create"
+	R bdev_lvol_create_lvstore '{"bdev_name":"ua","lvs_name":"lvsa","cluster_sz":1048576}' > /dev/null
+	R bdev_lvol_create '{"lvol_name":"lv","size_in_mib":64,"lvs_name":"lvsa"}' > /dev/null
+	target '{"zero_copy":true,"zero_copy_min_bytes":4096,"auto_buf_reg":true}'
+	[[ $(R ublk_get_target) == *'"auto_buf_reg": true'* ]] && pass "0082 ublk_get_target reports it" || fail "0082 target report"
+	R ublk_start_disk "{\"bdev_name\":\"lvsa/lv\",\"ublk_id\":$ID,\"identity\":4662}" > /dev/null || fail "0082 start"
+	wait_dev
+	[[ $(R ublk_get_disks) == *'"auto_buf_reg": true'* ]] && pass "0082 the disk reports it" || fail "0082 disk report"
+	dd if="$WORK/pattern" of="$(dev)" bs=4k oflag=direct conv=nocreat status=none
+	[ "$(dd if="$(dev)" bs=64k count=128 iflag=direct status=none | digest)" = "$PATTERN" ] &&
+		pass "0082 8 MiB in 4 KiB written, read back in 64 KiB" || fail "0082 read back"
+	R ublk_get_disks | python3 -c 'import json,sys
+z = json.load(sys.stdin)[0]["zero_copy"]
+sys.exit(0 if z["zero_copy"] >= 2048 + 128 and z["fallbacks"] == 0 else 1)' &&
+		pass "0082 every request went with no copy, no fallback" || fail "0082 zero copy counters: $(R ublk_get_disks)"
+	if has user_recovery && has user_recovery_reissue; then
+		writer 150
+		sleep 0.5
+		stop_kill
+		# A target not asked for it: the device was created so, and is served so.
+		start ""
+		R bdev_uring_create "{\"filename\":\"$WORK/auto.img\",\"name\":\"ua\",\"block_size\":4096}" > /dev/null
+		R bdev_wait_for_examine > /dev/null
+		target '{"zero_copy":true,"zero_copy_min_bytes":4096}'
+		R ublk_recover_disk "{\"bdev_name\":\"lvsa/lv\",\"ublk_id\":$ID,\"identity\":4662}" > /dev/null || fail "0082 recover after SIGKILL"
+		writer_check 150 && pass "0082 the writer's blocks survive a SIGKILL, recovered by a target not asked for it"
+		[[ $(R ublk_get_disks) == *'"auto_buf_reg": true'* ]] && pass "0082 the recovered disk is served as created" || fail "0082 recovered report"
+	fi
+	R ublk_stop_disk "{\"ublk_id\":$ID}" > /dev/null
+	stop_term
+else
+	skip "0082 the kernel registering request pages"
+fi
 
 echo "=== spdk-takeover-proof: this image against itself"
 PROOF=$(dirname "$TGT")/spdk-takeover-proof

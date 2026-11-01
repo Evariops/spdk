@@ -1,0 +1,90 @@
+diff --git a/lib/ublk/ublk.c b/lib/ublk/ublk.c
+index b8e42550b..c4d157077 100644
+--- a/lib/ublk/ublk.c
++++ b/lib/ublk/ublk.c
+@@ -297,15 +297,42 @@ static TAILQ_HEAD(, spdk_ublk_dev) g_ublk_devs = TAILQ_HEAD_INITIALIZER(g_ublk_d
+ static struct ublk_tgt g_ublk_tgt;
+ 
+ /* helpers for using io_uring */
++/*
++ * Evariops 0081: a queue's ring leaves the kernel's work on its completions (a request handed
++ * over, a fixed operation done, a copy done) for the next time the reactor enters the ring,
++ * instead of an interrupt of the reactor's core for each one. The kernel raises IORING_SQ_TASKRUN
++ * in the ring's flags when such work waits; ublk_io_recv reads completions in user space, so it
++ * enters the ring first (ublk_queue_run_task_work).
++ */
++#define UBLK_RING_DEFERRED_TASK_WORK	(IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG)
++
+ static inline int
+ ublk_setup_ring(uint32_t depth, struct io_uring *r, unsigned flags)
+ {
+ 	struct io_uring_params p = {};
++	int rc;
+ 
+ 	p.flags = flags | IORING_SETUP_CQSIZE;
+ 	p.cq_entries = depth;
+ 
+-	return io_uring_queue_init_params(depth, r, &p);
++	rc = io_uring_queue_init_params(depth, r, &p);
++	/* Evariops 0081: before 5.19 the kernel defers nothing; the ring is made the old way. */
++	if (rc == -EINVAL && (flags & UBLK_RING_DEFERRED_TASK_WORK) != 0) {
++		memset(&p, 0, sizeof(p));
++		p.flags = (flags & ~UBLK_RING_DEFERRED_TASK_WORK) | IORING_SETUP_CQSIZE;
++		p.cq_entries = depth;
++		rc = io_uring_queue_init_params(depth, r, &p);
++	}
++
++	return rc;
++}
++
++static inline void
++ublk_queue_run_task_work(struct io_uring *r)
++{
++	if (IO_URING_READ_ONCE(*r->sq.kflags) & IORING_SQ_TASKRUN) {
++		io_uring_get_events(r);
++	}
+ }
+ 
+ static inline struct io_uring_sqe *
+@@ -2485,6 +2512,7 @@ ublk_io_recv(struct ublk_queue *q)
+ 	}
+ 
+ 	iobuf_ch = &q->poll_group->iobuf_ch;
++	ublk_queue_run_task_work(&q->ring);
+ 	io_uring_for_each_cqe(&q->ring, head, cqe) {
+ 		q->cmd_inflight--;
+ 
+@@ -2755,7 +2783,7 @@ ublk_dev_queue_init(struct ublk_queue *q)
+ 
+ 	/* Evariops 0067: with zero copy a tag has more than its command on the ring. */
+ 	rc = ublk_setup_ring(ublk->zero_copy ? q->q_depth * UBLK_ZC_RING_ENTRIES_PER_TAG : q->q_depth,
+-			     &q->ring, IORING_SETUP_SQE128);
++			     &q->ring, IORING_SETUP_SQE128 | UBLK_RING_DEFERRED_TASK_WORK);
+ 	if (rc < 0) {
+ 		SPDK_ERRLOG("Failed at setup uring: %s\n", spdk_strerror(-rc));
+ 		munmap(q->io_cmd_buf, ublk_queue_cmd_buf_sz(q->q_depth));
+diff --git a/module/bdev/uring/bdev_uring.c b/module/bdev/uring/bdev_uring.c
+index 902f051a6..c77e99bad 100644
+--- a/module/bdev/uring/bdev_uring.c
++++ b/module/bdev/uring/bdev_uring.c
+@@ -963,10 +963,19 @@ static int
+ bdev_uring_group_create_cb(void *io_device, void *ctx_buf)
+ {
+ 	struct bdev_uring_group_channel *ch = ctx_buf;
++	int rc;
+ 
+ 	/* Do not use IORING_SETUP_IOPOLL until the Linux kernel can support not only
+ 	 * local devices but also devices attached from remote target */
+-	if (io_uring_queue_init(SPDK_URING_QUEUE_DEPTH, &ch->uring, 0) < 0) {
++	/* Evariops 0081: the kernel's work on a completion waits for the poller's next entry into
++	 * the ring instead of interrupting the reactor's core; io_uring_peek_cqe enters the ring
++	 * when the kernel says such work waits (IORING_SQ_TASKRUN). Before 5.19, the old way. */
++	rc = io_uring_queue_init(SPDK_URING_QUEUE_DEPTH, &ch->uring,
++				 IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG);
++	if (rc == -EINVAL) {
++		rc = io_uring_queue_init(SPDK_URING_QUEUE_DEPTH, &ch->uring, 0);
++	}
++	if (rc < 0) {
+ 		SPDK_ERRLOG("uring I/O context setup failure\n");
+ 		return -1;
+ 	}
