@@ -401,6 +401,14 @@ if [ -x "$PROOF" ]; then
 	done
 	[ -e /sys/class/ublk-char/ublkc1048064 ] || [ -e /sys/class/ublk-char/ublkc1048065 ] &&
 		fail "the proof left a device in the kernel" || pass "the proof left nothing in the kernel"
+	# A disk left to the kernel (a phase that failed, a pod cut short) is taken back by the next clean,
+	# over a bdev of the disk's own size: the recovery's size check (0070) refused any other.
+	"$PD/spdk-takeover-proof" create --tgt "$TGT" --dir "$PD" --core 0 --report "$PD/create-left.json" 2> /dev/null
+	[ -e /sys/class/ublk-char/ublkc1048064 ] || fail "the second create left no disk to the kernel"
+	"$PD/spdk-takeover-proof" clean --tgt "$TGT" --dir "$PD" --core 0 --report "$PD/clean-left.json" 2> /dev/null
+	said=$(python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(r["result"], "-", r["detail"])' "$PD/clean-left.json")
+	[ "${said%% *}" = ok ] && [ ! -e /sys/class/ublk-char/ublkc1048064 ] &&
+		pass "proof clean takes back a disk left to the kernel: ${said#* - }" || fail "proof clean of a disk left to the kernel: $said"
 else
 	echo "SKIP the takeover proof: this image has none"
 fi

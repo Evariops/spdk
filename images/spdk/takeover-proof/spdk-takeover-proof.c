@@ -36,7 +36,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define PROOF_VERSION 1
+#define PROOF_VERSION 2
 #define PATTERN_BYTES (8u << 20)
 #define CHUNK (1u << 20)
 #define LVOL_MIB 16
@@ -132,8 +132,8 @@ static void stop_served(void);
 static int g_failing;
 
 /* A failed phase ends its pod (restartPolicy Never): no later phase, and no last clean, runs. The
- * proof's disks this process serves are stopped first, so that none is left to the kernel
- * waiting for a server until the next proof's clean. */
+ * proof's disks are stopped first, those this process serves and those it left to the kernel,
+ * so that none waits for a server until the next proof's clean. */
 static void __attribute__((noreturn, format(printf, 1, 2)))
 fail(const char *fmt, ...)
 {
@@ -431,6 +431,23 @@ rpc_must(const char *method, const char *params)
 #define METHOD_NOT_FOUND (-32601)
 #define INVALID_PARAMS (-32602)
 
+/* How long a disk's start or recovery waits for the target: its poll groups set up their buffers
+ * on their own threads after ublk_create_target answered, and until then answer -EAGAIN (fork
+ * 0058). A not-yet, which a phase run right after the target's creation meets. */
+#define TARGET_READY_MS 10000
+
+static int
+rpc_when_ready(const char *method, const char *params)
+{
+	long long deadline = now_ms() + TARGET_READY_MS;
+	int rc;
+
+	while ((rc = rpc(method, params)) == -EAGAIN && now_ms() < deadline) {
+		usleep(20000);
+	}
+	return rc;
+}
+
 /* ── the disk's bytes ─────────────────────────────────────────────────────────────────── */
 
 static void
@@ -609,11 +626,11 @@ disk(const char *method, const char *name, unsigned id, unsigned long long ident
 	int rc;
 
 	snprintf(params, sizeof(params), "{\"bdev_name\":\"proof/%s\",\"ublk_id\":%u,\"identity\":%llu}", name, id, identity);
-	rc = rpc(method, params);
+	rc = rpc_when_ready(method, params);
 	if (rc == INVALID_PARAMS) {
 		note("this image carries no identity");
 		snprintf(params, sizeof(params), "{\"bdev_name\":\"proof/%s\",\"ublk_id\":%u}", name, id);
-		rc = rpc(method, params);
+		rc = rpc_when_ready(method, params);
 	}
 	if (rc != 0) {
 		fail("%s %s as ublk %u: %d %s", method, name, id, rc, rpc_message());
@@ -664,8 +681,51 @@ stop_disk(unsigned id)
 	wait_gone(id);
 }
 
-/* On a failure, best effort: a disk this process does not serve answers an error, and the
- * kernel's is left to the next clean. */
+/* A proof disk's size in 4 KiB blocks, as the kernel holds it: a recovery over a bdev of another
+ * size is refused (fork 0070). The proof's lvol size when the kernel does not say. */
+static unsigned long long
+held_blocks(unsigned id)
+{
+	char path[64];
+	unsigned long long sectors = 0;
+	FILE *f;
+
+	snprintf(path, sizeof(path), "/sys/block/ublkb%u/size", id);
+	f = fopen(path, "r");
+	if (f != NULL) {
+		if (fscanf(f, "%llu", &sectors) != 1) {
+			sectors = 0;
+		}
+		fclose(f);
+	}
+	return sectors >= 8 ? sectors / 8 : ((unsigned long long)LVOL_MIB << 20) / 4096;
+}
+
+/* Takes back a proof disk the kernel holds, and stops it: a bdev of its size serves a recovery
+ * that is only there to stop the device. Returns 0, or the code of the call that refused. */
+static int
+take_back_and_stop(unsigned id, int slot)
+{
+	char params[128];
+	int rc;
+
+	snprintf(params, sizeof(params), "{\"name\":\"clean%d\",\"num_blocks\":%llu,\"block_size\":4096}", slot,
+		 held_blocks(id));
+	rc = rpc("bdev_null_create", params);
+	if (rc == 0) {
+		snprintf(params, sizeof(params), "{\"bdev_name\":\"clean%d\",\"ublk_id\":%u}", slot, id);
+		rc = rpc_when_ready("ublk_recover_disk", params);
+	}
+	if (rc == 0) {
+		snprintf(params, sizeof(params), "{\"ublk_id\":%u}", id);
+		rc = rpc("ublk_stop_disk", params);
+	}
+	return rc;
+}
+
+/* On a failure, best effort: the proof's disks this process serves are stopped, and those it left
+ * to the kernel are taken back and stopped. Without a target in this process, the kernel's are
+ * left to the next clean. */
 static void
 stop_served(void)
 {
@@ -681,7 +741,7 @@ stop_served(void)
 			continue;
 		}
 		snprintf(params, sizeof(params), "{\"ublk_id\":%u}", ids[i]);
-		if (rpc("ublk_stop_disk", params) == 0) {
+		if (rpc("ublk_stop_disk", params) == 0 || take_back_and_stop(ids[i], i) == 0) {
 			note("ublk %u stopped", ids[i]);
 		}
 	}
@@ -693,8 +753,7 @@ static int
 phase_clean(void)
 {
 	unsigned ids[2] = { g_id_a, g_id_b };
-	char params[128];
-	int i, held = 0;
+	int i, rc, held = 0;
 
 	for (i = 0; i < 2; i++) {
 		held += device_held(ids[i]);
@@ -712,14 +771,11 @@ phase_clean(void)
 		if (!device_held(ids[i])) {
 			continue;
 		}
-		/* Any bdev serves a recovery that is only there to stop the device: no volume's. */
-		snprintf(params, sizeof(params), "{\"name\":\"clean%d\",\"num_blocks\":16384,\"block_size\":4096}", i);
-		rpc_must("bdev_null_create", params);
-		snprintf(params, sizeof(params), "{\"bdev_name\":\"clean%d\",\"ublk_id\":%u}", i, ids[i]);
-		if (rpc("ublk_recover_disk", params) != 0) {
-			fail("ublk %u is held and cannot be recovered (%s): another process serves it", ids[i], rpc_message());
+		rc = take_back_and_stop(ids[i], i);
+		if (rc != 0) {
+			fail("ublk %u, left from an earlier proof, was not taken back: %d %s", ids[i], rc, rpc_message());
 		}
-		stop_disk(ids[i]);
+		wait_gone(ids[i]);
 		note("ublk %u was left from an earlier proof: stopped", ids[i]);
 	}
 	tgt_stop();
